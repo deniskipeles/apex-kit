@@ -1,0 +1,108 @@
+import { AppSettings } from '../../../types';
+import { apiClient, pb } from '../../../lib/apiClient'; // Import pb
+
+// We map the API response (snake_case keys from Rust) to Frontend (camelCase)
+const mapToFrontend = (apiData: any): AppSettings => {
+    return {
+        appName: apiData.app_name || 'TinyBase',
+        appUrl: apiData.app_url || 'http://localhost:3000',
+        allowPublicRegistration: apiData.allow_public_registration || false,
+        theme: apiData.theme || 'system',
+        smtp: {
+            enabled: apiData.smtp?.enabled || false,
+            host: apiData.smtp?.host || '',
+            port: apiData.smtp?.port || 587,
+            username: apiData.smtp?.username || '',
+            password: apiData.smtp?.password || '', // Will be ******
+            fromEmail: apiData.smtp?.from_email || ''
+        },
+        storage: {
+            activeDriver: apiData.storage?.active_driver || 'local',
+            s3: {
+                enabled: apiData.storage?.s3?.enabled || false,
+                provider: apiData.storage?.s3?.provider || 'aws',
+                bucket: apiData.storage?.s3?.bucket || '',
+                region: apiData.storage?.s3?.region || '',
+                endpoint: apiData.storage?.s3?.endpoint || '',
+                accessKey: apiData.storage?.s3?.access_key || '',
+                secretKey: apiData.storage?.s3?.secret_key || '' // Will be ******
+            }
+        },
+        // Defaults for things not yet in API
+        backups: { enabled: false, schedule: '0 0 * * *', retention: 7, destination: 'local' },
+        cronJobs: apiData.cron_jobs || [],
+        apiTokens: [],
+        security: {
+            corsAllowAll: apiData.security?.cors_allow_all ?? true, // Default to true if missing
+            corsOrigins: apiData.security?.cors_origins || ''
+        },
+    };
+};
+
+const mapToApi = (settings: Partial<AppSettings>): any => {
+    const payload: any = {};
+    if (settings.appName) payload.app_name = settings.appName;
+    if (settings.appUrl) payload.app_url = settings.appUrl;
+    if (settings.allowPublicRegistration !== undefined) payload.allow_public_registration = settings.allowPublicRegistration;
+    if (settings.theme) payload.theme = settings.theme;
+
+    if (settings.smtp) {
+        payload.smtp = {
+            enabled: settings.smtp.enabled,
+            host: settings.smtp.host,
+            port: settings.smtp.port,
+            username: settings.smtp.username,
+            password: settings.smtp.password, // API handles masking
+            from_email: settings.smtp.fromEmail
+        };
+    }
+
+    if (settings.storage) {
+        payload.storage = {
+            active_driver: settings.storage.activeDriver,
+            s3: {
+                enabled: settings.storage.s3.enabled,
+                provider: settings.storage.s3.provider,
+                bucket: settings.storage.s3.bucket,
+                region: settings.storage.s3.region,
+                endpoint: settings.storage.s3.endpoint,
+                access_key: settings.storage.s3.accessKey,
+                secret_key: settings.storage.s3.secretKey
+            }
+        };
+    }
+    if (settings.security) {
+        payload.security = {
+            cors_allow_all: settings.security.corsAllowAll,
+            cors_origins: settings.security.corsOrigins
+        };
+    }
+    if (settings.cronJobs) {
+        payload.cron_jobs = settings.cronJobs;
+    }
+
+    return payload;
+};
+
+export const settingsService = {
+  get: async (): Promise<AppSettings> => {
+    try {
+        const res = await pb.admins.getSettings();
+        return mapToFrontend(res);
+    } catch (e) {
+        console.error("Failed to load settings", e);
+        // Return default on failure to not crash UI
+        return mapToFrontend({}); 
+    }
+  },
+
+  update: async (settings: Partial<AppSettings>): Promise<AppSettings> => {
+    const payload = mapToApi(settings);
+    const res = await pb.admins.updateSettings(payload);
+    return mapToFrontend(res);
+  },
+
+  // Keep mocks for untethered features
+  testEmail: async (email: string) => true,
+  generateToken: async (name: string) => ({ token: { id: '1', name, key: 'xxx', created: '' }, rawKey: 'xxx' })
+};

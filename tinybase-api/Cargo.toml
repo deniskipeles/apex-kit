@@ -1,0 +1,24 @@
+[package]
+name = "tinybase-api"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = "0.7.5"
+tokio = { version = "1.37.0", features = ["full"] }
+serde = { version = "1.0.200", features = ["derive"] }
+libsql = { version = "0.9.29", features = ["replication"] }
+tinybase-core = { path = "../tinybase-core" }
+serde_json = "1.0.117"
+utoipa = { version = "4.2.3", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "7.1.0", features = ["axum"] }
+validator = { version = "0.18.1", features = ["derive"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12.4", features = ["json"] }
+assert-json-diff = "2.0.2"
+serde_json = "1.0.117"
+tower = "0.4.13"
+hyper = "1.2.0"
