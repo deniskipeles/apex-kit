@@ -19,6 +19,8 @@ use async_graphql::dataloader::DataLoader;
 use async_graphql::Value;
 use async_graphql::dynamic::{Schema, Object, Field, TypeRef, FieldFuture}; 
 
+use tinybase_core::scripting::ScriptEngine;
+
 #[tokio::main]
 async fn main() {
     // Load .env file
@@ -109,6 +111,9 @@ async fn main() {
             }));
         builder.register(query).finish().expect("Failed to build empty schema")
     };
+
+    // Init Script Engine
+    let script_engine = Arc::new(ScriptEngine::new().await);
     
     // 4. Construct AppState
     let state = AppState {
@@ -120,6 +125,7 @@ async fn main() {
         vault,
         schema: Arc::new(RwLock::new(empty_schema)),
         scheduler: scheduler_arc.clone(),
+        script_engine,
     };
 
     // 5. Build Real Schema

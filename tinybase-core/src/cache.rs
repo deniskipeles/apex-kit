@@ -299,5 +299,22 @@ impl Db for CachedDb {
     async fn get_records_by_ids(&self, c: i64, i: &[i64]) -> Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.get_records_by_ids(c, i).await
     }
+
+    // --- Scripts ---
+    async fn list_scripts(&self) -> Result<Vec<crate::script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_scripts().await
+    }
+    async fn create_script(&self, req: crate::script_models::CreateScriptReq) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.create_script(req).await
+    }
+    async fn delete_script(&self, id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_script(id).await
+    }
+    async fn get_script_by_name(&self, name: &str) -> Result<Option<crate::script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_script_by_name(name).await
+    }
+    async fn get_scripts_by_trigger(&self, trigger: &str) -> Result<Vec<crate::script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_scripts_by_trigger(trigger).await
+    }
 }
 // =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/cache.rs ends here ===========================

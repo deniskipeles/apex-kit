@@ -23,7 +23,9 @@ pub mod search;
 pub mod security;
 pub mod storage;
 pub mod validation;
-pub mod ai_models; // AI Integration
+pub mod ai_models; 
+pub mod script_models;
+pub mod scripting;
 
 #[derive(Debug, Clone)]
 pub struct Collection {
@@ -221,6 +223,13 @@ pub trait Db: Send + Sync {
     ) -> std::result::Result<Vec<(i64, i64)>, Box<dyn std::error::Error + Send + Sync>>;
 
     async fn get_records_by_ids(&self, collection_id: i64, ids: &[i64]) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>>;
+
+    // Scripts
+    async fn list_scripts(&self) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn create_script(&self, req: script_models::CreateScriptReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
+    async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_script_by_name(&self, name: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_scripts_by_trigger(&self, trigger: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 fn row_to_collection(
@@ -887,6 +896,51 @@ impl Db for TinyBase {
         while let Some(row) = rows.next().await? { records.push(row_to_record(&row)?); }
         Ok(records)
     }
+
+    // Scripts
+    async fn list_scripts(&self) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.db.connect()?;
+        let mut rows = conn.query("SELECT id, name, trigger_type, code, active FROM _scripts", ()).await?;
+        let mut res = Vec::new();
+        while let Some(row) = rows.next().await? {
+            res.push(script_models::Script {
+                id: row.get(0)?, name: row.get(1)?, trigger_type: row.get(2)?, code: row.get(3)?, active: row.get(4)?
+            });
+        }
+        Ok(res)
+    }
+    
+    async fn create_script(&self, req: script_models::CreateScriptReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.db.connect()?.execute("INSERT INTO _scripts (name, trigger_type, code) VALUES (?1, ?2, ?3)", params![req.name, req.trigger_type, req.code]).await?;
+        Ok(self.db.connect()?.last_insert_rowid())
+    }
+    
+    async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.db.connect()?.execute("DELETE FROM _scripts WHERE id = ?1", params![id]).await?;
+        Ok(())
+    }
+    
+    async fn get_script_by_name(&self, name: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.db.connect()?;
+        let mut rows = conn.query("SELECT id, name, trigger_type, code, active FROM _scripts WHERE name = ?1", params![name]).await?;
+        if let Some(row) = rows.next().await? {
+            Ok(Some(script_models::Script {
+                id: row.get(0)?, name: row.get(1)?, trigger_type: row.get(2)?, code: row.get(3)?, active: row.get(4)?
+            }))
+        } else { Ok(None) }
+    }
+    
+    async fn get_scripts_by_trigger(&self, trigger: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.db.connect()?;
+        let mut rows = conn.query("SELECT id, name, trigger_type, code, active FROM _scripts WHERE trigger_type = ?1 AND active = 1", params![trigger]).await?;
+        let mut res = Vec::new();
+        while let Some(row) = rows.next().await? {
+            res.push(script_models::Script {
+                id: row.get(0)?, name: row.get(1)?, trigger_type: row.get(2)?, code: row.get(3)?, active: row.get(4)?
+            });
+        }
+        Ok(res)
+    }
 }
 
 // --- Mock Implementation for Testing ---
@@ -932,6 +986,12 @@ impl Db for Mutex<Connection> {
     async fn delete_relation(&self, _oc: i64, _oi: i64, _tc: i64, _ti: i64, _rn: &str) -> Result<()> { Ok(()) }
     async fn get_related_ids(&self, _oc: i64, _oi: i64, _rn: &str) -> std::result::Result<Vec<(i64, i64)>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
     async fn get_records_by_ids(&self, _c: i64, _i: &[i64]) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    // --- Script Mock ---
+    async fn list_scripts(&self) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn create_script(&self, _r: script_models::CreateScriptReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }
+    async fn delete_script(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    async fn get_script_by_name(&self, _n: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    async fn get_scripts_by_trigger(&self, _t: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
 }
 
 // --- Constructor ---
@@ -1010,6 +1070,18 @@ async fn setup_database(db: &Database) -> Result<()> {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )",
         (),
+    ).await?;
+
+    // Scripts
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _scripts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            trigger_type TEXT NOT NULL,
+            code TEXT NOT NULL,
+            active BOOLEAN DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )", ()
     ).await?;
 
     Ok(())

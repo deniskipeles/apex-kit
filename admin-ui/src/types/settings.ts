@@ -11,7 +11,7 @@ export interface SystemLog {
   source: string;
 }
 
-export type ViewState = 'dashboard' | 'collections' | 'collections-create' | 'collections-edit' | 'records' | 'files' | 'settings' | 'logs' | 'users' | 'overlay-demo';
+export type ViewState = 'dashboard' | 'collections' | 'collections-create' | 'collections-edit' | 'records' | 'files' | 'settings' | 'logs' | 'users' | 'scripts';
 
 export interface SmtpConfig {
   enabled: boolean;

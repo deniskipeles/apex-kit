@@ -1,4 +1,4 @@
-import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult } from '../types';
+import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult, Script } from '../types';
 import { PowerBase } from './sdk';
 
 // Initialize SDK
@@ -292,6 +292,25 @@ export const apiClient = {
     },
     delete: async (id: string): Promise<void> => {
         await pb.files.delete(id);
+    }
+  },
+
+  scripts: {
+    list: async (): Promise<Script[]> => {
+      const res = await pb.scripts.list();
+      // Map API response to UI types if necessary (snake_case -> camelCase)
+      // Assuming Rust returns matching fields based on struct
+      return res;
+    },
+    create: async (data: Partial<Script>): Promise<Script> => {
+      const res = await pb.scripts.create(data);
+      return { ...data, id: res.id } as Script;
+    },
+    delete: async (id: string): Promise<void> => {
+      await pb.scripts.delete(id);
+    },
+    run: async (name: string, variables: any): Promise<any> => {
+      return await pb.scripts.run(name, variables);
     }
   },
 

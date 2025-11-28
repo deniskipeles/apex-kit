@@ -467,6 +467,15 @@ export class PowerBase {
             run: (slug, variables) => this._request(`/ai/run/${slug}`, { method: 'POST', body: { variables } })
         }
     }
+
+    get scripts() {
+        return {
+            list: () => this._request('/admin/scripts'),
+            create: (data) => this._request('/admin/scripts', { method: 'POST', body: data }),
+            delete: (id) => this._request(`/admin/scripts/${id}`, { method: 'DELETE' }),
+            run: (name, variables) => this._request(`/run/${name}`, { method: 'POST', body: variables })
+        };
+    }
     
     get logs() {
         return {

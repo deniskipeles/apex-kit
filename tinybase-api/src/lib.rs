@@ -32,6 +32,7 @@ use std::time::Instant;
 
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use async_graphql::dynamic::Schema;
+use tinybase_core::scripting::ScriptEngine;
 
 // --- Module Registrations ---
 pub mod websocket;
@@ -45,6 +46,7 @@ pub mod scheduler;
 pub mod logging;
 pub mod assets;
 pub mod ai_routes;
+pub mod script_routes;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,6 +59,7 @@ pub struct AppState {
     // Hot-Swappable Components
     pub schema: Arc<RwLock<Schema>>, 
     pub scheduler: Arc<RwLock<scheduler::SchedulerService>>,
+    pub script_engine: Arc<ScriptEngine>,
 }
 
 // --- DTOs ---
@@ -264,7 +267,8 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
         list_users_handler, delete_user_handler,
         list_audit_logs,
         reload_system,
-        ai_routes::list_actions, ai_routes::create_action, ai_routes::delete_action, ai_routes::run_action
+        ai_routes::list_actions, ai_routes::create_action, ai_routes::delete_action, ai_routes::run_action,
+        script_routes::list_scripts, script_routes::create_script, script_routes::delete_script, script_routes::run_script
     ),
     components(schemas(
         CollectionResponse, AuthRequest, AuthResponse, RecordResponse, ProblemDetail, UserDto,
@@ -281,7 +285,10 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
         tinybase_core::schema::CollectionPolicies,
         tinybase_core::schema::FieldDefinition,
         tinybase_core::schema::FieldType,
-        ai_routes::ExecutePromptReq
+        ai_routes::ExecutePromptReq,
+        tinybase_core::script_models::Script,
+        tinybase_core::script_models::CreateScriptReq,
+
     )),
     tags((name = "Tinybase", description = "Tinybase API"))
 )]
@@ -316,6 +323,11 @@ pub fn app_router(state: AppState) -> Router {
         .route("/admin/ai/actions", get(ai_routes::list_actions).post(ai_routes::create_action))
         .route("/admin/ai/actions/{id}", axum::routing::delete(ai_routes::delete_action))
         .route("/ai/run/{slug}", post(ai_routes::run_action))
+
+        // SCRIPTING ENGINE
+        .route("/admin/scripts", get(script_routes::list_scripts).post(script_routes::create_script))
+        .route("/admin/scripts/{id}", axum::routing::delete(script_routes::delete_script))
+        .route("/run/{script_name}", post(script_routes::run_script))
 
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware)); 
 

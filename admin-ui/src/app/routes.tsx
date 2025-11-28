@@ -8,8 +8,8 @@ import { FilesPage } from '../pages/FilesPage';
 import { SettingsPage } from '../features/settings/pages/SettingsPage';
 import { LogsDashboardPage } from '../features/logs/pages/LogsDashboardPage';
 import { UsersListPage } from '../features/users/pages/UsersListPage';
+import { ScriptsPage } from '../features/scripts/pages/ScriptsPage';
 import { Dashboard } from '../pages/Dashboard';
-import { OverlayDemo } from '../pages/OverlayDemo';
 import { ViewState } from '../types';
 
 interface RouterProps {
@@ -28,7 +28,7 @@ export const Router = ({ view, onChangeView }: RouterProps) => {
         case 'settings': return <SettingsPage />;
         case 'logs': return <LogsDashboardPage />;
         case 'users': return <UsersListPage />;
-        case 'overlay-demo': return <OverlayDemo />;
+        case 'scripts': return <ScriptsPage />;
         default: return <Dashboard />;
     }
 };

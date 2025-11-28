@@ -8,3 +8,15 @@ local.db-journal
 # Other
 .vscode/
 Cargo.lock
+
+# Admin UI
+/admin-ui/node_modules
+/admin-ui/.env*
+/admin-ui/public
+admin-ui/node_modules
+admin-ui/.env*
+admin-ui/public
+
+# Static Files
+/static/dashboard/assets
+static/dashboard/assets
