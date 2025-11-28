@@ -4,6 +4,8 @@
 # database file
 local.db
 local.db-journal
+/logs
+/tantivy_indexes
 
 # Other
 .vscode/
