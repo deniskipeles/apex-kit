@@ -3,22 +3,71 @@ name = "tinybase-api"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-axum = "0.7.5"
+# Web Framework (Axum 0.8)
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1.37.0", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace", "fs"] }
+
+# Data & Database
 serde = { version = "1.0.200", features = ["derive"] }
+serde_json = "1.0.117"
 libsql = { version = "0.9.29", features = ["replication"] }
 tinybase-core = { path = "../tinybase-core" }
-serde_json = "1.0.117"
-utoipa = { version = "4.2.3", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "7.1.0", features = ["axum"] }
+
+# GraphQL
+async-graphql = { version = "7.0", features = ["dynamic-schema", "dataloader"] }
+async-graphql-axum = "7.0"
+
+# OpenAPI Docs
+utoipa = { version = "5.4.0", features = ["axum_extras"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+# Utilities
 validator = { version = "0.18.1", features = ["derive"] }
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
+dotenvy = "0.15"
+async-trait = "0.1"
+regex = "1.10" # For AI Prompt Templates
+
+# Headers & Extraction
+axum-extra = { version = "0.10", features = ["typed-header"] }
+headers = "0.4"
+
+# Logging & Monitoring
+tracing = "0.1"
+# Note: "json" feature added for file logging support
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+time = { version = "0.3", features = ["formatting"] }
+metrics = "0.21"
+metrics-exporter-prometheus = "0.12"
+
+# Rate Limiting (Updated for Axum 0.8)
+tower_governor = "0.8.0"
+governor = "0.6"
+
+# Static Assets
+rust-embed = "8.0"
+mime_guess = "2.0"
+
+# HTTP Client (Fix for Cloud Build Environment)
+# Using native-tls-vendored to avoid 'aws-lc-sys' compilation bugs on some Linux distros
+reqwest = { version = "0.12.4", default-features = false, features = ["json", "multipart", "native-tls-vendored"] }
+
+# Encryption
+openssl = { version = "0.10", features = ["vendored"] }
+
+# Scheduler
+tokio-cron-scheduler = "0.9"
 
 [dev-dependencies]
-reqwest = { version = "0.12.4", features = ["json"] }
 assert-json-diff = "2.0.2"
-serde_json = "1.0.117"
-tower = "0.4.13"
 hyper = "1.2.0"
+
+# Profile optimizations for release
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

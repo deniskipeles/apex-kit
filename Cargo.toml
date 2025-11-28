@@ -1,4 +1,13 @@
 [workspace]
 members = [
-    "tinybase-api", "tinybase-core",
+    "tinybase-api", 
+    "tinybase-core",
 ]
+resolver = "2"
+
+# Optimize for size and speed in release builds
+[profile.release]
+strip = true        # Automatically strip symbols from the binary to reduce size
+lto = true          # Link Time Optimization (slower build, smaller/faster binary)
+codegen-units = 1   # Maximize optimization (slower build)
+panic = "abort"     # Remove stack unwind tables to reduce size further

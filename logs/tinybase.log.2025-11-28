@@ -1,0 +1,4 @@
+{"timestamp":"2025-11-28T06:57:16.333063Z","level":"INFO","fields":{"message":"System starting up..."},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T06:57:16.356024Z","level":"INFO","fields":{"message":"Using Local Storage (Path: ./uploads)"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T06:57:16.364126Z","level":"INFO","fields":{"message":"Tinybase listening on 0.0.0.0:5000"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T06:58:55.917794Z","level":"INFO","fields":{"message":"save metas","log.target":"tantivy::indexer::segment_updater","log.module_path":"tantivy::indexer::segment_updater","log.file":"/teamspace/studios/this_studio/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tantivy-0.22.1/src/indexer/segment_updater.rs","log.line":40},"target":"tantivy::indexer::segment_updater"}

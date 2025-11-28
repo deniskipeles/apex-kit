@@ -1,3 +1,4 @@
+// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/validation.rs ===========================
 use serde::Serialize;
 use crate::schema::{CollectionSchema, FieldType};
 use serde_json::Value;
@@ -28,10 +29,22 @@ pub fn validate_record(
         }
     };
 
+    // Iterate through schema fields to check for presence and type correctness
     for (field_name, field_def) in &schema.fields {
         match data_map.get(field_name) {
             Some(value) => {
+                // If field is present, check type (unless it's null and not required? 
+                // Currently assuming required check handles nulls if strictly enforced, 
+                // but usually null matches nothing in is_correct_type so it fails if not handled.
+                // Here we check type strictness.)
                 if !is_correct_type(value, &field_def.r#type) {
+                    // Allow null if not required? 
+                    // This logic assumes if value exists, it must match type.
+                    // If you want to allow nulls for non-required fields:
+                    if value.is_null() && !field_def.required {
+                        continue;
+                    }
+
                     errors.push(ValidationError::InvalidType(
                         field_name.clone(),
                         format!("{:?}", field_def.r#type),
@@ -74,3 +87,4 @@ fn is_correct_type(value: &Value, field_type: &FieldType) -> bool {
         FieldType::Json => value.is_object() || value.is_array(),
     }
 }
+// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/validation.rs ends here ===========================

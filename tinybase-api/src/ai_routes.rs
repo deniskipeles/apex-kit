@@ -2,9 +2,13 @@ use axum::{
     extract::{Path, State, Json},
     Extension,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use tinybase_core::{auth::Claims, ai_models::{AiAction, CreateActionReq}};
+use tinybase_core::{
+    auth::Claims, 
+    ai_models::{AiAction, CreateActionReq},
+    security::EncryptedValue
+};
 use crate::{AppState, AppError, settings::AiConfigDto};
 use regex::Regex;
 
@@ -15,6 +19,11 @@ pub struct ExecutePromptReq {
 
 // --- ADMIN MANAGEMENT ---
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/ai/actions",
+    responses((status = 200, body = Vec<AiAction>))
+)]
 pub async fn list_actions(
     Extension(claims): Extension<Claims>,
     State(state): State<AppState>
@@ -24,6 +33,12 @@ pub async fn list_actions(
     Ok(Json(actions))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/ai/actions",
+    request_body = CreateActionReq,
+    responses((status = 200, body = Value))
+)]
 pub async fn create_action(
     Extension(claims): Extension<Claims>,
     State(state): State<AppState>,
@@ -34,6 +49,11 @@ pub async fn create_action(
     Ok(Json(json!({ "id": id })))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/ai/actions/{id}",
+    responses((status = 200, body = Value))
+)]
 pub async fn delete_action(
     Extension(claims): Extension<Claims>,
     State(state): State<AppState>,
@@ -46,6 +66,12 @@ pub async fn delete_action(
 
 // --- EXECUTION (PUBLIC/AUTH) ---
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/ai/run/{slug}",
+    request_body = ExecutePromptReq,
+    responses((status = 200, body = Value))
+)]
 pub async fn run_action(
     State(state): State<AppState>,
     Path(slug): Path<String>,
@@ -69,21 +95,24 @@ pub async fn run_action(
         return Err(AppError::Forbidden("AI features disabled".into()));
     }
 
-    let api_key_enc = ai_config.api_key.ok_or(AppError::UnknownError("API Key missing".into()))?;
-    // Decrypt the key (assuming it was stored as encrypted string JSON)
-    let api_key = state.vault.decrypt(&api_key_enc).map_err(|_| AppError::UnknownError("Failed to decrypt API Key".into()))?;
+    let api_key_str = ai_config.api_key.ok_or(AppError::UnknownError("API Key missing".into()))?;
+    
+    // FIX: Deserialize string back to EncryptedValue struct, then decrypt
+    let encrypted_val: EncryptedValue = serde_json::from_str(&api_key_str)
+        .map_err(|_| AppError::UnknownError("Invalid encrypted key format".into()))?;
+        
+    let api_key = state.vault.decrypt(&encrypted_val)
+        .map_err(|_| AppError::UnknownError("Failed to decrypt API Key".into()))?;
 
     // 3. Template Substitution
-    // Replace {{key}} with value from payload.variables
     let mut final_prompt = action.template.clone();
-    let re = Regex::new(r"\{\{(\w+)\}\}").unwrap(); // Matches {{word}}
+    let re = Regex::new(r"\{\{(\w+)\}\}").unwrap(); 
     
     final_prompt = re.replace_all(&final_prompt, |caps: &regex::Captures| {
         let key = &caps[1];
-        // Look up key in variables
         payload.variables.get(key)
             .and_then(|v| v.as_str())
-            .unwrap_or("") // Replace missing vars with empty string
+            .unwrap_or("") 
             .to_string()
     }).to_string();
 
@@ -94,7 +123,6 @@ pub async fn run_action(
         action.model, api_key
     );
 
-    // Construct Gemini Body
     let body = json!({
         "contents": [{
             "parts": [{ "text": final_prompt }]
@@ -114,7 +142,6 @@ pub async fn run_action(
 
     let response_json: Value = res.json().await.map_err(|_| AppError::JsonError("Invalid response".into()))?;
     
-    // Extract text from Gemini response structure
     let text = response_json["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .unwrap_or("")
