@@ -10,7 +10,10 @@ use std::time::Duration;
 pub struct CachedDb {
     inner: Arc<dyn Db>,
     collection_cache: Cache<i64, Arc<Collection>>,
-    record_cache: Cache<(i64, i64), Arc<Record>>, // Key: (collection_id, record_id)
+    // Key: (collection_id, record_id)
+    record_cache: Cache<(i64, i64), Arc<Record>>, 
+    // Cache templates by slug
+    template_cache: Cache<String, Arc<models::Template>>, 
 }
 
 impl CachedDb {
@@ -25,6 +28,10 @@ impl CachedDb {
             record_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(300))
                 .max_capacity(10_000) 
+                .build(),
+            
+            template_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(300))
                 .build(),
         }
     }
@@ -315,6 +322,46 @@ impl Db for CachedDb {
     }
     async fn get_scripts_by_trigger(&self, trigger: &str) -> Result<Vec<crate::script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.get_scripts_by_trigger(trigger).await
+    }
+
+    // --- Templates (Cached) ---
+
+    async fn list_templates(&self) -> Result<Vec<models::Template>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_templates().await
+    }
+
+    async fn get_template_by_slug(&self, slug: &str) -> Result<Option<models::Template>, Box<dyn std::error::Error + Send + Sync>> {
+        // 1. Try Cache
+        if let Some(cached) = self.template_cache.get(slug).await {
+            return Ok(Some((*cached).clone()));
+        }
+
+        // 2. Fetch from DB
+        let result = self.inner.get_template_by_slug(slug).await?;
+
+        // 3. Populate Cache
+        if let Some(tmpl) = &result {
+            self.template_cache.insert(slug.to_string(), Arc::new(tmpl.clone())).await;
+        }
+        Ok(result)
+    }
+
+    async fn create_template(&self, req: models::CreateTemplateReq) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.create_template(req).await
+    }
+
+    async fn update_template(&self, id: i64, content: String, script_id: Option<i64>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.update_template(id, content, script_id).await?;
+        // We don't know the slug here easily to invalidate just one, so we invalidate all to be safe.
+        // Templates change rarely, so this performance hit is negligible.
+        self.template_cache.invalidate_all();
+        Ok(())
+    }
+
+    async fn delete_template(&self, id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_template(id).await?;
+        self.template_cache.invalidate_all();
+        Ok(())
     }
 }
 // =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/cache.rs ends here ===========================

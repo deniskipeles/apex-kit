@@ -9,6 +9,7 @@ import { SettingsPage } from '../features/settings/pages/SettingsPage';
 import { LogsDashboardPage } from '../features/logs/pages/LogsDashboardPage';
 import { UsersListPage } from '../features/users/pages/UsersListPage';
 import { ScriptsPage } from '../features/scripts/pages/ScriptsPage';
+import { TemplatesPage } from '../features/templates/pages/TemplatesPage';
 import { Dashboard } from '../pages/Dashboard';
 import { ViewState } from '../types';
 
@@ -29,6 +30,7 @@ export const Router = ({ view, onChangeView }: RouterProps) => {
         case 'logs': return <LogsDashboardPage />;
         case 'users': return <UsersListPage />;
         case 'scripts': return <ScriptsPage />;
+        case 'templates': return <TemplatesPage />;
         default: return <Dashboard />;
     }
 };

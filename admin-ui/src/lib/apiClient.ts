@@ -1,4 +1,4 @@
-import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult, Script } from '../types';
+import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult, Script, Template } from '../types';
 import { PowerBase } from './sdk';
 
 // Initialize SDK
@@ -311,6 +311,26 @@ export const apiClient = {
     },
     run: async (name: string, variables: any): Promise<any> => {
       return await pb.scripts.run(name, variables);
+    }
+  },
+
+  templates: {
+    list: async (): Promise<Template[]> => {
+      const res = await pb.templates.list();
+      return res.map((t: any) => ({
+          ...t,
+          id: t.id.toString(),
+          script_id: t.script_id ? t.script_id.toString() : null
+      }));
+    },
+    create: async (data: Partial<Template>) => {
+      await pb.templates.create(data);
+    },
+    update: async (id: string, data: Partial<Template>) => {
+      await pb.templates.update(id, data);
+    },
+    delete: async (id: string) => {
+      await pb.templates.delete(id);
     }
   },
 

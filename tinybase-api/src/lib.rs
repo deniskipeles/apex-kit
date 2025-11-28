@@ -47,6 +47,8 @@ pub mod logging;
 pub mod assets;
 pub mod ai_routes;
 pub mod script_routes;
+pub mod renderer;
+pub mod template_routes;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -268,7 +270,8 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
         list_audit_logs,
         reload_system,
         ai_routes::list_actions, ai_routes::create_action, ai_routes::delete_action, ai_routes::run_action,
-        script_routes::list_scripts, script_routes::create_script, script_routes::delete_script, script_routes::run_script
+        script_routes::list_scripts, script_routes::create_script, script_routes::delete_script, script_routes::run_script,
+        template_routes::list_templates,template_routes::create_template,template_routes::update_template,template_routes::delete_template
     ),
     components(schemas(
         CollectionResponse, AuthRequest, AuthResponse, RecordResponse, ProblemDetail, UserDto,
@@ -288,7 +291,9 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
         ai_routes::ExecutePromptReq,
         tinybase_core::script_models::Script,
         tinybase_core::script_models::CreateScriptReq,
-
+        tinybase_core::models::Template,
+        tinybase_core::models::CreateTemplateReq,
+        template_routes::UpdateTemplateReq
     )),
     tags((name = "Tinybase", description = "Tinybase API"))
 )]
@@ -329,6 +334,10 @@ pub fn app_router(state: AppState) -> Router {
         .route("/admin/scripts/{id}", axum::routing::delete(script_routes::delete_script))
         .route("/run/{script_name}", post(script_routes::run_script))
 
+        // Templates CRUD Operations
+        .route("/admin/templates", get(template_routes::list_templates).post(template_routes::create_template))
+        .route("/admin/templates/{id}", axum::routing::patch(template_routes::update_template).delete(template_routes::delete_template))
+
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware)); 
 
     // 2. Auth Routes
@@ -340,9 +349,17 @@ pub fn app_router(state: AppState) -> Router {
         .route("/auth/verify", get(auth_advanced::verify_email))
         .route("/auth/verify/resend", post(auth_advanced::resend_verification));
 
+    // In app_router (Public Routes - No Auth Middleware)
+    // We put this BEFORE the auth layer if we want public pages, or AFTER if we want internal tools.
+    // Let's allow public access to /render/* for building public apps.
+
+    // 1. Create a separate router for public pages
+    let renderer_routes = Router::new()
+        .route("/render/{*slug}", get(renderer::render_view).post(renderer::render_view));
     // 3. Construct Main Router
     let app_router = Router::new()
         .nest("/api/v1", auth_routes.merge(api_routes))
+        .merge(renderer_routes) // Add renderer at root /render/
         .route("/metrics", get(metrics_handler))
         .route("/ws", get(websocket::websocket_handler))
         .route("/graphql", post(graphql_handler).get(graphql_playground))

@@ -51,4 +51,21 @@ pub struct InstantResult {
     #[schema(value_type = Object)]
     pub snippet: serde_json::Value, // Stored fields only (Title, Name, etc.)
 }
+
+// Templates
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct Template {
+    pub id: i64,
+    pub slug: String,         // e.g. "chat-room" or "components/like-button"
+    pub content: String,      // The HTML/Tera code
+    pub script_id: Option<i64>, // The script that provides data for this template
+    pub created_at: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CreateTemplateReq {
+    pub slug: String,
+    pub content: String,
+    pub script_id: Option<i64>,
+}
 // =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/models.rs ends here ===========================

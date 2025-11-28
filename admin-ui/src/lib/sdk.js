@@ -476,6 +476,15 @@ export class PowerBase {
             run: (name, variables) => this._request(`/run/${name}`, { method: 'POST', body: variables })
         };
     }
+
+    get templates() {
+        return {
+            list: () => this._request('/admin/templates'),
+            create: (data) => this._request('/admin/templates', { method: 'POST', body: data }),
+            update: (id, data) => this._request(`/admin/templates/${id}`, { method: 'PATCH', body: data }),
+            delete: (id) => this._request(`/admin/templates/${id}`, { method: 'DELETE' })
+        };
+    }
     
     get logs() {
         return {

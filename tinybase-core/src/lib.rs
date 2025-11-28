@@ -230,6 +230,13 @@ pub trait Db: Send + Sync {
     async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_script_by_name(&self, name: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>>;
     async fn get_scripts_by_trigger(&self, trigger: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>>;
+
+    // Templates
+    async fn list_templates(&self) -> std::result::Result<Vec<models::Template>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_template_by_slug(&self, slug: &str) -> std::result::Result<Option<models::Template>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn create_template(&self, req: models::CreateTemplateReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
+    async fn update_template(&self, id: i64, content: String, script_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn delete_template(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 fn row_to_collection(
@@ -941,6 +948,44 @@ impl Db for TinyBase {
         }
         Ok(res)
     }
+
+    // Templates
+    async fn list_templates(&self) -> std::result::Result<Vec<models::Template>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.db.connect()?;
+        let mut rows = conn.query("SELECT id, slug, content, script_id, created_at FROM _templates", ()).await?;
+        let mut res = Vec::new();
+        while let Some(row) = rows.next().await? {
+            res.push(models::Template {
+                id: row.get(0)?, slug: row.get(1)?, content: row.get(2)?, script_id: row.get(3)?, created_at: row.get(4)?
+            });
+        }
+        Ok(res)
+    }
+
+    async fn get_template_by_slug(&self, slug: &str) -> std::result::Result<Option<models::Template>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.db.connect()?;
+        let mut rows = conn.query("SELECT id, slug, content, script_id, created_at FROM _templates WHERE slug = ?1", params![slug]).await?;
+        if let Some(row) = rows.next().await? {
+            Ok(Some(models::Template {
+                id: row.get(0)?, slug: row.get(1)?, content: row.get(2)?, script_id: row.get(3)?, created_at: row.get(4)?
+            }))
+        } else { Ok(None) }
+    }
+
+    async fn create_template(&self, req: models::CreateTemplateReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.db.connect()?.execute("INSERT INTO _templates (slug, content, script_id) VALUES (?1, ?2, ?3)", params![req.slug, req.content, req.script_id]).await?;
+        Ok(self.db.connect()?.last_insert_rowid())
+    }
+
+    async fn update_template(&self, id: i64, content: String, script_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.db.connect()?.execute("UPDATE _templates SET content = ?1, script_id = ?2 WHERE id = ?3", params![content, script_id, id]).await?;
+        Ok(())
+    }
+
+    async fn delete_template(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.db.connect()?.execute("DELETE FROM _templates WHERE id = ?1", params![id]).await?;
+        Ok(())
+    }
 }
 
 // --- Mock Implementation for Testing ---
@@ -992,6 +1037,12 @@ impl Db for Mutex<Connection> {
     async fn delete_script(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn get_script_by_name(&self, _n: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     async fn get_scripts_by_trigger(&self, _t: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    // --- Template Mock ---
+    async fn list_templates(&self) -> std::result::Result<Vec<models::Template>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn get_template_by_slug(&self, _slug: &str) -> std::result::Result<Option<models::Template>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    async fn create_template(&self, _req: models::CreateTemplateReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }
+    async fn update_template(&self, _id: i64, _c: String, _s: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    async fn delete_template(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
 }
 
 // --- Constructor ---
@@ -1080,6 +1131,17 @@ async fn setup_database(db: &Database) -> Result<()> {
             trigger_type TEXT NOT NULL,
             code TEXT NOT NULL,
             active BOOLEAN DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )", ()
+    ).await?;
+
+    // Templates
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT UNIQUE NOT NULL,
+            content TEXT NOT NULL,
+            script_id INTEGER,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )", ()
     ).await?;

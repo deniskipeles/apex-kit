@@ -1,5 +1,5 @@
 import React from 'react';
-import { LayoutDashboard, Database, Table, Settings, LogOut, Folder, Activity, Users, FileCode } from 'lucide-react';
+import { LayoutDashboard, Database, Table, Settings, LogOut, Folder, Activity, Users, FileCode, LayoutTemplate } from 'lucide-react';
 import { ViewState } from '../../types';
 import { Button } from '../../components/form/FormPrimitives';
 import { useAuth } from '../../hooks/useAuth';
@@ -28,6 +28,7 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
     { icon: Activity, label: 'Logs', view: 'logs' },
     { icon: Settings, label: 'Settings', view: 'settings' },
     { icon: FileCode, label: 'Scripts', view: 'scripts' },
+    { icon: LayoutTemplate, label: 'Templates', view: 'templates' },
   ];
 
   return (

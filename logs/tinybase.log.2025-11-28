@@ -37,3 +37,17 @@
 {"timestamp":"2025-11-28T11:14:29.121428Z","level":"INFO","fields":{"message":"System starting up..."},"target":"tinybase_api"}
 {"timestamp":"2025-11-28T11:14:29.125744Z","level":"INFO","fields":{"message":"Using Local Storage (Path: ./uploads)"},"target":"tinybase_api"}
 {"timestamp":"2025-11-28T11:14:29.137003Z","level":"INFO","fields":{"message":"Tinybase listening on 0.0.0.0:5000"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T11:44:25.741885Z","level":"INFO","fields":{"message":"System starting up..."},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T11:44:25.848360Z","level":"INFO","fields":{"message":"Using Local Storage (Path: ./uploads)"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T11:44:25.966722Z","level":"INFO","fields":{"message":"Tinybase listening on 0.0.0.0:5000"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T11:52:01.551168Z","level":"INFO","fields":{"message":"System starting up..."},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T11:52:01.554502Z","level":"INFO","fields":{"message":"Using Local Storage (Path: ./uploads)"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T11:52:01.573336Z","level":"INFO","fields":{"message":"Tinybase listening on 0.0.0.0:5000"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T12:31:21.912547Z","level":"INFO","fields":{"message":"System starting up..."},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T12:31:21.933632Z","level":"INFO","fields":{"message":"Using Local Storage (Path: ./uploads)"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T12:31:21.944204Z","level":"INFO","fields":{"message":"Tinybase listening on 0.0.0.0:5000"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T12:44:21.657168Z","level":"INFO","fields":{"message":"System starting up..."},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T12:44:21.664204Z","level":"INFO","fields":{"message":"Using Local Storage (Path: ./uploads)"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T12:44:21.671866Z","level":"INFO","fields":{"message":"Tinybase listening on 0.0.0.0:5000"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T13:05:55.617945Z","level":"ERROR","fields":{"message":"Unknown error: Render Error: Failed to render 'components/test-1'"},"target":"tinybase_api"}
+{"timestamp":"2025-11-28T13:05:55.618266Z","level":"ERROR","fields":{"message":"response failed","classification":"Status code: 500 Internal Server Error","latency":"25 ms"},"target":"tower_http::trace::on_failure"}

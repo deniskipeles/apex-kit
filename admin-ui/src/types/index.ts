@@ -7,7 +7,7 @@ export * from './api';
 export * from './files';
 
 
-// NEW: Script Types
+// Script Types
 export interface Script {
     id: string;
     name: string;
@@ -15,3 +15,12 @@ export interface Script {
     code: string;
     active: boolean;
 }
+
+// Templates
+export interface Template {
+    id: string;
+    slug: string;
+    content: string;
+    script_id: string | null;
+    created_at: string;
+};
