@@ -1,147 +1,233 @@
 // =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/scripting.rs ===========================
-use tokio::sync::{mpsc, oneshot};
-use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use serde_json::Value as JsonValue;
 use crate::Db;
-use rquickjs::{AsyncRuntime, AsyncContext, Function, Object, Value, Promise, Error};
 
-// The handle we store in AppState (Must be Send + Sync)
+// Boa Imports
+use boa_engine::{
+    Context, JsValue, Source, JsResult, NativeFunction, 
+    object::ObjectInitializer, property::Attribute,
+    JsString
+};
+
 #[derive(Clone)]
-pub struct ScriptEngine {
-    sender: mpsc::Sender<ScriptJob>,
-}
-
-struct ScriptJob {
-    code: String,
-    input: JsonValue,
-    resp: oneshot::Sender<Result<JsonValue, String>>,
-}
+pub struct ScriptEngine;
 
 impl ScriptEngine {
     pub async fn new() -> Self {
-        let (tx, mut rx) = mpsc::channel::<ScriptJob>(100);
-
-        // FIX: Spawn a dedicated OS thread for the JS Runtime.
-        // This avoids "Send" issues because the runtime never leaves this thread.
-        std::thread::spawn(move || {
-            // Create a LocalSet to run !Send futures (rquickjs)
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            let local = tokio::task::LocalSet::new();
-
-            local.block_on(&rt, async move {
-                let runtime = AsyncRuntime::new().unwrap();
-                let context = AsyncContext::full(&runtime).await.unwrap();
-
-                while let Some(job) = rx.recv().await {
-                    let ScriptJob { code, input, resp } = job;
-                    let code_script = code.clone();
-                    let input_data = input.clone();
-
-                    // Use with() instead of async_with() for simpler lifetime management inside LocalSet
-                    // We can spawn the inner async block on the same LocalSet if needed, 
-                    // but since we are already in a LocalSet, standard async_with should work if we don't move context out.
-                    // However, async_with returns a Future that is !Send, which is fine here inside LocalSet.
-                    
-                    let execution_future = context.async_with(move |ctx| Box::pin(async move {
-                        let global = ctx.globals();
-                        
-                        let _ = global.set("log", Function::new(ctx.clone(), move |msg: String| {
-                            println!("[JS Script]: {}", msg);
-                        }));
-
-                        let input_json = serde_json::to_string(&input_data).unwrap();
-                        if let Ok(js_input) = ctx.json_parse(input_json) {
-                             let _ = global.set("$input", js_input);
-                        }
-
-                        if let Ok(http_obj) = Object::new(ctx.clone()) {
-                            let get_ctx = ctx.clone();
-                            let _ = http_obj.set("get", Function::new(ctx.clone(), move |url: String| {
-                                let future_ctx = get_ctx.clone();
-                                let future = async move {
-                                    match reqwest::get(&url).await {
-                                        Ok(res) => res.text().await.unwrap_or_default(),
-                                        Err(e) => format!("Error: {}", e),
-                                    }
-                                };
-                                Promise::wrap_future(&future_ctx, future)
-                            }));
-
-                            let post_ctx = ctx.clone();
-                            let _ = http_obj.set("post", Function::new(ctx.clone(), move |url: String, body: String| {
-                                let future_ctx = post_ctx.clone();
-                                let future = async move {
-                                    let client = reqwest::Client::new();
-                                    match client.post(&url).header("Content-Type", "application/json").body(body).send().await {
-                                        Ok(res) => res.text().await.unwrap_or_default(),
-                                        Err(e) => format!("Error: {}", e),
-                                    }
-                                };
-                                Promise::wrap_future(&future_ctx, future)
-                            }));
-
-                            let _ = global.set("$http", http_obj);
-                        }
-
-                        let script = format!(
-                            r#"
-                            async function main() {{
-                                {}
-                            }}
-                            main()
-                            "#,
-                            code_script
-                        );
-
-                        let promise = ctx.eval::<Promise, _>(script)?;
-                        let result_val: Value = promise.finish()?;
-
-                        if result_val.is_undefined() || result_val.is_null() {
-                             Ok("null".to_string())
-                        } else {
-                             let json_str: String = ctx.json_stringify(result_val)?
-                                .expect("Serialization failed")
-                                .to_string()?;
-                             Ok(json_str)
-                        }
-                    }));
-                    
-                    // Await result inside LocalSet
-                    let result_json = execution_future.await;
-
-                    let final_result = result_json
-                        .map_err(|e: Error| e.to_string())
-                        .and_then(|json_string: String| {
-                             serde_json::from_str(&json_string).map_err(|e| e.to_string())
-                        });
-
-                    let _ = resp.send(final_result);
-                }
-            });
-        });
-
-        Self { sender: tx }
+        Self
     }
 
     pub async fn run_script(
         &self, 
         code: &str, 
         input_data: JsonValue, 
-        _db: Arc<dyn Db> 
+        db: Arc<dyn Db>
     ) -> Result<JsonValue, String> {
-        let (tx, rx) = oneshot::channel();
-        let job = ScriptJob {
-            code: code.to_string(),
-            input: input_data,
-            resp: tx,
-        };
+        
+        let code_owned = code.to_string();
+        let handle = tokio::runtime::Handle::current();
+        
+        // Spawn a blocking thread for the JS Engine
+        let result = tokio::task::spawn_blocking(move || -> Result<JsonValue, String> {
+            // 1. Initialize Boa Context
+            let mut context = Context::default();
 
-        self.sender.send(job).await.map_err(|_| "Script engine dead".to_string())?;
-        rx.await.map_err(|_| "Script execution cancelled".to_string())?
+            // 2. Setup Helper for Native Functions
+            let create_fn = |context: &mut Context, f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>| -> JsValue {
+                let native = NativeFunction::from_fn_ptr(f);
+                JsValue::new(boa_engine::object::FunctionObjectBuilder::new(context.realm(), native).build())
+            };
+
+            // --- REGISTER $input ---
+            match JsValue::from_json(&input_data, &mut context) {
+                Ok(js_input) => {
+                    let key = JsString::from("$input");
+                    if let Err(e) = context.register_global_property(key, js_input, Attribute::all()) {
+                        return Err(format!("Failed to register $input: {}", e));
+                    }
+                },
+                Err(e) => return Err(format!("Input Serialization Error: {}", e)),
+            }
+
+            // --- REGISTER log() ---
+            fn log_impl(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+                let msg = args.get(0)
+                    .map(|v| v.to_string(ctx).unwrap_or_default().to_std_string_escaped())
+                    .unwrap_or_default();
+                println!("[JS LOG]: {}", msg);
+                Ok(JsValue::undefined())
+            }
+            let log_js = create_fn(&mut context, log_impl);
+            let log_key = JsString::from("log");
+            let _ = context.register_global_property(log_key, log_js, Attribute::all());
+
+            // --- REGISTER $util ---
+            fn util_uuid(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+                let id = uuid::Uuid::new_v4().to_string();
+                Ok(JsValue::from(JsString::from(id)))
+            }
+            let uuid_js = create_fn(&mut context, util_uuid);
+            
+            let mut util_builder = ObjectInitializer::new(&mut context);
+            util_builder.property(JsString::from("uuid"), uuid_js, Attribute::all());
+            let util_obj = util_builder.build();
+            
+            let util_key = JsString::from("$util");
+            let _ = context.register_global_property(util_key, util_obj, Attribute::all());
+
+            // --- REGISTER $http ---
+            fn http_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+                let url_val = args.get(0).unwrap_or(&JsValue::undefined()).clone();
+                let url = match url_val.to_string(ctx) {
+                    Ok(s) => s.to_std_string_escaped(),
+                    Err(_) => return Ok(JsValue::null())
+                };
+                
+                println!("[SCRIPT DEBUG] HTTP GET {}", url);
+                match reqwest::blocking::get(&url) {
+                    Ok(res) => Ok(JsValue::from(JsString::from(res.text().unwrap_or_default()))),
+                    Err(e) => { println!("[SCRIPT ERROR] HTTP GET: {}", e); Ok(JsValue::null()) }
+                }
+            }
+
+            fn http_post(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+                let url_val = args.get(0).unwrap_or(&JsValue::undefined()).clone();
+                let url = match url_val.to_string(ctx) {
+                    Ok(s) => s.to_std_string_escaped(),
+                    Err(_) => return Ok(JsValue::null())
+                };
+
+                let body_val = args.get(1).unwrap_or(&JsValue::undefined()).clone();
+                
+                // FIX: Handle Result<Option<Value>> -> Value
+                let body_json = body_val.to_json(ctx)
+                    .unwrap_or(None)
+                    .unwrap_or(serde_json::Value::Null);
+
+                println!("[SCRIPT DEBUG] HTTP POST {}", url);
+                
+                let client = reqwest::blocking::Client::new();
+                match client.post(&url).json(&body_json).send() {
+                    Ok(res) => Ok(JsValue::from(JsString::from(res.text().unwrap_or_default()))),
+                    Err(e) => { println!("[SCRIPT ERROR] HTTP POST: {}", e); Ok(JsValue::null()) }
+                }
+            }
+
+            let get_js = create_fn(&mut context, http_get);
+            let post_js = create_fn(&mut context, http_post);
+            
+            let mut http_builder = ObjectInitializer::new(&mut context);
+            http_builder.property(JsString::from("get"), get_js, Attribute::all());
+            http_builder.property(JsString::from("post"), post_js, Attribute::all());
+            let http_obj = http_builder.build();
+
+            let http_key = JsString::from("$http");
+            let _ = context.register_global_property(http_key, http_obj, Attribute::all());
+
+            // --- REGISTER $db (The Bridge) ---
+            ACTIVE_DB_CONTEXT.with(|c| {
+                *c.borrow_mut() = Some((db.clone(), handle.clone()));
+            });
+
+            fn db_find_one(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+                let col_name = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+                let id = args.get(1).and_then(|v| v.as_number()).map(|n| n as i64).unwrap_or(0);
+
+                let result_json = ACTIVE_DB_CONTEXT.with(|c| {
+                    if let Some((db, handle)) = &*c.borrow() {
+                        handle.block_on(async {
+                            if let Ok(cols) = db.list_collections().await {
+                                if let Some(col) = cols.iter().find(|c| c.name == col_name) {
+                                    if let Ok(Some(rec)) = db.get_record(col.id, id).await {
+                                        let mut data = rec.data.clone();
+                                        if let Some(obj) = data.as_object_mut() {
+                                            obj.insert("id".to_string(), serde_json::json!(rec.id));
+                                        }
+                                        return Some(data);
+                                    }
+                                }
+                            }
+                            None
+                        })
+                    } else { None }
+                });
+
+                match result_json {
+                    Some(val) => JsValue::from_json(&val, ctx),
+                    None => Ok(JsValue::null())
+                }
+            }
+
+            fn db_insert(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+                let col_name = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+                let data_val = args.get(1).unwrap_or(&JsValue::undefined()).clone();
+                
+                // FIX: Handle Result<Option<Value>> -> Value
+                let data_json = data_val.to_json(ctx)
+                    .unwrap_or(None)
+                    .unwrap_or(serde_json::Value::Null);
+
+                let new_id = ACTIVE_DB_CONTEXT.with(|c| {
+                    if let Some((db, handle)) = &*c.borrow() {
+                        handle.block_on(async {
+                            if let Ok(cols) = db.list_collections().await {
+                                if let Some(col) = cols.iter().find(|c| c.name == col_name) {
+                                    // data_json is now &Value, which matches &serde_json::Value
+                                    if let Ok(id) = db.create_record(col.id, &data_json).await {
+                                        return Some(id);
+                                    }
+                                }
+                            }
+                            None
+                        })
+                    } else { None }
+                });
+
+                match new_id {
+                    Some(id) => Ok(JsValue::from(id)),
+                    None => Ok(JsValue::null())
+                }
+            }
+
+            let find_one_js = create_fn(&mut context, db_find_one);
+            let insert_js = create_fn(&mut context, db_insert);
+
+            let mut db_builder = ObjectInitializer::new(&mut context);
+            db_builder.property(JsString::from("find_one"), find_one_js, Attribute::all());
+            db_builder.property(JsString::from("insert"), insert_js, Attribute::all());
+            let db_obj = db_builder.build();
+
+            let db_key = JsString::from("$db");
+            let _ = context.register_global_property(db_key, db_obj, Attribute::all());
+
+            // --- EXECUTE ---
+            let res_result = context.eval(Source::from_bytes(code_owned.as_bytes()));
+            
+            ACTIVE_DB_CONTEXT.with(|c| *c.borrow_mut() = None);
+
+            match res_result {
+                Ok(res) => {
+                    // FIX: Handle Result<Option<Value>> -> Ok(Value)
+                    match res.to_json(&mut context) {
+                        Ok(json_opt) => Ok(json_opt.unwrap_or(JsonValue::Null)),
+                        Err(e) => Err(format!("Output Serialization Error: {}", e))
+                    }
+                },
+                Err(e) => Err(format!("Runtime Error: {}", e))
+            }
+
+        }).await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(e) => Err(format!("System Error (Panic?): {}", e)),
+        }
     }
 }
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/scripting.rs ends here ===========================
+
+// Thread-local storage to pass the DB connection into the Boa Native Functions
+use std::cell::RefCell;
+thread_local! {
+    static ACTIVE_DB_CONTEXT: RefCell<Option<(Arc<dyn Db>, tokio::runtime::Handle)>> = RefCell::new(None);
+}

@@ -24,3 +24,13 @@ export interface Template {
     script_id: string | null;
     created_at: string;
 };
+
+export interface AiAction {
+    id: string;
+    slug: string;
+    name: string;
+    model: string;
+    system_prompt?: string;
+    template: string;
+    config?: any;
+};

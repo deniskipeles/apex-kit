@@ -1,9 +1,7 @@
 /**
- * PowerBase Client SDK
+ * PowerBase Client SDK v1.4.0
  * A vanilla JavaScript client for the Tinybase API.
  * Compatible with modern Browsers and Node.js (v18+).
- *
- * @version 1.3.0
  */
 export class PowerBase {
     /**
@@ -34,25 +32,22 @@ export class PowerBase {
     }
 
     /**
-     * Get the currently logged-in user details.
-     * @returns {object|null}
-     */
-    getUser() {
-        return this.currentUser;
-    }
-
-    /**
      * Internal request handler using the Fetch API.
      * @private
      * @param {string} endpoint - The API path.
-     * @param {object} [options={}] - Fetch options (method, headers, body, params, isRoot).
+     * @param {object} [options={}] - Fetch options.
+     * @param {string} [options.method] - HTTP Method.
+     * @param {object} [options.headers] - HTTP Headers.
+     * @param {object|FormData} [options.body] - Request body.
+     * @param {object} [options.params] - Query parameters.
+     * @param {boolean} [options.isRoot] - If true, does not prepend '/api/v1'.
      * @returns {Promise<any>} The JSON response data.
      * @throws {Error} If the API returns a non-2xx status code.
      */
     async _request(endpoint, options = {}) {
         let path = endpoint;
 
-        // Prefix with /api/v1 unless 'isRoot' is true (e.g. for /graphql)
+        // Prefix with /api/v1 unless 'isRoot' is true (e.g. for /graphql or /render)
         if (!options.isRoot && !endpoint.startsWith('/api/v1')) {
             path = endpoint.startsWith('/') ? `/api/v1${endpoint}` : `/api/v1/${endpoint}`;
         }
@@ -64,7 +59,6 @@ export class PowerBase {
             Object.keys(options.params).forEach(key => {
                 let value = options.params[key];
                 if (value !== undefined && value !== null) {
-                    // The API expects 'filter' to be a JSON string
                     if (typeof value === 'object' && key === 'filter') {
                         value = JSON.stringify(value);
                     }
@@ -109,8 +103,8 @@ export class PowerBase {
 
             const contentType = response.headers.get("content-type");
 
-            // Handle non-JSON responses (like verifying email returning plain text)
-            if (contentType && contentType.includes("text/plain")) {
+            // Handle non-JSON responses
+            if (contentType && (contentType.includes("text/plain") || contentType.includes("text/html"))) {
                 const text = await response.text();
                 if (!response.ok) throw new Error(text || 'API Error');
                 return text;
@@ -118,7 +112,7 @@ export class PowerBase {
 
             const data = await response.json();
 
-            // Handle GraphQL Errors (which return 200 OK but contain an 'errors' array)
+            // Handle GraphQL Errors
             if (options.isRoot && data.errors) {
                  const error = new Error(data.errors[0].message || 'GraphQL Error');
                  error.details = data.errors;
@@ -128,8 +122,8 @@ export class PowerBase {
             if (!response.ok) {
                 const error = new Error(data.message || 'API Error');
                 error.status = response.status;
-                error.code = data.error; // e.g., 'validation_error'
-                error.details = data.details; // Validation details
+                error.code = data.error; 
+                error.details = data.details;
                 throw error;
             }
 
@@ -140,7 +134,7 @@ export class PowerBase {
     }
 
     // ==========================================
-    // Authentication & Users
+    // 1. Authentication
     // ==========================================
 
     get auth() {
@@ -178,40 +172,7 @@ export class PowerBase {
             },
 
             /**
-             * Verify an email address using a token.
-             * @param {string} token - Token received in email link.
-             * @returns {Promise<string>} Success message.
-             */
-            verifyEmail: async (token) => {
-                return this._request('/auth/verify', {
-                    method: 'GET',
-                    params: { token }
-                });
-            },
-
-            /**
-             * Resend verification email.
-             * @param {string} email 
-             * @returns {Promise<void>}
-             */
-            resendVerification: async (email) => {
-                await this._request('/auth/verify/resend', {
-                    method: 'POST',
-                    body: { email }
-                });
-            },
-
-            /**
-             * Get the GitHub OAuth Login URL.
-             * Redirect `window.location.href` to this result to start OAuth flow.
-             * @returns {string}
-             */
-            getGithubLoginUrl: () => {
-                return `${this.baseUrl}/api/v1/auth/github`;
-            },
-
-            /**
-             * Log out (clears local state).
+             * Logout (clears local state only).
              */
             logout: () => {
                 this.token = null;
@@ -221,372 +182,364 @@ export class PowerBase {
     }
 
     // ==========================================
-    // Admin / System Management
+    // 2. Admin System Management
     // ==========================================
 
     get admins() {
         return {
+            // --- Collections ---
             /**
-             * List all collections.
-             * @returns {Promise<Array<{id: number, name: string, schema: object}>>}
+             * List all database collections.
+             * @returns {Promise<Array<object>>}
              */
-            listCollections: async () => {
-                return this._request('/collections');
-            },
+            listCollections: () => this._request('/collections'),
 
             /**
              * Create a new collection.
-             * @param {string} name 
-             * @param {object} schema - { fields: { title: { type: "string", required: true } } }
-             * @returns {Promise<object>}
+             * @param {string} name - The name of the collection (table).
+             * @param {object} schema - The schema definition object.
+             * @returns {Promise<object>} The created collection.
              */
-            createCollection: async (name, schema) => {
-                return this._request('/collections', {
-                    method: 'POST',
-                    body: { name, schema }
-                });
-            },
+            createCollection: (name, schema) => this._request('/collections', { method: 'POST', body: { name, schema } }),
 
             /**
-             * Get details of a specific collection.
-             * @param {number} id 
+             * Get a single collection by ID.
+             * @param {number|string} id 
              * @returns {Promise<object>}
              */
-            getCollection: async (id) => {
-                return this._request(`/collections/${id}`);
-            },
+            getCollection: (id) => this._request(`/collections/${id}`),
 
             /**
-             * Update a collection.
-             * @param {number} id 
+             * Update a collection's name or schema.
+             * @param {number|string} id 
              * @param {object} payload 
              * @returns {Promise<object>}
              */
-            updateCollection: async (id, payload) => {
-                return this._request(`/collections/${id}`, {
-                    method: 'PATCH',
-                    body: payload
-                });
-            },
+            updateCollection: (id, payload) => this._request(`/collections/${id}`, { method: 'PATCH', body: payload }),
 
             /**
              * Delete a collection.
-             * @param {number} id 
-             * @returns {Promise<boolean>}
-             */
-            deleteCollection: async (id) => {
-                await this._request(`/collections/${id}`, { method: 'DELETE' });
-                return true;
-            },
-
-            /**
-             * Update encrypted system configuration (Admin Only).
-             * @param {string} key - e.g., 'smtp_pass', 'github_client_secret'
-             * @param {string} value - The plain text value to encrypt and store.
+             * @param {number|string} id 
              * @returns {Promise<void>}
              */
-            updateSystemConfig: async (key, value) => {
-                await this._request('/admin/config', {
-                    method: 'POST',
-                    body: { key, value }
-                });
-            },
+            deleteCollection: (id) => this._request(`/collections/${id}`, { method: 'DELETE' }),
+
+            // --- Users ---
+            /**
+             * List all registered users (Admin only).
+             * @returns {Promise<Array<object>>}
+             */
+            listUsers: () => this._request('/admin/users'),
 
             /**
-             * 
+             * Delete a user by ID (Admin only).
+             * @param {number|string} id 
+             * @returns {Promise<void>}
              */
-            // users
-            listUsers: () => this._request('/admin/users'),
             deleteUser: (id) => this._request(`/admin/users/${id}`, { method: 'DELETE' }),
-            // settings
+
+            // --- Configuration ---
+            /**
+             * Get current system settings (SMTP, Storage, AI, etc.).
+             * Secrets are masked.
+             * @returns {Promise<object>}
+             */
             getSettings: () => this._request('/admin/settings'),
+
+            /**
+             * Update system settings.
+             * @param {object} settings - The settings object to merge.
+             * @returns {Promise<object>}
+             */
             updateSettings: (settings) => this._request('/admin/settings', { method: 'PATCH', body: settings }),
-            // Reload System
-            reloadSystem: () => this._request('/admin/system/reload', { method: 'POST', body:JSON.stringify({}) }),
-            listLogs: () => this._request('/admin/logs'),
+
+            /**
+             * Force a system reload.
+             * Syncs GraphQL schema, Cron jobs, and caches.
+             * @returns {Promise<object>} Status message.
+             */
+            reloadSystem: () => this._request('/admin/system/reload', { method: 'POST', body: JSON.stringify({}) }),
         };
     }
 
     // ==========================================
-    // Records (Data)
+    // 3. AI Actions (LLM Integration)
+    // ==========================================
+
+    get ai() {
+        return {
+            /**
+             * List configured AI actions/prompts.
+             * @returns {Promise<Array<object>>}
+             */
+            getActions: () => this._request('/admin/ai/actions'),
+
+            /**
+             * Create a new AI action template.
+             * @param {object} data - { name, slug, model, template, system_prompt }
+             * @returns {Promise<object>}
+             */
+            createAction: (data) => this._request('/admin/ai/actions', { method: 'POST', body: data }),
+
+            /**
+             * Delete an AI action.
+             * @param {number|string} id 
+             * @returns {Promise<void>}
+             */
+            deleteAction: (id) => this._request(`/admin/ai/actions/${id}`, { method: 'DELETE' }),
+            
+            /**
+             * Execute a defined AI action.
+             * @param {string} slug - The slug of the action (e.g., 'summarize').
+             * @param {object} variables - Variables to replace in the template (e.g., { text: "..." }).
+             * @returns {Promise<{result: string}>} The AI response.
+             */
+            run: (slug, variables) => this._request(`/ai/run/${slug}`, { method: 'POST', body: { variables } })
+        };
+    }
+
+    // ==========================================
+    // 4. Server-Side Scripting (JS)
+    // ==========================================
+
+    get scripts() {
+        return {
+            /**
+             * List all server-side scripts.
+             * @returns {Promise<Array<object>>}
+             */
+            list: () => this._request('/admin/scripts'),
+
+            /**
+             * Create a new script.
+             * @param {object} data - { name, trigger_type, code, active }
+             * @returns {Promise<object>}
+             */
+            create: (data) => this._request('/admin/scripts', { method: 'POST', body: data }),
+
+            /**
+             * Delete a script.
+             * @param {number|string} id 
+             * @returns {Promise<void>}
+             */
+            delete: (id) => this._request(`/admin/scripts/${id}`, { method: 'DELETE' }),
+
+            /**
+             * Manually execute a script by name.
+             * @param {string} name - The script name (slug).
+             * @param {object} variables - Input data accessible as `$input` in the script.
+             * @returns {Promise<any>} The result returned by the script.
+             */
+            run: (name, variables) => this._request(`/run/${name}`, { method: 'POST', body: variables })
+        };
+    }
+
+    // ==========================================
+    // 5. Templates (HTML/HTMX Rendering)
+    // ==========================================
+
+    get templates() {
+        return {
+            /**
+             * List all HTML templates.
+             * @returns {Promise<Array<object>>}
+             */
+            list: () => this._request('/admin/templates'),
+
+            /**
+             * Create a new template.
+             * @param {object} data - { slug, content, script_id }
+             * @returns {Promise<object>}
+             */
+            create: (data) => this._request('/admin/templates', { method: 'POST', body: data }),
+
+            /**
+             * Update a template.
+             * @param {number|string} id 
+             * @param {object} data 
+             * @returns {Promise<void>}
+             */
+            update: (id, data) => this._request(`/admin/templates/${id}`, { method: 'PATCH', body: data }),
+
+            /**
+             * Delete a template.
+             * @param {number|string} id 
+             * @returns {Promise<void>}
+             */
+            delete: (id) => this._request(`/admin/templates/${id}`, { method: 'DELETE' })
+        };
+    }
+
+    // ==========================================
+    // 6. Data Collection Operations
     // ==========================================
 
     /**
-     * Access operations for a specific collection.
-     * @param {number} collectionId 
+     * Access operations for a specific data collection.
+     * @param {number|string} collectionId - ID or Name of the collection.
      */
     collection(collectionId) {
         return {
             /**
-             * List records.
+             * List records with pagination, sorting, and filtering.
              * @param {object} [options={}] 
-             * @param {number} [options.page=1]
-             * @param {number} [options.per_page=30]
-             * @param {string} [options.sort] - "-created" (desc) or "created" (asc)
-             * @param {object} [options.filter] - { "field": "value" }
-             * @param {string} [options.expand] - "author,comments.user" (Recursive relation fetch)
-             * @returns {Promise<Array<{id: number, data: object}>>}
+             * @param {number} [options.page]
+             * @param {number} [options.per_page]
+             * @param {string} [options.sort] - e.g. "-created"
+             * @param {object|string} [options.filter] - e.g. { "status": "active" }
+             * @param {string} [options.expand] - e.g. "author,comments"
+             * @returns {Promise<Array<object>>}
              */
-            list: async (options = {}) => {
-                return this._request(`/collections/${collectionId}/records`, {
-                    method: 'GET',
-                    params: options
-                });
-            },
+            list: (options = {}) => this._request(`/collections/${collectionId}/records`, { method: 'GET', params: options }),
 
             /**
-             * Full-text search records (Tantivy).
-             * @param {string} query - The search query text.
-             * @returns {Promise<Array<{id: number, data: object}>>}
+             * Perform a full-text search (SQL-based).
+             * @param {string} query 
+             * @returns {Promise<Array<object>>}
              */
-            search: async (query) => {
-                return this._request(`/collections/${collectionId}/search`, {
-                    method: 'GET',
-                    params: { q: query }
-                });
-            },
+            search: (query) => this._request(`/collections/${collectionId}/search`, { method: 'GET', params: { q: query } }),
 
             /**
-             * Create a record.
+             * Perform an ultra-fast Instant Search via Tantivy Index (No SQL).
+             * @param {string} query 
+             * @returns {Promise<Array<{id: number, score: number, snippet: object}>>}
+             */
+            instantSearch: (query) => this._request(`/collections/${collectionId}/instant-search`, { method: 'GET', params: { q: query } }),
+
+            /**
+             * Create a new record.
              * @param {object} data 
-             * @returns {Promise<{id: number, data: object}>}
+             * @returns {Promise<object>}
              */
-            create: async (data) => {
-                return this._request(`/collections/${collectionId}/records`, {
-                    method: 'POST',
-                    body: { data }
-                });
-            },
+            create: (data) => this._request(`/collections/${collectionId}/records`, { method: 'POST', body: { data } }),
 
             /**
-             * Get a record by ID.
-             * @param {number} recordId 
-             * @returns {Promise<{id: number, data: object}>}
+             * Get a single record by ID.
+             * @param {number|string} recordId 
+             * @returns {Promise<object>}
              */
-            get: async (recordId) => {
-                return this._request(`/collections/${collectionId}/records/${recordId}`);
-            },
+            get: (recordId) => this._request(`/collections/${collectionId}/records/${recordId}`),
 
             /**
              * Update a record.
-             * @param {number} recordId 
+             * @param {number|string} recordId 
              * @param {object} data 
-             * @returns {Promise<{id: number, data: object}>}
+             * @returns {Promise<object>}
              */
-            update: async (recordId, data) => {
-                return this._request(`/collections/${collectionId}/records/${recordId}`, {
-                    method: 'PATCH',
-                    body: { data }
-                });
-            },
+            update: (recordId, data) => this._request(`/collections/${collectionId}/records/${recordId}`, { method: 'PATCH', body: { data } }),
 
             /**
              * Delete a record.
-             * @param {number} recordId 
-             * @returns {Promise<boolean>}
+             * @param {number|string} recordId 
+             * @returns {Promise<void>}
              */
-            delete: async (recordId) => {
-                await this._request(`/collections/${collectionId}/records/${recordId}`, {
-                    method: 'DELETE'
-                });
-                return true;
-            },
+            delete: (recordId) => this._request(`/collections/${collectionId}/records/${recordId}`, { method: 'DELETE' }),
 
             // --- Relations ---
 
             /**
-             * Create a relation (edge) between this record and another.
-             * @param {number} originRecordId - The ID of the record in the current collection.
-             * @param {number} targetCollectionId - The ID of the collection to link to.
-             * @param {number} targetRecordId - The ID of the record to link to.
-             * @param {string} relationName - The name of the relation (e.g., 'author', 'comments').
-             * @returns {Promise<void>}
+             * Add a relationship edge between records.
+             * @param {number|string} originRecordId 
+             * @param {number|string} targetCollectionId 
+             * @param {number|string} targetRecordId 
+             * @param {string} relationName 
              */
-            addRelation: async (originRecordId, targetCollectionId, targetRecordId, relationName) => {
-                await this._request(`/collections/${collectionId}/records/${originRecordId}/relations`, {
+            addRelation: (originRecordId, targetCollectionId, targetRecordId, relationName) => {
+                return this._request(`/collections/${collectionId}/records/${originRecordId}/relations`, {
                     method: 'POST',
                     body: {
-                        target_collection_id: targetCollectionId,
-                        target_record_id: targetRecordId,
+                        target_collection_id: parseInt(targetCollectionId),
+                        target_record_id: parseInt(targetRecordId),
                         relation_name: relationName
                     }
                 });
             },
 
             /**
-             * Delete a relation (edge).
-             * @param {number} originRecordId 
-             * @param {number} targetCollectionId 
-             * @param {number} targetRecordId 
-             * @param {string} relationName 
-             * @returns {Promise<void>}
+             * Remove a relationship edge.
              */
-            removeRelation: async (originRecordId, targetCollectionId, targetRecordId, relationName) => {
-                await this._request(`/collections/${collectionId}/records/${originRecordId}/relations`, {
+            removeRelation: (originRecordId, targetCollectionId, targetRecordId, relationName) => {
+                return this._request(`/collections/${collectionId}/records/${originRecordId}/relations`, {
                     method: 'DELETE',
                     body: {
-                        target_collection_id: targetCollectionId,
-                        target_record_id: targetRecordId,
+                        target_collection_id: parseInt(targetCollectionId),
+                        target_record_id: parseInt(targetRecordId),
                         relation_name: relationName
                     }
                 });
-            },
-
-            // INSTANT SEARCH
-            instantSearch: (query) => this._request(`/collections/${collectionId}/instant-search`, { 
-                method: 'GET', 
-                params: { q: query } 
-            })
+            }
         };
     }
-    
+
+    // ==========================================
+    // 7. File Storage
+    // ==========================================
+
     get files() {
         return {
-            // Update list to pass query params
-            list: (page = 1, perPage = 20) => 
-                this._request('/storage/files', { method: 'GET', params: { page, per_page: perPage } }),
-            
+            /**
+             * List uploaded files.
+             * @param {number} [page=1] 
+             * @param {number} [perPage=20] 
+             * @returns {Promise<{items: Array<object>, total: number}>}
+             */
+            list: (page = 1, perPage = 20) => this._request('/storage/files', { method: 'GET', params: { page, per_page: perPage } }),
+
+            /**
+             * Upload a file.
+             * @param {File} file - The file object from input.
+             * @returns {Promise<object>} Metadata of uploaded file.
+             */
             upload: (file) => {
                 const formData = new FormData();
                 formData.append('file', file);
                 return this._request('/storage/upload', { method: 'POST', body: formData });
             },
-            
-            // Add delete
-            delete: (id) => this._request(`/storage/files/${id}`, { method: 'DELETE' })
-        }
-    }
 
-    get ai() {
-        return {
-            getActions: () => this._request('/admin/ai/actions'),
-            createAction: (data) => this._request('/admin/ai/actions', { method: 'POST', body: data }),
-            deleteAction: (id) => this._request(`/admin/ai/actions/${id}`, { method: 'DELETE' }),
-            
-            // The method apps will use:
-            run: (slug, variables) => this._request(`/ai/run/${slug}`, { method: 'POST', body: { variables } })
-        }
-    }
+            /**
+             * Delete a file by ID.
+             * @param {number|string} id 
+             * @returns {Promise<void>}
+             */
+            delete: (id) => this._request(`/storage/files/${id}`, { method: 'DELETE' }),
 
-    get scripts() {
-        return {
-            list: () => this._request('/admin/scripts'),
-            create: (data) => this._request('/admin/scripts', { method: 'POST', body: data }),
-            delete: (id) => this._request(`/admin/scripts/${id}`, { method: 'DELETE' }),
-            run: (name, variables) => this._request(`/run/${name}`, { method: 'POST', body: variables })
+            /**
+             * Helper to get public URL.
+             * @param {string} filename 
+             */
+            getFileUrl: (filename) => `${this.baseUrl}/api/v1/storage/file/${filename}`
         };
-    }
-
-    get templates() {
-        return {
-            list: () => this._request('/admin/templates'),
-            create: (data) => this._request('/admin/templates', { method: 'POST', body: data }),
-            update: (id, data) => this._request(`/admin/templates/${id}`, { method: 'PATCH', body: data }),
-            delete: (id) => this._request(`/admin/templates/${id}`, { method: 'DELETE' })
-        };
-    }
-    
-    get logs() {
-        return {
-            list: () => this._request('/admin/logs', { method: 'GET' })
-        }
     }
 
     // ==========================================
-    // GraphQL
+    // 8. Logs
+    // ==========================================
+
+    get logs() {
+        return {
+            /**
+             * Fetch system audit logs.
+             * @returns {Promise<Array<object>>}
+             */
+            list: () => this._request('/admin/logs')
+        };
+    }
+
+    // ==========================================
+    // 9. GraphQL
     // ==========================================
 
     /**
-     * Execute a GraphQL query or mutation.
-     * @param {string} query - The GraphQL query string.
-     * @param {object} [variables={}] - Query variables.
+     * Execute a GraphQL query.
+     * @param {string} query 
+     * @param {object} [variables={}] 
      * @returns {Promise<{data: object, errors?: Array}>}
      */
     async graphql(query, variables = {}) {
         return this._request('/graphql', {
             method: 'POST',
-            isRoot: true, // Tells _request NOT to add /api/v1 prefix
+            isRoot: true,
             body: { query, variables }
         });
     }
-
-    // ==========================================
-    // File Storage
-    // ==========================================
-
-    get storage() {
-        return {
-            /**
-             * Upload a file.
-             * @param {File | Blob} file - Browser File object or Blob.
-             * @returns {Promise<{id: number, url: string, filename: string}>}
-             */
-            upload: async (file) => {
-                const formData = new FormData();
-                formData.append('file', file);
-
-                // Content-Type header is automatically set by browser with boundary
-                return this._request('/storage/upload', {
-                    method: 'POST',
-                    body: formData
-                });
-            },
-
-            /**
-             * Get the public URL for a file.
-             * @param {string} filename 
-             * @returns {string}
-             */
-            getFileUrl: (filename) => {
-                return `${this.baseUrl}/api/v1/storage/file/${filename}`;
-            }
-        };
-    }
-
-    // ==========================================
-    // Real-time (WebSockets)
-    // ==========================================
-
-    /**
-     * Subscribe to real-time database events.
-     * @param {function(object): void} onEvent - Callback for events (Insert, Update, Delete).
-     * @returns {WebSocket} The socket instance. Call .close() to unsubscribe.
-     */
-    subscribe(onEvent) {
-        const wsProtocol = this.baseUrl.startsWith('https') ? 'wss' : 'ws';
-        // Strip protocol from baseUrl to append ws://
-        const host = this.baseUrl.replace(/^https?:\/\//, '');
-        const wsUrl = `${wsProtocol}://${host}/ws`;
-
-        // Check environment support
-        if (typeof WebSocket === 'undefined') {
-            console.warn("PowerBase: WebSocket not available in this environment.");
-            return null;
-        }
-
-        const socket = new WebSocket(wsUrl);
-
-        socket.onopen = () => console.debug("PowerBase: Realtime Connected");
-
-        socket.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                onEvent(data);
-            } catch (e) {
-                console.error("PowerBase: Realtime parse error", e);
-            }
-        };
-
-        socket.onerror = (err) => console.error("PowerBase: Realtime Error", err);
-
-        return socket;
-    }
-}
-
-// Export for Module Systems (Node.js / Bundlers)
-if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
-    module.exports = PowerBase;
-} else {
-    // Browser Global
-    window.PowerBase = PowerBase;
 }

@@ -45,6 +45,10 @@ openssl = { version = "0.10", features = ["vendored"] }
 # Search Engine
 tantivy = "0.22"
 
-rquickjs = { version = "0.6", features = ["full-async", "macro"] }
+# --- SCRIPTING ENGINE (Boa 0.21) ---
+# FIX: Removed features = ["intl"] to prevent "missing Intl provider" panic
+boa_engine = { version = "0.21.0" }
+boa_gc = "0.21.0"
 
-reqwest = { version = "0.12", features = ["json", "blocking"] } # Added reqwest
+# HTTP Client (Added blocking feature for easier scripting)
+reqwest = { version = "0.12", features = ["json", "blocking"] }

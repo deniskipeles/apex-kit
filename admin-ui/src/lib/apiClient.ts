@@ -1,8 +1,8 @@
-import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult, Script, Template } from '../types';
+import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult, Script, Template, CollectionType, AiAction } from '../types';
 import { PowerBase } from './sdk';
 
 // Initialize SDK
-const apiUrl = import.meta.env.VITE_API_URL || 'http://127.0.0.1:5000';
+const apiUrl = (import.meta as any).env.VITE_API_URL || 'http://127.0.0.1:5000';
 export const pb = new PowerBase(apiUrl);
 
 // Load persisted token
@@ -47,7 +47,7 @@ const transformCollection = (col: any): Collection => {
     return {
         id: col.id.toString(),
         name: col.name,
-        type: 'base',
+        type: CollectionType.BASE,
         schema: schemaArray,
         rules: rules,
         created: new Date().toISOString(),
@@ -334,11 +334,27 @@ export const apiClient = {
     }
   },
 
+  ai: {
+    getActions: async (): Promise<AiAction[]> => {
+      const res = await pb.ai.getActions();
+      return res
+    },
+    createAction: async (data: Partial<AiAction>) => {
+      await pb.ai.createAction(data);
+    },
+    deleteAction: async (id: string) => {
+      await pb.ai.deleteAction(id);
+    },
+    run: async (slug: string, variables: Record<string, string>) => {
+      return await pb.ai.run(slug, variables);
+    }
+  },
+
   logs: {
     list: async (): Promise<SystemLog[]> => {
         try {
             // Fetch from real endpoint
-            const res = await pb.admins.listLogs(); // You need to add listLogs to SDK admin object
+            const res = await pb.logs.list(); // You need to add listLogs to SDK admin object
             return res.map((l: any) => ({
                 id: l.id.toString(),
                 level: l.level,

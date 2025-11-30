@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State, Json},
     Extension,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize};
 use serde_json::{json, Value};
 use tinybase_core::{auth::Claims, models::{Template, CreateTemplateReq}};
 use crate::{AppState, AppError};

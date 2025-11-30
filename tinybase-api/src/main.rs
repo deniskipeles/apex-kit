@@ -104,7 +104,7 @@ async fn main() {
 
     // 3. Create Initial Empty Schema (To satisfy AppState requirements before full build)
     let empty_schema = {
-        let mut builder = Schema::build("Query", None, None);
+        let builder = Schema::build("Query", None, None);
         let query = Object::new("Query")
             .field(Field::new("status", TypeRef::named(TypeRef::STRING), |_| {
                 FieldFuture::new(async { Ok(Some(Value::from("Initializing..."))) })
@@ -146,8 +146,8 @@ async fn main() {
     // --- MIDDLEWARE CONFIG ---
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(60) // Increased for dashboard usage
-            .burst_size(100)
+            .per_second(600) // Increased for dashboard usage
+            .burst_size(1000)
             .finish()
             .unwrap(),
     );

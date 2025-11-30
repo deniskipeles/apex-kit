@@ -1,12 +1,13 @@
 
 import React, { useEffect, useState } from 'react';
-import { Save, Loader2, Settings as SettingsIcon, Shield, Database, HardDrive, Key } from 'lucide-react';
+import { Save, Loader2, Settings as SettingsIcon, Shield, Database, BrainCircuit, HardDrive, Key } from 'lucide-react';
 import { Button } from '../../../components/ui/Elements';
 import { GeneralSettings } from '../components/GeneralSettings';
 import { SecuritySettings } from '../components/SecuritySettings';
 import { StorageSettings } from '../components/StorageSettings';
 import { BackupSettings } from '../components/BackupSettings';
 import { TokenSettings } from '../components/TokenSettings';
+import { AiSettings } from '../components/AiSettings';
 import { settingsService } from '../services/settingsService';
 import { AppSettings } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
@@ -58,6 +59,7 @@ export const SettingsPage = () => {
       { id: 'general', label: 'General', icon: SettingsIcon },
       { id: 'security', label: 'Security', icon: Shield },
       { id: 'storage', label: 'Storage', icon: HardDrive },
+      { id: 'ai', label: 'AI', icon: BrainCircuit },
       { id: 'backups', label: 'System & Backups', icon: Database },
       { id: 'tokens', label: 'API Keys', icon: Key },
   ];
@@ -93,6 +95,7 @@ export const SettingsPage = () => {
             {activeTab === 'storage' && <StorageSettings settings={settings} onChange={updateLocalSettings} />}
             {activeTab === 'backups' && <BackupSettings settings={settings} onChange={updateLocalSettings} />}
             {activeTab === 'tokens' && <TokenSettings settings={settings} onChange={updateLocalSettings} />}
+            {activeTab === 'ai' && <AiSettings settings={settings} onChange={updateLocalSettings} />}
         </div>
     </div>
   );

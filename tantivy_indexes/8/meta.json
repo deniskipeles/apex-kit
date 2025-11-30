@@ -16,7 +16,7 @@
       }
     },
     {
-      "name": "website-source",
+      "name": "title",
       "type": "text",
       "options": {
         "indexing": {
@@ -29,7 +29,7 @@
       }
     },
     {
-      "name": "title",
+      "name": "website-source",
       "type": "text",
       "options": {
         "indexing": {
