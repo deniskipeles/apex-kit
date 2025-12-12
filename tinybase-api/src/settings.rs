@@ -22,6 +22,8 @@ pub struct AppSettingsDto {
     pub security: Option<SecurityConfigDto>,
     pub cron_jobs: Option<Vec<tinybase_core::models::CronJob>>,
     pub ai: Option<AiConfigDto>,
+    pub app_logo: Option<String>,
+    pub log_retention_days: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
@@ -40,7 +42,7 @@ pub struct StorageConfigDto {
     pub s3: S3ConfigDto,
 }
 
-#[derive(Serialize, Deserialize, ToSchema, Clone)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Default)]
 pub struct S3ConfigDto {
     pub enabled: bool,
     pub provider: String,
@@ -61,6 +63,12 @@ pub struct SecurityConfigDto {
 pub struct AiConfigDto {
     pub enabled: bool,
     pub provider: String, // e.g., "gemini"
+    pub model: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub api_key: Option<String>, // Masked on GET
 }
 
@@ -98,6 +106,8 @@ pub async fn get_settings(
         security: None,
         cron_jobs: None,
         ai: None,
+        app_logo: None,
+        log_retention_days: None,
     };
 
     // SMTP (Mask Password)
@@ -168,6 +178,8 @@ pub async fn update_settings(
     if let Some(v) = &payload.app_url { general["app_url"] = json!(v); }
     if let Some(v) = &payload.allow_public_registration { general["allow_public_registration"] = json!(v); }
     if let Some(v) = &payload.theme { general["theme"] = json!(v); }
+    if let Some(v) = &payload.app_logo { general["app_logo"] = json!(v); }
+    if let Some(v) = &payload.log_retention_days { general["log_retention_days"] = json!(v); }
     
     state.db.save_setting("general", general, false).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 

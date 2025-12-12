@@ -4,6 +4,31 @@ use utoipa::ToSchema;
 use serde_json::Value;
 use crate::schema::CollectionSchema;
 
+
+// --- ADD NEW MODELS ---
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DashboardStats {
+    pub total_requests: i64, // Based on audit logs count
+    pub db_size_mb: f64,
+    pub collections_count: i64,
+    pub total_records: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)] // Added Clone
+pub struct ChartPoint {
+    pub name: String,
+    pub requests: i64,
+    pub errors: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DashboardData {
+    pub stats: DashboardStats,
+    pub chart: Vec<ChartPoint>,
+    pub recent_logs: Vec<serde_json::Value>,
+}
+
 /// Represents a generic Data Record (JSON document)
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct Record {
@@ -68,4 +93,33 @@ pub struct CreateTemplateReq {
     pub content: String,
     pub script_id: Option<i64>,
 }
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/models.rs ends here ===========================
+
+// --- APP MANIFEST (AI Architect) ---
+
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct AppManifest {
+    pub app_name: String,
+    pub collections: Vec<ManifestCollection>,
+    pub scripts: Vec<ManifestScript>,
+    pub templates: Vec<ManifestTemplate>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct ManifestCollection {
+    pub name: String,
+    pub schema: CollectionSchema,
+}
+
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct ManifestScript {
+    pub name: String,       // e.g. "create-task"
+    pub trigger_type: String, // "manual", "before_create", etc.
+    pub code: String,       // JS Code
+}
+
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct ManifestTemplate {
+    pub slug: String,       // e.g. "dashboard/tasks"
+    pub content: String,    // HTML + Tera
+    pub loader_script: Option<String>, // Name of script to run before rendering
+}

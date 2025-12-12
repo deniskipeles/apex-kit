@@ -36,6 +36,12 @@ const mapToFrontend = (apiData: any): AppSettings => {
             corsAllowAll: apiData.security?.cors_allow_all ?? true, // Default to true if missing
             corsOrigins: apiData.security?.cors_origins || ''
         },
+        ai: {
+            enabled: apiData.ai?.enabled || false,
+            apiKey: apiData.ai?.api_key || '',
+            provider: apiData.ai?.provider || ''
+        },
+        logRetentionDays: 30
     };
 };
 
@@ -79,6 +85,14 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
     }
     if (settings.cronJobs) {
         payload.cron_jobs = settings.cronJobs;
+    }
+
+    if (settings.ai){
+        payload.ai = {
+            enabled: settings.ai.enabled,
+            api_key: settings.ai.apiKey,
+            provider: settings.ai.provider
+        }
     }
 
     return payload;

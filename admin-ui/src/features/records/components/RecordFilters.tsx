@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { X, Filter, Search } from 'lucide-react';
 import { Button, Input, Select } from '../../../components/form/FormPrimitives';
@@ -12,6 +12,9 @@ interface RecordFiltersProps {
 }
 
 export const RecordFilters = ({ isOpen, onClose, collection, onApplyFilters }: RecordFiltersProps) => {
+
+  const [filters, setFilters] = useState({});
+
   if (!isOpen) return null;
 
   return createPortal(
@@ -27,20 +30,20 @@ export const RecordFilters = ({ isOpen, onClose, collection, onApplyFilters }: R
         <div className="flex-1 overflow-y-auto p-6 space-y-4">
           <div className="relative">
              <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-             <Input placeholder="Search all fields..." className="pl-9" />
+             <Input name="search" placeholder="Search all fields..." className="pl-9" />
           </div>
 
           {collection?.schema.map(field => (
             <div key={field.name} className="space-y-2">
                 <label className="text-sm font-medium capitalize">{field.name}</label>
-                <Input placeholder={`Filter by ${field.name}...`}/>
+                <Input value={filters[field.name] || ''} onChange={(e) => setFilters({...filters, [e.target.name]: e.target.value})} name={field.name} type={field.type} placeholder={`Filter by ${field.name}...`}/>
             </div>
           ))}
 
         </div>
         <div className="p-4 border-t flex gap-3">
-            <Button variant="outline" className="flex-1" onClick={onClose}>Clear</Button>
-            <Button className="flex-1" onClick={() => onApplyFilters({})}>Apply</Button>
+            <Button variant="outline" className="flex-1" onClick={()=>{ setFilters({})}}>Clear</Button>
+            <Button className="flex-1" onClick={() => onApplyFilters(filters)}>Apply</Button>
         </div>
       </div>
     </div>,

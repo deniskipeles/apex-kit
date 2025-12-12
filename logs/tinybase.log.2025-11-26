@@ -1,4 +1,0 @@
-{"timestamp":"2025-11-26T11:55:51.130629Z","level":"INFO","fields":{"message":"System starting up..."},"target":"tinybase_api"}
-{"timestamp":"2025-11-26T11:55:51.164139Z","level":"INFO","fields":{"message":"Using Local Storage (Path: ./uploads)"},"target":"tinybase_api"}
-{"timestamp":"2025-11-26T11:55:51.172596Z","level":"INFO","fields":{"message":"Tinybase listening on 0.0.0.0:5000"},"target":"tinybase_api"}
-{"timestamp":"2025-11-26T11:58:31.966308Z","level":"INFO","fields":{"message":"User logged in successfully","user_email":"admin@tinybase.io"},"target":"tinybase_api"}

@@ -4,6 +4,7 @@ import { persist } from 'zustand/middleware';
 import { AdminUser } from '../types';
 import { apiClient } from '../lib/apiClient';
 import { storage } from '../lib/storage';
+import { APEX_AUTH } from '../constants';
 
 interface AuthState {
   user: AdminUser | null;
@@ -49,7 +50,7 @@ export const useAuthStore = create<AuthState>()(
       }
     }),
     {
-      name: 'tinybase-auth',
+      name: APEX_AUTH,
       partialize: (state) => ({ user: state.user, token: state.token }),
     }
   )

@@ -67,6 +67,13 @@ impl SearchManager {
                         // Store boolean as u64 (0 or 1)
                         schema_builder.add_u64_field(name, STORED | INDEXED | FAST);
                     },
+                    // --- OPTIMIZATION: FLATTEN GEOPOINT ---
+                    FieldType::GeoPoint => {
+                        // We add two fields: {name}_lat and {name}_lng
+                        // FAST is required for Range Queries (Bounding Box)
+                        schema_builder.add_f64_field(&format!("{}_lat", name), STORED | INDEXED | FAST);
+                        schema_builder.add_f64_field(&format!("{}_lng", name), STORED | INDEXED | FAST);
+                    },
                     _ => {} // Json not searchable yet
                 }
             }
@@ -111,6 +118,26 @@ impl SearchManager {
         Ok(())
     }
 
+    /// Completely removes an index from memory and disk
+    pub fn delete_index(&self, collection_id: i64) -> Result<(), String> {
+        // 1. Remove from memory maps to drop file locks
+        {
+            let mut w_lock = self.writers.lock().unwrap();
+            w_lock.remove(&collection_id);
+        }
+        {
+            let mut i_lock = self.indexes.lock().unwrap();
+            i_lock.remove(&collection_id);
+        }
+
+        // 2. Delete directory from disk
+        let index_path = self.base_path.join(collection_id.to_string());
+        if index_path.exists() {
+            fs::remove_dir_all(&index_path).map_err(|e| format!("Failed to delete index dir: {}", e))?;
+        }
+        Ok(())
+    }
+
     pub fn index_record(&self, collection_id: i64, record_id: i64, data: &JsonValue, schema: &CollectionSchema) -> Result<(), String> {
         let mut lock = self.writers.lock().unwrap();
         let writer = lock.get_mut(&collection_id).ok_or("Index not loaded")?;
@@ -141,6 +168,23 @@ impl SearchManager {
                             FieldType::Boolean => {
                                 if let Some(b) = val.as_bool() {
                                     doc.add_u64(field, if b { 1 } else { 0 });
+                                }
+                            },
+                            // --- OPTIMIZATION: INJECT FLATTENED DATA ---
+                            FieldType::GeoPoint => {
+                                if let Some(obj) = val.as_object() {
+                                    let lat = obj.get("lat").and_then(|v| v.as_f64());
+                                    let lng = obj.get("lng").or_else(|| obj.get("lon")).and_then(|v| v.as_f64());
+
+                                    if let (Some(l), Some(g)) = (lat, lng) {
+                                        // Find the schema fields we created in load_index
+                                        if let Ok(field_lat) = index_schema.get_field(&format!("{}_lat", name)) {
+                                            doc.add_f64(field_lat, l);
+                                        }
+                                        if let Ok(field_lng) = index_schema.get_field(&format!("{}_lng", name)) {
+                                            doc.add_f64(field_lng, g);
+                                        }
+                                    }
                                 }
                             },
                             _ => {}
@@ -174,40 +218,29 @@ impl SearchManager {
         let lock = self.indexes.lock().unwrap();
         let index = lock.get(&collection_id).ok_or("Index not loaded")?;
 
-        let reader = index.reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .map_err(|e| e.to_string())?;
-        
+        let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into().map_err(|e| e.to_string())?;
         let searcher = reader.searcher();
         let schema = index.schema();
 
-        // Filter text fields
         let default_fields: Vec<Field> = schema.fields()
             .filter(|(_, entry)| matches!(entry.field_type(), TantivyFieldType::Str(_)))
             .map(|(f, _)| f)
             .collect();
         
-        if default_fields.is_empty() {
-            return Ok(vec![]);
-        }
+        if default_fields.is_empty() { return Ok(vec![]); }
 
         let query_parser = QueryParser::for_index(index, default_fields);
         let query = query_parser.parse_query(query_str).map_err(|e| e.to_string())?;
-
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit)).map_err(|e| e.to_string())?;
 
         let id_field = schema.get_field("record_id").unwrap();
         let mut results = Vec::new();
-        for (_score, doc_address) in top_docs {
+        for (_, doc_address) in top_docs {
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| e.to_string())?;
             if let Some(val) = retrieved_doc.get_first(id_field) {
-                if let Some(id) = val.as_i64() {
-                    results.push(id);
-                }
+                if let Some(id) = val.as_i64() { results.push(id); }
             }
         }
-
         Ok(results)
     }
 
@@ -216,83 +249,42 @@ impl SearchManager {
         let lock = self.indexes.lock().unwrap();
         let index = lock.get(&collection_id).ok_or("Index not loaded")?;
 
-        // Create a reader for the latest commit
-        let reader = index.reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .map_err(|e| e.to_string())?;
-        
+        let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into().map_err(|e| e.to_string())?;
         let searcher = reader.searcher();
         let schema = index.schema();
 
-        // 1. Get ALL Indexed Text Fields
-        // This ensures we search Title AND Description AND Email, etc.
         let default_fields: Vec<Field> = schema.fields()
             .filter(|(_, entry)| matches!(entry.field_type(), TantivyFieldType::Str(_)))
             .map(|(f, _)| f)
             .collect();
         
-        if default_fields.is_empty() {
-            return Ok(vec![]);
-        }
+        if default_fields.is_empty() { return Ok(vec![]); }
 
-        // 2. Construct Prefix Query
-        // If user types "Ap", we make it "Ap*"
-        // If user types "Ap Pi", we make it "Ap Pi*" (Last word is prefix)
         let trimmed = query_str.trim();
-        let clean_query = if trimmed.is_empty() { 
-            "*".to_string() 
-        } else {
-            // Escape special characters that might break Tantivy syntax (like :, -, +)
-            // Then append * to make it a prefix search
-            // Simple approach: Just append * to the raw string. 
-            // Tantivy QueryParser is smart enough to distribute the * to fields.
-            format!("{}*", trimmed)
-        };
-        
+        let clean_query = if trimmed.is_empty() { "*".to_string() } else { format!("{}*", trimmed) };
         let query_parser = QueryParser::for_index(index, default_fields);
-        
-        // 3. Parse Query
-        // This automatically expands to: (title:Ap* OR description:Ap*)
-        let query = match query_parser.parse_query(&clean_query) {
-            Ok(q) => q,
-            Err(_) => return Ok(vec![]) // Return empty on invalid syntax
-        };
+        let query = match query_parser.parse_query(&clean_query) { Ok(q) => q, Err(_) => return Ok(vec![]) };
 
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit)).map_err(|e| e.to_string())?;
-
         let id_field = schema.get_field("record_id").unwrap();
         let mut results = Vec::new();
 
         for (score, doc_address) in top_docs {
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| e.to_string())?;
-            
             let mut doc_id = 0;
             if let Some(val) = retrieved_doc.get_first(id_field) {
-                if let Some(id) = val.as_i64() {
-                    doc_id = id;
-                }
+                if let Some(id) = val.as_i64() { doc_id = id; }
             }
-
             let mut snippet = Map::new();
             for (field, entry) in schema.fields() {
                 let name = entry.name();
                 if name == "record_id" { continue; }
-
                 if let Some(val) = retrieved_doc.get_first(field) {
-                    if let Some(s) = val.as_str() {
-                        snippet.insert(name.to_string(), JsonValue::String(s.to_string()));
-                    }
+                    if let Some(s) = val.as_str() { snippet.insert(name.to_string(), JsonValue::String(s.to_string())); }
                 }
             }
-
-            results.push(InstantResult {
-                id: doc_id,
-                score,
-                snippet: JsonValue::Object(snippet),
-            });
+            results.push(InstantResult { id: doc_id, score, snippet: JsonValue::Object(snippet) });
         }
-
         Ok(results)
     }
 }

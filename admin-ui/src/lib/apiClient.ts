@@ -1,106 +1,168 @@
-import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult, Script, Template, CollectionType, AiAction } from '../types';
+import { APEX_TOKEN } from '../constants';
+import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult, Script, Template, AiAction } from '../types';
 import { PowerBase } from './sdk';
 
+// const env = (import.meta as any).env;
 // Initialize SDK
-const apiUrl = (import.meta as any).env.VITE_API_URL || 'http://127.0.0.1:5000';
+const apiUrl = (import.meta as any).env.DEV
+  ? (import.meta as any).env.VITE_API_URL?.trim() || 'http://127.0.0.1:5000'
+  : (typeof window !== 'undefined' ? window.origin : 'http://127.0.0.1:5000').trim();
 export const pb = new PowerBase(apiUrl);
 
 // Load persisted token
-const storedToken = localStorage.getItem('tinybase_token');
+const storedToken = localStorage.getItem(APEX_TOKEN);
 if (storedToken) {
     pb.setToken(storedToken);
 }
 
+
 // --- HELPER: Transform Backend Collection to Frontend Interface ---
 const transformCollection = (col: any): Collection => {
-    if (!col) return col;
+  if (!col) return col;
 
-    let schemaArray: any[] = [];
+  let schemaArray: any[] = [];
 
-    // 1. Map Standard Fields
-    if (col.schema && col.schema.fields) {
-        schemaArray = Object.entries(col.schema.fields).map(([name, def]: [string, any]) => {
-            let uiType = def.type;
-            if (uiType === 'boolean') uiType = 'bool'; 
-            return {
-                name,
-                ...def,
-                type: uiType
-            };
-        });
-    }
+  // 1. Map Standard Fields
+  if (col.schema && col.schema.fields) {
+      schemaArray = Object.entries(col.schema.fields).map(([name, def]: [string, any]) => {
+          let uiType = def.type;
+          if (uiType === 'boolean') uiType = 'bool'; 
+          
+          return {
+              name,
+              type: uiType,
+              required: def.required,
+              unique: def.unique,
+              indexed: def.indexed,
+              default: def.default,
+              uid: def.uid,
+              position: def.position,
+              vectorize: def.vectorize,
+              
+              // Map snake_case (Backend) -> camelCase (Frontend)
+              min: def.min,
+              max: def.max,
+              minLength: def.min_length,
+              maxLength: def.max_length,
+              pattern: def.pattern,
+              options: def.options,
+              mimeTypes: def.mime_types,
+              maxSize: def.max_size,
+              dimension: def.dimension,
+              relationTo: def.relation_to, // For 'owner' fields
+              
+              originalName: name // Initialize tracking
+          };
+      });
+  }
 
-    // 2. Map Relations (Backend stores them separately, UI treats them as fields)
-    if (col.schema && col.schema.relations) {
-        Object.entries(col.schema.relations).forEach(([name, def]: [string, any]) => {
-            schemaArray.push({
-                name,
-                type: 'relation',
-                relationTo: def.target_collection,
-                required: false // Relations are complex, usually optional in schema view
-            });
-        });
-    }
+  // 2. Map Relations (Separate map in backend -> Field in frontend)
+  if (col.schema && col.schema.relations) {
+      Object.entries(col.schema.relations).forEach(([name, def]: [string, any]) => {
+          schemaArray.push({
+              name,
+              type: 'relation',
+              relationTo: def.target_collection,
+              required: false,
+              originalName: name
+          });
+      });
+  }
 
-    const rules = col.schema?.policies || { read: 'public', create: 'admin', update: 'admin', delete: 'admin' };
+  const rules = col.schema?.policies || { read: 'public', create: 'admin', update: 'admin', delete: 'admin' };
+  const fieldHistory = col.schema?.field_history || {};
+  const compositeUnique = col.schema?.composite_unique || [];
 
-    return {
-        id: col.id.toString(),
-        name: col.name,
-        type: CollectionType.BASE,
-        schema: schemaArray,
-        rules: rules,
-        created: new Date().toISOString(),
-        updated: new Date().toISOString()
-    };
+  return {
+      id: col.id.toString(),
+      name: col.name,
+      type: col.type || 'base', // Default to 'base' if missing
+      schema: schemaArray,
+      rules: rules,
+      fieldHistory: fieldHistory,
+      compositeUnique: compositeUnique,
+      created: new Date().toISOString(),
+      updated: new Date().toISOString()
+  };
 };
 
 // --- HELPER: Transform Frontend Schema -> Backend Format ---
 const transformToBackendSchema = (data: Partial<Collection>) => {
-    const schema: any = { 
-        fields: {}, 
-        relations: {}, // Initialize relations object
-        policies: data.rules || {} 
-    };
-    
-    if (data.schema) {
-        data.schema.forEach(field => {
-            const { name, ...rest } = field;
-            const backendField = { ...rest };
+  const schema: any = { 
+      fields: {}, 
+      relations: {}, 
+      policies: data.rules || {},
+      field_history: data.fieldHistory || {},
 
-            // CASE 1: RELATION
-            // Move to schema.relations, do NOT add to schema.fields
-            if (backendField.type === 'relation') {
-                schema.relations[name] = {
-                    target_collection: backendField.relationTo,
-                    relation_type: 'one' // Default to 'one' for now
-                };
-                return; 
-            }
+  };
+  
+  if (data.schema) {
+      data.schema.forEach(field => {
+          const { name } = field;
 
-            // CASE 2: BOOLEAN
-            if (backendField.type === 'bool') {
-                (backendField as any).type = 'boolean';
-            }
-            
-            // CASE 3: UI-ONLY TYPES
-            // Map types not yet supported by backend to 'text' to avoid crash
-            if (['date', 'url', 'email', 'select', 'file'].includes(backendField.type)) {
-                 (backendField as any).type = 'text'; 
-            }
+          // CASE 1: RELATION (Explicit Type)
+          // 'relation' type moves to schema.relations
+          // Note: 'owner' stays in fields as it's a value type with validation logic
+          if (field.type === 'relation') {
+              schema.relations[name] = {
+                  target_collection: field.relationTo,
+                  relation_type: 'one' // Default to 'one'
+              };
+              return; 
+          }
 
-            // CASE 4: STANDARD FIELDS
-            schema.fields[name] = backendField;
-        });
-    }
-    return schema;
+          // Prepare Backend Field Definition
+          // Map camelCase (Frontend) -> snake_case (Backend)
+          const backendField: any = {
+              type: field.type,
+              required: field.required,
+              unique: field.unique,
+              indexed: field.indexed,
+              default: field.default,
+              uid: field.uid,
+              position: field.position,
+              vectorize: field.vectorize,
+              
+              // Validation Props
+              min: field.min,
+              max: field.max,
+              min_length: field.minLength,
+              max_length: field.maxLength,
+              pattern: field.pattern,
+              options: field.options,
+              mime_types: field.mimeTypes,
+              max_size: field.maxSize,
+              dimension: field.dimension,
+              relation_to: field.relationTo // For 'owner' type
+          };
+
+          // CASE 2: BOOLEAN MAPPING
+          if (backendField.type === 'bool') {
+              backendField.type = 'boolean';
+          }
+          
+          // Cleanup undefined values to keep JSON payload clean
+          Object.keys(backendField).forEach(key => backendField[key] === undefined && delete backendField[key]);
+
+          schema.fields[name] = backendField;
+      });
+  }
+  return schema;
 };
 
 export const apiClient = {
+  apiUrl: apiUrl,
+  stripHtmlTags: pb.utils.stripHtmlTags,
+  getAdminDashboardStats: pb.admins.getDashboardStats,
+  reIndex:  async (collectionId?: string) => {
+    const res = await pb.admins.reIndex(collectionId);
+    return res;
+  },
+
   auth: {
     login: async (email: string, password: string) => {
       const response = await pb.auth.login(email, password);
-      localStorage.setItem('tinybase_token', response.token);
+      localStorage.setItem(APEX_TOKEN, response.token);
       const user = {
           id: response.user.id.toString(),
           email: response.user.email,
@@ -110,7 +172,7 @@ export const apiClient = {
     },
     logout: async () => {
       pb.auth.logout();
-      localStorage.removeItem('tinybase_token');
+      localStorage.removeItem(APEX_TOKEN);
       return true;
     }
   },
@@ -173,6 +235,8 @@ export const apiClient = {
     create: async (data: Partial<Collection>): Promise<Collection> => {
       const backendSchema = transformToBackendSchema(data);
       if(data.rules) backendSchema.policies = data.rules;
+      if(data.compositeUnique) backendSchema.composite_unique = data.compositeUnique;
+      if(data.fieldHistory) backendSchema.field_history = data.fieldHistory;
       
       const res = await pb.admins.createCollection(data.name, backendSchema);
       return transformCollection(res);
@@ -182,6 +246,9 @@ export const apiClient = {
       if (data.schema || data.rules) {
           payload.schema = transformToBackendSchema(data);
       }
+      if(data.rules) payload.policies = data.rules;
+      if(data.compositeUnique) payload.composite_unique = data.compositeUnique;
+      if(data.fieldHistory) payload.field_history = data.fieldHistory;
       
       const res = await pb.admins.updateCollection(id, payload);
       return transformCollection(res);
@@ -192,16 +259,18 @@ export const apiClient = {
   },
 
   records: {
-    list: async (collectionId: string, page = 1, perPage = 20, expand = ''): Promise<{ items: AppRecord[], totalItems: number }> => {
+    list: async (collectionId: string, page = 1, perPage = 20, expand = '', filter = {}, sort = '-id'): Promise<{ items: AppRecord[], totalItems: number }> => {
       
       // Pass expand to the SDK list call
-      const items = await pb.collection(collectionId).list({ 
+      const result = await pb.collection(collectionId).list({ 
           page, 
           per_page: perPage,
-          expand: expand 
+          expand: expand,
+          filter: filter,
+          sort: sort,
       });
       
-      const formattedItems = items.map((item: any) => ({
+      const formattedItems = result.items.map((item: any) => ({
           id: item.id.toString(),
           collectionId,
           collectionName: 'unknown', 
@@ -213,7 +282,7 @@ export const apiClient = {
 
       return {
         items: formattedItems,
-        totalItems: items.length // Note: Backend needs to update to return count in meta
+        totalItems: result.total // Note: Backend needs to update to return count in meta
       };
     },
     instantSearch: async (collectionId: string|number, query: string): Promise<InstantResult[]> => {
@@ -246,6 +315,18 @@ export const apiClient = {
           created: new Date().toISOString(),
           updated: new Date().toISOString(),
           ...res.data
+      };
+    },
+    getOne: async (collectionId: string, recordId: string, expand = ''): Promise<AppRecord> => {
+      const res = await pb.collection(collectionId).get(recordId, { expand: expand });
+      return {
+          id: res.id.toString(),
+          collectionId,
+          collectionName: '',
+          created: new Date().toISOString(),
+          updated: new Date().toISOString(),
+          ...res.data,
+          expand: res.expand || {} // Ensure expand object exists
       };
     },
     delete: async (id: string): Promise<void> => {

@@ -16,7 +16,7 @@
       }
     },
     {
-      "name": "field_name",
+      "name": "name",
       "type": "text",
       "options": {
         "indexing": {

@@ -7,6 +7,7 @@ edition = "2021"
 # Web Framework (Axum 0.8)
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1.37.0", features = ["full"] }
+futures = "0.3" 
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5.2", features = ["cors", "trace", "fs"] }
 
@@ -15,6 +16,7 @@ serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.117"
 libsql = { version = "0.9.29", features = ["replication"] }
 tinybase-core = { path = "../tinybase-core" }
+apex-vector = { path = "../apex-vector" }
 
 # GraphQL
 async-graphql = { version = "7.0", features = ["dynamic-schema", "dataloader"] }
@@ -65,6 +67,11 @@ tokio-cron-scheduler = "0.9"
 # Templates
 tera = "1.19" 
 serde_qs = "0.13" # To parse query strings/form data for scripts
+
+chrono = { version = "0.4", features = ["serde"] }
+# Image processing and Caching
+image = "0.24" # For image resizing
+moka = { version = "0.12", features = ["future"] } # High performance cache
 
 [dev-dependencies]
 assert-json-diff = "2.0.2"

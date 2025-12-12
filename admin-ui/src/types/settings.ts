@@ -1,3 +1,5 @@
+import { AiAction } from ".";
+
 export interface SecurityConfig {
   corsAllowAll: boolean;
   corsOrigins: string;
@@ -11,7 +13,7 @@ export interface SystemLog {
   source: string;
 }
 
-export type ViewState = 'dashboard' | 'collections' | 'collections-create' | 'collections-edit' | 'records' | 'files' | 'settings' | 'logs' | 'users' | 'scripts' | 'templates';
+export type ViewState =  'ai-architect' | 'ai-actions' | 'dashboard' | 'collections' | 'collections-create' | 'collections-edit' | 'records' | 'files' | 'settings' | 'logs' | 'users' | 'scripts' | 'templates';
 
 export interface SmtpConfig {
   enabled: boolean;
@@ -59,6 +61,12 @@ export interface ApiToken {
   created: string;
 }
 
+export interface AIProvider{
+  enabled: Boolean;
+  apiKey: string;
+  provider: string;
+}
+
 export interface AppSettings {
   appName: string;
   appUrl: string;
@@ -71,4 +79,6 @@ export interface AppSettings {
   apiTokens: ApiToken[];
   security: SecurityConfig;
   logRetentionDays: Number;
+  ai:AIProvider;
 }
+

@@ -12,7 +12,7 @@ import { settingsService } from '../services/settingsService';
 import { AppSettings } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
 
-type Tab = 'general' | 'security' | 'storage' | 'backups' | 'tokens';
+type Tab = 'general' | 'security' | 'storage' | 'backups' | 'tokens' | 'ai';
 
 export const SettingsPage = () => {
   const [settings, setSettings] = useState<AppSettings | null>(null);

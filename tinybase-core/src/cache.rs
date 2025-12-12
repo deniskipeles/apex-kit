@@ -5,6 +5,9 @@ use moka::future::Cache;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
+use crate::ai_models::{AiSession, Plugin};
+use crate::ListResult;
+use std::error::Error as StdError;
 
 #[derive(Clone)]
 pub struct CachedDb {
@@ -84,7 +87,8 @@ impl Db for CachedDb {
         Ok(res)
     }
 
-    async fn delete_collection(&self, id: i64) -> crate::Result<()> {
+    // FIX: Updated return type to match trait
+    async fn delete_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_collection(id).await?;
         self.collection_cache.invalidate(&id).await;
         Ok(())
@@ -104,14 +108,23 @@ impl Db for CachedDb {
         &self,
         collection_id: i64,
         record_id: i64,
+        expand: Option<String>,
     ) -> Result<Option<Record>, Box<dyn std::error::Error + Send + Sync>> {
+        // 1. If Expanding, bypass cache (Dynamic content)
+        if let Some(ex) = &expand {
+            if !ex.trim().is_empty() {
+                return self.inner.get_record(collection_id, record_id, expand).await;
+            }
+        }
+
         let key = (collection_id, record_id);
         
         if let Some(cached) = self.record_cache.get(&key).await {
             return Ok(Some((*cached).clone()));
         }
 
-        let result = self.inner.get_record(collection_id, record_id).await?;
+        // Pass None for expand to get raw record
+        let result = self.inner.get_record(collection_id, record_id, None).await?;
         if let Some(rec) = &result {
             self.record_cache.insert(key, Arc::new(rec.clone())).await;
         }
@@ -122,7 +135,9 @@ impl Db for CachedDb {
         &self,
         collection_id: i64,
         options: QueryOptions,
-    ) -> Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<ListResult, Box<dyn std::error::Error + Send + Sync>> {
+        // Caching list results is tricky with complex filters/expands.
+        // For now, pass through. If you want to cache, use (collection_id, options) as key.
         self.inner.list_records(collection_id, options).await
     }
 
@@ -137,7 +152,8 @@ impl Db for CachedDb {
         Ok(res)
     }
 
-    async fn delete_record(&self, collection_id: i64, record_id: i64) -> crate::Result<()> {
+    // FIX: Updated return type to match trait
+    async fn delete_record(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_record(collection_id, record_id).await?;
         self.record_cache.invalidate(&(collection_id, record_id)).await;
         Ok(())
@@ -150,6 +166,17 @@ impl Db for CachedDb {
 
     async fn instant_search(&self, collection_id: i64, query: &str) -> Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.instant_search(collection_id, query).await
+    }
+
+    // FIX: Correct Signature and Return Type
+    async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.search_vector(collection_id, field, vector, limit).await
+    }
+
+    // FIX: Add reindex_collection to match trait
+    async fn reindex_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        // Pass through to inner (TinyBase)
+        self.inner.reindex_collection(id).await
     }
 
     // --- Users ---
@@ -174,7 +201,8 @@ impl Db for CachedDb {
         self.inner.list_users().await
     }
 
-    async fn delete_user(&self, id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // FIX: Updated return type
+    async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_user(id).await
     }
 
@@ -199,7 +227,8 @@ impl Db for CachedDb {
         self.inner.get_file_metadata(id).await
     }
 
-    async fn delete_file_metadata(&self, id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // FIX: Updated return type
+    async fn delete_file_metadata(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_file_metadata(id).await
     }
 
@@ -288,8 +317,37 @@ impl Db for CachedDb {
         self.inner.create_ai_action(action).await
     }
 
-    async fn delete_ai_action(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // FIX: Updated return type
+    async fn delete_ai_action(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_ai_action(id).await
+    }
+
+    // --- AI Sessions (Pass-through, no caching for chat state) ---
+
+    async fn create_ai_session(&self, session: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.create_ai_session(session).await
+    }
+
+    async fn get_ai_session(&self, id: &str) -> std::result::Result<Option<AiSession>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_ai_session(id).await
+    }
+
+    async fn update_ai_session(&self, session: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.update_ai_session(session).await
+    }
+
+    async fn list_ai_sessions(&self) -> std::result::Result<Vec<AiSession>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_ai_sessions().await
+    }
+
+    // --- Plugins (Pass-through) ---
+
+    async fn save_plugin(&self, plugin: &Plugin) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.save_plugin(plugin).await
+    }
+
+    async fn list_plugins(&self) -> std::result::Result<Vec<Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_plugins().await
     }
 
     // --- Relations ---
@@ -297,7 +355,8 @@ impl Db for CachedDb {
     async fn create_relation(&self, oc: i64, oi: i64, tc: i64, ti: i64, rn: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.create_relation(oc, oi, tc, ti, rn).await
     }
-    async fn delete_relation(&self, oc: i64, oi: i64, tc: i64, ti: i64, rn: &str) -> crate::Result<()> {
+    // FIX: Updated return type
+    async fn delete_relation(&self, oc: i64, oi: i64, tc: i64, ti: i64, rn: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_relation(oc, oi, tc, ti, rn).await
     }
     async fn get_related_ids(&self, oc: i64, oi: i64, rn: &str) -> std::result::Result<Vec<(i64, i64)>, Box<dyn std::error::Error + Send + Sync>> {
@@ -314,7 +373,8 @@ impl Db for CachedDb {
     async fn create_script(&self, req: crate::script_models::CreateScriptReq) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.create_script(req).await
     }
-    async fn delete_script(&self, id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // FIX: Updated return type
+    async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_script(id).await
     }
     async fn get_script_by_name(&self, name: &str) -> Result<Option<crate::script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
@@ -347,21 +407,27 @@ impl Db for CachedDb {
     }
 
     async fn create_template(&self, req: models::CreateTemplateReq) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.create_template(req).await
+        let slug = req.slug.clone();
+        let id = self.inner.create_template(req).await?;
+        self.template_cache.invalidate(&slug).await;
+        Ok(id)
     }
 
-    async fn update_template(&self, id: i64, content: String, script_id: Option<i64>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn update_template(&self, id: i64, content: String, script_id: Option<i64>) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.update_template(id, content, script_id).await?;
-        // We don't know the slug here easily to invalidate just one, so we invalidate all to be safe.
-        // Templates change rarely, so this performance hit is negligible.
+        // Invalidate all for safety or implement lookup to find slug by id
         self.template_cache.invalidate_all();
         Ok(())
     }
 
-    async fn delete_template(&self, id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // FIX: Updated return type
+    async fn delete_template(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_template(id).await?;
         self.template_cache.invalidate_all();
         Ok(())
     }
+
+    async fn get_dashboard_stats(&self) -> Result<crate::models::DashboardData, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_dashboard_stats().await
+    }
 }
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/cache.rs ends here ===========================

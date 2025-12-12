@@ -11,6 +11,7 @@ import { UsersListPage } from '../features/users/pages/UsersListPage';
 import { ScriptsPage } from '../features/scripts/pages/ScriptsPage';
 import { TemplatesPage } from '../features/templates/pages/TemplatesPage';
 import { AiActionsPage } from '../features/ai/pages/AiActionsPage';
+import { AiArchitectPage } from '../features/ai/pages/AiArchitectPage';
 import { Dashboard } from '../pages/Dashboard';
 import { ViewState } from '../types';
 
@@ -33,6 +34,7 @@ export const Router = ({ view, onChangeView }: RouterProps) => {
         case 'scripts': return <ScriptsPage />;
         case 'templates': return <TemplatesPage />;
         case 'ai-actions': return <AiActionsPage />;
+        case 'ai-architect': return <AiArchitectPage />;
         default: return <Dashboard />;
     }
 };

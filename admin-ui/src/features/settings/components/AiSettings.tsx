@@ -9,10 +9,10 @@ interface AiSettingsProps {
   onChange: (settings: Partial<AppSettings>) => void;
 }
 
-export const AiSettings = ({ settings, onChange }: AiSettingsProps) => {
+export const AiSettings = ({ settings, onChange:onChangeValue }: AiSettingsProps) => {
   
   const updateAi = (key: string, value: any) => {
-      onChange({ ai: { ...settings.ai, [key]: value } });
+    onChangeValue({ ai: { ...settings.ai, [key]: value } });
   };
 
   return (

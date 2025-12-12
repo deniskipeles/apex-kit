@@ -1,6 +1,7 @@
+// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-api/src/graphql.rs ===========================
 use async_graphql::{dynamic::*, Value as GqlValue};
 use async_graphql::dataloader::*;
-use tinybase_core::{Db, schema::{FieldType, RelationType}, Record};
+use tinybase_core::{Db, schema::{FieldType, RelationType}, Record, ListResult}; // Added ListResult
 use crate::AppState;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -15,7 +16,6 @@ impl RelationLoader {
     }
 }
 
-// Ensure RelationKey derives these to work as HashMap keys
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
 pub struct RelationKey {
     pub origin_col_id: i64,
@@ -25,13 +25,10 @@ pub struct RelationKey {
 }
 
 impl Loader<RelationKey> for RelationLoader {
-    // Define types here
     type Value = Vec<Record>;
     type Error = String;
     
-    // REMOVED <'a> and &'a
     async fn load(&self, keys: &[RelationKey]) -> std::result::Result<HashMap<RelationKey, Self::Value>, Self::Error> {
-        // 1. Clone keys immediately so they are owned inside the async block
         let keys_cloned = keys.to_vec();
         let mut results: HashMap<RelationKey, Vec<Record>> = HashMap::new();
         let mut grouped_keys: HashMap<(i64, String), Vec<i64>> = HashMap::new();
@@ -45,14 +42,12 @@ impl Loader<RelationKey> for RelationLoader {
         let mut target_ids_map: HashMap<RelationKey, Vec<(i64, i64)>> = HashMap::new();
         let mut needed_records: HashMap<String, Vec<i64>> = HashMap::new();
 
-        // 2. Fetch Relations
         for ((o_col, rel), o_ids) in grouped_keys {
             for o_id in o_ids {
                 let links = self.db.get_related_ids(o_col, o_id, &rel)
                     .await
                     .map_err(|e| e.to_string())?;
                 
-                // Match back to the specific RelationKey
                 if let Some(key) = keys_cloned.iter().find(|k| k.origin_col_id == o_col && k.origin_rec_id == o_id && k.rel_name == rel) {
                     target_ids_map.insert(key.clone(), links.clone());
                     for (_, t_rec_id) in links {
@@ -68,7 +63,6 @@ impl Loader<RelationKey> for RelationLoader {
         let col_name_to_id: HashMap<String, i64> = cols.into_iter().map(|c| (c.name, c.id)).collect();
         let mut fetched_record_cache: HashMap<(String, i64), Record> = HashMap::new();
 
-        // 3. Fetch Records
         for (t_col_name, t_ids) in needed_records {
             if let Some(t_col_id) = col_name_to_id.get(&t_col_name) {
                 let recs = self.db.get_records_by_ids(*t_col_id, &t_ids)
@@ -80,7 +74,6 @@ impl Loader<RelationKey> for RelationLoader {
             }
         }
 
-        // 4. Assemble Results
         for key in keys_cloned {
             let mut records = Vec::new();
             if let Some(links) = target_ids_map.get(&key) {
@@ -99,23 +92,24 @@ impl Loader<RelationKey> for RelationLoader {
 
 pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader>>) -> Result<Schema, SchemaError> {
     let mut schema_builder = Schema::build("Query", None, None);
+    // Register custom JSON scalar for 'where' arguments
+    schema_builder = schema_builder.register(Scalar::new("JSON"));
+
     let mut query_root = Object::new("Query");
 
-    // Default field to ensure schema is valid even if empty
     query_root = query_root.field(Field::new("status", TypeRef::named(TypeRef::STRING), |_| {
         FieldFuture::new(async { Ok(Some(GqlValue::from("TinyBase is running"))) })
     }));
 
     let collections = state.db.list_collections().await.unwrap_or_default();
-
-    // --- FIX START: Create ID -> Name Lookup Map ---
     let col_id_to_name: HashMap<String, String> = collections.iter()
         .map(|c| (c.id.to_string(), c.name.clone()))
         .collect();
-    // --- FIX END ---
 
     for col in &collections {
         let type_name = capitalize(&col.name);
+        
+        // 1. Define the Single Item Object (e.g., "Post")
         let mut object = Object::new(&type_name);
 
         object = object.field(Field::new("id", TypeRef::named_nn(TypeRef::ID), |ctx| {
@@ -150,15 +144,11 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
             }
 
             for (rel_name, rel_def) in &schema.relations {
-                // --- FIX START: Resolve Target Name ---
-                // If target is "3", look it up to find "users"
                 let raw_target = &rel_def.target_collection;
                 let resolved_target_name = col_id_to_name.get(raw_target).unwrap_or(raw_target);
                 
                 let target_type_name = capitalize(resolved_target_name);
-                // Capture resolved name for the closure
                 let t_col_name = resolved_target_name.clone(); 
-                // --- FIX END ---
 
                 let origin_col_id = col.id;
                 let r_name = rel_name.clone();
@@ -197,19 +187,88 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
                 object = object.field(field);
             }
         }
+        
+        // Register the Item Type (e.g., "Post")
         schema_builder = schema_builder.register(object);
 
+        // 2. Define the List Wrapper Object (e.g., "PostList")
+        // This holds { items: [Post], total: Int }
+        let list_type_name = format!("{}List", type_name);
+        let mut list_object = Object::new(&list_type_name);
+
+        // Field: total
+        list_object = list_object.field(Field::new("total", TypeRef::named_nn(TypeRef::INT), |ctx| {
+            FieldFuture::new(async move {
+                let res = ctx.parent_value.try_downcast_ref::<ListResult>()
+                    .map_err(|_| async_graphql::Error::new("Internal List Error"))?;
+                Ok(Some(GqlValue::from(res.total)))
+            })
+        }));
+
+        // Field: items
+        let items_type_name = type_name.clone();
+        list_object = list_object.field(Field::new("items", TypeRef::named_nn_list(&items_type_name), move |ctx| {
+            FieldFuture::new(async move {
+                let res = ctx.parent_value.try_downcast_ref::<ListResult>()
+                    .map_err(|_| async_graphql::Error::new("Internal List Error"))?;
+                
+                // Convert Vec<Record> to Vec<FieldValue>
+                let items: Vec<FieldValue> = res.items.iter()
+                    .map(|r| FieldValue::owned_any(r.clone()))
+                    .collect();
+                
+                Ok(Some(FieldValue::list(items)))
+            })
+        }));
+
+        // Register the List Type
+        schema_builder = schema_builder.register(list_object);
+
+        // 3. Define the Root Query Field (e.g., "posts")
+        // Now returns "PostList" instead of "[Post]"
         let col_id = col.id;
         let query_name = col.name.clone();
-        let type_name_clone = type_name.clone();
+        let list_type_name_ref = list_type_name.clone();
         
-        let list_field = Field::new(query_name, TypeRef::named_list(&type_name_clone), move |ctx| {
+        let list_field = Field::new(query_name, TypeRef::named(&list_type_name_ref), move |ctx| {
             let state = ctx.data::<AppState>().unwrap().clone();
             FieldFuture::new(async move {
-                let records = state.db.list_records(col_id, Default::default()).await.map_err(|e| async_graphql::Error::new(e.to_string()))?;
-                Ok(Some(FieldValue::list(records.into_iter().map(FieldValue::owned_any))))
+                // Extract Pagination Arguments
+                let limit = ctx.args.get("limit").and_then(|v| v.u64().ok());
+                let offset = ctx.args.get("offset").and_then(|v| v.u64().ok());
+                
+                // Extract 'where' filter
+                let filter_str = match ctx.args.get("where") {
+                    Some(accessor) => {
+                        match accessor.deserialize::<serde_json::Value>() {
+                            Ok(json_val) => Some(json_val.to_string()),
+                            Err(_) => None
+                        }
+                    },
+                    None => None,
+                };
+
+                let mut options = tinybase_core::query::QueryOptions::default();
+                if limit.is_some() || offset.is_some() {
+                    options.limit = limit;
+                    options.offset = offset;
+                } else {
+                    options.limit = Some(100); 
+                }
+                
+                options.filter = filter_str;
+
+                // Returns ListResult struct { items, total }
+                let result = state.db.list_records(col_id, options).await.map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                
+                // Pass the whole ListResult struct as the parent value for the sub-fields
+                Ok(Some(FieldValue::owned_any(result)))
             })
-        });
+        })
+        .argument(InputValue::new("limit", TypeRef::named(TypeRef::INT)))
+        .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
+        .argument(InputValue::new("where", TypeRef::named("JSON")));
+
         query_root = query_root.field(list_field);
     }
 
@@ -219,6 +278,7 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
         .data(loader)
         .finish()
 }
+
 
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();

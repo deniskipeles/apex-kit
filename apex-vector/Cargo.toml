@@ -1,0 +1,30 @@
+[package]
+name = "apex-vector"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Candle (Pure Rust ML)
+candle-core = "0.5.1"
+candle-nn = "0.5.1"
+candle-transformers = "0.5.1"
+tokenizers = "0.19.1"
+hf-hub = "0.4"
+
+# Vector Search
+hnsw_rs = "0.3"
+
+# Utils
+serde = { version = "1.0.200", features = ["derive"] }
+serde_json = "1.0.117"
+anyhow = "1.0"
+tokio = { version = "1.37.0", features = ["full"] }
+tracing = "0.1"
+
+
+# Explicitly pin rand to match candle-core
+rand = "0.8.5"
+
+# FIX: Force half to 2.3.1 to prevent it from pulling rand 0.9
+# We enable the "rand" feature so it implements traits for rand 0.8
+half = { version = "=2.3.1", features = ["rand_distr", "std"] }

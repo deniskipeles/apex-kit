@@ -5,7 +5,8 @@ use tinybase_api::{app_router, AppState};
 use tinybase_core::{
     a_new_database_connection, jobs, cache::CachedDb, realtime, 
     storage::{LocalStorage, S3Storage, StorageBackend}, 
-    security::{MasterKey, Vault}
+    security::{MasterKey, Vault},
+    ai_models::CreateActionReq
 };
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -20,6 +21,53 @@ use async_graphql::Value;
 use async_graphql::dynamic::{Schema, Object, Field, TypeRef, FieldFuture}; 
 
 use tinybase_core::scripting::ScriptEngine;
+use moka::future::Cache;
+
+// Import ApexVector types
+use apex_vector::VectorEngine;
+use tinybase_core::VectorProvider;
+
+// --- 1. Define Bridge (Real AI) ---
+struct ApexBridge {
+    engine: VectorEngine,
+}
+
+#[async_trait::async_trait]
+impl VectorProvider for ApexBridge {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        let engine = self.engine.clone();
+        let text = text.to_string();
+        // Offload blocking Candle task
+        tokio::task::spawn_blocking(move || {
+            engine.embedder.embed(&text).map_err(|e| e.to_string())
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    async fn search(&self, col_id: i64, field: &str, vec: &[f32], limit: usize) -> Result<Vec<(i64, f32)>, String> {
+        Ok(self.engine.index.search(col_id, field, vec, limit))
+    }
+
+    async fn index(&self, col_id: i64, rec_id: i64, field: &str, vec: &[f32]) -> Result<(), String> {
+        self.engine.index.insert(col_id, rec_id, field, vec);
+        Ok(())
+    }
+}
+
+// --- 2. Define Fallback (No AI) ---
+struct FallbackVectorProvider;
+
+#[async_trait::async_trait]
+impl VectorProvider for FallbackVectorProvider {
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+        Err("Vector Engine failed to initialize. Check server logs.".to_string())
+    }
+    async fn search(&self, _c: i64, _f: &str, _v: &[f32], _l: usize) -> Result<Vec<(i64, f32)>, String> {
+        Ok(vec![])
+    }
+    async fn index(&self, _c: i64, _r: i64, _f: &str, _v: &[f32]) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -57,8 +105,23 @@ async fn main() {
     let builder = PrometheusBuilder::new();
     let handle = builder.install_recorder().expect("failed to install Prometheus recorder");
 
-    // --- DATABASE INIT ---
-    let raw_db = match a_new_database_connection().await {
+    // --- 3. Initialize AI Engine (With Graceful Fallback) ---
+    tracing::info!("Initializing Apex Vector Engine...");
+    
+    let vector_provider: Arc<dyn VectorProvider> = match VectorEngine::new().await {
+        Ok(engine) => {
+            tracing::info!("✅ Apex Vector Engine (Candle + HNSW) ready.");
+            Arc::new(ApexBridge { engine })
+        },
+        Err(e) => {
+            // Log the error but DO NOT CRASH
+            tracing::error!("⚠️  Failed to init Vector Engine: {}. AI features will be disabled.", e);
+            Arc::new(FallbackVectorProvider)
+        }
+    };
+
+    // Pass the provider (Real or Fallback) to the DB
+    let raw_db = match a_new_database_connection(vector_provider.clone()).await {
         Ok(db) => db,
         Err(e) => {
             tracing::error!("Failed to connect to database: {}", e);
@@ -68,27 +131,27 @@ async fn main() {
 
     let cached_db = Arc::new(CachedDb::new(Arc::new(raw_db)));
 
+    // --- SEEDING DEFAULTS ---
     if let Err(e) = seed_admin(cached_db.as_ref()).await {
-         tracing::error!("Failed to seed admin: {}", e);
+            tracing::error!("Failed to seed admin: {}", e);
+    }
+    
+    // Seed AI Actions
+    if let Err(e) = seed_ai_actions(cached_db.as_ref()).await {
+        tracing::error!("Failed to seed AI actions: {}", e);
     }
 
-    let job_queue = jobs::start_background_worker();
+    let job_queue = jobs::start_background_worker(cached_db.clone(), vector_provider.clone());
     let (tx, _rx) = broadcast::channel::<realtime::DbEvent>(100);
 
-    // --- STORAGE BACKEND ---
-    let storage_type = env::var("STORAGE_TYPE").unwrap_or_else(|_| "local".to_string());
-    let storage: Arc<dyn StorageBackend> = if storage_type == "s3" {
-        let bucket = env::var("S3_BUCKET").expect("S3_BUCKET must be set");
-        let region = env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-        let public_url = env::var("S3_PUBLIC_URL").expect("S3_PUBLIC_URL must be set");
-        
-        tracing::info!("Using S3 Storage (Bucket: {})", bucket);
-        Arc::new(S3Storage::new(&bucket, &region, &public_url).await)
-    } else {
-        let storage_path = "./uploads";
-        tracing::info!("Using Local Storage (Path: {})", storage_path);
-        Arc::new(LocalStorage::new(storage_path, "/api/v1/storage/file/").await)
-    };
+    // --- STORAGE BACKEND (UPDATED) ---
+    // Instead of reading ENV, we wrap the DB and Vault in the DynamicStorage proxy.
+    // This allows the backend to switch between Local and S3 based on the 'settings' table.
+    
+    tracing::info!("Initializing Dynamic Storage Backend (DB-backed configuration)");
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        tinybase_api::storage::DynamicStorage::new(cached_db.clone(), vault.clone())
+    );
 
     // --- SCHEDULER & STATE ---
     
@@ -114,7 +177,13 @@ async fn main() {
 
     // Init Script Engine
     let script_engine = Arc::new(ScriptEngine::new().await);
-    
+    // Configure Cache: Max 1000 images or 500MB (approx), TTL 1 hour (matches HTTP header)
+    let thumb_cache = Cache::builder()
+        .max_capacity(1000)
+        .time_to_live(std::time::Duration::from_secs(3600)) 
+        .build();
+    // Initialize EmbedderService
+    let embedder = Arc::new(tinybase_core::embeddings::EmbedderService::new());
     // 4. Construct AppState
     let state = AppState {
         db: cached_db.clone(),
@@ -126,6 +195,10 @@ async fn main() {
         schema: Arc::new(RwLock::new(empty_schema)),
         scheduler: scheduler_arc.clone(),
         script_engine,
+        css_cache: Arc::new(RwLock::new(String::new())),
+        thumb_cache,
+        embedder,
+        vector_provider: vector_provider.clone(),
     };
 
     // 5. Build Real Schema
@@ -154,14 +227,7 @@ async fn main() {
 
     // --- ROUTER SETUP ---
     let app = app_router(state.clone())
-        // 1. Serve React Dashboard (Embed) - Axum 0.8 Wildcard Syntax
-        .route("/_dashboard", get(tinybase_api::assets::dashboard_handler))
-        .route("/_dashboard/{*path}", get(tinybase_api::assets::dashboard_handler))
-        
-        // 2. Serve Landing Page (Embed)
-        .route("/", get(tinybase_api::assets::index_handler))
-        
-        // 3. Middleware Stack
+        // Middleware Stack
         .layer(TraceLayer::new_for_http())
         // Dynamic CORS from DB
         .layer(middleware::from_fn_with_state(state.clone(), tinybase_api::dynamic_cors::cors_middleware)) 
@@ -196,4 +262,41 @@ async fn seed_admin(db: &impl tinybase_core::Db) -> Result<(), Box<dyn std::erro
     }
     Ok(())
 }
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-api/src/main.rs ends here ===========================
+
+// --- NEW: SEED AI ACTIONS ---
+async fn seed_ai_actions(db: &impl tinybase_core::Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let actions = vec![
+        // 1. Generate Image (gemini-2.5-flash-image)
+        CreateActionReq {
+            name: "Generate Image".to_string(),
+            slug: "generate-image".to_string(),
+            model: "gemini-2.5-flash-image".to_string(),
+            system_prompt: Some("You are a creative image generation assistant.".to_string()),
+            template: "{{prompt}}".to_string(),
+        },
+        // 2. Content Editor (gemini-2.5-flash-lite)
+        CreateActionReq {
+            name: "Content Editor".to_string(),
+            slug: "content-editor".to_string(),
+            model: "gemini-2.5-flash-lite".to_string(),
+            system_prompt: Some("You are an expert content editor. Use Google Search to ensure information is accurate. Respond in Markdown.".to_string()),
+            template: "User Request: {{prompt}}\n\nOriginal Text:\n{{originalText}}".to_string(),
+        },
+        // 3. Edit Image (gemini-2.5-flash-image) - Required for Magic Wand in Editor
+        CreateActionReq {
+            name: "Edit Image".to_string(),
+            slug: "edit-image".to_string(),
+            model: "gemini-2.5-flash-image".to_string(),
+            system_prompt: Some("You are an expert image editor.".to_string()),
+            template: "Edit the attached image based on this instruction: {{prompt}}".to_string(),
+        }
+    ];
+
+    for action in actions {
+        if db.get_ai_action(&action.slug).await?.is_none() {
+            tracing::info!("Seeding AI Action: {}", action.name);
+            db.create_ai_action(action).await?;
+        }
+    }
+    Ok(())
+}

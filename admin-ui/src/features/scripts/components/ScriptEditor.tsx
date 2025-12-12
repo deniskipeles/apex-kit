@@ -3,6 +3,7 @@ import { Save, X, Play } from 'lucide-react';
 import { Button, Input, Label, Select, Switch } from '../../../components/ui/Elements';
 import { Dialog } from '../../../components/ui/Dialog';
 import { Script } from '../../../types';
+import { AiCodeAssistant } from '../../ai/components/AiCodeAssistant';
 
 interface ScriptEditorProps {
   isOpen: boolean;
@@ -74,8 +75,17 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
                 </div>
             </div>
 
-            <div className="md:col-span-2 flex flex-col">
-                <Label className="mb-2">JavaScript Code</Label>
+            <div className="md:col-span-2 flex flex-col h-full">
+                <div className="flex items-center justify-between mb-2">
+                    <Label>JavaScript Code</Label>
+                    <div className="w-64">
+                        <AiCodeAssistant 
+                            currentCode={formData.code || ''}
+                            contextType="script"
+                            onApply={(code) => setFormData({ ...formData, code })}
+                        />
+                    </div>
+                </div>
                 <textarea 
                     className="flex-1 w-full bg-[#1e1e1e] text-[#d4d4d4] font-mono text-sm p-4 rounded-md border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-none leading-relaxed"
                     value={formData.code}

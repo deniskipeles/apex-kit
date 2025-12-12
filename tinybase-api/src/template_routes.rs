@@ -47,6 +47,10 @@ pub async fn create_template(
     // Check if slug exists? DB constraint handles uniqueness usually, but we catch error
     let id = state.db.create_template(payload).await
         .map_err(|e| AppError::UnknownError(format!("Failed to create template: {}", e)))?;
+    {
+        let mut cache = state.css_cache.write().await;
+        *cache = String::new(); // Clear css cache
+    }
         
     Ok(Json(json!({ "id": id })))
 }
@@ -67,6 +71,10 @@ pub async fn update_template(
     
     state.db.update_template(id, payload.content, payload.script_id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    {
+        let mut cache = state.css_cache.write().await;
+        *cache = String::new(); // Clear css cache
+    }
         
     Ok(Json(json!({ "success": true })))
 }

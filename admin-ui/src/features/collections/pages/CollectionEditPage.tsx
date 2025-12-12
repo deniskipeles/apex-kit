@@ -1,6 +1,6 @@
 
 import React from 'react';
-import { CollectionForm } from '../components/CollectionForm';
+import { CollectionForm } from '../components/CollectionCreator';
 import { useCollectionsStore } from '../../../store/useCollectionsStore';
 
 interface CollectionEditPageProps {

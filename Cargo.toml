@@ -2,6 +2,7 @@
 members = [
     "tinybase-api", 
     "tinybase-core",
+    "apex-vector",
 ]
 resolver = "2"
 

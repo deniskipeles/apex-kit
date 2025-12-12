@@ -259,6 +259,13 @@ export class PowerBase {
              * @returns {Promise<object>} Status message.
              */
             reloadSystem: () => this._request('/admin/system/reload', { method: 'POST', body: JSON.stringify({}) }),
+            reIndex: (collectionId) => this._request(`/collections/${collectionId}/reindex`, { method: 'POST', body: JSON.stringify({}) }),
+            /**
+             * Get dashboard data
+             */
+            getDashboardStats: async () => {
+                return this._request('/admin/dashboard'); 
+            },
         };
     }
 
@@ -292,7 +299,7 @@ export class PowerBase {
              * Execute a defined AI action.
              * @param {string} slug - The slug of the action (e.g., 'summarize').
              * @param {object} variables - Variables to replace in the template (e.g., { text: "..." }).
-             * @returns {Promise<{result: string}>} The AI response.
+             * @returns {Promise<object>} The AI response.
              */
             run: (slug, variables) => this._request(`/ai/run/${slug}`, { method: 'POST', body: { variables } })
         };
@@ -416,9 +423,10 @@ export class PowerBase {
             /**
              * Get a single record by ID.
              * @param {number|string} recordId 
+             * @param {string} [options.expand] - e.g. "author,comments"
              * @returns {Promise<object>}
              */
-            get: (recordId) => this._request(`/collections/${collectionId}/records/${recordId}`),
+            get: (recordId, options = {}) => this._request(`/collections/${collectionId}/records/${recordId}`, { method: 'GET', params: options }),
 
             /**
              * Update a record.
@@ -541,5 +549,24 @@ export class PowerBase {
             isRoot: true,
             body: { query, variables }
         });
+    }
+    
+    // ==========================================
+    // 10. Custom Helpers
+    // ==========================================
+    get utils() {
+        return {
+            /**
+             * Strips all HTML tags from a string, returning only the text content.
+             * Handles malformed HTML and entities properly.
+             * @param html - The HTML string to strip
+             * @returns Plain text without HTML tags
+             */
+            stripHtmlTags: function (html) {
+                if (!html) return '';
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                return doc.body.textContent || '';
+            }
+        }
     }
 }

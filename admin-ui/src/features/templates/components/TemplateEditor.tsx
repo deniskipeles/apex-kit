@@ -4,6 +4,7 @@ import { Button, Input, Label, Select } from '../../../components/ui/Elements';
 import { Dialog } from '../../../components/ui/Dialog';
 import { Template, Script } from '../../../types';
 import { scriptsService } from '../../scripts/services/scriptsService';
+import { AiCodeAssistant } from '../../ai/components/AiCodeAssistant';
 
 interface TemplateEditorProps {
   isOpen: boolean;
@@ -71,8 +72,17 @@ export const TemplateEditor = ({ isOpen, onClose, onSave, initialData }: Templat
                 </div>
             </div>
 
-            <div className="md:col-span-2 flex flex-col">
-                <Label className="mb-2 flex items-center gap-2"><Code className="h-4 w-4"/> HTML / Tera Template</Label>
+            <div className="md:col-span-2 flex flex-col h-full">
+                <div className="flex items-center justify-between mb-2">
+                    <Label className="flex items-center gap-2"><Code className="h-4 w-4"/> HTML / Tera Template</Label>
+                    <div className="w-64">
+                        <AiCodeAssistant 
+                            currentCode={formData.content || ''}
+                            contextType="template"
+                            onApply={(code) => setFormData({ ...formData, content: code })}
+                        />
+                    </div>
+                </div>
                 <textarea 
                     className="flex-1 w-full bg-[#1e1e1e] text-[#d4d4d4] font-mono text-sm p-4 rounded-md border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-none leading-relaxed"
                     value={formData.content}

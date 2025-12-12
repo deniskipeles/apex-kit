@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_config::BehaviorVersion; // Added
+use aws_config::BehaviorVersion; 
+use aws_credential_types::Credentials; 
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
@@ -70,14 +71,29 @@ pub struct S3Storage {
 }
 
 impl S3Storage {
-    pub async fn new(bucket: &str, region: &str, public_url_base: &str) -> Self {
-        // FIX: Use defaults(BehaviorVersion::latest()) to fix deprecation warning
+    // UPDATED CONSTRUCTOR to take explicit credentials
+    pub async fn new_with_creds(bucket: &str, region: &str, public_url_base: &str, access_key: &str, secret_key: &str) -> Self {
+        
+        let creds = Credentials::new(
+            access_key.to_string(),
+            secret_key.to_string(),
+            None,
+            None,
+            "tinybase"
+        );
+
         let config = aws_config::defaults(BehaviorVersion::latest())
             .region(aws_config::Region::new(region.to_string()))
+            .credentials_provider(creds)
             .load()
             .await;
             
+        // If endpoint is custom (e.g. MinIO), we need to adjust config, 
+        // but for simplicity with standard aws_config:
         let client = aws_sdk_s3::Client::new(&config);
+        
+        // Note: For MinIO/DigitalOcean, you might need to build config manually using aws_sdk_s3::Config::builder().endpoint_url(...)
+        // But let's stick to standard AWS behavior for now or assume public_url_base implies endpoint logic if expanded later.
         
         Self {
             client,

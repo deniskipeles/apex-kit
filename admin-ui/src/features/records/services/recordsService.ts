@@ -2,8 +2,8 @@ import { apiClient, pb } from '../../../lib/apiClient'; // Import pb instance di
 import { AppRecord } from '../../../types';
 
 export const recordsService = {
-  list: (collectionId: string, page = 1, perPage = 20, expand = '') => {
-    return apiClient.records.list(collectionId, page, perPage, expand);
+  list: (collectionId: string, page = 1, perPage = 20, expand = '', filter = {}, sort = '-id') => {
+    return apiClient.records.list(collectionId, page, perPage, expand, filter);
   },
   create: (collectionId: string, data: any) => {
     return apiClient.records.create(collectionId, data);
@@ -19,4 +19,8 @@ export const recordsService = {
   instantSearch: (collectionId: string, query: string) => {
     return apiClient.records.instantSearch(collectionId, query);
   },
+  getOne: async (collectionId: string, recordId: string, expand = '') => {
+    return await apiClient.records.getOne(collectionId, recordId, expand);
+  },
+
 };

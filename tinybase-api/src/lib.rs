@@ -1,7 +1,6 @@
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-api/src/lib.rs start here ===========================
 use axum::{
-    extract::{Path, State, Query, Request},
-    http::{StatusCode},
+    extract::{Path, State, Query, Request, FromRef},
+    http::{StatusCode, request::Parts}, // <--- Import Parts here
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -10,6 +9,7 @@ use axum::{
 use axum_extra::headers::{Authorization, authorization::Bearer, HeaderMapExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::fmt; 
 use tinybase_core::{
     models::Record,
     schema::CollectionSchema,
@@ -29,10 +29,13 @@ use utoipa_scalar::{Scalar, Servable};
 use validator::Validate;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::time::Instant;
-
+use moka::future::Cache;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use async_graphql::dynamic::Schema;
 use tinybase_core::scripting::ScriptEngine;
+
+use tinybase_core::models::DashboardData;
+use crate::sandbox_manager::SandboxManager; 
 
 // --- Module Registrations ---
 pub mod websocket;
@@ -49,6 +52,11 @@ pub mod ai_routes;
 pub mod script_routes;
 pub mod renderer;
 pub mod template_routes;
+pub mod ai_architect;
+pub mod css_compiler;
+pub mod sandbox_manager; 
+
+
 
 #[derive(Clone)]
 pub struct AppState {
@@ -58,13 +66,20 @@ pub struct AppState {
     pub tx: broadcast::Sender<DbEvent>, 
     pub storage: Arc<dyn StorageBackend>,
     pub vault: Arc<Vault>,
-    // Hot-Swappable Components
     pub schema: Arc<RwLock<Schema>>, 
     pub scheduler: Arc<RwLock<scheduler::SchedulerService>>,
     pub script_engine: Arc<ScriptEngine>,
+    pub css_cache: Arc<RwLock<String>>,
+    // Cache for thumbnails (Key: "filename_100x100", Value: Bytes)
+    pub thumb_cache: Cache<String, Arc<Vec<u8>>>, 
+    pub embedder: Arc<tinybase_core::embeddings::EmbedderService>,
+    pub vector_provider: Arc<dyn tinybase_core::VectorProvider>,
 }
 
-// --- DTOs ---
+// --- REMOVED CONFLICTING IMPL OF FromRef ---
+// axum provides this automatically because AppState derives Clone.
+
+// --- DTOs (Same as before) ---
 
 #[derive(Serialize, ToSchema)]
 pub struct CollectionResponse {
@@ -134,6 +149,7 @@ pub struct SearchQuery {
     pub q: String,
 }
 
+#[derive(Debug)] 
 pub enum AppError {
     LibsqlError(libsql::Error),
     JsonError(String),
@@ -143,6 +159,21 @@ pub enum AppError {
     InputValidation(validator::ValidationErrors), 
     Unauthorized(String),
     Forbidden(String),
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AppError::LibsqlError(e) => write!(f, "Database Error: {}", e),
+            AppError::JsonError(e) => write!(f, "JSON Error: {}", e),
+            AppError::UnknownError(e) => write!(f, "Unknown Error: {}", e),
+            AppError::NotFound(e) => write!(f, "Not Found: {}", e),
+            AppError::Validation(e) => write!(f, "Schema Validation Error: {:?}", e),
+            AppError::InputValidation(e) => write!(f, "Input Validation Error: {}", e),
+            AppError::Unauthorized(e) => write!(f, "Unauthorized: {}", e),
+            AppError::Forbidden(e) => write!(f, "Forbidden: {}", e),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -213,6 +244,8 @@ impl IntoResponse for AppError {
     }
 }
 
+// --- MIDDLEWARE ---
+
 async fn auth_middleware(
     State(_state): State<AppState>, 
     mut req: Request,
@@ -255,6 +288,52 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
     response
 }
 
+// --- SANDBOX MIDDLEWARE ---
+// --- SANDBOX MIDDLEWARE (FIXED) ---
+
+async fn sandbox_middleware(
+    // FIX: Accept 2 path arguments because routes like /render/{slug} inside /sandbox/{id} have 2 params.
+    // The first one is session_id, the second is dropped (_) because we only need session_id here.
+    Path((session_id, _)): Path<(String, String)>,
+    State(_state): State<AppState>, 
+    mut req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    tracing::info!("[Sandbox Middleware] Intercepting request for session: {}", session_id);
+
+    match SandboxManager::get_sandbox(&session_id).await {
+        Ok(sandbox_db) => {
+            req.extensions_mut().insert(sandbox_db);
+            Ok(next.run(req).await)
+        }
+        Err(_) => {
+            tracing::error!("Sandbox {} not found", session_id);
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+}
+
+// --- DB EXTRACTOR ---
+pub struct DatabaseConnection(pub Arc<dyn Db>);
+
+impl<S> axum::extract::FromRequestParts<S> for DatabaseConnection
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(db) = parts.extensions.get::<Arc<dyn Db>>() {
+            return Ok(DatabaseConnection(db.clone()));
+        }
+        let app_state = AppState::from_ref(state);
+        Ok(DatabaseConnection(app_state.db))
+    }
+}
+
+// --- ROUTER ---
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -271,7 +350,9 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
         reload_system,
         ai_routes::list_actions, ai_routes::create_action, ai_routes::delete_action, ai_routes::run_action,
         script_routes::list_scripts, script_routes::create_script, script_routes::delete_script, script_routes::run_script,
-        template_routes::list_templates,template_routes::create_template,template_routes::update_template,template_routes::delete_template
+        template_routes::list_templates,template_routes::create_template,template_routes::update_template,template_routes::delete_template,
+        // NEW AI ARCHITECT ROUTES
+        ai_architect::start_session, ai_architect::continue_chat, ai_architect::publish_plugin,ai_architect::list_sessions,
     ),
     components(schemas(
         CollectionResponse, AuthRequest, AuthResponse, RecordResponse, ProblemDetail, UserDto,
@@ -293,14 +374,24 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
         tinybase_core::script_models::CreateScriptReq,
         tinybase_core::models::Template,
         tinybase_core::models::CreateTemplateReq,
-        template_routes::UpdateTemplateReq
+        template_routes::UpdateTemplateReq,
+        tinybase_core::ai_models::AiSession,
+        tinybase_core::ai_models::ChatMessage,
+        tinybase_core::ai_models::Plugin,
+        tinybase_core::ai_models::CreateSessionReq,
+        tinybase_core::ai_models::ChatReq,
+        tinybase_core::models::DashboardData,
+        tinybase_core::models::DashboardStats,
+        tinybase_core::models::ChartPoint
     )),
     tags((name = "Tinybase", description = "Tinybase API"))
 )]
 struct ApiDoc;
 
 pub fn app_router(state: AppState) -> Router {
-    // 1. API Routes (Protected via Middleware)
+    SandboxManager::init();
+
+    // 1. API Routes
     let api_routes = Router::new()
         .route("/collections", post(create_collection).get(list_collections))
         .route("/collections/{id}", get(get_collection).patch(update_collection).delete(delete_collection))
@@ -308,6 +399,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/collections/{id}/records/{record_id}", get(get_record).patch(update_record).delete(delete_record))
         .route("/collections/{id}/search", get(search_records))
         .route("/collections/{id}/instant-search", get(instant_search_handler))
+        .route("/collections/{id}/reindex", post(reindex_collection_handler))
         .route("/collections/{id}/records/{record_id}/relations", post(create_relation).delete(delete_relation))
         
         // Storage
@@ -323,11 +415,18 @@ pub fn app_router(state: AppState) -> Router {
         .route("/admin/users", get(list_users_handler))
         .route("/admin/users/{id}", axum::routing::delete(delete_user_handler))
         .route("/admin/logs", get(list_audit_logs))
+        .route("/admin/dashboard", get(get_dashboard_stats_handler))
 
         // AI
         .route("/admin/ai/actions", get(ai_routes::list_actions).post(ai_routes::create_action))
         .route("/admin/ai/actions/{id}", axum::routing::delete(ai_routes::delete_action))
         .route("/ai/run/{slug}", post(ai_routes::run_action))
+
+        // NEW AI ARCHITECT ROUTES
+        .route("/admin/ai/sessions", post(ai_architect::start_session).get(ai_architect::list_sessions))
+        .route("/admin/ai/sessions/{id}/chat", post(ai_architect::continue_chat))
+        .route("/admin/ai/sessions/{id}/publish", post(ai_architect::publish_plugin))
+        .route("/admin/ai/plugins", get(ai_architect::list_plugins))
 
         // SCRIPTING ENGINE
         .route("/admin/scripts", get(script_routes::list_scripts).post(script_routes::create_script))
@@ -349,32 +448,50 @@ pub fn app_router(state: AppState) -> Router {
         .route("/auth/verify", get(auth_advanced::verify_email))
         .route("/auth/verify/resend", post(auth_advanced::resend_verification));
 
-    // In app_router (Public Routes - No Auth Middleware)
-    // We put this BEFORE the auth layer if we want public pages, or AFTER if we want internal tools.
-    // Let's allow public access to /render/* for building public apps.
-
-    // 1. Create a separate router for public pages
+    // Public Routes
     let renderer_routes = Router::new()
         .route("/render/{*slug}", get(renderer::render_view).post(renderer::render_view));
+
+     // --- SANDBOX ROUTES (Updated) ---
+     let sandbox_routes = Router::new()
+        // Use the Sandbox-specific handlers (they accept 2 path parameters)
+        .route("/render/{*slug}", get(renderer::render_sandbox_view).post(renderer::render_sandbox_view))
+        .route("/run/{script_name}", post(script_routes::run_sandbox_script))
+        .layer(middleware::from_fn_with_state(state.clone(), sandbox_middleware));
+
     // 3. Construct Main Router
     let app_router = Router::new()
         .nest("/api/v1", auth_routes.merge(api_routes))
-        .merge(renderer_routes) // Add renderer at root /render/
+        .nest("/sandbox/{session_id}", sandbox_routes) 
+        .merge(renderer_routes)
+        
+        .route("/styles.css", get(serve_styles)) 
         .route("/metrics", get(metrics_handler))
         .route("/ws", get(websocket::websocket_handler))
         .route("/graphql", post(graphql_handler).get(graphql_playground))
+
+        .route("/_dashboard", get(assets::dashboard_handler))
+        .route("/_dashboard/{*path}", get(assets::dashboard_handler))
+        
+        .route("/static/{*path}", get(assets::serve_static_asset))
+        // --- LOGO ENDPOINT ---
+        // Serves /logo or /logo?thumb=50x50
+        .route("/logo", get(storage::serve_app_logo)) 
+
+        
+        .route("/", get(assets::index_handler))
+
         .layer(middleware::from_fn(metrics_middleware));
     
     // 4. Inject State
     let app_router_with_state = app_router.with_state(state);
 
-    // 5. Scalar Docs
     let scalar_router: Router = Scalar::with_url("/scalar", ApiDoc::openapi()).into();
 
     app_router_with_state.merge(scalar_router)
 }
 
-// Handler to serve GraphQL using Hot-Swappable Schema from State
+
 async fn graphql_handler(
     State(state): State<AppState>, 
     req: GraphQLRequest
@@ -396,7 +513,6 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
     }
 }
 
-// --- Handler Implementations ---
 
 #[utoipa::path(
     post,
@@ -450,7 +566,6 @@ pub async fn instant_search_handler(
     let collection = state.db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound(format!("Collection {} not found", id)))?;
 
-    // Check Read Policy
     let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
     if !policies::check_access(policy, claims.as_ref(), None) {
         return Err(AppError::Forbidden("Search denied by policy".into()));
@@ -536,7 +651,6 @@ async fn login(
     let token = auth::create_jwt(user.id, &user.email, &user.role)
         .map_err(|_| AppError::UnknownError("Token generation failed".into()))?;
 
-    // Audit Log
     let _ = state.db.log_audit_event(
         "info",
         "User Login",
@@ -576,7 +690,6 @@ async fn register(
         user_id: user.id 
     }).await;
 
-    // Audit Log
     let _ = state.db.log_audit_event("info", "User Registered", "auth", Some(serde_json::json!({"email": user.email}))).await;
 
     Ok(Json(AuthResponse {
@@ -611,7 +724,6 @@ async fn create_collection(
     let id = state.db.create_collection(&payload.name, &payload.schema).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // Audit
     let _ = state.db.log_audit_event("info", "Collection Created", "system", Some(serde_json::json!({"name": payload.name}))).await;
 
     Ok((StatusCode::CREATED, Json(CollectionResponse { id, name: payload.name, schema: payload.schema })))
@@ -697,20 +809,46 @@ async fn create_record(
     
     let _ = state.tx.send(DbEvent::Insert { collection_id: id, record_id, data: payload.data.clone() });
 
+    // --- Trigger Vectorization ---
+    // Fetch schema to check which fields need embedding
+    if let Some(col) = state.db.get_collection(id).await.unwrap_or(None) {
+        if let Some(schema) = col.schema {
+            for (field_name, def) in schema.fields {
+                // If field is marked for vectorization AND data exists
+                if def.vectorize {
+                    if let Some(text_val) = payload.data.get(&field_name).and_then(|v| v.as_str()) {
+                        let job = tinybase_core::jobs::Job::GenerateEmbedding {
+                            collection_id: id,
+                            record_id: record_id,
+                            field_name: field_name,
+                            text_content: text_val.to_string()
+                        };
+                        state.queue.enqueue(job).await;
+                    }
+                }
+            }
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(RecordResponse { id: record_id, data: payload.data })))
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct RecordListResponse {
+    items: Vec<RecordResponse>,
+    total: i64,
+}
 #[utoipa::path(
     get,
     path = "/api/v1/collections/{id}/records",
-    responses((status = 200, body = Vec<RecordResponse>))
+    responses((status = 200, body = RecordListResponse))
 )]
 async fn list_records(
     auth: Option<Extension<Claims>>,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(params): Query<QueryOptions>,
-) -> Result<Json<Vec<RecordResponse>>, AppError> {
+) -> Result<Json<RecordListResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
 
     let collection = state.db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
@@ -721,22 +859,37 @@ async fn list_records(
         return Err(AppError::Forbidden("Read denied by policy".into()));
     }
     
-    let records = state.db.list_records(id, params).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data }).collect()))
+    let result = state.db.list_records(id, params).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    Ok(Json(RecordListResponse {
+        items: result.items.into_iter().map(|r| RecordResponse { id: r.id, data: r.data }).collect(),
+        total: result.total,
+    }))
 }
 
-#[utoipa::path(get, path = "/api/v1/collections/{id}/records/{record_id}")]
+#[utoipa::path(
+    get, 
+    path = "/api/v1/collections/{id}/records/{record_id}",
+    params(
+        ("id" = i64, Path, description = "Collection ID"),
+        ("record_id" = i64, Path, description = "Record ID"),
+        ("expand" = Option<String>, Query, description = "Expand relations (e.g. 'author, comments(5)')")
+    ),
+    responses((status = 200, body = RecordResponse))
+)]
 async fn get_record(
     auth: Option<Extension<Claims>>,
     State(state): State<AppState>, 
-    Path((cid, rid)): Path<(i64, i64)>
+    Path((cid, rid)): Path<(i64, i64)>,
+    Query(opts): Query<QueryOptions>, // Accept query params
 ) -> Result<Json<RecordResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
 
     let collection = state.db.get_collection(cid).await.map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Collection not found".into()))?;
 
-    let r = state.db.get_record(cid, rid).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    // Pass the expand option
+    let r = state.db.get_record(cid, rid, opts.expand).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
 
     let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
     if !policies::check_access(policy, claims.as_ref(), Some(&r.data)) {
@@ -758,7 +911,7 @@ async fn update_record(
     let collection = state.db.get_collection(cid).await.map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Collection not found".into()))?;
 
-    let existing = state.db.get_record(cid, rid).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    let existing = state.db.get_record(cid, rid, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
 
     let policy = collection.schema.as_ref().map(|s| s.policies.update.as_str()).unwrap_or("admin");
     if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) {
@@ -783,7 +936,7 @@ async fn delete_record(
     let collection = state.db.get_collection(cid).await.map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Collection not found".into()))?;
 
-    let existing = state.db.get_record(cid, rid).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    let existing = state.db.get_record(cid, rid, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
 
     let policy = collection.schema.as_ref().map(|s| s.policies.delete.as_str()).unwrap_or("admin");
     if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) {
@@ -867,4 +1020,81 @@ async fn delete_relation(
     
     Ok(StatusCode::NO_CONTENT)
 }
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-api/src/lib.rs ends here ===========================
+
+#[utoipa::path(
+    get,
+    path = "/styles.css",
+    responses((status = 200, description = "Purged Tailwind CSS", content_type = "text/css"))
+)]
+pub async fn serve_styles(
+    State(state): State<AppState>,
+) -> Result<Response, AppError> {
+    // 1. Return Cache if exists
+    {
+        let cache = state.css_cache.read().await;
+        if !cache.is_empty() {
+            return Ok(Response::builder()
+                .header("Content-Type", "text/css")
+                .header("Cache-Control", "public, max-age=60") // 1 minute cache (invalidated by logic)
+                .body(axum::body::Body::from(cache.clone()))
+                .unwrap());
+        }
+    }
+
+    // 2. Compile (Purge) if empty
+    // This runs the regex logic over the 3MB file
+    let css = css_compiler::compile_styles(state.db.clone()).await
+        .map_err(|e| AppError::UnknownError(e))?;
+
+    // 3. Update Cache
+    {
+        let mut cache = state.css_cache.write().await;
+        *cache = css.clone();
+    }
+
+    Ok(Response::builder()
+        .header("Content-Type", "text/css")
+        .body(axum::body::Body::from(css))
+        .unwrap())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/dashboard",
+    responses((status = 200, body = DashboardData))
+)]
+pub async fn get_dashboard_stats_handler(
+    auth: Option<Extension<Claims>>,
+    State(state): State<AppState>,
+) -> Result<Json<DashboardData>, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let data = state.db.get_dashboard_stats().await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    Ok(Json(data))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/collections/{id}/reindex",
+    responses((status = 200, description = "Reindexing started"))
+)]
+pub async fn reindex_collection_handler(
+    auth: Option<Extension<Claims>>,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // 1. Security Check (Admins Only)
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { 
+        return Err(AppError::Forbidden("Admins only".into())); 
+    }
+
+    // 2. Run Reindex
+    state.db.reindex_collection(id).await
+        .map_err(|e| AppError::UnknownError(format!("Reindex failed: {}", e)))?;
+
+    Ok(Json(serde_json::json!({ "success": true, "message": "Collection re-indexed successfully" })))
+}

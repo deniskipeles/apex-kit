@@ -5,58 +5,64 @@ use axum::{
     body::Body,
 };
 
-// This tells Rust to compile everything inside "../static" into the binary
+// 1. EMBEDDING: This macro compiles everything in "../static/" into the binary.
 #[derive(RustEmbed)]
 #[folder = "../static/"] 
 pub struct Assets;
 
-pub struct StaticFile<T>(pub T);
-
-impl<T> IntoResponse for StaticFile<T>
-where
-    T: Into<String>,
-{
-    fn into_response(self) -> Response {
-        let path = self.0.into();
-        
-        match Assets::get(path.as_str()) {
-            Some(content) => {
-                let mime = mime_guess::from_path(path).first_or_octet_stream();
-                (
-                    [(header::CONTENT_TYPE, mime.as_ref())],
-                    Body::from(content.data),
-                )
-                    .into_response()
-            }
-            None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
+// Helper to serve a specific file by path string
+fn serve_file(path: &str) -> Response {
+    match Assets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            Response::builder()
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                // Cache control: Cache for 1 hour
+                .header(header::CACHE_CONTROL, "public, max-age=3600")
+                .body(Body::from(content.data))
+                .unwrap()
         }
+        None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
     }
 }
 
-// Handler for the Root Landing Page
+// 2. ROOT HANDLER: Serves index.html
 pub async fn index_handler() -> impl IntoResponse {
-    StaticFile("index.html")
+    serve_file("index.html")
 }
 
-// Handler for the React Dashboard (supports SPA routing)
+// 3. GENERIC STATIC ASSET HANDLER
+// This will take any URL path (e.g. /favicon.ico, /js/microframe.js) 
+// and try to find it in the embedded folder.
+pub async fn serve_static_asset(uri: Uri) -> impl IntoResponse {
+    // 1. Get the full path (e.g., "/static/microframe.js")
+    let full_path = uri.path();
+    
+    // 2. Strip the "/static/" prefix to match the embedded file structure
+    // If the URL is "/static/microframe.js", we want "microframe.js"
+    let clean_path = full_path.strip_prefix("/static/")
+        .unwrap_or(full_path.trim_start_matches('/'));
+
+    serve_file(clean_path)
+}
+
+// 4. DASHBOARD HANDLER (React SPA Logic)
 pub async fn dashboard_handler(uri: Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/').to_string();
 
-    // If accessing /_dashboard/, we want to look inside the "dashboard" folder in static
+    // Explicitly handle the root dashboard request
     if path == "_dashboard" || path == "_dashboard/" {
-        return StaticFile("dashboard/index.html").into_response();
+        return serve_file("dashboard/index.html");
     }
 
-    // Determine the file path relative to the embedded root
-    // Example: /_dashboard/assets/index.js -> dashboard/assets/index.js
-    // We strip the "_dashboard/" prefix to find it in the embedded "dashboard/" folder
+    // Rewrite path: /_dashboard/assets/x.js -> dashboard/assets/x.js
     let relative_path = path.replace("_dashboard/", "dashboard/");
 
-    // Check if file exists
+    // Try to serve the exact file
     if Assets::get(&relative_path).is_some() {
-        return StaticFile(relative_path).into_response();
+        return serve_file(&relative_path);
     }
 
-    // Fallback for React Router: If file not found (and it's inside dashboard), serve dashboard/index.html
-    StaticFile("dashboard/index.html").into_response()
+    // Fallback for SPA routing (if file not found, serve index.html)
+    serve_file("dashboard/index.html")
 }
