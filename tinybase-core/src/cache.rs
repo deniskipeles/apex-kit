@@ -168,8 +168,16 @@ impl Db for CachedDb {
         self.inner.instant_search(collection_id, query).await
     }
 
-    // FIX: Correct Signature and Return Type
-    async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
+    // Methods for VECTORS
+    async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.save_vector(collection_id, record_id, field_name, vector).await
+    }
+    
+    async fn get_vectors_for_collection(&self, collection_id: i64) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> {
+        self.inner.get_vectors_for_collection(collection_id).await
+    }
+    
+    async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn StdError + Send + Sync>> {
         self.inner.search_vector(collection_id, field, vector, limit).await
     }
 

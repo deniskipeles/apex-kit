@@ -6,7 +6,8 @@ use tinybase_core::{
     a_new_database_connection, jobs, cache::CachedDb, realtime, 
     storage::{LocalStorage, S3Storage, StorageBackend}, 
     security::{MasterKey, Vault},
-    ai_models::CreateActionReq
+    ai_models::CreateActionReq,
+    Db,
 };
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -130,6 +131,38 @@ async fn main() {
     };
 
     let cached_db = Arc::new(CachedDb::new(Arc::new(raw_db)));
+
+    // --- STARTUP ROUTINE TO RELOAD HNSW INDEX ---
+    // This logic should be placed after the vector_provider and cached_db are initialized.
+    let mut total_vectors_loaded = 0;
+
+    tracing::info!("Reloading HNSW index from vectors database...");
+
+    // FIX: Db trait is now imported, so these methods are visible.
+    let all_collections = cached_db.list_collections().await
+        .expect("Failed to list collections for HNSW reload");
+
+    for col in &all_collections {
+        let col_id = col.id;
+        
+        // Get all stored vectors for this collection
+        let vectors_to_load = cached_db.get_vectors_for_collection(col_id).await
+            .expect(&format!("Failed to get vectors for collection {}", col_id));
+            
+        // FIX: The types in the tuple are String and Vec<f32>, which are Sized.
+        // The compiler just needed the trait in scope to correctly bind this method.
+        for (rec_id, field_name, vector) in vectors_to_load {
+            // Index each one into the in-memory HNSW index
+            let field_name_ref: &str = &field_name;
+            let vector_ref: &[f32] = &vector;
+
+            vector_provider.index(col_id, rec_id, field_name_ref, vector_ref).await
+                .unwrap_or_else(|e| tracing::error!("HNSW Reload Error: {}", e));
+            total_vectors_loaded += 1;
+        }
+    }
+
+    tracing::info!("HNSW index reload complete. {} vectors loaded.", total_vectors_loaded); 
 
     // --- SEEDING DEFAULTS ---
     if let Err(e) = seed_admin(cached_db.as_ref()).await {

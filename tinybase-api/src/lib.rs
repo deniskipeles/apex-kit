@@ -55,6 +55,7 @@ pub mod template_routes;
 pub mod ai_architect;
 pub mod css_compiler;
 pub mod sandbox_manager; 
+pub mod vector_routes;
 
 
 
@@ -399,7 +400,8 @@ pub fn app_router(state: AppState) -> Router {
         .route("/collections/{id}/records/{record_id}", get(get_record).patch(update_record).delete(delete_record))
         .route("/collections/{id}/search", get(search_records))
         .route("/collections/{id}/instant-search", get(instant_search_handler))
-        .route("/collections/{id}/reindex", post(reindex_collection_handler))
+        .route("/collections/{id}/search-vector", post(vector_routes::search_vector))
+        .route("/collections/{id}/search-text-vector", post(vector_routes::query_vector_search))
         .route("/collections/{id}/records/{record_id}/relations", post(create_relation).delete(delete_relation))
         
         // Storage
@@ -416,6 +418,8 @@ pub fn app_router(state: AppState) -> Router {
         .route("/admin/users/{id}", axum::routing::delete(delete_user_handler))
         .route("/admin/logs", get(list_audit_logs))
         .route("/admin/dashboard", get(get_dashboard_stats_handler))
+        .route("/admin/collections/{id}/reindex", post(reindex_collection_handler))
+        .route("/admin/collections/{id}/revectorize", post(vector_routes::revectorize_collection_handler))
 
         // AI
         .route("/admin/ai/actions", get(ai_routes::list_actions).post(ai_routes::create_action))

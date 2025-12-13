@@ -41,7 +41,7 @@ impl JobQueue {
 
 // Updated to accept dependencies needed for processing
 pub fn start_background_worker(
-    _db: Arc<dyn Db>, // Kept for future DB access (e.g. email settings)
+    db: Arc<dyn Db>,
     vector_provider: Arc<dyn VectorProvider>
 ) -> JobQueue {
     let (tx, mut rx) = mpsc::channel(100);
@@ -49,6 +49,8 @@ pub fn start_background_worker(
     tokio::spawn(async move {
         println!("Background worker started...");
         while let Some(job) = rx.recv().await {
+            // Clone db for async job task
+            let db_clone = db.clone(); 
             match job {
                 Job::SendWelcomeEmail { email, .. } => {
                     send_email(&email, "Welcome to TinyBase!", "Thanks for signing up!").await;
@@ -68,11 +70,18 @@ pub fn start_background_worker(
                     // 1. Generate Embedding (Calls Candle or API)
                     match vector_provider.embed(&text_content).await {
                         Ok(vec) => {
-                            // 2. Index the result (In-Memory HNSW + Persistence)
+                            // 2. Index the result (In-Memory HNSW)
                             if let Err(e) = vector_provider.index(collection_id, record_id, &field_name, &vec).await {
-                                eprintln!("[Job] Failed to index vector: {}", e);
+                                eprintln!("[Job] Failed to index vector to HNSW: {}", e);
                             } else {
-                                println!("[Job] Vector indexed successfully.");
+                                println!("[Job] HNSW Index updated successfully.");
+                            }
+                            
+                            // 3. PERSIST THE VECTOR TO DATABASE
+                            if let Err(e) = db_clone.save_vector(collection_id, record_id, &field_name, vec).await {
+                                eprintln!("[Job] Failed to persist vector to DB: {}", e);
+                            } else {
+                                println!("[Job] Vector persisted to DB successfully.");
                             }
                         },
                         Err(e) => {

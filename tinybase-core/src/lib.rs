@@ -158,7 +158,12 @@ pub trait Db: Send + Sync {
     async fn get_dashboard_stats(&self) -> std::result::Result<DashboardData, Box<dyn std::error::Error + Send + Sync>>;
 
     // VECTORS
+    // Retrieve all vectors for a collection (for HNSW reload on startup)
+    async fn get_vectors_for_collection(&self, collection_id: i64) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn std::error::Error + Send + Sync>>;
+
     async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>>;
+    // Save vector to persistence layer (used by job worker)
+    async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 fn row_to_collection(row: &Row) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
@@ -243,6 +248,7 @@ impl TinyBase {
     fn get_data(&self) -> Result<Connection> { self.data_db.connect() }
     fn get_log(&self) -> Result<Connection> { self.log_db.connect() }
     fn get_sys(&self) -> Result<Connection> { self.sys_db.connect() }
+    fn get_vector(&self) -> Result<Connection> { self.vector_db.connect() }
     
     
     async fn ensure_search_index(&self, collection_id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -299,30 +305,6 @@ impl TinyBase {
                 }
             }
         }
-        Ok(())
-    }
-    
-    async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 1. Serialize vector to JSON string for storage
-        let vec_json = serde_json::to_string(&vector)?;
-
-        // 2. Persist to vectors.db (SQLite) via Batcher
-        // Using UPSERT style logic: Delete existing first to ensure clean state
-        self.vector_batcher.execute(
-            "DELETE FROM vectors WHERE collection_id=?1 AND record_id=?2 AND field_name=?3".into(),
-            vec![collection_id.into(), record_id.into(), field_name.into()]
-        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        self.vector_batcher.execute(
-            "INSERT INTO vectors (collection_id, record_id, field_name, vector) VALUES (?1, ?2, ?3, ?4)".into(),
-            vec![collection_id.into(), record_id.into(), field_name.into(), vec_json.into()]
-        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        // 3. Update In-Memory Index (HNSW) via Provider
-        // This ensures the vector is immediately searchable without restarting server
-        self.vector_provider.index(collection_id, record_id, field_name, &vector).await
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
-
         Ok(())
     }
 }
@@ -921,6 +903,51 @@ impl Db for TinyBase {
         })
     }
 
+    // VECTORS: Implement save_vector
+    async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let vec_json = serde_json::to_string(&vector)?;
+        let map_err = |e: String| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+        };
+        
+        // 1. Delete existing doc for this field
+        self.vector_batcher.execute(
+            "DELETE FROM vectors WHERE collection_id=?1 AND record_id=?2 AND field_name=?3".into(),
+            vec![collection_id.into(), record_id.into(), field_name.into()]
+        ).await.map_err(map_err)?;
+        
+        // 2. Insert new vector
+        self.vector_batcher.insert(
+            "INSERT INTO vectors (collection_id, record_id, field_name, vector) VALUES (?1, ?2, ?3, ?4)".into(),
+            vec![collection_id.into(), record_id.into(), field_name.into(), vec_json.into()]
+        ).await.map_err(map_err)?;
+
+        Ok(())
+    }
+
+    // VECTORS: Implement get_vectors_for_collection
+    async fn get_vectors_for_collection(&self, collection_id: i64) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn std::error::Error + Send + Sync>> {
+        // FIX: Corrected method call to self.get_vector()?
+        let conn = self.get_vector()?; 
+        let mut rows = conn.query(
+            "SELECT record_id, field_name, vector FROM vectors WHERE collection_id = ?1", 
+            params![collection_id]
+        ).await?;
+        
+        let mut vectors = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let record_id: i64 = row.get(0)?;
+            let field_name: String = row.get(1)?;
+            let vector_json_str: String = row.get(2)?;
+            
+            // Deserialize the vector JSON string
+            let vector: Vec<f32> = serde_json::from_str(&vector_json_str)?;
+            
+            vectors.push((record_id, field_name, vector));
+        }
+        Ok(vectors)
+    }
+
     // VECTORS Implement search_vector
     async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
         // 1. Search Index via Provider
@@ -1109,4 +1136,6 @@ impl Db for Mutex<Connection> {
         Ok(DashboardData { stats: DashboardStats { total_requests: 0, db_size_mb: 0.0, collections_count: 0, total_records: 0 }, chart: vec![], recent_logs: vec![] })
     }
     async fn search_vector(&self, _c: i64, _f: &str, _v: Vec<f32>, _l: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn save_vector(&self, _collection_id: i64, _record_id: i64, _field_name: &str, _vector: Vec<f32>) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { Ok(()) }
+    async fn get_vectors_for_collection(&self, _c: i64) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> { Ok(vec![]) }
 }
