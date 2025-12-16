@@ -1,6 +1,7 @@
+// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-api/src/lib.rs ===========================
 use axum::{
     extract::{Path, State, Query, Request, FromRef},
-    http::{StatusCode, request::Parts}, // <--- Import Parts here
+    http::{StatusCode, request::Parts}, 
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -32,10 +33,14 @@ use std::time::Instant;
 use moka::future::Cache;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use async_graphql::dynamic::Schema;
-use tinybase_core::scripting::ScriptEngine;
+use async_graphql::dataloader::DataLoader;
+use async_graphql::Value;
+use async_graphql::dynamic::{Object, Field, TypeRef, FieldFuture}; 
 
+use tinybase_core::scripting::ScriptEngine;
+use crate::sandbox_manager::SandboxManager;
+use crate::graphql::RelationLoader;
 use tinybase_core::models::DashboardData;
-use crate::sandbox_manager::SandboxManager; 
 
 // --- Module Registrations ---
 pub mod websocket;
@@ -60,8 +65,6 @@ pub mod import_data_routes;
 pub mod export_data_routes;
 pub mod cli;
 
-
-
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<dyn Db>,
@@ -74,246 +77,60 @@ pub struct AppState {
     pub scheduler: Arc<RwLock<scheduler::SchedulerService>>,
     pub script_engine: Arc<ScriptEngine>,
     pub css_cache: Arc<RwLock<String>>,
-    // Cache for thumbnails (Key: "filename_100x100", Value: Bytes)
     pub thumb_cache: Cache<String, Arc<Vec<u8>>>, 
     pub embedder: Arc<tinybase_core::embeddings::EmbedderService>,
     pub vector_provider: Arc<dyn tinybase_core::VectorProvider>,
 }
 
-// --- REMOVED CONFLICTING IMPL OF FromRef ---
-// axum provides this automatically because AppState derives Clone.
+// --- DTOs ---
 
-// --- DTOs (Same as before) ---
+#[derive(Serialize, ToSchema)] pub struct CollectionResponse { id: i64, name: String, schema: Option<CollectionSchema> }
+#[derive(Deserialize, ToSchema, Validate)] pub struct UpdateCollection { #[validate(length(min = 1, max = 50))] name: Option<String>, schema: Option<CollectionSchema> }
+#[derive(Deserialize, ToSchema, Validate)] pub struct CreateCollectionReq { #[validate(length(min = 1, max = 50))] name: String, schema: Option<CollectionSchema> }
+#[derive(Serialize, ToSchema)] pub struct RecordResponse { id: i64, data: serde_json::Value }
+#[derive(Deserialize, ToSchema, Validate)] pub struct AuthRequest { #[validate(email)] email: String, #[validate(length(min = 6))] password: String }
+#[derive(Serialize, ToSchema)] pub struct AuthResponse { token: String, user: UserDto }
+#[derive(Serialize, ToSchema)] pub struct UserDto { id: i64, email: String, role: String }
+#[derive(Serialize, ToSchema)] struct ProblemDetail { error: String, message: String, details: Option<serde_json::Value>, status: u16 }
+#[derive(Deserialize, ToSchema)] pub struct RelationRequest { target_collection_id: i64, target_record_id: i64, relation_name: String }
+#[derive(Deserialize, ToSchema, IntoParams)] pub struct SearchQuery { pub q: String }
+#[derive(Serialize, ToSchema)] pub struct RecordListResponse { items: Vec<RecordResponse>, total: i64 }
 
-#[derive(Serialize, ToSchema)]
-pub struct CollectionResponse {
-    id: i64,
-    name: String,
-    schema: Option<CollectionSchema>,
-}
-
-#[derive(Deserialize, ToSchema, Validate)]
-pub struct UpdateCollection {
-    #[validate(length(min = 1, max = 50))]
-    name: Option<String>,
-    schema: Option<CollectionSchema>,
-}
-
-#[derive(Deserialize, ToSchema, Validate)]
-pub struct CreateCollectionReq {
-    #[validate(length(min = 1, max = 50))]
-    name: String,
-    schema: Option<CollectionSchema>,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct RecordResponse {
-    id: i64,
-    data: serde_json::Value,
-}
-
-#[derive(Deserialize, ToSchema, Validate)]
-pub struct AuthRequest {
-    #[validate(email)]
-    email: String,
-    #[validate(length(min = 6))]
-    password: String,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct AuthResponse {
-    token: String,
-    user: UserDto,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct UserDto {
-    id: i64,
-    email: String,
-    role: String,
-}
-
-#[derive(Serialize, ToSchema)]
-struct ProblemDetail {
-    error: String,
-    message: String,
-    details: Option<serde_json::Value>,
-    status: u16,
-}
-
-#[derive(Deserialize, ToSchema)]
-pub struct RelationRequest {
-    target_collection_id: i64,
-    target_record_id: i64,
-    relation_name: String, 
-}
-
-#[derive(Deserialize, ToSchema, IntoParams)]
-pub struct SearchQuery {
-    pub q: String,
-}
-
-#[derive(Debug)] 
+#[derive(Debug)]
 pub enum AppError {
     LibsqlError(libsql::Error),
     JsonError(String),
     UnknownError(String),
     NotFound(String),
-    Validation(Vec<ValidationError>), 
-    InputValidation(validator::ValidationErrors), 
+    Validation(Vec<ValidationError>),
+    InputValidation(validator::ValidationErrors),
     Unauthorized(String),
     Forbidden(String),
 }
-
 impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AppError::LibsqlError(e) => write!(f, "Database Error: {}", e),
-            AppError::JsonError(e) => write!(f, "JSON Error: {}", e),
-            AppError::UnknownError(e) => write!(f, "Unknown Error: {}", e),
-            AppError::NotFound(e) => write!(f, "Not Found: {}", e),
-            AppError::Validation(e) => write!(f, "Schema Validation Error: {:?}", e),
-            AppError::InputValidation(e) => write!(f, "Input Validation Error: {}", e),
-            AppError::Unauthorized(e) => write!(f, "Unauthorized: {}", e),
-            AppError::Forbidden(e) => write!(f, "Forbidden: {}", e),
-        }
-    }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{:?}", self) }
 }
-
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        match &self {
-            AppError::LibsqlError(e) => tracing::error!("Database error: {}", e),
-            AppError::UnknownError(e) => tracing::error!("Unknown error: {}", e),
-            _ => (),
-        }
-
-        let (status, problem) = match self {
-            AppError::LibsqlError(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ProblemDetail {
-                    error: "database_error".to_string(),
-                    message: "A database error occurred.".to_string(),
-                    details: Some(serde_json::json!({ "db_error": e.to_string() })),
-                    status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-                },
-            ),
-            AppError::InputValidation(e) => (
-                StatusCode::BAD_REQUEST,
-                ProblemDetail {
-                    error: "invalid_input".to_string(),
-                    message: "Input validation failed".to_string(),
-                    details: Some(serde_json::json!(e)),
-                    status: StatusCode::BAD_REQUEST.as_u16(),
-                }
-            ),
-            AppError::Unauthorized(e) => (
-                StatusCode::UNAUTHORIZED,
-                ProblemDetail {
-                    error: "unauthorized".to_string(),
-                    message: e,
-                    details: None,
-                    status: StatusCode::UNAUTHORIZED.as_u16(),
-                }
-            ),
-            AppError::Forbidden(e) => (
-                StatusCode::FORBIDDEN,
-                ProblemDetail {
-                    error: "forbidden".to_string(),
-                    message: e,
-                    details: None,
-                    status: StatusCode::FORBIDDEN.as_u16(),
-                }
-            ),
-            AppError::Validation(e) => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                ProblemDetail {
-                    error: "schema_validation_error".to_string(),
-                    message: "Record data does not match collection schema.".to_string(),
-                    details: Some(serde_json::json!(e)),
-                    status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
-                },
-            ),
-            AppError::NotFound(e) => (
-                StatusCode::NOT_FOUND, 
-                ProblemDetail { error: "not_found".into(), message: e, details: None, status: 404 }
-            ),
-            AppError::JsonError(e) | AppError::UnknownError(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR, 
-                ProblemDetail { error: "server_error".into(), message: e, details: None, status: 500 }
-            ),
+        let (status, msg, details) = match self {
+            AppError::NotFound(m) => (StatusCode::NOT_FOUND, m, None),
+            AppError::Forbidden(m) => (StatusCode::FORBIDDEN, m, None),
+            AppError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m, None),
+            AppError::Validation(v) => (StatusCode::UNPROCESSABLE_ENTITY, "Schema Validation Failed".into(), Some(serde_json::json!(v))),
+            AppError::InputValidation(v) => (StatusCode::BAD_REQUEST, "Input Validation Failed".into(), Some(serde_json::json!(v))),
+            AppError::JsonError(m) => (StatusCode::BAD_REQUEST, m, None),
+            AppError::LibsqlError(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Database Error: {}", e), None),
+            AppError::UnknownError(m) => (StatusCode::INTERNAL_SERVER_ERROR, m, None),
         };
-
-        (status, Json(problem)).into_response()
-    }
-}
-
-// --- MIDDLEWARE ---
-
-async fn auth_middleware(
-    State(_state): State<AppState>, 
-    mut req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    if let Some(auth_header) = req.headers().typed_get::<Authorization<Bearer>>() {
-        let token = auth_header.token();
-        if let Ok(claims) = auth::decode_jwt(token) {
-            req.extensions_mut().insert(claims);
-        }
-    }
-    Ok(next.run(req).await)
-}
-
-async fn metrics_middleware(req: Request, next: Next) -> Response {
-    let start = Instant::now();
-    let path = req.uri().path().to_owned();
-    let method = req.method().to_string();
-
-    let response = next.run(req).await;
-
-    let latency = start.elapsed().as_secs_f64();
-    let status = response.status().as_u16().to_string();
-
-    metrics::increment_counter!(
-        "http_requests_total",
-        "method" => method.clone(),
-        "path" => path.clone(),
-        "status" => status.clone()
-    );
-
-    metrics::histogram!(
-        "http_request_duration_seconds",
-        latency,
-        "method" => method,
-        "path" => path,
-        "status" => status
-    );
-      
-    response
-}
-
-// --- SANDBOX MIDDLEWARE ---
-// --- SANDBOX MIDDLEWARE (FIXED) ---
-
-async fn sandbox_middleware(
-    // FIX: Accept 2 path arguments because routes like /render/{slug} inside /sandbox/{id} have 2 params.
-    // The first one is session_id, the second is dropped (_) because we only need session_id here.
-    Path((session_id, _)): Path<(String, String)>,
-    State(_state): State<AppState>, 
-    mut req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    tracing::info!("[Sandbox Middleware] Intercepting request for session: {}", session_id);
-
-    match SandboxManager::get_sandbox(&session_id).await {
-        Ok(sandbox_db) => {
-            req.extensions_mut().insert(sandbox_db);
-            Ok(next.run(req).await)
-        }
-        Err(_) => {
-            tracing::error!("Sandbox {} not found", session_id);
-            Err(StatusCode::NOT_FOUND)
-        }
+        
+        let body = Json(ProblemDetail {
+            error: status.canonical_reason().unwrap_or("error").to_string(),
+            message: msg,
+            details,
+            status: status.as_u16()
+        });
+        
+        (status, body).into_response()
     }
 }
 
@@ -336,8 +153,39 @@ where
     }
 }
 
-// --- ROUTER ---
+// --- MIDDLEWARE ---
 
+async fn auth_middleware(State(_state): State<AppState>, mut req: Request, next: Next) -> Result<Response, StatusCode> {
+    if let Some(auth_header) = req.headers().typed_get::<Authorization<Bearer>>() {
+        if let Ok(claims) = auth::decode_jwt(auth_header.token()) {
+            req.extensions_mut().insert(claims);
+        }
+    }
+    Ok(next.run(req).await)
+}
+
+async fn metrics_middleware(req: Request, next: Next) -> Response {
+    let _start = Instant::now();
+    let response = next.run(req).await;
+    response
+}
+
+async fn sandbox_lifecycle_middleware(
+    Path((session_id, _)): Path<(String, String)>,
+    State(_state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    match SandboxManager::get_sandbox(&session_id).await {
+        Ok(sandbox_db) => {
+            req.extensions_mut().insert(sandbox_db);
+            Ok(next.run(req).await)
+        }
+        Err(_) => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+// --- OPENAPI DOCS ---
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -351,16 +199,23 @@ where
         settings::get_settings, settings::update_settings,
         list_users_handler, delete_user_handler,
         list_audit_logs,
+        get_dashboard_stats_handler,
         reload_system,
-        ai_routes::list_actions, ai_routes::create_action, ai_routes::delete_action, ai_routes::run_action,
+        reindex_collection_handler,
+        serve_styles,
+        ai_routes::list_actions, ai_routes::create_action, ai_routes::delete_action, ai_routes::run_action, ai_routes::edit_code,
         script_routes::list_scripts, script_routes::create_script, script_routes::delete_script, script_routes::run_script,
-        template_routes::list_templates,template_routes::create_template,template_routes::update_template,template_routes::delete_template,
-        // NEW AI ARCHITECT ROUTES
-        ai_architect::start_session, ai_architect::continue_chat, ai_architect::publish_plugin,ai_architect::list_sessions,
+        template_routes::list_templates, template_routes::create_template, template_routes::update_template, template_routes::delete_template,
+        ai_architect::start_session, ai_architect::continue_chat, ai_architect::publish_plugin, ai_architect::list_sessions,
+        import_data_routes::import_data_handler,
+        export_data_routes::export_data_handler,
+        vector_routes::revectorize_collection_handler,
+        vector_routes::search_vector,
+        vector_routes::query_vector_search
     ),
     components(schemas(
         CollectionResponse, AuthRequest, AuthResponse, RecordResponse, ProblemDetail, UserDto,
-        CreateCollectionReq, UpdateCollection, RelationRequest, SearchQuery,
+        CreateCollectionReq, UpdateCollection, RelationRequest, SearchQuery, RecordListResponse,
         config_routes::SetConfigRequest, 
         storage::FileResponse, storage::FileUploadRequest, storage::FileListResponse, storage::FileListQuery,
         settings::AppSettingsDto, settings::SmtpConfigDto, settings::StorageConfigDto, settings::S3ConfigDto, settings::SecurityConfigDto, settings::AiConfigDto,
@@ -373,7 +228,7 @@ where
         tinybase_core::schema::CollectionPolicies,
         tinybase_core::schema::FieldDefinition,
         tinybase_core::schema::FieldType,
-        ai_routes::ExecutePromptReq,
+        ai_routes::ExecutePromptReq, ai_routes::CodeEditReq,
         tinybase_core::script_models::Script,
         tinybase_core::script_models::CreateScriptReq,
         tinybase_core::models::Template,
@@ -387,23 +242,19 @@ where
         tinybase_core::models::DashboardData,
         tinybase_core::models::DashboardStats,
         tinybase_core::models::ChartPoint,
-
         import_data_routes::ImportRequestDto,
         import_data_routes::ImportResponseDto,
-
         export_data_routes::ExportQuery,
-        import_data_routes::ImportRequestDto,
-        import_data_routes::ImportResponseDto,
+        vector_routes::VectorSearchReq, vector_routes::TextVectorSearchReq
     )),
     tags((name = "Tinybase", description = "Tinybase API"))
 )]
 struct ApiDoc;
 
-pub fn app_router(state: AppState) -> Router {
-    SandboxManager::init();
-
-    // 1. API Routes
-    let api_routes = Router::new()
+// --- ROUTER FACTORY ---
+fn make_api_router() -> Router<AppState> {
+    Router::new()
+        // Collections & Records
         .route("/collections", post(create_collection).get(list_collections))
         .route("/collections/{id}", get(get_collection).patch(update_collection).delete(delete_collection))
         .route("/collections/{id}/records", post(create_record).get(list_records))
@@ -438,24 +289,33 @@ pub fn app_router(state: AppState) -> Router {
         .route("/admin/ai/actions/{id}", axum::routing::delete(ai_routes::delete_action))
         .route("/ai/run/{slug}", post(ai_routes::run_action))
 
-        // NEW AI ARCHITECT ROUTES
+        // AI Architect
         .route("/admin/ai/sessions", post(ai_architect::start_session).get(ai_architect::list_sessions))
         .route("/admin/ai/sessions/{id}/chat", post(ai_architect::continue_chat))
         .route("/admin/ai/sessions/{id}/publish", post(ai_architect::publish_plugin))
         .route("/admin/ai/plugins", get(ai_architect::list_plugins))
+        .route("/admin/ai/edit-code", post(ai_routes::edit_code))
 
-        // SCRIPTING ENGINE
+        // Scripting
         .route("/admin/scripts", get(script_routes::list_scripts).post(script_routes::create_script))
         .route("/admin/scripts/{id}", axum::routing::delete(script_routes::delete_script))
         .route("/run/{script_name}", post(script_routes::run_script))
 
-        // Templates CRUD Operations
+        // Templates
         .route("/admin/templates", get(template_routes::list_templates).post(template_routes::create_template))
         .route("/admin/templates/{id}", axum::routing::patch(template_routes::update_template).delete(template_routes::delete_template))
+}
 
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware)); 
+// --- MAIN ROUTER ---
 
-    // 2. Auth Routes
+pub fn app_router(state: AppState) -> Router {
+    SandboxManager::init();
+
+    // 1. Core API (Reusable)
+    let core_api = make_api_router()
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    // 2. Auth Routes (Shared)
     let auth_routes = Router::new()
         .route("/auth/login", post(login))
         .route("/auth/register", post(register))
@@ -464,56 +324,84 @@ pub fn app_router(state: AppState) -> Router {
         .route("/auth/verify", get(auth_advanced::verify_email))
         .route("/auth/verify/resend", post(auth_advanced::resend_verification));
 
-    // Public Routes
+    // 3. Renderer Routes (Public)
     let renderer_routes = Router::new()
         .route("/render/{*slug}", get(renderer::render_view).post(renderer::render_view));
 
-     // --- SANDBOX ROUTES (Updated) ---
-     let sandbox_routes = Router::new()
-        // Use the Sandbox-specific handlers (they accept 2 path parameters)
-        .route("/render/{*slug}", get(renderer::render_sandbox_view).post(renderer::render_sandbox_view))
-        .route("/run/{script_name}", post(script_routes::run_sandbox_script))
-        .layer(middleware::from_fn_with_state(state.clone(), sandbox_middleware));
+    // 4. Scalar Documentation
+    let scalar_router: Router<AppState> = Scalar::with_url("/scalar", ApiDoc::openapi()).into();
 
-    // 3. Construct Main Router
-    let app_router = Router::new()
-        .nest("/api/v1", auth_routes.merge(api_routes))
-        .nest("/sandbox/{session_id}", sandbox_routes) 
+    // =========================================================
+    // 5. THE SANDBOX FACTORY
+    // =========================================================
+    let sandbox_router = Router::new()
+        // A. Nest the full API
+        .nest("/api/v1", core_api.clone())
+        // B. Merge Auth
+        .merge(auth_routes.clone())
+        // C. Specific Sandbox Renderer
+        .route("/render/{*slug}", get(renderer::render_sandbox_view).post(renderer::render_sandbox_view))
+        // D. Sandbox GraphQL
+        .route("/graphql", post(sandbox_graphql_handler).get(graphql_playground))
+        // E. Sandbox Scalar
+        .merge(scalar_router.clone())
+
+        // Middleware injects DB connection into Extensions
+        .layer(middleware::from_fn_with_state(state.clone(), sandbox_lifecycle_middleware));
+
+    // =========================================================
+    // 6. ROOT ROUTER ASSEMBLY
+    // =========================================================
+    Router::new()
+        // --- PRODUCTION ---
+        .nest("/api/v1", core_api)
+        .merge(auth_routes)
         .merge(renderer_routes)
-        
-        .route("/styles.css", get(serve_styles)) 
-        .route("/metrics", get(metrics_handler))
-        .route("/ws", get(websocket::websocket_handler))
+        .merge(scalar_router)
         .route("/graphql", post(graphql_handler).get(graphql_playground))
 
+        // --- SANDBOX ---
+        .nest("/sandbox/{session_id}", sandbox_router)
+
+        // --- GLOBAL STATIC & UTILS ---
+        .route("/styles.css", get(serve_styles)) 
+        .route("/metrics", get(metrics_handler))
+        .route("/ws", get(websocket::websocket_handler)) 
         .route("/_dashboard", get(assets::dashboard_handler))
         .route("/_dashboard/{*path}", get(assets::dashboard_handler))
-        
         .route("/static/{*path}", get(assets::serve_static_asset))
-        // --- LOGO ENDPOINT ---
-        // Serves /logo or /logo?thumb=50x50
         .route("/logo", get(storage::serve_app_logo)) 
-
-        
         .route("/", get(assets::index_handler))
 
-        .layer(middleware::from_fn(metrics_middleware));
-    
-    // 4. Inject State
-    let app_router_with_state = app_router.with_state(state);
-
-    let scalar_router: Router = Scalar::with_url("/scalar", ApiDoc::openapi()).into();
-
-    app_router_with_state.merge(scalar_router)
+        .layer(middleware::from_fn(metrics_middleware))
+        .with_state(state)
 }
 
+// --- GRAPHQL HANDLERS ---
 
-async fn graphql_handler(
-    State(state): State<AppState>, 
-    req: GraphQLRequest
-) -> GraphQLResponse {
+async fn graphql_handler(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
     let schema = state.schema.read().await;
     schema.execute(req.into_inner()).await.into()
+}
+
+async fn sandbox_graphql_handler(
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>,              
+    req: GraphQLRequest
+) -> GraphQLResponse {
+    let relation_loader = Arc::new(DataLoader::new(
+        RelationLoader::new(db.clone()), 
+        tokio::spawn
+    ));
+    let mut sandbox_state = state.clone();
+    sandbox_state.db = db;
+    match crate::graphql::build_schema(sandbox_state, relation_loader).await {
+        Ok(schema) => schema.execute(req.into_inner()).await.into(),
+        Err(e) => {
+            let err = async_graphql::ServerError::new(e.to_string(), None);
+            async_graphql::Response::from_errors(vec![err]).into()
+        }
+    }
 }
 
 async fn graphql_playground() -> impl IntoResponse {
@@ -529,6 +417,197 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
     }
 }
 
+// --- CRUD HANDLERS (With Macros) ---
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/collections",
+    responses((status = 200, body = Vec<CollectionResponse>))
+)]
+async fn list_collections(DatabaseConnection(db): DatabaseConnection) -> Result<Json<Vec<CollectionResponse>>, AppError> {
+    let cols = db.list_collections().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(cols.into_iter().map(|c| CollectionResponse { id: c.id, name: c.name, schema: c.schema }).collect()))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/collections",
+    request_body = CreateCollectionReq,
+    responses((status = 201, body = CollectionResponse))
+)]
+async fn create_collection(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Json(payload): Json<CreateCollectionReq>) -> Result<(StatusCode, Json<CollectionResponse>), AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    if !matches!(claims, Some(c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+    
+    let id = db.create_collection(&payload.name, &payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(CollectionResponse{id, name: payload.name, schema: payload.schema})))
+}
+
+#[utoipa::path(get, path = "/api/v1/collections/{id}")]
+async fn get_collection(DatabaseConnection(db): DatabaseConnection, Path(id): Path<i64>) -> Result<Json<CollectionResponse>, AppError> {
+    let c = db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Not found".into()))?;
+    Ok(Json(CollectionResponse{id: c.id, name: c.name, schema: c.schema}))
+}
+
+#[utoipa::path(patch, path = "/api/v1/collections/{id}")]
+async fn update_collection(DatabaseConnection(db): DatabaseConnection, Path(id): Path<i64>, Json(payload): Json<UpdateCollection>) -> Result<Json<CollectionResponse>, AppError> {
+    let c = db.update_collection(id, payload.name, payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(CollectionResponse{id: c.id, name: c.name, schema: c.schema}))
+}
+
+#[utoipa::path(delete, path = "/api/v1/collections/{id}")]
+async fn delete_collection(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(id): Path<i64>) -> Result<StatusCode, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    if !matches!(claims, Some(c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+    db.delete_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/collections/{id}/records",
+    responses((status = 200, body = RecordListResponse))
+)]
+async fn list_records(
+    auth: Option<Extension<Claims>>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    Path(id): Path<i64>, 
+    Query(q): Query<QueryOptions>
+) -> Result<Json<RecordListResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Read denied".into())); }
+
+    let res = db.list_records(id, q).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(RecordListResponse{ items: res.items.into_iter().map(|r| RecordResponse{id: r.id, data: r.data}).collect(), total: res.total }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/collections/{id}/records",
+    request_body = tinybase_core::models::Record,
+    responses((status = 201, body = RecordResponse))
+)]
+async fn create_record(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(id): Path<i64>, Json(p): Json<tinybase_core::models::Record>) -> Result<Json<RecordResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    let policy = col.schema.as_ref().map(|s| s.policies.create.as_str()).unwrap_or("auth");
+    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Create denied".into())); }
+    
+    if let Some(schema) = &col.schema { validate_record(schema, &p.data).map_err(AppError::Validation)?; }
+
+    let rid = db.create_record(id, &p.data).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(RecordResponse{id: rid, data: p.data}))
+}
+
+#[utoipa::path(
+    get, 
+    path = "/api/v1/collections/{id}/records/{record_id}",
+    responses((status = 200, body = RecordResponse))
+)]
+async fn get_record(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path((cid, rid)): Path<(i64, i64)>, Query(q): Query<QueryOptions>) -> Result<Json<RecordResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(cid).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    let r = db.get_record(cid, rid, q.expand).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    
+    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !policies::check_access(policy, claims.as_ref(), Some(&r.data)) { return Err(AppError::Forbidden("Read denied".into())); }
+
+    Ok(Json(RecordResponse{id: r.id, data: r.data}))
+}
+
+#[utoipa::path(patch, path = "/api/v1/collections/{id}/records/{record_id}")]
+async fn update_record(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path((cid, rid)): Path<(i64, i64)>, Json(p): Json<tinybase_core::models::Record>) -> Result<Json<RecordResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(cid).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    let existing = db.get_record(cid, rid, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+
+    let policy = col.schema.as_ref().map(|s| s.policies.update.as_str()).unwrap_or("admin");
+    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) { return Err(AppError::Forbidden("Update denied".into())); }
+
+    let r = db.update_record(cid, rid, &p.data).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(RecordResponse{id: r.id, data: r.data}))
+}
+
+#[utoipa::path(delete, path = "/api/v1/collections/{id}/records/{record_id}")]
+async fn delete_record(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path((cid, rid)): Path<(i64, i64)>) -> Result<StatusCode, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(cid).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    let existing = db.get_record(cid, rid, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+
+    let policy = col.schema.as_ref().map(|s| s.policies.delete.as_str()).unwrap_or("admin");
+    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) { return Err(AppError::Forbidden("Delete denied".into())); }
+
+    db.delete_record(cid, rid).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/collections/{id}/search",
+    params(SearchQuery),
+    responses((status = 200, body = Vec<RecordResponse>))
+)]
+async fn search_records(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(id): Path<i64>, Query(q): Query<SearchQuery>) -> Result<Json<Vec<RecordResponse>>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Search denied".into())); }
+
+    let res = db.search_records(id, &q.q).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(res.into_iter().map(|r| RecordResponse{id: r.id, data: r.data}).collect()))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/collections/{id}/instant-search",
+    params(SearchQuery),
+    responses((status = 200, body = Vec<tinybase_core::models::InstantResult>))
+)]
+pub async fn instant_search_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection, // Use DB connection extractor
+    Path(id): Path<i64>,
+    Query(params): Query<SearchQuery>,
+) -> Result<Json<Vec<tinybase_core::models::InstantResult>>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    
+    let collection = db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
+        .ok_or(AppError::NotFound(format!("Collection {} not found", id)))?;
+
+    let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !policies::check_access(policy, claims.as_ref(), None) {
+        return Err(AppError::Forbidden("Search denied by policy".into()));
+    }
+
+    let results = db.instant_search(id, &params.q).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    Ok(Json(results))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/collections/{id}/records/{record_id}/relations",
+    request_body = RelationRequest,
+    responses((status = 201, description = "Relation created"))
+)]
+async fn create_relation(DatabaseConnection(db): DatabaseConnection, Path((oc, oi)): Path<(i64, i64)>, Json(p): Json<RelationRequest>) -> Result<StatusCode, AppError> {
+    db.create_relation(oc, oi, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(StatusCode::CREATED)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/collections/{id}/records/{record_id}/relations",
+    request_body = RelationRequest,
+    responses((status = 204, description = "Relation deleted"))
+)]
+async fn delete_relation(DatabaseConnection(db): DatabaseConnection, Path((oc, oi)): Path<(i64, i64)>, Json(p): Json<RelationRequest>) -> Result<StatusCode, AppError> {
+    db.delete_relation(oc, oi, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 #[utoipa::path(
     post,
@@ -541,8 +620,6 @@ pub async fn reload_system(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-
-    tracing::info!("System Reload Triggered by Admin...");
 
     let relation_loader = async_graphql::dataloader::DataLoader::new(
         crate::graphql::RelationLoader::new(state.db.clone()), 
@@ -560,37 +637,29 @@ pub async fn reload_system(
     }
     
     state.scheduler.read().await.load_jobs(state.clone()).await;
-
-    tracing::info!("System Reload Complete.");
+    
     Ok(Json(serde_json::json!({ "status": "ok", "message": "System reloaded successfully" })))
 }
 
 #[utoipa::path(
-    get,
-    path = "/api/v1/collections/{id}/instant-search",
-    params(SearchQuery),
-    responses((status = 200, body = Vec<tinybase_core::models::InstantResult>))
+    post,
+    path = "/api/v1/collections/{id}/reindex",
+    responses((status = 200, description = "Reindexing started"))
 )]
-pub async fn instant_search_handler(
+pub async fn reindex_collection_handler(
     auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection,
     Path(id): Path<i64>,
-    Query(params): Query<SearchQuery>,
-) -> Result<Json<Vec<tinybase_core::models::InstantResult>>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    
-    let collection = state.db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or(AppError::NotFound(format!("Collection {} not found", id)))?;
-
-    let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) {
-        return Err(AppError::Forbidden("Search denied by policy".into()));
+) -> Result<Json<serde_json::Value>, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { 
+        return Err(AppError::Forbidden("Admins only".into())); 
     }
 
-    let results = state.db.instant_search(id, &params.q).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    Ok(Json(results))
+    db.reindex_collection(id).await
+        .map_err(|e| AppError::UnknownError(format!("Reindex failed: {}", e)))?;
+
+    Ok(Json(serde_json::json!({ "success": true, "message": "Collection re-indexed successfully" })))
 }
 
 #[utoipa::path(
@@ -600,12 +669,11 @@ pub async fn instant_search_handler(
 )]
 pub async fn list_users_handler(
     auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection,
 ) -> Result<Json<Vec<UserDto>>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    
-    let users = state.db.list_users().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let users = db.list_users().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(users.into_iter().map(|u| UserDto { id: u.id, email: u.email, role: u.role }).collect()))
 }
 
@@ -616,13 +684,12 @@ pub async fn list_users_handler(
 )]
 pub async fn delete_user_handler(
     auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    
-    state.db.delete_user(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    db.delete_user(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -633,14 +700,26 @@ pub async fn delete_user_handler(
 )]
 pub async fn list_audit_logs(
     auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-
-    let logs = state.db.list_audit_logs().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
+    let logs = db.list_audit_logs().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(logs))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/dashboard",
+    responses((status = 200, body = DashboardData))
+)]
+pub async fn get_dashboard_stats_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Json<tinybase_core::models::DashboardData>, AppError> {
+    if !matches!(auth.map(|e| e.0.role), Some(r) if r == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+    let data = db.get_dashboard_stats().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(data))
 }
 
 #[utoipa::path(
@@ -649,35 +728,12 @@ pub async fn list_audit_logs(
     request_body = AuthRequest,
     responses((status = 200, body = AuthResponse), (status = 401, body = ProblemDetail))
 )]
-async fn login(
-    State(state): State<AppState>,
-    Json(payload): Json<AuthRequest>,
-) -> Result<Json<AuthResponse>, AppError> {
-    payload.validate().map_err(AppError::InputValidation)?;
-
-    let user = state.db.get_user_by_email(&payload.email).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or(AppError::Unauthorized("Invalid credentials".into()))?;
-
-    if !auth::verify_password(&payload.password, &user.password_hash) {
-        tracing::warn!("Failed login attempt for {}", payload.email);
-        return Err(AppError::Unauthorized("Invalid credentials".into()));
-    }
-
-    let token = auth::create_jwt(user.id, &user.email, &user.role)
-        .map_err(|_| AppError::UnknownError("Token generation failed".into()))?;
-
-    let _ = state.db.log_audit_event(
-        "info",
-        "User Login",
-        "auth",
-        Some(serde_json::json!({ "email": user.email }))
-    ).await;
-
-    Ok(Json(AuthResponse {
-        token,
-        user: UserDto { id: user.id, email: user.email, role: user.role },
-    }))
+async fn login(DatabaseConnection(db): DatabaseConnection, Json(p): Json<AuthRequest>) -> Result<Json<AuthResponse>, AppError> {
+    let u = db.get_user_by_email(&p.email).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::Unauthorized("Bad creds".into()))?;
+    if !auth::verify_password(&p.password, &u.password_hash) { return Err(AppError::Unauthorized("Bad creds".into())); }
+    let token = auth::create_jwt(u.id, &u.email, &u.role).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
+    let _ = db.log_audit_event("info", "Login", "auth", Some(serde_json::json!({"email": u.email}))).await;
+    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role}}))
 }
 
 #[utoipa::path(
@@ -686,355 +742,13 @@ async fn login(
     request_body = AuthRequest,
     responses((status = 200, body = AuthResponse), (status = 400, body = ProblemDetail))
 )]
-async fn register(
-    State(state): State<AppState>,
-    Json(payload): Json<AuthRequest>,
-) -> Result<Json<AuthResponse>, AppError> {
-    payload.validate().map_err(AppError::InputValidation)?;
-
-    let hash = auth::hash_password(&payload.password)
-        .map_err(|_| AppError::UnknownError("Hashing failed".into()))?;
-
-    let user = state.db.create_user(&payload.email, &hash, "user").await
-        .map_err(|_| AppError::UnknownError("Failed to create user (email might exist)".into()))?;
-
-    let token = auth::create_jwt(user.id, &user.email, &user.role)
-        .map_err(|_| AppError::UnknownError("Token generation failed".into()))?;
-
-    state.queue.enqueue(Job::SendWelcomeEmail { 
-        email: user.email.clone(), 
-        user_id: user.id 
-    }).await;
-
-    let _ = state.db.log_audit_event("info", "User Registered", "auth", Some(serde_json::json!({"email": user.email}))).await;
-
-    Ok(Json(AuthResponse {
-        token,
-        user: UserDto { id: user.id, email: user.email, role: user.role },
-    }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/collections",
-    request_body = CreateCollectionReq,
-    responses((status = 201, body = CollectionResponse))
-)]
-async fn create_collection(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    Json(payload): Json<CreateCollectionReq>,
-) -> Result<(StatusCode, Json<CollectionResponse>), AppError> {
-    let claims = auth.map(|Extension(c)| c);
-
-    if let Some(claims) = claims {
-        if claims.role != "admin" {
-             return Err(AppError::Forbidden("Only admins can create collections".into()));
-        }
-    } else {
-        return Err(AppError::Unauthorized("Admin login required".into()));
-    }
-
-    payload.validate().map_err(AppError::InputValidation)?;
-
-    let id = state.db.create_collection(&payload.name, &payload.schema).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    let _ = state.db.log_audit_event("info", "Collection Created", "system", Some(serde_json::json!({"name": payload.name}))).await;
-
-    Ok((StatusCode::CREATED, Json(CollectionResponse { id, name: payload.name, schema: payload.schema })))
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/collections",
-    responses((status = 200, body = Vec<CollectionResponse>))
-)]
-async fn list_collections(State(state): State<AppState>) -> Result<Json<Vec<CollectionResponse>>, AppError> {
-    let cols = state.db.list_collections().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(cols.into_iter().map(|c| CollectionResponse { id: c.id, name: c.name, schema: c.schema }).collect()))
-}
-
-#[utoipa::path(get, path = "/api/v1/collections/{id}")]
-async fn get_collection(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<CollectionResponse>, AppError> {
-    let c = state.db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
-    Ok(Json(CollectionResponse { id: c.id, name: c.name, schema: c.schema }))
-}
-
-#[utoipa::path(patch, path = "/api/v1/collections/{id}")]
-async fn update_collection(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>, 
-    Path(id): Path<i64>, 
-    Json(payload): Json<UpdateCollection>
-) -> Result<Json<CollectionResponse>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-
-    if let Some(claims) = claims {
-        if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    } else { return Err(AppError::Unauthorized("Admin login required".into())); }
-
-    payload.validate().map_err(AppError::InputValidation)?;
-    let c = state.db.update_collection(id, payload.name, payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(CollectionResponse { id: c.id, name: c.name, schema: c.schema }))
-}
-
-#[utoipa::path(delete, path = "/api/v1/collections/{id}")]
-async fn delete_collection(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>, 
-    Path(id): Path<i64>
-) -> Result<StatusCode, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-
-    if let Some(claims) = claims {
-        if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    } else { return Err(AppError::Unauthorized("Admin login required".into())); }
-
-    state.db.delete_collection(id).await.map_err(|_| AppError::UnknownError("DB Error".into()))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/collections/{id}/records",
-    request_body = Record,
-    responses((status = 201, body = RecordResponse))
-)]
-async fn create_record(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(payload): Json<Record>, 
-) -> Result<(StatusCode, Json<RecordResponse>), AppError> {
-    let claims = auth.map(|Extension(c)| c);
-
-    let collection = state.db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or(AppError::NotFound(format!("Collection {} not found", id)))?;
-
-    let policy = collection.schema.as_ref().map(|s| s.policies.create.as_str()).unwrap_or("auth");
-    if !policies::check_access(policy, claims.as_ref(), None) {
-        return Err(AppError::Forbidden("Create denied by policy".into()));
-    }
-
-    if let Some(schema) = &collection.schema {
-        validate_record(schema, &payload.data).map_err(AppError::Validation)?;
-    }
-
-    let record_id = state.db.create_record(id, &payload.data).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    let _ = state.tx.send(DbEvent::Insert { collection_id: id, record_id, data: payload.data.clone() });
-
-    // --- Trigger Vectorization ---
-    // Fetch schema to check which fields need embedding
-    if let Some(col) = state.db.get_collection(id).await.unwrap_or(None) {
-        if let Some(schema) = col.schema {
-            for (field_name, def) in schema.fields {
-                // If field is marked for vectorization AND data exists
-                if def.vectorize {
-                    if let Some(text_val) = payload.data.get(&field_name).and_then(|v| v.as_str()) {
-                        let job = tinybase_core::jobs::Job::GenerateEmbedding {
-                            collection_id: id,
-                            record_id: record_id,
-                            field_name: field_name,
-                            text_content: text_val.to_string()
-                        };
-                        state.queue.enqueue(job).await;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok((StatusCode::CREATED, Json(RecordResponse { id: record_id, data: payload.data })))
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct RecordListResponse {
-    items: Vec<RecordResponse>,
-    total: i64,
-}
-#[utoipa::path(
-    get,
-    path = "/api/v1/collections/{id}/records",
-    responses((status = 200, body = RecordListResponse))
-)]
-async fn list_records(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Query(params): Query<QueryOptions>,
-) -> Result<Json<RecordListResponse>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-
-    let collection = state.db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or(AppError::NotFound(format!("Collection {} not found", id)))?;
-
-    let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) {
-        return Err(AppError::Forbidden("Read denied by policy".into()));
-    }
-    
-    let result = state.db.list_records(id, params).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    Ok(Json(RecordListResponse {
-        items: result.items.into_iter().map(|r| RecordResponse { id: r.id, data: r.data }).collect(),
-        total: result.total,
-    }))
-}
-
-#[utoipa::path(
-    get, 
-    path = "/api/v1/collections/{id}/records/{record_id}",
-    params(
-        ("id" = i64, Path, description = "Collection ID"),
-        ("record_id" = i64, Path, description = "Record ID"),
-        ("expand" = Option<String>, Query, description = "Expand relations (e.g. 'author, comments(5)')")
-    ),
-    responses((status = 200, body = RecordResponse))
-)]
-async fn get_record(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>, 
-    Path((cid, rid)): Path<(i64, i64)>,
-    Query(opts): Query<QueryOptions>, // Accept query params
-) -> Result<Json<RecordResponse>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-
-    let collection = state.db.get_collection(cid).await.map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or(AppError::NotFound("Collection not found".into()))?;
-
-    // Pass the expand option
-    let r = state.db.get_record(cid, rid, opts.expand).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
-
-    let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), Some(&r.data)) {
-        return Err(AppError::Forbidden("Read denied by policy".into()));
-    }
-
-    Ok(Json(RecordResponse { id: r.id, data: r.data }))
-}
-
-#[utoipa::path(patch, path = "/api/v1/collections/{id}/records/{record_id}")]
-async fn update_record(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>, 
-    Path((cid, rid)): Path<(i64, i64)>, 
-    Json(payload): Json<Record>
-) -> Result<Json<RecordResponse>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-
-    let collection = state.db.get_collection(cid).await.map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or(AppError::NotFound("Collection not found".into()))?;
-
-    let existing = state.db.get_record(cid, rid, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
-
-    let policy = collection.schema.as_ref().map(|s| s.policies.update.as_str()).unwrap_or("admin");
-    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) {
-        return Err(AppError::Forbidden("Update denied by policy".into()));
-    }
-
-    let r = state.db.update_record(cid, rid, &payload.data).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    let _ = state.tx.send(DbEvent::Update { collection_id: cid, record_id: rid, data: r.data.clone() });
-
-    Ok(Json(RecordResponse { id: r.id, data: r.data }))
-}
-
-#[utoipa::path(delete, path = "/api/v1/collections/{id}/records/{record_id}")]
-async fn delete_record(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>, 
-    Path((cid, rid)): Path<(i64, i64)>
-) -> Result<StatusCode, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-
-    let collection = state.db.get_collection(cid).await.map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or(AppError::NotFound("Collection not found".into()))?;
-
-    let existing = state.db.get_record(cid, rid, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
-
-    let policy = collection.schema.as_ref().map(|s| s.policies.delete.as_str()).unwrap_or("admin");
-    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) {
-        return Err(AppError::Forbidden("Delete denied by policy".into()));
-    }
-
-    state.db.delete_record(cid, rid).await.map_err(|_| AppError::UnknownError("DB Error".into()))?;
-    
-    let _ = state.tx.send(DbEvent::Delete { collection_id: cid, record_id: rid });
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/collections/{id}/search",
-    params(SearchQuery),
-    responses((status = 200, body = Vec<RecordResponse>))
-)]
-async fn search_records(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Query(params): Query<SearchQuery>,
-) -> Result<Json<Vec<RecordResponse>>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    
-    let collection = state.db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or(AppError::NotFound(format!("Collection {} not found", id)))?;
-
-    let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) {
-        return Err(AppError::Forbidden("Search denied by policy".into()));
-    }
-
-    let records = state.db.search_records(id, &params.q).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data }).collect()))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/collections/{id}/records/{record_id}/relations",
-    request_body = RelationRequest,
-    responses((status = 201, description = "Relation created"))
-)]
-async fn create_relation(
-    State(state): State<AppState>,
-    Path((origin_col_id, origin_rec_id)): Path<(i64, i64)>,
-    Json(payload): Json<RelationRequest>,
-) -> Result<StatusCode, AppError> {
-    state.db.create_relation(
-        origin_col_id, 
-        origin_rec_id, 
-        payload.target_collection_id, 
-        payload.target_record_id, 
-        &payload.relation_name
-    ).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    Ok(StatusCode::CREATED)
-}
-
-#[utoipa::path(
-    delete,
-    path = "/api/v1/collections/{id}/records/{record_id}/relations",
-    request_body = RelationRequest,
-    responses((status = 204, description = "Relation deleted"))
-)]
-async fn delete_relation(
-    State(state): State<AppState>,
-    Path((origin_col_id, origin_rec_id)): Path<(i64, i64)>,
-    Json(payload): Json<RelationRequest>,
-) -> Result<StatusCode, AppError> {
-    state.db.delete_relation(
-        origin_col_id, 
-        origin_rec_id, 
-        payload.target_collection_id, 
-        payload.target_record_id, 
-        &payload.relation_name
-    ).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    Ok(StatusCode::NO_CONTENT)
+async fn register(DatabaseConnection(db): DatabaseConnection, State(state): State<AppState>, Json(p): Json<AuthRequest>) -> Result<Json<AuthResponse>, AppError> {
+    let hash = auth::hash_password(&p.password).map_err(|_| AppError::UnknownError("Hash fail".into()))?;
+    let u = db.create_user(&p.email, &hash, "user").await.map_err(|_| AppError::UnknownError("User exists".into()))?;
+    let token = auth::create_jwt(u.id, &u.email, &u.role).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
+    state.queue.enqueue(Job::SendWelcomeEmail { email: u.email.clone(), user_id: u.id }).await;
+    let _ = db.log_audit_event("info", "Register", "auth", Some(serde_json::json!({"email": u.email}))).await;
+    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role}}))
 }
 
 #[utoipa::path(
@@ -1044,6 +758,7 @@ async fn delete_relation(
 )]
 pub async fn serve_styles(
     State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection,
 ) -> Result<Response, AppError> {
     // 1. Return Cache if exists
     {
@@ -1051,15 +766,14 @@ pub async fn serve_styles(
         if !cache.is_empty() {
             return Ok(Response::builder()
                 .header("Content-Type", "text/css")
-                .header("Cache-Control", "public, max-age=60") // 1 minute cache (invalidated by logic)
+                .header("Cache-Control", "public, max-age=60") 
                 .body(axum::body::Body::from(cache.clone()))
                 .unwrap());
         }
     }
 
-    // 2. Compile (Purge) if empty
-    // This runs the regex logic over the 3MB file
-    let css = css_compiler::compile_styles(state.db.clone()).await
+    // 2. Compile (Purge) using the correct DB (Prod or Sandbox)
+    let css = css_compiler::compile_styles(db.clone()).await
         .map_err(|e| AppError::UnknownError(e))?;
 
     // 3. Update Cache
@@ -1072,45 +786,4 @@ pub async fn serve_styles(
         .header("Content-Type", "text/css")
         .body(axum::body::Body::from(css))
         .unwrap())
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/admin/dashboard",
-    responses((status = 200, body = DashboardData))
-)]
-pub async fn get_dashboard_stats_handler(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-) -> Result<Json<DashboardData>, AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-
-    let data = state.db.get_dashboard_stats().await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    Ok(Json(data))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/collections/{id}/reindex",
-    responses((status = 200, description = "Reindexing started"))
-)]
-pub async fn reindex_collection_handler(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    // 1. Security Check (Admins Only)
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { 
-        return Err(AppError::Forbidden("Admins only".into())); 
-    }
-
-    // 2. Run Reindex
-    state.db.reindex_collection(id).await
-        .map_err(|e| AppError::UnknownError(format!("Reindex failed: {}", e)))?;
-
-    Ok(Json(serde_json::json!({ "success": true, "message": "Collection re-indexed successfully" })))
 }
