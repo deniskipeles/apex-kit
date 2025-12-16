@@ -13,7 +13,6 @@ use crate::models::{DashboardData, DashboardStats, ChartPoint};
 use chrono::Utc;
 use std::collections::{HashMap, BTreeMap};
 use std::error::Error as StdError;
-use crate::schema::FieldType; 
 
 const COMPOSITE_SEPARATOR: &str = "__::__";
 
@@ -967,6 +966,7 @@ impl Db for TinyBase {
 }
 
 // DUMMY Provider for Core initialization (since Core can't depend on ApexVector)
+#[allow(dead_code)] // Allow dead code on this struct since it's a fallback
 struct NoOpVectorProvider;
 #[async_trait]
 impl VectorProvider for NoOpVectorProvider {

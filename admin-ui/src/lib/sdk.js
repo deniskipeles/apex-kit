@@ -259,9 +259,61 @@ export class PowerBase {
              * @returns {Promise<object>} Status message.
              */
             reloadSystem: () => this._request('/admin/system/reload', { method: 'POST', body: JSON.stringify({}) }),
-            reIndex: (collectionId) => this._request(`/collections/${collectionId}/reindex`, { method: 'POST', body: JSON.stringify({}) }),
+
             /**
-             * Get dashboard data
+             * Re-build the Tantivy search index for a specific collection.
+             * Useful if the index becomes out of sync with the database.
+             * @param {number|string} collectionId - The ID of the collection.
+             * @returns {Promise<object>} Success message.
+             */
+            reIndex: (collectionId) => this._request(`/admin/collections/${collectionId}/reindex`, { method: 'POST', body: JSON.stringify({}) }),
+
+            /**
+             * Trigger a background job to re-generate AI embeddings (vectors) for a collection.
+             * Scans all records and queues embedding generation for fields marked as 'vectorize'.
+             * @param {number|string} collectionId - The ID of the collection.
+             * @returns {Promise<object>} Status message and number of jobs queued.
+             */
+            revectorizeCollection: (collectionId) => this._request(`/admin/collections/${collectionId}/revectorize`, { method: 'POST', body: JSON.stringify({}) }),
+
+            /**
+             * Import data from a File (CSV or JSON).
+             * Automatically infers schema if the collection does not exist.
+             * @param {string} collectionName - The name of the target collection.
+             * @param {File} file - The file object to upload.
+             * @returns {Promise<object>} Import statistics (records imported, collection created status).
+             */
+            importData: (collectionName, file) => {
+                const formData = new FormData();
+                formData.append('collection_name', collectionName);
+                formData.append('file', file);
+                // _request automatically detects FormData and sets headers appropriately
+                return this._request('/admin/import-data', { method: 'POST', body: formData });
+            },
+
+            /**
+             * Export collection data to a downloadable Blob.
+             * @param {number|string} collectionId - The ID of the collection.
+             * @param {'json'|'csv'} [format='json'] - The desired export format.
+             * @returns {Promise<Blob>} The binary blob of the file.
+             */
+            exportData: async (collectionId, format = 'json') => {
+                // Direct fetch is used here to handle Blob response type specifically
+                const url = `${this.baseUrl}/api/v1/admin/export-data/${collectionId}?format=${format}`;
+                const headers = {};
+                if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+                
+                const response = await fetch(url, { method: 'GET', headers });
+                
+                if (!response.ok) {
+                    throw new Error(`Export failed: ${response.statusText}`);
+                }
+                return response.blob();
+            },
+
+            /**
+             * Get dashboard data (stats, charts, logs).
+             * @returns {Promise<object>} Dashboard analytics data.
              */
             getDashboardStats: async () => {
                 return this._request('/admin/dashboard'); 
@@ -395,7 +447,7 @@ export class PowerBase {
              * @param {string} [options.sort] - e.g. "-created"
              * @param {object|string} [options.filter] - e.g. { "status": "active" }
              * @param {string} [options.expand] - e.g. "author,comments"
-             * @returns {Promise<Array<object>>}
+             * @returns {Promise<{items: Array<object>, total: number}>} Object containing items array and total count.
              */
             list: (options = {}) => this._request(`/collections/${collectionId}/records`, { method: 'GET', params: options }),
 
@@ -475,7 +527,30 @@ export class PowerBase {
                         relation_name: relationName
                     }
                 });
-            }
+            },
+            /**
+             * Perform a semantic vector search using a raw float array.
+             * @param {string} field - The field name storing vectors (e.g. "description_vec").
+             * @param {Array<number>} vector - The embedding vector.
+             * @param {number} [limit=10] - Max results.
+             * @returns {Promise<Array<object>>} List of matching records.
+             */
+            searchVector: (field, vector, limit = 10) => this._request(`/collections/${collectionId}/search-vector`, {
+                method: 'POST',
+                body: { field, vector, limit }
+            }),
+
+            /**
+             * Perform a semantic search by converting text to vector on the server.
+             * Automatically aggregates scores if multiple vector fields exist.
+             * @param {string} queryText - The natural language query.
+             * @param {number} [limit=10] - Max results.
+             * @returns {Promise<Array<object>>} List of matching records.
+             */
+            searchTextVector: (queryText, limit = 10) => this._request(`/collections/${collectionId}/search-text-vector`, {
+                method: 'POST',
+                body: { query_text: queryText, limit }
+            }),
         };
     }
 

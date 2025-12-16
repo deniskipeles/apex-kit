@@ -68,27 +68,50 @@ impl FilterNode {
     fn parse_field_condition(field: &str, val: &Value) -> FilterNode {
         if let Value::Object(map) = val {
             // Check for operators: { "age": { "$gt": 18 } }
-            // For simplicity, we take the first operator found. Complex fields should use $and
+            // Supports aliases: { "age": { "_gt": 18 } } or { "age": { "gt": 18 } }
             if let Some((op_key, op_val)) = map.iter().next() {
                 let op = match op_key.as_str() {
-                    "$eq" => FilterOp::Eq,
-                    "$neq" => FilterOp::Neq,
-                    "$gt" => FilterOp::Gt,
-                    "$gte" => FilterOp::Gte,
-                    "$lt" => FilterOp::Lt,
-                    "$lte" => FilterOp::Lte,
-                    "$in" => FilterOp::In,
-                    "$nin" => FilterOp::Nin,
-                    "$like" => FilterOp::Like,
-                    "$contains" => FilterOp::Contains, // Array contains or String contains
-                    _ => return FilterNode::Condition { field: field.to_string(), op: FilterOp::Eq, value: val.clone() } // Treat entire object as equality match
+                    // Equality
+                    "$eq" | "eq" | "_eq" => FilterOp::Eq,
+                    "$neq" | "neq" | "_neq" => FilterOp::Neq,
+                    
+                    // Numeric / Range
+                    "$gt" | "gt" | "_gt" => FilterOp::Gt,
+                    "$gte" | "gte" | "_gte" => FilterOp::Gte,
+                    "$lt" | "lt" | "_lt" => FilterOp::Lt,
+                    "$lte" | "lte" | "_lte" => FilterOp::Lte,
+                    
+                    // Lists
+                    "$in" | "in" | "_in" => FilterOp::In,
+                    "$nin" | "nin" | "_nin" => FilterOp::Nin,
+                    
+                    // String Matching
+                    "$like" | "like" | "_like" => FilterOp::Like,
+                    "$contains" | "contains" | "_contains" => FilterOp::Contains,
+                    
+                    // Default: Treat entire object as a literal equality match
+                    _ => return FilterNode::Condition { 
+                        field: field.to_string(), 
+                        op: FilterOp::Eq, 
+                        value: val.clone() 
+                    }
                 };
-                return FilterNode::Condition { field: field.to_string(), op, value: op_val.clone() };
+                
+                // Return the condition using the detected operator and the INNER value
+                return FilterNode::Condition { 
+                    field: field.to_string(), 
+                    op, 
+                    value: op_val.clone() 
+                };
             }
         }
         
-        // Simple Equality: { "status": "active" }
-        FilterNode::Condition { field: field.to_string(), op: FilterOp::Eq, value: val.clone() }
+        // Handle Primitive Values (Implicit Equality): { "status": "active" }
+        FilterNode::Condition { 
+            field: field.to_string(), 
+            op: FilterOp::Eq, 
+            value: val.clone() 
+        }
     }
 
     // --- SQL GENERATION (For Database Queries) ---

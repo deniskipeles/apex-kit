@@ -56,6 +56,9 @@ pub mod ai_architect;
 pub mod css_compiler;
 pub mod sandbox_manager; 
 pub mod vector_routes;
+pub mod import_data_routes;
+pub mod export_data_routes;
+pub mod cli;
 
 
 
@@ -383,7 +386,14 @@ where
         tinybase_core::ai_models::ChatReq,
         tinybase_core::models::DashboardData,
         tinybase_core::models::DashboardStats,
-        tinybase_core::models::ChartPoint
+        tinybase_core::models::ChartPoint,
+
+        import_data_routes::ImportRequestDto,
+        import_data_routes::ImportResponseDto,
+
+        export_data_routes::ExportQuery,
+        import_data_routes::ImportRequestDto,
+        import_data_routes::ImportResponseDto,
     )),
     tags((name = "Tinybase", description = "Tinybase API"))
 )]
@@ -418,6 +428,8 @@ pub fn app_router(state: AppState) -> Router {
         .route("/admin/users/{id}", axum::routing::delete(delete_user_handler))
         .route("/admin/logs", get(list_audit_logs))
         .route("/admin/dashboard", get(get_dashboard_stats_handler))
+        .route("/admin/import-data", post(import_data_routes::import_data_handler))
+        .route("/admin/export-data/{id}", get(export_data_routes::export_data_handler))
         .route("/admin/collections/{id}/reindex", post(reindex_collection_handler))
         .route("/admin/collections/{id}/revectorize", post(vector_routes::revectorize_collection_handler))
 

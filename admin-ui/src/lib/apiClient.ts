@@ -12,7 +12,7 @@ export const pb = new PowerBase(apiUrl);
 // Load persisted token
 const storedToken = localStorage.getItem(APEX_TOKEN);
 if (storedToken) {
-    pb.setToken(storedToken);
+  pb.setToken(storedToken);
 }
 
 
@@ -39,7 +39,6 @@ const transformCollection = (col: any): Collection => {
               position: def.position,
               vectorize: def.vectorize,
               
-              // Map snake_case (Backend) -> camelCase (Frontend)
               min: def.min,
               max: def.max,
               minLength: def.min_length,
@@ -49,9 +48,9 @@ const transformCollection = (col: any): Collection => {
               mimeTypes: def.mime_types,
               maxSize: def.max_size,
               dimension: def.dimension,
-              relationTo: def.relation_to, // For 'owner' fields
+              relationTo: def.relation_to, 
               
-              originalName: name // Initialize tracking
+              originalName: name 
           };
       });
   }
@@ -63,11 +62,17 @@ const transformCollection = (col: any): Collection => {
               name,
               type: 'relation',
               relationTo: def.target_collection,
-              required: false,
-              originalName: name
+              required: def.required || false,
+              unique: def.relation_type === 'one' ? true : false,
+              originalName: name,
+              position: def.position || 999, 
+              uid: def.uid || "gen_rel"
           });
       });
   }
+
+  // Sort schema array by position to ensure UI renders correctly
+  schemaArray.sort((a, b) => (a.position || 0) - (b.position || 0));
 
   const rules = col.schema?.policies || { read: 'public', create: 'admin', update: 'admin', delete: 'admin' };
   const fieldHistory = col.schema?.field_history || {};
@@ -76,7 +81,7 @@ const transformCollection = (col: any): Collection => {
   return {
       id: col.id.toString(),
       name: col.name,
-      type: col.type || 'base', // Default to 'base' if missing
+      type: col.type || 'base', 
       schema: schemaArray,
       rules: rules,
       fieldHistory: fieldHistory,
@@ -93,7 +98,7 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
       relations: {}, 
       policies: data.rules || {},
       field_history: data.fieldHistory || {},
-
+      composite_unique: data.compositeUnique || []
   };
   
   if (data.schema) {
@@ -101,18 +106,18 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
           const { name } = field;
 
           // CASE 1: RELATION (Explicit Type)
-          // 'relation' type moves to schema.relations
-          // Note: 'owner' stays in fields as it's a value type with validation logic
           if (field.type === 'relation') {
               schema.relations[name] = {
                   target_collection: field.relationTo,
-                  relation_type: 'one' // Default to 'one'
+                  relation_type: field.unique ? 'one' : 'many',
+                  position: field.position,
+                  required: field.required,
+                  uid: field.uid
               };
               return; 
           }
 
           // Prepare Backend Field Definition
-          // Map camelCase (Frontend) -> snake_case (Backend)
           const backendField: any = {
               type: field.type,
               required: field.required,
@@ -123,7 +128,6 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
               position: field.position,
               vectorize: field.vectorize,
               
-              // Validation Props
               min: field.min,
               max: field.max,
               min_length: field.minLength,
@@ -133,15 +137,13 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
               mime_types: field.mimeTypes,
               max_size: field.maxSize,
               dimension: field.dimension,
-              relation_to: field.relationTo // For 'owner' type
+              relation_to: field.relationTo 
           };
 
-          // CASE 2: BOOLEAN MAPPING
           if (backendField.type === 'bool') {
               backendField.type = 'boolean';
           }
           
-          // Cleanup undefined values to keep JSON payload clean
           Object.keys(backendField).forEach(key => backendField[key] === undefined && delete backendField[key]);
 
           schema.fields[name] = backendField;
@@ -154,19 +156,34 @@ export const apiClient = {
   apiUrl: apiUrl,
   stripHtmlTags: pb.utils.stripHtmlTags,
   getAdminDashboardStats: pb.admins.getDashboardStats,
-  reIndex:  async (collectionId?: string) => {
+  searchVector: (collectionId: string | number, field: string, vector: Array<number>, limit?: number) => pb.collection(collectionId).searchVector(field, vector, limit),
+  searchTextVector: (collectionId: string | number, queryText: string, limit?: number) => pb.collection(collectionId).searchTextVector(queryText, limit),
+  reIndex: async (collectionId?: string) => {
     const res = await pb.admins.reIndex(collectionId);
     return res;
   },
+  revectorizeCollection: async (collectionId?: string) => {
+    const res = await pb.admins.revectorizeCollection(collectionId);
+    return res;
+  },
+  importData: async (collectionName: string, file: File) => {
+    const res = await pb.admins.importData(collectionName, file);
+    return res;
+  },
+  exportData: async (collectionId: number | string, format?: "json" | "csv") => {
+    const res = await pb.admins.exportData(collectionId, format);
+    return res;
+  },
+
 
   auth: {
     login: async (email: string, password: string) => {
       const response = await pb.auth.login(email, password);
       localStorage.setItem(APEX_TOKEN, response.token);
       const user = {
-          id: response.user.id.toString(),
-          email: response.user.email,
-          lastActive: new Date().toISOString()
+        id: response.user.id.toString(),
+        email: response.user.email,
+        lastActive: new Date().toISOString()
       };
       return { token: response.token, user };
     },
@@ -176,50 +193,50 @@ export const apiClient = {
       return true;
     }
   },
-  
+
   users: {
     list: async (): Promise<AdminUser[]> => {
-        try {
-            // Call the new Admin API
-            const res = await pb.admins.listUsers();
-            
-            // Map to AdminUser type
-            return res.map((u: any) => ({
-                id: u.id.toString(),
-                email: u.email,
-                lastActive: new Date().toISOString(), // API doesn't track this yet, simulate
-                avatar: '' 
-            }));
-        } catch (e) {
-            console.error("Error fetching users", e);
-            return [];
-        }
+      try {
+        // Call the new Admin API
+        const res = await pb.admins.listUsers();
+
+        // Map to AdminUser type
+        return res.map((u: any) => ({
+          id: u.id.toString(),
+          email: u.email,
+          lastActive: new Date().toISOString(), // API doesn't track this yet, simulate
+          avatar: ''
+        }));
+      } catch (e) {
+        console.error("Error fetching users", e);
+        return [];
+      }
     },
-    create: async(data: Partial<AdminUser>): Promise<AdminUser> => {
-        // Use Auth Register endpoint to create user
-        // Note: We assume a default password if not provided, or require it in UI
-        const password = (data as any).password || 'password123';
-        
-        const res = await pb.auth.register(data.email!, password);
-        
-        return { 
-            id: res.user.id.toString(), 
-            email: res.user.email, 
-            lastActive: new Date().toISOString() 
-        };
+    create: async (data: Partial<AdminUser>): Promise<AdminUser> => {
+      // Use Auth Register endpoint to create user
+      // Note: We assume a default password if not provided, or require it in UI
+      const password = (data as any).password || 'password123';
+
+      const res = await pb.auth.register(data.email!, password);
+
+      return {
+        id: res.user.id.toString(),
+        email: res.user.email,
+        lastActive: new Date().toISOString()
+      };
     },
-    update: async(id: string, data: Partial<AdminUser>): Promise<AdminUser> => {
-        // Backend doesn't have user update yet (e.g. changing email/password as admin)
-        // We return the data to optimistic update the UI so it doesn't crash
-        return { 
-            id, 
-            email: data.email || '', 
-            lastActive: new Date().toISOString(),
-            ...data 
-        } as AdminUser;
+    update: async (id: string, data: Partial<AdminUser>): Promise<AdminUser> => {
+      // Backend doesn't have user update yet (e.g. changing email/password as admin)
+      // We return the data to optimistic update the UI so it doesn't crash
+      return {
+        id,
+        email: data.email || '',
+        lastActive: new Date().toISOString(),
+        ...data
+      } as AdminUser;
     },
-    delete: async(id: string): Promise<void> => {
-        await pb.admins.deleteUser(id);
+    delete: async (id: string): Promise<void> => {
+      await pb.admins.deleteUser(id);
     }
   },
 
@@ -234,22 +251,22 @@ export const apiClient = {
     },
     create: async (data: Partial<Collection>): Promise<Collection> => {
       const backendSchema = transformToBackendSchema(data);
-      if(data.rules) backendSchema.policies = data.rules;
-      if(data.compositeUnique) backendSchema.composite_unique = data.compositeUnique;
-      if(data.fieldHistory) backendSchema.field_history = data.fieldHistory;
-      
+      if (data.rules) backendSchema.policies = data.rules;
+      if (data.compositeUnique) backendSchema.composite_unique = data.compositeUnique;
+      if (data.fieldHistory) backendSchema.field_history = data.fieldHistory;
+
       const res = await pb.admins.createCollection(data.name, backendSchema);
       return transformCollection(res);
     },
     update: async (id: string, data: Partial<Collection>): Promise<Collection> => {
       const payload: any = { name: data.name };
       if (data.schema || data.rules) {
-          payload.schema = transformToBackendSchema(data);
+        payload.schema = transformToBackendSchema(data);
       }
-      if(data.rules) payload.policies = data.rules;
-      if(data.compositeUnique) payload.composite_unique = data.compositeUnique;
-      if(data.fieldHistory) payload.field_history = data.fieldHistory;
-      
+      if (data.rules) payload.policies = data.rules;
+      if (data.compositeUnique) payload.composite_unique = data.compositeUnique;
+      if (data.fieldHistory) payload.field_history = data.fieldHistory;
+
       const res = await pb.admins.updateCollection(id, payload);
       return transformCollection(res);
     },
@@ -260,24 +277,24 @@ export const apiClient = {
 
   records: {
     list: async (collectionId: string, page = 1, perPage = 20, expand = '', filter = {}, sort = '-id'): Promise<{ items: AppRecord[], totalItems: number }> => {
-      
+
       // Pass expand to the SDK list call
-      const result = await pb.collection(collectionId).list({ 
-          page, 
-          per_page: perPage,
-          expand: expand,
-          filter: filter,
-          sort: sort,
+      const result = await pb.collection(collectionId).list({
+        page,
+        per_page: perPage,
+        expand: expand,
+        filter: filter,
+        sort: sort,
       });
-      
+
       const formattedItems = result.items.map((item: any) => ({
-          id: item.id.toString(),
-          collectionId,
-          collectionName: 'unknown', 
-          created: new Date().toISOString(), 
-          updated: new Date().toISOString(),
-          ...item.data,
-          expand: item.expand || {} // Ensure expand object exists
+        id: item.id.toString(),
+        collectionId,
+        collectionName: 'unknown',
+        created: new Date().toISOString(),
+        updated: new Date().toISOString(),
+        ...item.data,
+        expand: item.expand || {} // Ensure expand object exists
       }));
 
       return {
@@ -285,94 +302,94 @@ export const apiClient = {
         totalItems: result.total // Note: Backend needs to update to return count in meta
       };
     },
-    instantSearch: async (collectionId: string|number, query: string): Promise<InstantResult[]> => {
-        if (!query) return [];
-        try {
-          // Call the SDK
-          return await pb.collection(collectionId).instantSearch(query);
-        } catch (e) {
-          console.error("Instant search failed", e);
-          return [];
-        }
+    instantSearch: async (collectionId: string | number, query: string): Promise<InstantResult[]> => {
+      if (!query) return [];
+      try {
+        // Call the SDK
+        return await pb.collection(collectionId).instantSearch(query);
+      } catch (e) {
+        console.error("Instant search failed", e);
+        return [];
+      }
     },
     create: async (collectionId: string, data: any): Promise<AppRecord> => {
       const res = await pb.collection(collectionId).create(data);
       return {
-          id: res.id.toString(),
-          collectionId,
-          collectionName: '',
-          created: new Date().toISOString(),
-          updated: new Date().toISOString(),
-          ...res.data
+        id: res.id.toString(),
+        collectionId,
+        collectionName: '',
+        created: new Date().toISOString(),
+        updated: new Date().toISOString(),
+        ...res.data
       };
     },
     update: async (collectionId: string, id: string, data: any): Promise<AppRecord> => {
       const res = await pb.collection(collectionId).update(id, data);
       return {
-          id: res.id.toString(),
-          collectionId,
-          collectionName: '',
-          created: new Date().toISOString(),
-          updated: new Date().toISOString(),
-          ...res.data
+        id: res.id.toString(),
+        collectionId,
+        collectionName: '',
+        created: new Date().toISOString(),
+        updated: new Date().toISOString(),
+        ...res.data
       };
     },
     getOne: async (collectionId: string, recordId: string, expand = ''): Promise<AppRecord> => {
       const res = await pb.collection(collectionId).get(recordId, { expand: expand });
       return {
-          id: res.id.toString(),
-          collectionId,
-          collectionName: '',
-          created: new Date().toISOString(),
-          updated: new Date().toISOString(),
-          ...res.data,
-          expand: res.expand || {} // Ensure expand object exists
+        id: res.id.toString(),
+        collectionId,
+        collectionName: '',
+        created: new Date().toISOString(),
+        updated: new Date().toISOString(),
+        ...res.data,
+        expand: res.expand || {} // Ensure expand object exists
       };
     },
     delete: async (id: string): Promise<void> => {
-       console.warn("Use recordsService.delete(collectionId, recordId) instead");
+      console.warn("Use recordsService.delete(collectionId, recordId) instead");
     }
   },
-  
+
   files: {
     list: async (page = 1, perPage = 20, search = ''): Promise<{ items: StoredFile[], totalItems: number }> => {
-        try {
-            const res = await pb.files.list(page, perPage);
-            
-            // Map backend response to UI StoredFile type
-            const items = res.items.map((f: any) => ({
-                id: f.id.toString(),
-                name: f.original_name, // Map original_name -> name
-                size: f.size,
-                mimeType: f.mime_type, // Map snake_case -> camelCase
-                url: `${pb.baseUrl}/api/v1/storage/file/${f.filename}`, // Construct public URL
-                created: f.created_at,
-                updated: f.created_at
-            }));
+      try {
+        const res = await pb.files.list(page, perPage);
 
-            return {
-                items,
-                totalItems: res.total || items.length
-            };
-        } catch (e) {
-            console.error("File list error", e);
-            return { items: [], totalItems: 0 };
-        }
+        // Map backend response to UI StoredFile type
+        const items = res.items.map((f: any) => ({
+          id: f.id.toString(),
+          name: f.original_name, // Map original_name -> name
+          size: f.size,
+          mimeType: f.mime_type, // Map snake_case -> camelCase
+          url: `${pb.baseUrl}/api/v1/storage/file/${f.filename}`, // Construct public URL
+          created: f.created_at,
+          updated: f.created_at
+        }));
+
+        return {
+          items,
+          totalItems: res.total || items.length
+        };
+      } catch (e) {
+        console.error("File list error", e);
+        return { items: [], totalItems: 0 };
+      }
     },
     upload: async (file: File): Promise<StoredFile> => {
-        const res = await pb.files.upload(file);
-        return {
-            id: res.id.toString(),
-            name: res.filename, // Note: Upload response might differ slightly, verify backend
-            size: file.size, // Optimistic size
-            mimeType: file.type,
-            url: res.url,
-            created: new Date().toISOString(),
-            updated: new Date().toISOString()
-        };
+      const res = await pb.files.upload(file);
+      return {
+        id: res.id.toString(),
+        name: res.filename, // Note: Upload response might differ slightly, verify backend
+        size: file.size, // Optimistic size
+        mimeType: file.type,
+        url: res.url,
+        created: new Date().toISOString(),
+        updated: new Date().toISOString()
+      };
     },
     delete: async (id: string): Promise<void> => {
-        await pb.files.delete(id);
+      await pb.files.delete(id);
     }
   },
 
@@ -399,9 +416,9 @@ export const apiClient = {
     list: async (): Promise<Template[]> => {
       const res = await pb.templates.list();
       return res.map((t: any) => ({
-          ...t,
-          id: t.id.toString(),
-          script_id: t.script_id ? t.script_id.toString() : null
+        ...t,
+        id: t.id.toString(),
+        script_id: t.script_id ? t.script_id.toString() : null
       }));
     },
     create: async (data: Partial<Template>) => {
@@ -433,19 +450,19 @@ export const apiClient = {
 
   logs: {
     list: async (): Promise<SystemLog[]> => {
-        try {
-            // Fetch from real endpoint
-            const res = await pb.logs.list(); // You need to add listLogs to SDK admin object
-            return res.map((l: any) => ({
-                id: l.id.toString(),
-                level: l.level,
-                message: l.message,
-                source: l.source,
-                timestamp: l.timestamp
-            }));
-        } catch {
-            return [];
-        }
+      try {
+        // Fetch from real endpoint
+        const res = await pb.logs.list(); // You need to add listLogs to SDK admin object
+        return res.map((l: any) => ({
+          id: l.id.toString(),
+          level: l.level,
+          message: l.message,
+          source: l.source,
+          timestamp: l.timestamp
+        }));
+      } catch {
+        return [];
+      }
     }
   }
 };

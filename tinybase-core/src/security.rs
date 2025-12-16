@@ -28,6 +28,10 @@ impl MasterKey {
         key.zeroize(); 
         encoded
     }
+
+    pub fn generate_random_password() -> String {
+        uuid::Uuid::new_v4().to_string().chars().take(16).collect()
+    }
 }
 
 #[derive(Serialize, Deserialize)]

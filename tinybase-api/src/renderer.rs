@@ -2,7 +2,7 @@
 use axum::{
     extract::{Path, State, Query},
     response::{Html, IntoResponse, Response},
-    http::{HeaderMap, StatusCode}, 
+    http::{HeaderMap}, 
 };
 use serde_json::{json, Value};
 use tera::{Tera, Context, Function}; 
@@ -10,7 +10,7 @@ use crate::{AppState, AppError, DatabaseConnection};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tinybase_core::Db;
-use tracing::{warn, error, info};
+use tracing::{warn, info};
 
 // --- HELPERS ---
 fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
@@ -158,7 +158,7 @@ async fn render_view_core(
     register_helpers(&mut tera);
 
     // --- ROBUST TEMPLATE LOADING (Multi-Pass) ---
-    let mut template_vec: Vec<(String, String)> = all_templates.iter()
+    let template_vec: Vec<(String, String)> = all_templates.iter()
         .map(|t| (t.slug.clone(), t.content.clone()))
         .collect();
     

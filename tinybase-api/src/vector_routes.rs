@@ -2,9 +2,10 @@ use axum::{
     extract::{Path, State, Json},
     Extension,
 };
-use serde::{Deserialize, Serialize};
-use tinybase_core::{auth::Claims, models::Record, jobs::Job}; // Import Job
+use serde::{ Deserialize };
+use tinybase_core::{auth::Claims, jobs::Job}; // Import Job
 use crate::{AppState, AppError, RecordResponse};
+use std::collections::HashMap;
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct VectorSearchReq {

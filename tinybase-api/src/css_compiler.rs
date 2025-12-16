@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::collections::HashSet;
 use tinybase_core::Db;
 use regex::Regex;
-use tracing::{info, error, debug};
+use tracing::{info, error };
 use std::time::Instant;
 
 // Embed the CSS.

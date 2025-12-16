@@ -3,17 +3,16 @@ use axum::{
     extract::{Path, State, Json},
     Extension,
 };
-use serde::{Deserialize};
 use serde_json::{json, Value};
 use tinybase_core::{
     auth::Claims,
     models::{AppManifest, CreateTemplateReq},
-    script_models::{self, CreateScriptReq},
+    script_models::{self},
     ai_models::{AiSession, ChatMessage, CreateSessionReq, ChatReq, Plugin},
     Db, // Import Db trait
 };
 use crate::{AppState, AppError, sandbox_manager::SandboxManager};
-use tracing::{info, error, debug, warn};
+use tracing::{info, error, warn};
 use std::sync::Arc;
 
 // --- DOCS & KNOWLEDGE BASE ---
@@ -170,6 +169,7 @@ fn get_docs() -> String {
 }
 
 // --- 1. START SESSION ---
+// --- 1. START SESSION ---
 #[utoipa::path(
     post, 
     path = "/api/v1/ai/sessions", 
@@ -203,8 +203,8 @@ pub async fn start_session(
 
     // 3. If prompt exists, run it against SANDBOX
     if let Some(prompt) = req.initial_prompt {
-        // use_sandbox = true
-        return chat_handler(id, prompt, None, state, true).await;
+        // PASS THE MODEL FROM THE REQUEST
+        return chat_handler(id, prompt, req.model, state, true).await;
     }
 
     Ok(Json(session))
@@ -224,8 +224,9 @@ pub async fn continue_chat(
     Json(req): Json<ChatReq>,
 ) -> Result<Json<AiSession>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    // Always use sandbox for iterative chat
-    chat_handler(id, req.prompt, None, state, true).await
+    
+    // PASS THE MODEL FROM THE REQUEST
+    chat_handler(id, req.prompt, req.model, state, true).await
 }
 
 // --- 3. EXPORT AS PLUGIN (COMMIT) ---

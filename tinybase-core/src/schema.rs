@@ -5,7 +5,7 @@ use utoipa::ToSchema;
 use rand::Rng;
 
 // Helper to generate Hex ID
-fn generate_hex_id() -> String {
+pub fn generate_hex_id() -> String {
     let mut rng = rand::thread_rng();
     format!("{:x}", rng.gen::<u32>())
 }
@@ -35,6 +35,12 @@ pub struct CollectionSchema {
 pub struct RelationDefinition {
     pub target_collection: String,
     pub relation_type: RelationType,
+    #[serde(default)]
+    pub position: i32,
+    #[serde(default = "generate_hex_id")]
+    pub uid: String,
+    #[serde(default)]
+    pub required: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema, PartialEq)]

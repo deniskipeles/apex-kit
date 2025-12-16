@@ -246,7 +246,7 @@ pub async fn edit_code(
     // 1. Get Config
     // Reuse the get_ai_config logic or duplicate it here for now
     let ai_settings = state.db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let (api_key, model) = match ai_settings {
+    let (api_key, _model) = match ai_settings {
         Some(val) => {
             let conf: crate::settings::AiConfigDto = serde_json::from_value(val).unwrap_or_default();
             if !conf.enabled { return Err(AppError::Forbidden("AI disabled".into())); }
