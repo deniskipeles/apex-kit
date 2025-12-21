@@ -140,7 +140,7 @@ async fn render_view_core(
     if let Some(script_id) = target_template.script_id {
         let scripts = db.list_scripts().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         if let Some(script) = scripts.into_iter().find(|s| s.id == script_id) {
-            let script_res = state.script_engine.run_script(&script.code, context_data.clone(), db.clone(), state.embedder.clone(), state.vector_provider.clone())
+            let script_res = state.script_engine.run_script(&script.code, context_data.clone(), db.clone(), state.embedder.clone(), state.vector_provider.clone(),  state.vault.clone())
                 .await.map_err(|e| AppError::UnknownError(format!("Script Error: {}", e)))?;
             merge_json(&mut context_data, script_res);
         }

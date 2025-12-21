@@ -1,7 +1,9 @@
-
 import React, { useEffect, useState } from 'react';
-import { Save, Loader2, Settings as SettingsIcon, Shield, Database, BrainCircuit, HardDrive, Key } from 'lucide-react';
-import { Button } from '../../../components/ui/Elements';
+import { 
+    Save, Loader2, Settings as SettingsIcon, Shield, Database, 
+    BrainCircuit, HardDrive, Key, BellRing, Monitor
+} from 'lucide-react';
+import { Button, Card, CardHeader, CardTitle, CardContent } from '../../../components/ui/Elements';
 import { GeneralSettings } from '../components/GeneralSettings';
 import { SecuritySettings } from '../components/SecuritySettings';
 import { StorageSettings } from '../components/StorageSettings';
@@ -53,49 +55,86 @@ export const SettingsPage = () => {
       setSettings(prev => prev ? ({ ...prev, ...updates }) : null);
   };
 
-  if (isLoading || !settings) return <div className="flex justify-center p-12"><Loader2 className="animate-spin h-8 w-8 text-primary" /></div>;
-
-  const tabs: { id: Tab; label: string; icon: any }[] = [
-      { id: 'general', label: 'General', icon: SettingsIcon },
-      { id: 'security', label: 'Security', icon: Shield },
-      { id: 'storage', label: 'Storage', icon: HardDrive },
-      { id: 'ai', label: 'AI', icon: BrainCircuit },
-      { id: 'backups', label: 'System & Backups', icon: Database },
-      { id: 'tokens', label: 'API Keys', icon: Key },
+  const tabs: { id: Tab; label: string; icon: any; desc: string }[] = [
+      { id: 'general', label: 'General', icon: SettingsIcon, desc: 'App identity and branding' },
+      { id: 'security', label: 'Security', icon: Shield, desc: 'Access control and CORS' },
+      { id: 'storage', label: 'Storage', icon: HardDrive, desc: 'File uploads and S3' },
+      { id: 'ai', label: 'AI Engine', icon: BrainCircuit, desc: 'LLM providers and keys' },
+      { id: 'backups', label: 'System', icon: Database, desc: 'Backups and cron jobs' },
+      { id: 'tokens', label: 'API Keys', icon: Key, desc: 'Manage access tokens' },
   ];
 
+  if (isLoading || !settings) {
+      return (
+          <div className="flex h-[calc(100vh-100px)] items-center justify-center">
+              <Loader2 className="animate-spin h-8 w-8 text-primary/50" />
+          </div>
+      );
+  }
+
   return (
-    <div className="space-y-6 pb-20">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <div className="flex flex-col h-full max-w-7xl mx-auto space-y-6 pb-20">
+        
+        {/* Page Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 border-b border-border/50 pb-6">
             <div>
-                <h2 className="text-3xl font-bold tracking-tight">Settings</h2>
-                <p className="text-muted-foreground">Manage application configuration.</p>
+                <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
+                    <SettingsIcon className="h-8 w-8 text-primary" /> Settings
+                </h1>
+                <p className="text-muted-foreground mt-1">Manage your application configuration and preferences.</p>
             </div>
-            <Button onClick={handleSave} isLoading={isSaving}>
+            <Button onClick={handleSave} isLoading={isSaving} className="shadow-lg hover:shadow-primary/20 transition-all">
                 <Save className="mr-2 h-4 w-4" /> Save Changes
             </Button>
         </div>
 
-        <div className="flex space-x-1 rounded-xl bg-secondary/20 p-1 overflow-x-auto">
-            {tabs.map(tab => (
-                <button 
-                    key={tab.id}
-                    className={`flex items-center gap-2 whitespace-nowrap px-4 rounded-lg py-2.5 text-sm font-medium leading-5 transition-all ${activeTab === tab.id ? 'bg-background shadow text-primary' : 'text-muted-foreground hover:bg-white/[0.12] hover:text-white'}`}
-                    onClick={() => setActiveTab(tab.id)}
-                >
-                    <tab.icon className="h-4 w-4" />
-                    {tab.label}
-                </button>
-            ))}
-        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+            
+            {/* Sidebar Navigation */}
+            <div className="lg:col-span-3 space-y-1 overflow-x-auto lg:overflow-visible flex lg:flex-col gap-1 lg:gap-1 pb-2 lg:pb-0 sticky top-4">
+                {tabs.map(tab => {
+                    const isActive = activeTab === tab.id;
+                    const Icon = tab.icon;
+                    return (
+                        <button 
+                            key={tab.id}
+                            onClick={() => setActiveTab(tab.id)}
+                            className={`
+                                flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all w-full text-left whitespace-nowrap lg:whitespace-normal
+                                ${isActive 
+                                    ? 'bg-primary text-primary-foreground shadow-md' 
+                                    : 'text-muted-foreground hover:bg-secondary/50 hover:text-foreground'
+                                }
+                            `}
+                        >
+                            <Icon className={`h-5 w-5 shrink-0 ${isActive ? 'text-primary-foreground' : 'text-muted-foreground/70'}`} />
+                            <div className="flex flex-col">
+                                <span>{tab.label}</span>
+                                {isActive && <span className="text-[10px] opacity-90 font-normal hidden lg:block">{tab.desc}</span>}
+                            </div>
+                        </button>
+                    );
+                })}
+            </div>
 
-        <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
-            {activeTab === 'general' && <GeneralSettings settings={settings} onChange={updateLocalSettings} />}
-            {activeTab === 'security' && <SecuritySettings settings={settings} onChange={updateLocalSettings} />}
-            {activeTab === 'storage' && <StorageSettings settings={settings} onChange={updateLocalSettings} />}
-            {activeTab === 'backups' && <BackupSettings settings={settings} onChange={updateLocalSettings} />}
-            {activeTab === 'tokens' && <TokenSettings settings={settings} onChange={updateLocalSettings} />}
-            {activeTab === 'ai' && <AiSettings settings={settings} onChange={updateLocalSettings} />}
+            {/* Main Content Area */}
+            <div className="lg:col-span-9 space-y-6 min-h-[500px]">
+                {/* Mobile Helper Title */}
+                <div className="lg:hidden font-semibold text-lg flex items-center gap-2 mb-2 px-1">
+                    {tabs.find(t => t.id === activeTab)?.icon && React.createElement(tabs.find(t => t.id === activeTab)!.icon, { className: "h-5 w-5 text-primary" })}
+                    {tabs.find(t => t.id === activeTab)?.label}
+                </div>
+
+                <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
+                    {activeTab === 'general' && <GeneralSettings settings={settings} onChange={updateLocalSettings} />}
+                    {activeTab === 'security' && <SecuritySettings settings={settings} onChange={updateLocalSettings} />}
+                    {activeTab === 'storage' && <StorageSettings settings={settings} onChange={updateLocalSettings} />}
+                    {activeTab === 'backups' && <BackupSettings settings={settings} onChange={updateLocalSettings} />}
+                    {activeTab === 'tokens' && <TokenSettings settings={settings} onChange={updateLocalSettings} />}
+                    {activeTab === 'ai' && <AiSettings settings={settings} onChange={updateLocalSettings} />}
+                </div>
+            </div>
+
         </div>
     </div>
   );

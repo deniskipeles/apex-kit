@@ -5,6 +5,7 @@ import { Dialog } from '../../../components/ui/Dialog';
 import { Template, Script } from '../../../types';
 import { scriptsService } from '../../scripts/services/scriptsService';
 import { AiCodeAssistant } from '../../ai/components/AiCodeAssistant';
+import { CodeEditor } from '../../../components/form/CodeEditor'; // Import Monaco Editor
 
 interface TemplateEditorProps {
   isOpen: boolean;
@@ -42,9 +43,11 @@ export const TemplateEditor = ({ isOpen, onClose, onSave, initialData }: Templat
 
   return (
     <Dialog isOpen={isOpen} onClose={onClose} title={initialData ? 'Edit Template' : 'New Template'} size="xl">
-      <div className="flex flex-col h-[80vh]">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-            <div className="space-y-4">
+      <div className="flex flex-col h-[85vh]">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6 h-full overflow-hidden">
+            
+            {/* Sidebar Settings */}
+            <div className="space-y-4 overflow-y-auto pr-2">
                 <div className="space-y-2">
                     <Label>Slug (URL Path)</Label>
                     <Input 
@@ -70,25 +73,35 @@ export const TemplateEditor = ({ isOpen, onClose, onSave, initialData }: Templat
                     </Select>
                     <p className="text-[10px] text-muted-foreground">Script output will be available as variables.</p>
                 </div>
+
+                 <div className="pt-4 border-t border-border">
+                    <Label className="mb-2 block">AI Assistant</Label>
+                    <AiCodeAssistant 
+                        currentCode={formData.content || ''}
+                        contextType="template"
+                        onApply={(code) => setFormData({ ...formData, content: code })}
+                    />
+                </div>
             </div>
 
-            <div className="md:col-span-2 flex flex-col h-full">
+            {/* Editor Area */}
+            <div className="md:col-span-2 flex flex-col h-full border-l border-border pl-0 md:pl-6">
                 <div className="flex items-center justify-between mb-2">
                     <Label className="flex items-center gap-2"><Code className="h-4 w-4"/> HTML / Tera Template</Label>
-                    <div className="w-64">
-                        <AiCodeAssistant 
-                            currentCode={formData.content || ''}
-                            contextType="template"
-                            onApply={(code) => setFormData({ ...formData, content: code })}
-                        />
+                    <div className="text-[10px] text-muted-foreground font-mono">
+                         Supported: HTML5, Tailwind, HTMX, Tera Syntax
                     </div>
                 </div>
-                <textarea 
-                    className="flex-1 w-full bg-[#1e1e1e] text-[#d4d4d4] font-mono text-sm p-4 rounded-md border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-none leading-relaxed"
-                    value={formData.content}
-                    onChange={(e) => setFormData({...formData, content: e.target.value})}
-                    spellCheck={false}
-                />
+                
+                <div className="flex-1 min-h-[400px]">
+                    <CodeEditor 
+                        value={formData.content || ''}
+                        onChange={(val) => setFormData({...formData, content: val})}
+                        language="html"
+                        height="100%"
+                        label="TEMPLATE CODE"
+                    />
+                </div>
             </div>
         </div>
 

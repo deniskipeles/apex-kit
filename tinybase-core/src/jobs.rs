@@ -1,9 +1,11 @@
+// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/jobs.rs ===========================
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use lettre::{Message, SmtpTransport, Transport};
 use lettre::transport::smtp::authentication::Credentials;
 use std::sync::Arc;
-use crate::{Db, VectorProvider, security::{ Vault, EncryptedValue }};
+use crate::{Db, VectorProvider, security::{ Vault, EncryptedValue }, schema::CollectionSchema};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Job {
@@ -11,6 +13,7 @@ pub enum Job {
     SendPasswordReset { email: String, token: String },
     SendVerification { email: String, token: String },
     ProcessImage { record_id: i64 },
+    
     // --- Vectorization Job ---
     GenerateEmbedding { 
         collection_id: i64, 
@@ -18,6 +21,19 @@ pub enum Job {
         field_name: String, 
         text_content: String 
     },
+
+    // --- Async Search Indexing (High Throughput) ---
+    IndexRecord {
+        collection_id: i64,
+        record_id: i64,
+        data: Value,
+        schema: CollectionSchema
+    },
+    
+    DeleteFromIndex {
+        collection_id: i64,
+        record_id: i64
+    }
 }
 
 #[derive(Clone)]
@@ -31,6 +47,8 @@ impl JobQueue {
     }
 
     pub async fn enqueue(&self, job: Job) {
+        // We use a larger buffer in the channel, but if it's full, 
+        // we log an error rather than crashing or blocking indefinitely in critical paths.
         if let Err(e) = self.sender.send(job).await {
             eprintln!("Failed to enqueue job: {}", e);
         }
@@ -43,78 +61,93 @@ pub fn start_background_worker(
     vector_provider: Arc<dyn VectorProvider>,
     vault: Arc<Vault>,
 ) -> JobQueue {
-    let (tx, mut rx) = mpsc::channel(100);
+    // Increased buffer size to handle bursts of write requests (e.g. imports)
+    let (tx, mut rx) = mpsc::channel(1000);
 
     tokio::spawn(async move {
         println!("Background worker started...");
+        
         while let Some(job) = rx.recv().await {
-            // Clone db for async job task
             let db_clone = db.clone(); 
             let vault_clone = vault.clone();
-            match job {
-                Job::SendWelcomeEmail { email, .. } => {
-                    // Pass DB and Vault
-                    send_email(db_clone, vault_clone, &email, "Welcome to TinyBase!", "Thanks for signing up!").await;
-                }
-                Job::SendPasswordReset { email, token } => {
-                    let body = format!("Click here to reset your password: http://localhost:5000/reset-password?token={}", token);
-                    send_email(db_clone, vault_clone, &email, "Reset Password", &body).await;
-                }
-                Job::SendVerification { email, token } => {
-                    let body = format!("Verify your email: http://localhost:5000/verify?token={}", token);
-                    send_email(db_clone, vault_clone, &email, "Verify Email", &body).await;
-                }
-                // --- Logic for Vector Generation ---
-                Job::GenerateEmbedding { collection_id, record_id, field_name, text_content } => {
-                    println!("[Job] Processing vector for {}.{} (Record {})", collection_id, field_name, record_id);
-                    
-                    // 1. Generate Embedding (Calls Candle or API)
-                    match vector_provider.embed(&text_content).await {
-                        Ok(vec) => {
-                            // 2. Index the result (In-Memory HNSW)
-                            if let Err(e) = vector_provider.index(collection_id, record_id, &field_name, &vec).await {
-                                eprintln!("[Job] Failed to index vector to HNSW: {}", e);
-                            } else {
-                                println!("[Job] HNSW Index updated successfully.");
+            let vector_provider = vector_provider.clone();
+
+            // Spawn a new task for each job to ensure concurrency.
+            // If one email takes 2 seconds, it shouldn't block indexing.
+            tokio::spawn(async move {
+                match job {
+                    // --- Email Jobs ---
+                    Job::SendWelcomeEmail { email, .. } => {
+                        send_email(db_clone, vault_clone, &email, "Welcome to TinyBase!", "Thanks for signing up!").await;
+                    }
+                    Job::SendPasswordReset { email, token } => {
+                        let body = format!("Click here to reset your password: http://localhost:5000/reset-password?token={}", token);
+                        send_email(db_clone, vault_clone, &email, "Reset Password", &body).await;
+                    }
+                    Job::SendVerification { email, token } => {
+                        let body = format!("Verify your email: http://localhost:5000/verify?token={}", token);
+                        send_email(db_clone, vault_clone, &email, "Verify Email", &body).await;
+                    }
+
+                    // --- Vector Generation ---
+                    Job::GenerateEmbedding { collection_id, record_id, field_name, text_content } => {
+                        // println!("[Job] Processing vector for {}.{} (Record {})", collection_id, field_name, record_id);
+                        
+                        match vector_provider.embed(&text_content).await {
+                            Ok(vec) => {
+                                // 1. Index in HNSW (Memory)
+                                if let Err(e) = vector_provider.index(collection_id, record_id, &field_name, &vec).await {
+                                    eprintln!("[Job] Failed to index vector to HNSW: {}", e);
+                                }
+                                
+                                // 2. Persist to DB
+                                if let Err(e) = db_clone.save_vector(collection_id, record_id, &field_name, vec).await {
+                                    eprintln!("[Job] Failed to persist vector to DB: {}", e);
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("[Job] Failed to generate embedding: {}", e);
                             }
-                            
-                            // 3. PERSIST THE VECTOR TO DATABASE
-                            if let Err(e) = db_clone.save_vector(collection_id, record_id, &field_name, vec).await {
-                                eprintln!("[Job] Failed to persist vector to DB: {}", e);
-                            } else {
-                                println!("[Job] Vector persisted to DB successfully.");
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("[Job] Failed to generate embedding: {}", e);
                         }
                     }
+
+                    // --- Search Indexing (Tantivy) ---
+                    Job::IndexRecord { collection_id, record_id, data, schema } => {
+                        if let Err(e) = db_clone.index_record_search(collection_id, record_id, &data, &schema).await {
+                            eprintln!("[Job] Search Indexing failed for {}: {}", record_id, e);
+                        }
+                    }
+
+                    Job::DeleteFromIndex { collection_id, record_id } => {
+                        if let Err(e) = db_clone.delete_record_search(collection_id, record_id).await {
+                            eprintln!("[Job] Search Index Deletion failed for {}: {}", record_id, e);
+                        }
+                    }
+
+                    _ => {} // Handle others
                 }
-                _ => {} // Handle others
-            }
+            });
         }
     });
 
     JobQueue::new(tx)
 }
 
-// --- SMTP CONFIG STRUCT (Minimal internal definition) ---
+// --- SMTP CONFIG STRUCT ---
 #[derive(Debug, Deserialize)]
 struct SmtpSettings {
     enabled: bool,
     host: String,
     port: u16,
     username: Option<String>,
-    password: Option<String>, // This holds the encrypted string
+    password: Option<String>, 
     from_email: String,
 }
 
 async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str, body: &str) {
-    // 1. Fetch SMTP configuration from DB
     let settings_val = db.get_setting("smtp").await.unwrap_or(None);
     
     let settings: SmtpSettings = if let Some(val) = settings_val {
-        // Fallback or default values needed here if deserialization fails
         serde_json::from_value(val).unwrap_or_else(|_| SmtpSettings { 
             enabled: false, 
             host: "".into(), 
@@ -133,7 +166,6 @@ async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str,
         return;
     }
 
-    // 2. Decrypt Password
     let decrypted_password = if let Some(encrypted_str) = settings.password {
         match serde_json::from_str::<EncryptedValue>(&encrypted_str) {
             Ok(enc_val) => match vault.decrypt(&enc_val) {
@@ -144,7 +176,6 @@ async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str,
                 }
             },
             Err(e) => {
-                // If it's not a JSON object, assume it's an old raw password (unlikely but safe check)
                 eprintln!("Failed to deserialize encrypted password: {}", e);
                 None 
             }
@@ -153,7 +184,6 @@ async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str,
         None
     };
     
-    // 3. Configure Mailer
     let from_address = format!("{} <{}>", settings.from_email, settings.from_email);
 
     let email = Message::builder()
@@ -172,7 +202,6 @@ async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str,
         ))
         .build();
 
-    // 4. Send Email
     match mailer.send(&email) {
         Ok(_) => println!("[SMTP] Email sent to {}", to),
         Err(e) => eprintln!("[SMTP] Could not send email: {}", e),

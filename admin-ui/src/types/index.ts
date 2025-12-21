@@ -13,6 +13,7 @@ export interface Script {
     name: string;
     trigger_type: 'manual' | 'before_create' | 'after_create' | 'before_update' | 'after_update' | 'before_delete' | 'after_delete' | 'cron';
     code: string;
+    target_collection: string;
     active: boolean;
 }
 

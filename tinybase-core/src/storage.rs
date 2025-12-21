@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/storage.rs start here ===========================
 use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::fs;
@@ -146,4 +145,3 @@ impl StorageBackend for S3Storage {
         self.public_url.clone()
     }
 }
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-core/src/storage.rs ends here ===========================

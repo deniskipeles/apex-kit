@@ -1,17 +1,16 @@
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-api/src/websocket.rs ===========================
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
     response::IntoResponse,
+    Extension,
 };
 use serde::Deserialize;
-use tinybase_core::{realtime::DbEvent, filter::FilterNode};
+use tinybase_core::{realtime::{DbEvent, EventScope}, filter::FilterNode};
 use crate::AppState;
-// These imports will now work because 'futures' is in Cargo.toml
 use futures::{sink::SinkExt, stream::StreamExt}; 
-use tracing::{info, warn};
+use tracing::{warn};
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct SubscriptionFilter {
@@ -32,17 +31,21 @@ pub enum ClientMessage {
 pub async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    // Extract scope injected by middleware (Tenant/Sandbox/Root)
+    scope: Option<Extension<EventScope>>, 
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+    let client_scope = scope.map(|e| e.0).unwrap_or_default();
+    ws.on_upgrade(move |socket| handle_socket(socket, state, client_scope))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
-    // .split() comes from StreamExt trait
+async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventScope) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = state.tx.subscribe();
 
     let mut current_filter = SubscriptionFilter::default();
     let mut current_filter_node = FilterNode::Empty;
+    
+    // info!("WS Connected. Scope: {:?}", client_scope);
 
     loop {
         tokio::select! {
@@ -54,7 +57,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Message::Text(text) => {
                                 match serde_json::from_str::<ClientMessage>(&text) {
                                     Ok(ClientMessage::Subscribe(filter)) => {
-                                        info!("WS Subscribed: {:?}", filter);
+                                        // info!("WS Subscribed: {:?}", filter);
                                         if let Some(json) = &filter.filter {
                                             current_filter_node = FilterNode::parse(json);
                                         } else {
@@ -63,7 +66,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         current_filter = filter;
                                     },
                                     Ok(ClientMessage::Unsubscribe) => {
-                                        info!("WS Unsubscribed");
                                         current_filter = SubscriptionFilter::default();
                                         current_filter_node = FilterNode::Empty;
                                     },
@@ -87,7 +89,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
             // 2. Broadcast Events
             Ok(event) = rx.recv() => {
-                if matches_filter(&event, &current_filter, &current_filter_node) {
+                // Critical: Check Isolation Scope FIRST
+                if matches_scope(&event, &client_scope) && matches_filter(&event, &current_filter, &current_filter_node) {
                     if let Ok(json_msg) = serde_json::to_string(&event) {
                         if sender.send(Message::Text(json_msg.into())).await.is_err() {
                             break; 
@@ -99,15 +102,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 }
 
+fn matches_scope(event: &DbEvent, client_scope: &EventScope) -> bool {
+    let event_scope = match event {
+        DbEvent::Insert { scope, .. } => scope,
+        DbEvent::Update { scope, .. } => scope,
+        DbEvent::Delete { scope, .. } => scope,
+    };
+    event_scope == client_scope
+}
+
 fn matches_filter(
     event: &DbEvent, 
     filter: &SubscriptionFilter, 
     filter_node: &FilterNode
 ) -> bool {
     let (col_id, rec_id, type_str, event_data) = match event {
-        DbEvent::Insert { collection_id, record_id, data } => (*collection_id, *record_id, "Insert", Some(data)),
-        DbEvent::Update { collection_id, record_id, data } => (*collection_id, *record_id, "Update", Some(data)),
-        DbEvent::Delete { collection_id, record_id } => (*collection_id, *record_id, "Delete", None),
+        DbEvent::Insert { collection_id, record_id, data, .. } => (*collection_id, *record_id, "Insert", Some(data)),
+        DbEvent::Update { collection_id, record_id, data, .. } => (*collection_id, *record_id, "Update", Some(data)),
+        DbEvent::Delete { collection_id, record_id, .. } => (*collection_id, *record_id, "Delete", None),
     };
 
     if let Some(req_col) = filter.collection_id {

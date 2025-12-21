@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Play, Trash2, Code, Zap } from 'lucide-react';
+import { Plus, Play, Trash2, Code, Zap, Database } from 'lucide-react';
 import { Button, Badge } from '../../../components/ui/Elements';
 import { DataGrid } from '../../../components/data/DataGrid';
 import { ScriptEditor } from '../components/ScriptEditor';
@@ -35,7 +35,7 @@ export const ScriptsPage = () => {
 
   const handleCreate = async (data: Partial<Script>) => {
       await scriptsService.create(data);
-      toast('Script created', 'success');
+      toast('Script saved successfully', 'success');
       loadScripts();
   };
 
@@ -53,25 +53,41 @@ export const ScriptsPage = () => {
           renderCell: (s: Script) => (
               <div className="flex flex-col">
                   <span className="font-medium text-primary font-mono">{s.name}</span>
-                  <span className="text-[10px] text-muted-foreground truncate max-w-[200px]">/api/v1/run/{s.name}</span>
+                  {s.trigger_type === 'manual' && <span className="text-[10px] text-muted-foreground truncate max-w-[200px]">/api/v1/run/{s.name}</span>}
               </div>
           ) 
       },
       { 
-          field: 'trigger_type', headerName: 'Trigger', width: '150px',
-          renderCell: (s: Script) => <Badge variant="outline" className="uppercase text-[10px]">{s.trigger_type}</Badge>
-      },
-      { 
-          field: 'active', headerName: 'Status', width: '100px',
-          renderCell: (s: Script) => s.active ? <span className="text-xs text-emerald-500 font-medium">Active</span> : <span className="text-xs text-muted-foreground">Disabled</span>
+          field: 'trigger_type', headerName: 'Trigger', width: '140px',
+          renderCell: (s: Script) => (
+              <Badge variant="outline" className={`uppercase text-[10px] ${s.trigger_type === 'manual' ? 'border-blue-500/30 text-blue-500' : 'border-orange-500/30 text-orange-500'}`}>
+                  {s.trigger_type.replace('_', ' ')}
+              </Badge>
+          )
       },
       {
-          field: 'actions', headerName: '', align: 'right' as const, width: '150px',
+          field: 'target_collection', headerName: 'Target', width: '120px',
+          renderCell: (s: Script) => s.target_collection ? (
+              <span className="flex items-center gap-1 text-xs text-foreground/80 bg-secondary/30 px-2 py-1 rounded">
+                  <Database className="h-3 w-3 opacity-50" /> {s.target_collection}
+              </span>
+          ) : (
+              <span className="text-muted-foreground text-xs opacity-50">-</span>
+          )
+      },
+      { 
+          field: 'active', headerName: 'Status', width: '90px',
+          renderCell: (s: Script) => s.active ? <span className="text-xs text-emerald-500 font-medium flex items-center gap-1"><Zap className="h-3 w-3" /> Active</span> : <span className="text-xs text-muted-foreground">Disabled</span>
+      },
+      {
+          field: 'actions', headerName: '', align: 'right' as const, width: '120px',
           renderCell: (s: Script) => (
               <div className="flex justify-end gap-1">
-                  <Button size="icon" variant="ghost" onClick={(e) => { e.stopPropagation(); setSelectedScript(s); setTesterOpen(true); }} title="Test Run">
-                      <Play className="h-4 w-4 text-emerald-500" />
-                  </Button>
+                  {s.trigger_type === 'manual' && (
+                      <Button size="icon" variant="ghost" onClick={(e) => { e.stopPropagation(); setSelectedScript(s); setTesterOpen(true); }} title="Test Run">
+                          <Play className="h-4 w-4 text-emerald-500" />
+                      </Button>
+                  )}
                   <Button size="icon" variant="ghost" onClick={(e) => { e.stopPropagation(); setScriptToDelete(s); }}>
                       <Trash2 className="h-4 w-4 text-muted-foreground hover:text-destructive" />
                   </Button>
@@ -85,7 +101,7 @@ export const ScriptsPage = () => {
         <div className="flex items-center justify-between">
             <div>
                 <h2 className="text-3xl font-bold tracking-tight">Scripting</h2>
-                <p className="text-muted-foreground">Custom server-side logic and API endpoints.</p>
+                <p className="text-muted-foreground">Custom server-side logic, endpoints, and event hooks.</p>
             </div>
             <Button onClick={() => { setSelectedScript(null); setEditorOpen(true); }}>
                 <Plus className="mr-2 h-4 w-4" /> New Script
@@ -97,7 +113,7 @@ export const ScriptsPage = () => {
             columns={columns} 
             keyField="id" 
             isLoading={isLoading}
-            onRowClick={(s) => { setSelectedScript(s); setEditorOpen(true); }} // Re-open editor on click (read-only mode logic needs to be handled if desired)
+            onRowClick={(s) => { setSelectedScript(s); setEditorOpen(true); }} 
         />
 
         {/* Editor Modal */}

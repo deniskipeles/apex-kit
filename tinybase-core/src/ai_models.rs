@@ -26,16 +26,25 @@ use crate::models::AppManifest;
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct AiSession {
-    pub id: String, // UUID
-    pub name: String, // "Todo App Project"
+    pub id: String, 
+    pub name: String, 
     pub messages: Vec<ChatMessage>,
     pub current_manifest: Option<AppManifest>,
+    
+    // --- NEW FIELDS FOR INTERACTIVE FLOW ---
+    #[serde(default)]
+    pub pending_manifest: Option<AppManifest>, // The draft code waiting for approval
+    #[serde(default)]
+    pub diff_summary: Option<String>,          // Human readable diff (e.g. "+ Collection: posts")
+    #[serde(default)]
+    pub last_error: Option<String>,            // If generation failed, show here instead of crashing
+    
     pub created_at: String,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ChatMessage {
-    pub role: String, // "user" | "assistant" | "system"
+    pub role: String, // "user" | "assistant" | "system" | "error"
     pub content: String,
 }
 

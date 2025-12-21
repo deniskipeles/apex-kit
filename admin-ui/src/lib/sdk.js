@@ -16,6 +16,43 @@ export class PowerBase {
     }
 
     /**
+     * Creates a new client instance pointed at a specific Sandbox session.
+     * All subsequent API calls on the returned instance will be routed to that sandbox.
+     * @param {string} uuid - The Sandbox Session ID.
+     * @returns {PowerBase} A new SDK instance.
+     */
+    sandbox(uuid) {
+        // Construct the sandbox URL: http://host/sandbox/{uuid}
+        const sandboxUrl = `${this.baseUrl}/sandbox/${uuid}`;
+        const instance = new PowerBase(sandboxUrl);
+        
+        // Copy auth state to the sandbox instance
+        instance.token = this.token;
+        instance.currentUser = this.currentUser;
+        instance.sandboxId = uuid;
+        
+        return instance;
+    }
+
+    /**
+     * Creates a new client instance pointed at a specific Tenant.
+     * All subsequent API calls on the returned instance will be routed to that tenant.
+     * @param {string} tenantId - The Tenant ID.
+     * @returns {PowerBase} A new SDK instance.
+     */
+    tenant(tenantId) {
+        // Construct the tenant URL: http://host/tenant/{tenantId}
+        const tenantUrl = `${this.baseUrl}/tenant/${tenantId}`;
+        const instance = new PowerBase(tenantUrl);
+        
+        // Copy auth state to the tenant instance
+        instance.token = this.token;
+        instance.currentUser = this.currentUser;
+        
+        return instance;
+    }
+
+    /**
      * Manually set the JWT token (e.g., after loading from localStorage).
      * @param {string} token - The JWT string.
      */
@@ -283,6 +320,7 @@ export class PowerBase {
              * @param {File} file - The file object to upload.
              * @returns {Promise<object>} Import statistics (records imported, collection created status).
              */
+            
             importData: (collectionName, file) => {
                 const formData = new FormData();
                 formData.append('collection_name', collectionName);
@@ -318,11 +356,26 @@ export class PowerBase {
             getDashboardStats: async () => {
                 return this._request('/admin/dashboard'); 
             },
+
+            /**
+             * Create a new Tenant (Database instance).
+             * @param {string} tenantId - Unique alphanumeric ID (e.g. "client-a").
+             */
+            createTenant: (tenantId) => this._request('/admin/tenants', { 
+                method: 'POST', 
+                body: { tenant_id: tenantId } 
+            }),
+            
+            /**
+             * List all Tenants.
+             * @returns {Promise<string[]>} List of tenant IDs.
+             */
+            listTenants: () => this._request('/admin/tenants', { method: 'GET' }),
         };
     }
 
     // ==========================================
-    // 3. AI Actions (LLM Integration)
+    // 3. AI Actions & Architect
     // ==========================================
 
     get ai() {
@@ -350,10 +403,57 @@ export class PowerBase {
             /**
              * Execute a defined AI action.
              * @param {string} slug - The slug of the action (e.g., 'summarize').
-             * @param {object} variables - Variables to replace in the template (e.g., { text: "..." }).
+             * @param {object} variables - Variables to replace in the template.
              * @returns {Promise<object>} The AI response.
              */
-            run: (slug, variables) => this._request(`/ai/run/${slug}`, { method: 'POST', body: { variables } })
+            run: (slug, variables) => this._request(`/ai/run/${slug}`, { method: 'POST', body: { variables } }),
+
+            // --- AI ARCHITECT SESSIONS ---
+
+            /**
+             * List active AI Architect sessions.
+             * @returns {Promise<Array<object>>}
+             */
+            listSessions: () => this._request('/admin/ai/sessions'),
+
+            /**
+             * Start a new AI Architect session.
+             * @param {string} name - Project name.
+             * @param {string} [initialPrompt] - First instruction.
+             * @param {string} [model] - LLM Model ID.
+             * @returns {Promise<object>} New session object.
+             */
+            createSession: (name, initialPrompt, model) => this._request('/admin/ai/sessions', { 
+                method: 'POST', 
+                body: { name, initial_prompt: initialPrompt, model } 
+            }),
+
+            /**
+             * Send a message to the Architect in a specific session.
+             * Generates a pending manifest but does not apply it.
+             * @param {string} sessionId
+             * @param {string} prompt
+             * @param {string} [model]
+             * @returns {Promise<object>} Updated session with diff_summary.
+             */
+            chat: (sessionId, prompt, model) => this._request(`/admin/ai/sessions/${sessionId}/chat`, { 
+                method: 'POST', 
+                body: { prompt, model } 
+            }),
+
+            /**
+             * Apply pending changes from an AI Session to the Sandbox DB.
+             * @param {string} sessionId
+             * @returns {Promise<object>} Updated session.
+             */
+            applySessionChanges: (sessionId) => this._request(`/admin/ai/sessions/${sessionId}/apply`, { method: 'POST' }),
+
+            /**
+             * Publish a session as a Plugin (Commit to Production).
+             * @param {string} sessionId
+             * @returns {Promise<object>} Plugin definition.
+             */
+            publishSession: (sessionId) => this._request(`/admin/ai/sessions/${sessionId}/publish`, { method: 'POST' })
         };
     }
 
@@ -588,9 +688,24 @@ export class PowerBase {
 
             /**
              * Helper to get public URL.
+             * Smartly detects if the context is Root, Tenant, or Sandbox based on the current SDK instance.
+             * Also handles S3/External URLs gracefully.
              * @param {string} filename 
              */
-            getFileUrl: (filename) => `${this.baseUrl}/api/v1/storage/file/${filename}`
+            getFileUrl: (filename) => {
+                // 1. If it's already a full URL (e.g. S3), return as is
+                if (filename.startsWith('http://') || filename.startsWith('https://')) {
+                    return filename;
+                }
+
+                // 2. Clean inputs
+                const base = this.baseUrl.replace(/\/$/, "");
+                const name = filename.replace(/^\//, "");
+
+                // 3. Construct URL relative to current context (Root/Tenant/Sandbox)
+                // The `baseUrl` is automatically adjusted when you use pb.tenant('id') or pb.sandbox('id')
+                return `${base}/api/v1/storage/file/${name}`;
+            }
         };
     }
 

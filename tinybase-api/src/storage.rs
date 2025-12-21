@@ -1,3 +1,4 @@
+// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-api/src/storage.rs ===========================
 use axum::{
     extract::{Multipart, State, Path, Query},
     response::{Response},
@@ -10,7 +11,7 @@ use utoipa::{ToSchema, IntoParams};
 use std::io::Cursor;
 use image::imageops::FilterType;
 use std::sync::Arc;
-use tokio::sync::RwLock; // Import RwLock
+use tokio::sync::RwLock; 
 
 use tinybase_core::{
     auth::Claims, 
@@ -19,7 +20,7 @@ use tinybase_core::{
     security::{Vault, EncryptedValue},
     Db
 };
-use crate::{AppState, AppError, assets::Assets, settings::StorageConfigDto};
+use crate::{AppState, AppError, assets::Assets, settings::StorageConfigDto, DatabaseConnection, StorageConnection};
 
 use async_trait::async_trait;
 
@@ -54,32 +55,46 @@ pub struct FileUploadRequest {
     file: Vec<u8>,
 }
 
+// --- PATH STRUCTS FOR NESTED ROUTING ---
+#[derive(Deserialize)]
+pub struct FilenamePath {
+    pub filename: String,
+}
+
+#[derive(Deserialize)]
+pub struct FileIdPath {
+    pub id: i64,
+}
+
 // --- DYNAMIC STORAGE PROXY ---
 
 pub struct DynamicStorage {
     db: Arc<dyn Db>,
     vault: Arc<Vault>,
-    // Cache the resolved backend to avoid re-init on every request
-    // Wrapped in Arc to be cloneable if needed, RwLock for thread safety
     backend_cache: RwLock<Option<Arc<dyn StorageBackend>>>,
-    // Timestamp of last cache update to allow config refresh
     last_update: RwLock<std::time::Instant>,
+    fs_root_override: Option<String>,
+    public_url_prefix: Option<String>, 
 }
 
 impl DynamicStorage {
-    pub fn new(db: Arc<dyn Db>, vault: Arc<Vault>) -> Self {
+    pub fn new(
+        db: Arc<dyn Db>, 
+        vault: Arc<Vault>,
+        fs_root_override: Option<String>,
+        public_url_prefix: String
+    ) -> Self {
         Self { 
             db, 
             vault,
             backend_cache: RwLock::new(None),
-            last_update: RwLock::new(std::time::Instant::now())
+            last_update: RwLock::new(std::time::Instant::now()),
+            fs_root_override,
+            public_url_prefix: Some(public_url_prefix)
         }
     }
 
-    /// Resolves the concrete backend (S3 or Local) based on DB settings
-    /// Caches the result for 60 seconds to reduce DB hits
     async fn resolve_backend(&self) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error + Send + Sync>> {
-        // 1. Check Cache (Read Lock)
         {
             let cache = self.backend_cache.read().await;
             let time = self.last_update.read().await;
@@ -90,12 +105,9 @@ impl DynamicStorage {
             }
         }
 
-        // 2. Fetch Settings (Write Lock)
-        // We re-check condition after acquiring write lock to avoid race conditions
         let mut cache_write = self.backend_cache.write().await;
         let mut time_write = self.last_update.write().await;
         
-        // Double-check optimization
         if let Some(backend) = cache_write.as_ref() {
              if time_write.elapsed() < std::time::Duration::from_secs(60) {
                  return Ok(backend.clone());
@@ -116,7 +128,6 @@ impl DynamicStorage {
             }
         };
 
-        // 3. Initialize Backend
         let backend: Arc<dyn StorageBackend> = if config.active_driver == "s3" && config.s3.enabled {
             let secret_key = if let Some(encrypted_str) = config.s3.secret_key {
                 if !encrypted_str.is_empty() {
@@ -140,11 +151,12 @@ impl DynamicStorage {
             
             Arc::new(s3)
         } else {
-            let local = LocalStorage::new("./uploads", "/api/v1/storage/file/").await;
-            Arc::new(local)
+            let path = self.fs_root_override.clone().unwrap_or_else(|| "./uploads".to_string());
+            let url_base = self.public_url_prefix.clone().unwrap_or_else(|| "/api/v1/storage/file/".to_string());
+            
+            Arc::new(LocalStorage::new(&path, &url_base).await)
         };
 
-        // 4. Update Cache
         *cache_write = Some(backend.clone());
         *time_write = std::time::Instant::now();
 
@@ -177,10 +189,11 @@ impl StorageBackend for DynamicStorage {
     }
 
     fn get_public_url_base(&self) -> String {
-        "/api/v1/storage/file/".to_string() 
+        self.public_url_prefix.clone().unwrap_or_else(|| "/api/v1/storage/file/".to_string())
     }
 }
 
+// --- HANDLER: Upload File ---
 #[utoipa::path(
     post,
     path = "/api/v1/storage/upload",
@@ -189,7 +202,8 @@ impl StorageBackend for DynamicStorage {
 )]
 pub async fn upload_file(
     auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection,   
+    StorageConnection(storage): StorageConnection, 
     mut multipart: Multipart,
 ) -> Result<Json<FileResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
@@ -200,8 +214,8 @@ pub async fn upload_file(
         let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
         
         let data = field.bytes().await.map_err(|_| AppError::UnknownError("Failed to read bytes".into()))?;
-        
         let size = data.len() as i64;
+        
         let ext = std::path::Path::new(&original_name)
             .extension()
             .and_then(std::ffi::OsStr::to_str)
@@ -209,22 +223,101 @@ pub async fn upload_file(
         
         let filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
 
-        state.storage.save(&filename, &data).await
+        storage.save(&filename, &data).await
             .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-        let id = state.db.create_file_metadata(&filename, &original_name, &content_type, size, user_id).await
+        let id = db.create_file_metadata(&filename, &original_name, &content_type, size, user_id).await
             .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-        let url = format!("{}{}", state.storage.get_public_url_base(), filename);
+        let url = format!("{}{}", storage.get_public_url_base(), filename);
 
-        return Ok(Json(FileResponse {
-            id,
-            url,
-            filename,
-        }));
+        return Ok(Json(FileResponse { id, url, filename }));
     }
 
     Err(AppError::InputValidation(validator::ValidationErrors::new()))
+}
+
+// --- HANDLER: Serve Generic File ---
+#[utoipa::path(
+    get,
+    path = "/api/v1/storage/file/{filename}",
+    params(FileParams),
+    responses((status = 200, description = "File Content"))
+)]
+pub async fn serve_file(
+    StorageConnection(storage): StorageConnection,
+    State(state): State<AppState>, 
+    Path(path): Path<FilenamePath>, // <--- FIXED: Use Struct for Path
+    Query(params): Query<FileParams>,
+) -> Result<Response, AppError> {
+    
+    let original_bytes = storage.get(&path.filename).await
+        .map_err(|_| AppError::NotFound("File not found".into()))?;
+
+    let mime_type = mime_guess::from_path(&path.filename).first_or_octet_stream();
+
+    process_image(
+        &state, 
+        original_bytes, 
+        mime_type.as_ref(), 
+        path.filename, 
+        params.thumb
+    ).await
+}
+
+// --- HANDLER: List Files ---
+#[utoipa::path(
+    get,
+    path = "/api/v1/storage/files",
+    params(FileListQuery),
+    responses((status = 200, body = FileListResponse))
+)]
+pub async fn list_files(
+    DatabaseConnection(db): DatabaseConnection, 
+    Query(params): Query<FileListQuery>,
+) -> Result<Json<FileListResponse>, AppError> {
+    let page = params.page.unwrap_or(1).max(1);
+    let limit = params.per_page.unwrap_or(20).min(100);
+    let offset = (page - 1) * limit;
+
+    let files = db.list_files(limit, offset).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    let total = files.len() as i64; 
+
+    Ok(Json(FileListResponse { items: files, total }))
+}
+
+// --- HANDLER: Delete File ---
+#[utoipa::path(
+    delete,
+    path = "/api/v1/storage/files/{id}",
+    responses((status = 204, description = "File deleted"))
+)]
+pub async fn delete_file(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    StorageConnection(storage): StorageConnection,
+    Path(path): Path<FileIdPath>, // <--- FIXED: Use Struct for Path
+) -> Result<StatusCode, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    if let Some(claims) = claims {
+        if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    } else {
+        return Err(AppError::Unauthorized("Login required".into()));
+    }
+
+    let file = db.get_file_metadata(path.id).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?
+        .ok_or(AppError::NotFound("File not found".into()))?;
+
+    storage.delete(&file.filename).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    db.delete_file_metadata(path.id).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- HELPER: Centralized Image Resizing Logic ---
@@ -236,7 +329,6 @@ async fn process_image(
     dim_str: Option<String>
 ) -> Result<Response, AppError> {
 
-    // 1. If no thumb param or it's SVG (vector), return original immediately
     if dim_str.is_none() || mime_type.contains("svg") {
          return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -246,7 +338,6 @@ async fn process_image(
             .unwrap());
     }
 
-    // 2. Check Cache
     let dim = dim_str.unwrap();
     let full_cache_key = format!("{}_{}", cache_key, dim);
 
@@ -259,11 +350,9 @@ async fn process_image(
             .unwrap());
     }
 
-    // 3. Process Image
     let (w, h) = parse_dimensions(&dim).unwrap_or((0, 0));
     
     if w == 0 && h == 0 {
-         // Invalid dimensions, return original
          return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime_type)
@@ -272,12 +361,9 @@ async fn process_image(
             .unwrap());
     }
 
-    // Load image (CPU intensive)
     let format = image::ImageFormat::from_mime_type(mime_type)
         .unwrap_or(image::ImageFormat::Png);
 
-    // Clone the bytes for the background thread
-    // This leaves 'original_bytes' valid for the Err case below
     let bytes_for_processing = original_bytes.clone();
 
     let img_result = tokio::task::spawn_blocking(move || {
@@ -293,13 +379,11 @@ async fn process_image(
             
             let mut buffer = Cursor::new(Vec::new());
             if let Err(_) = scaled.write_to(&mut buffer, format) {
-                // If encoding fails, return error
                 return Err(AppError::UnknownError("Image encoding failed".into()));
             }
 
             let thumb_bytes = buffer.into_inner();
             
-            // Cache it
             state.thumb_cache.insert(full_cache_key, Arc::new(thumb_bytes.clone())).await;
 
             Ok(Response::builder()
@@ -310,8 +394,6 @@ async fn process_image(
                 .unwrap())
         },
         Err(_) => {
-             // If load/resize fails (e.g. corrupted image), return original
-             // 'original_bytes' is valid here because we cloned it above
              Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime_type)
@@ -322,33 +404,6 @@ async fn process_image(
     }
 }
 
-// --- HANDLER: Serve Generic File ---
-#[utoipa::path(
-    get,
-    path = "/api/v1/storage/file/{filename}",
-    params(FileParams),
-    responses((status = 200, description = "File Content"))
-)]
-pub async fn serve_file(
-    State(state): State<AppState>,
-    Path(filename): Path<String>,
-    Query(params): Query<FileParams>,
-) -> Result<Response, AppError> {
-    
-    let original_bytes = state.storage.get(&filename).await
-        .map_err(|_| AppError::NotFound("File not found".into()))?;
-
-    let mime_type = mime_guess::from_path(&filename).first_or_octet_stream();
-
-    process_image(
-        &state, 
-        original_bytes, 
-        mime_type.as_ref(), 
-        filename, 
-        params.thumb
-    ).await
-}
-
 // --- HANDLER: Serve App Logo ---
 #[utoipa::path(
     get,
@@ -357,16 +412,20 @@ pub async fn serve_file(
     responses((status = 200, description = "App Logo"))
 )]
 pub async fn serve_app_logo(
+    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Tenant-aware metadata
+    StorageConnection(storage): StorageConnection, // <--- FIXED: Tenant-aware files
     State(state): State<AppState>,
     Query(params): Query<FileParams>,
 ) -> Result<Response, AppError> {
     
-    let settings = state.db.get_setting("general").await
+    // 1. Get settings from Tenant DB
+    let settings = db.get_setting("general").await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     let (bytes, mime, cache_key_base) = if let Some(val) = settings {
         if let Some(logo_filename) = val.get("app_logo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-            match state.storage.get(logo_filename).await {
+            // 2. Fetch file from Tenant Storage
+            match storage.get(logo_filename).await {
                 Ok(b) => {
                      let m = mime_guess::from_path(logo_filename).first_or_octet_stream();
                      (b, m.to_string(), logo_filename.to_string())
@@ -408,56 +467,4 @@ fn parse_dimensions(s: &str) -> Option<(u32, u32)> {
         return Some((w, h));
     }
     None
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/storage/files",
-    params(FileListQuery),
-    responses((status = 200, body = FileListResponse))
-)]
-pub async fn list_files(
-    State(state): State<AppState>,
-    Query(params): Query<FileListQuery>,
-) -> Result<Json<FileListResponse>, AppError> {
-    let page = params.page.unwrap_or(1).max(1);
-    let limit = params.per_page.unwrap_or(20).min(100);
-    let offset = (page - 1) * limit;
-
-    let files = state.db.list_files(limit, offset).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    let total = files.len() as i64; 
-
-    Ok(Json(FileListResponse { items: files, total }))
-}
-
-#[utoipa::path(
-    delete,
-    path = "/api/v1/storage/files/{id}",
-    responses((status = 204, description = "File deleted"))
-)]
-pub async fn delete_file(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    if let Some(claims) = claims {
-        if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    } else {
-        return Err(AppError::Unauthorized("Login required".into()));
-    }
-
-    let file = state.db.get_file_metadata(id).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or(AppError::NotFound("File not found".into()))?;
-
-    state.storage.delete(&file.filename).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    state.db.delete_file_metadata(id).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    Ok(StatusCode::NO_CONTENT)
 }

@@ -18,6 +18,8 @@ export interface AiSession {
     name: string;
     messages: ChatMessage[];
     current_manifest: AppManifest | null;
+    diff_summary: string;
+    last_error: string;
     created_at: string;
 }
 
@@ -32,25 +34,16 @@ export interface Plugin {
 export const architectService = {
     // List all past sessions
     listSessions: async (): Promise<AiSession[]> => {
-        // Note: You need to ensure the Rust endpoint list_ai_sessions is exposed in lib.rs router
-        // If not exposed in sdk.js yet, we use raw fetch for the admin namespace
         const token = localStorage.getItem(APEX_TOKEN);
-        const res = await fetch(`${apiClient.apiUrl}/api/v1/admin/ai/sessions`, {
-            headers: { 'Authorization': `Bearer ${token}` }
-        });
-        return await res.json();
+        const res = await apiClient.ai.listSessions();
+        return res as AiSession[];
     },
 
     // Start a new project
     createSession: async (name: string, initialPrompt?: string, model?: string): Promise<AiSession> => {
-        const token = localStorage.getItem(APEX_TOKEN);
-        const res = await fetch(`${apiClient.apiUrl}/api/v1/admin/ai/sessions`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ name, initial_prompt: initialPrompt, model }) 
-        });
-        if (!res.ok) throw new Error((await res.json()).message);
-        return await res.json();
+        const res = await apiClient.ai.createSession(name, initialPrompt, model);
+        if (!res.id) throw new Error(res.message);
+        return res as AiSession;
     },
 
     // Continue conversation
@@ -103,5 +96,8 @@ export const architectService = {
         });
         if (!res.ok) throw new Error("Failed to load plugins");
         return await res.json();
-    }
+    },
+    // Apply Changes
+    applySessionChanges: async (id: string): Promise<any> => await apiClient.ai.applySessionChanges(id),
+    // Publish
 };

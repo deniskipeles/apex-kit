@@ -13,6 +13,7 @@ use crate::models::{DashboardData, DashboardStats, ChartPoint};
 use chrono::Utc;
 use std::collections::{HashMap, BTreeMap};
 use std::error::Error as StdError;
+use std::path::Path;
 
 const COMPOSITE_SEPARATOR: &str = "__::__";
 
@@ -84,7 +85,10 @@ pub trait Db: Send + Sync {
     // --- Search ---
     async fn search_records(&self, collection_id: i64, query: &str) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>>;
     async fn reindex_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
-    async fn instant_search(&self, collection_id: i64, query: &str) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn instant_search(&self, collection_id: i64, query: &str, limit: usize) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>>;
+    // --- NEW: Search Helpers exposed for Job Worker ---
+    async fn index_record_search(&self, collection_id: i64, record_id: i64, data: &Value, schema: &CollectionSchema) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
+    async fn delete_record_search(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
 
     // --- Users (Auth) ---
     async fn create_user(&self, email: &str, password_hash: &str, role: &str) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>>;
@@ -116,6 +120,7 @@ pub trait Db: Send + Sync {
     // --- Audit Logs ---
     async fn log_audit_event(&self, level: &str, message: &str, source: &str, meta: Option<serde_json::Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn list_audit_logs(&self) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn log_system_event(&self, level: &str, target: &str, message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     // --- AI Actions ---
     async fn list_ai_actions(&self) -> std::result::Result<Vec<ai_models::AiAction>, Box<dyn std::error::Error + Send + Sync>>;
@@ -199,6 +204,7 @@ fn row_to_record(
 }
 
 // --- The Orchestrator: TinyBase ---
+#[derive(Clone)] 
 pub struct TinyBase {
     // Sharded Databases (Wrapped in Arc for Clone)
     core_db: Arc<Database>,  
@@ -240,6 +246,56 @@ impl TinyBase {
             search: Arc::new(SearchManager::new("./tantivy_indexes")),
             embedder: Arc::new(embeddings::EmbedderService::new()), // Init service
         }
+    }
+
+    /// Factory method to initialize a TinyBase instance from a specific folder path.
+    /// This handles connection opening and Schema Migration automatically.
+    pub async fn init_filesystem(
+        base_path: &str, 
+        vector_provider: Arc<dyn VectorProvider>
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        
+        // 1. Ensure directory exists
+        if !Path::new(base_path).exists() {
+            std::fs::create_dir_all(base_path)?;
+        }
+
+        // 2. Connect to DBs
+        let core = Builder::new_local(&format!("{}/core.db", base_path)).build().await?;
+        let data = Builder::new_local(&format!("{}/data.db", base_path)).build().await?;
+        let log = Builder::new_local(&format!("{}/logs.db", base_path)).build().await?;
+        let sys = Builder::new_local(&format!("{}/system.db", base_path)).build().await?;
+        let vec = Builder::new_local(&format!("{}/vectors.db", base_path)).build().await?;
+
+        // 3. Apply Pragmas (Performance settings)
+        apply_pragmas(&core).await?;
+        apply_pragmas(&data).await?;
+        apply_pragmas(&log).await?;
+        apply_pragmas(&sys).await?;
+        apply_pragmas(&vec).await?;
+
+        // 4. Run Migrations (Create Tables if not exist)
+        // These use the internal private setup_* functions in this file
+        setup_core(&core).await?;
+        setup_data(&data).await?;
+        setup_logs(&log).await?;
+        setup_sys(&sys).await?;
+        setup_vectors(&vec).await?;
+
+        // 5. Construct Instance
+        Ok(Self::new(
+            Arc::new(core),
+            Arc::new(data),
+            Arc::new(log),
+            Arc::new(sys),
+            Arc::new(vec),
+            vector_provider
+        ))
+    }
+
+    // FIX 2: Add setter for SearchManager (used by TenantManager)
+    pub fn set_search_manager(&mut self, manager: Arc<SearchManager>) {
+        self.search = manager;
     }
 
     // Helper: Which connection to use?
@@ -445,28 +501,34 @@ impl Db for TinyBase {
     }
 
     // --- Records ---
+
     async fn create_record(&self, collection_id: i64, data: &Value) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_data()?; 
         let col = self.get_collection(collection_id).await?.ok_or("Collection not found")?;
         let schema = col.schema.unwrap_or_default();
         
+        // 1. Serialization (Do once)
+        let json_str = serde_json::to_string(data)?;
+
+        // 2. Logic Checks (Must block)
         enforce_uniqueness(&conn, collection_id, None, data, &schema).await?;
 
-        // Batcher INSERT
+        // 3. Batcher INSERT (Fast)
         let record_id = self.data_batcher.insert(
             "INSERT INTO records (collection_id, data) VALUES (?1, jsonb(?2))".into(),
-            vec![collection_id.into(), serde_json::to_string(data)?.into()]
+            vec![collection_id.into(), json_str.into()] // Pass pre-serialized string
         ).await?;
         
-        commit_uniqueness(&self.data_batcher, collection_id, record_id, data, &schema).await?;
-        self.sync_relations(&conn, collection_id, record_id, data).await?;
+        // 4. Post-Process (Parallelize)
+        // We can run uniqueness commitment and relation syncing concurrently
+        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, data, &schema);
+        let relation_future = self.sync_relations(&conn, collection_id, record_id, data);
 
-        // 1. Search Indexing (Text)
-        if schema.fields.values().any(|f| f.indexed) {
-            let _ = self.search.load_index(collection_id, &schema);
-            self.search.index_record(collection_id, record_id, data, &schema)?;
-        }
+        // Wait for both, but let them run in parallel
+        tokio::try_join!(unique_future, relation_future)?;
 
+        // NOTE: Search Indexing is now handled by the API Layer via JobQueue (Async)
+        
         Ok(record_id)
     }
 
@@ -476,20 +538,33 @@ impl Db for TinyBase {
         let schema = col.schema.unwrap_or_default();
         let existing = self.get_record(collection_id, record_id, None).await?.ok_or("Rec not found")?;
         
+        // 1. Data Merging
         let mut merged_data = existing.data.clone();
         if let Some(obj) = merged_data.as_object_mut() {
             if let Some(new_obj) = data.as_object() {
                 for (k, v) in new_obj { obj.insert(k.clone(), v.clone()); }
             }
         }
+        
+        // 2. Serialization
+        let json_str = serde_json::to_string(&merged_data)?;
 
+        // 3. Constraints
         enforce_uniqueness(&conn, collection_id, Some(record_id), &merged_data, &schema).await?;
 
-        self.data_batcher.execute("UPDATE records SET data = jsonb(?1) WHERE collection_id = ?2 AND id = ?3".into(), vec![serde_json::to_string(&merged_data)?.into(), collection_id.into(), record_id.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
-        commit_uniqueness(&self.data_batcher, collection_id, record_id, &merged_data, &schema).await?;
-        self.sync_relations(&conn, collection_id, record_id, &merged_data).await?;
+        // 4. Update (Fast)
+        self.data_batcher.execute(
+            "UPDATE records SET data = jsonb(?1) WHERE collection_id = ?2 AND id = ?3".into(), 
+            vec![json_str.into(), collection_id.into(), record_id.into()]
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         
-        if schema.fields.values().any(|f| f.indexed) { let _ = self.search.load_index(collection_id, &schema); self.search.index_record(collection_id, record_id, &merged_data, &schema)?; }
+        // 5. Post-Process (Parallelize)
+        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, &merged_data, &schema);
+        let relation_future = self.sync_relations(&conn, collection_id, record_id, &merged_data);
+        
+        tokio::try_join!(unique_future, relation_future)?;
+        
+        // NOTE: Search Indexing is now handled by the API Layer via JobQueue (Async)
         
         Ok(Record { id: record_id, data: merged_data })
     }
@@ -498,17 +573,55 @@ impl Db for TinyBase {
         let map_err = |e: String| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
         };
-        self.data_batcher.execute("DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(), vec![collection_id.into(), record_id.into()]).await.map_err(map_err)?;
-        self.data_batcher.execute("DELETE FROM _unique_values WHERE record_id = ?1".into(), vec![record_id.into()]).await.map_err(map_err)?;
-        self.data_batcher.execute("DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(), vec![collection_id.into(), record_id.into()]).await.map_err(map_err)?;
-        self.data_batcher.execute("DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id=?2".into(), vec![collection_id.into(), record_id.into()]).await.map_err(map_err)?;
-        let _ = self.search.delete_record(collection_id, record_id);
-        // Also delete associated vectors
-        self.vector_batcher.execute(
+
+        // 1. Parallelize Deletions
+        // Instead of waiting for one SQL execute to finish before sending the next,
+        // we fire all of them at the batcher simultaneously. 
+        // The batcher queue will handle serialization, but we don't pay the round-trip latency cost 5 times.
+        
+        let f1 = self.data_batcher.execute(
+            "DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(), 
+            vec![collection_id.into(), record_id.into()]
+        );
+        
+        let f2 = self.data_batcher.execute(
+            "DELETE FROM _unique_values WHERE record_id = ?1".into(), 
+            vec![record_id.into()]
+        );
+        
+        let f3 = self.data_batcher.execute(
+            "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(), 
+            vec![collection_id.into(), record_id.into()]
+        );
+        
+        let f4 = self.data_batcher.execute(
+            "DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id=?2".into(), 
+            vec![collection_id.into(), record_id.into()]
+        );
+        
+        // Vectors are in a different DB file (different batcher), so it runs perfectly in parallel
+        let f5 = self.vector_batcher.execute(
             "DELETE FROM vectors WHERE collection_id = ?1 AND record_id = ?2".into(),
             vec![collection_id.into(), record_id.into()]
-        ).await.map_err(map_err)?;
+        );
+
+        // 2. Await all
+        // We define Search deletion as non-critical here (handled by API job), 
+        // but if we did it here, we'd add it to the join.
+        let _ = tokio::try_join!(f1, f2, f3, f4).map_err(map_err)?;
+        let _ = f5.await.map_err(map_err)?;
+
         Ok(())
+    }
+
+    // --- Implement New Trait Methods ---
+    async fn index_record_search(&self, collection_id: i64, record_id: i64, data: &Value, schema: &CollectionSchema) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        // This is now called by the Background Worker
+        self.search.index_record(collection_id, record_id, data, schema).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn StdError + Send + Sync>)
+    }
+
+    async fn delete_record_search(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.search.delete_record(collection_id, record_id).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn StdError + Send + Sync>)
     }
 
     async fn list_records(&self, collection_id: i64, options: QueryOptions) -> std::result::Result<ListResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -599,32 +712,50 @@ impl Db for TinyBase {
     async fn reindex_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         let col = self.get_collection(id).await?.ok_or_else(|| format!("Collection {} not found", id))?; 
         let schema = col.schema.unwrap_or_default();
+        
         if !schema.fields.values().any(|f| f.indexed) { return Ok(()); }
         
+        // 1. Reset Index
         self.search.delete_index(id).map_err(|e| format!("Search Delete Error: {}", e))?; 
         self.search.load_index(id, &schema).map_err(|e| format!("Search Load Error: {}", e))?;
         
-        // FIX: Use self.get_data() instead of self.db.connect()
         let conn = self.get_data().map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
         
+        // 2. Stream records
         let mut rows = conn.query("SELECT id, json(data) FROM records WHERE collection_id = ?1", params![id])
             .await
             .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
             
+        // 3. Batching Strategy
+        let mut buffer: Vec<(i64, serde_json::Value)> = Vec::with_capacity(1000);
+        let batch_size = 1000;
+
         while let Some(row) = rows.next().await.map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)? {
             let record = row_to_record(&row)?;
-            self.search.index_record(id, record.id, &record.data, &schema).map_err(|e| format!("Indexing Error: {}", e))?;
+            buffer.push((record.id, record.data));
+
+            if buffer.len() >= batch_size {
+                // Flush buffer to Tantivy
+                self.search.index_batch(id, &buffer, &schema).map_err(|e| format!("Indexing Error: {}", e))?;
+                buffer.clear();
+            }
         }
+
+        // 4. Flush remaining items
+        if !buffer.is_empty() {
+            self.search.index_batch(id, &buffer, &schema).map_err(|e| format!("Indexing Error: {}", e))?;
+        }
+
         Ok(())
     }
 
-    async fn instant_search(&self, collection_id: i64, query: &str) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn instant_search(&self, collection_id: i64, query: &str, limit: usize) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(col) = self.get_collection(collection_id).await? {
             if let Some(schema) = &col.schema {
                 if schema.fields.values().any(|f| f.indexed) { self.search.load_index(collection_id, schema)?; } else { return Ok(vec![]); }
             }
         }
-        let results = self.search.instant_search(collection_id, query, 5)?;
+        let results = self.search.instant_search(collection_id, query, limit.try_into().unwrap())?;
         Ok(results)
     }
 
@@ -722,6 +853,14 @@ impl Db for TinyBase {
         }
         Ok(logs)
     }
+    async fn log_system_event(&self, level: &str, target: &str, message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Use log_batcher to avoid locking issues
+        self.log_batcher.execute(
+            "INSERT INTO _system_logs (level, target, message) VALUES (?1, ?2, ?3)".into(),
+            vec![level.into(), target.into(), message.into()]
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+        Ok(())
+    }
 
     // --- System DB ---
     async fn list_ai_actions(&self) -> std::result::Result<Vec<ai_models::AiAction>, Box<dyn std::error::Error + Send + Sync>> {
@@ -748,23 +887,82 @@ impl Db for TinyBase {
         Ok(conn.last_insert_rowid())
     }
     async fn delete_ai_action(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("DELETE FROM _ai_actions WHERE id = ?1", params![id]).await?; Ok(()) }
-    async fn create_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("INSERT INTO _ai_sessions (id, name, messages, current_manifest, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![s.id.clone(), s.name.clone(), serde_json::to_string(&s.messages)?, serde_json::to_string(&s.current_manifest)?, s.created_at.clone()]).await?; Ok(()) }
+    async fn create_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
+        self.get_sys()?.execute(
+            "INSERT INTO _ai_sessions (id, name, messages, current_manifest, pending_manifest, diff_summary, last_error, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", 
+            params![
+                s.id.clone(), 
+                s.name.clone(), 
+                serde_json::to_string(&s.messages)?, 
+                serde_json::to_string(&s.current_manifest)?, 
+                serde_json::to_string(&s.pending_manifest)?, 
+                s.diff_summary.clone(), 
+                s.last_error.clone(), 
+                s.created_at.clone()
+            ]
+        ).await?; 
+        Ok(()) 
+    }
     async fn get_ai_session(&self, id: &str) -> std::result::Result<Option<AiSession>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        let mut r = conn.query("SELECT id, name, messages, current_manifest, created_at FROM _ai_sessions WHERE id = ?1", params![id]).await?;
+        let mut r = conn.query("SELECT id, name, messages, current_manifest, pending_manifest, diff_summary, last_error, created_at FROM _ai_sessions WHERE id = ?1", params![id]).await?;
+        
         if let Some(row) = r.next().await? {
-            let m_str: String = row.get(2)?; let man_str: Option<String> = row.get(3)?;
-            Ok(Some(AiSession { id: row.get(0)?, name: row.get(1)?, messages: serde_json::from_str(&m_str)?, current_manifest: match man_str { Some(s) => serde_json::from_str(&s).ok(), None => None }, created_at: row.get(4)? }))
+            let m_str: String = row.get(2)?; 
+            let man_str: Option<String> = row.get(3)?;
+            let pend_str: Option<String> = row.get(4).unwrap_or(None);
+
+            Ok(Some(AiSession { 
+                id: row.get(0)?, 
+                name: row.get(1)?, 
+                messages: serde_json::from_str(&m_str)?, 
+                current_manifest: match man_str { Some(s) => serde_json::from_str(&s).ok(), None => None },
+                // NEW FIELDS
+                pending_manifest: match pend_str { Some(s) => serde_json::from_str(&s).ok(), None => None },
+                diff_summary: row.get(5).unwrap_or(None),
+                last_error: row.get(6).unwrap_or(None),
+                created_at: row.get(7)? 
+            }))
         } else { Ok(None) }
     }
-    async fn update_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("UPDATE _ai_sessions SET messages = ?1, current_manifest = ?2 WHERE id = ?3", params![serde_json::to_string(&s.messages)?, serde_json::to_string(&s.current_manifest)?, s.id.clone()]).await?; Ok(()) }
+
+    // 4. UPDATE UPDATE SESSION
+    async fn update_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
+        self.get_sys()?.execute(
+            "UPDATE _ai_sessions SET messages = ?1, current_manifest = ?2, pending_manifest = ?3, diff_summary = ?4, last_error = ?5 WHERE id = ?6", 
+            params![
+                serde_json::to_string(&s.messages)?, 
+                serde_json::to_string(&s.current_manifest)?, 
+                serde_json::to_string(&s.pending_manifest)?, 
+                s.diff_summary.clone(), 
+                s.last_error.clone(), 
+                s.id.clone()
+            ]
+        ).await?; 
+        Ok(()) 
+    }
+
+    // 5. UPDATE LIST SESSIONS
     async fn list_ai_sessions(&self) -> std::result::Result<Vec<AiSession>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        let mut r = conn.query("SELECT id, name, messages, current_manifest, created_at FROM _ai_sessions ORDER BY created_at DESC", ()).await?;
+        let mut r = conn.query("SELECT id, name, messages, current_manifest, pending_manifest, diff_summary, last_error, created_at FROM _ai_sessions ORDER BY created_at DESC", ()).await?;
         let mut s = Vec::new();
         while let Some(row) = r.next().await? {
-             let m_str: String = row.get(2)?; let man_str: Option<String> = row.get(3)?;
-             s.push(AiSession { id: row.get(0)?, name: row.get(1)?, messages: serde_json::from_str(&m_str).unwrap_or_default(), current_manifest: match man_str { Some(str) => serde_json::from_str(&str).ok(), None => None }, created_at: row.get(4)? });
+             let m_str: String = row.get(2)?; 
+             let man_str: Option<String> = row.get(3)?;
+             let pend_str: Option<String> = row.get(4).unwrap_or(None);
+
+             s.push(AiSession { 
+                 id: row.get(0)?, 
+                 name: row.get(1)?, 
+                 messages: serde_json::from_str(&m_str).unwrap_or_default(), 
+                 current_manifest: match man_str { Some(str) => serde_json::from_str(&str).ok(), None => None }, 
+                 // NEW FIELDS
+                 pending_manifest: match pend_str { Some(str) => serde_json::from_str(&str).ok(), None => None },
+                 diff_summary: row.get(5).unwrap_or(None),
+                 last_error: row.get(6).unwrap_or(None),
+                 created_at: row.get(7)? 
+             });
         }
         Ok(s)
     }
@@ -778,27 +976,68 @@ impl Db for TinyBase {
     }
     async fn list_scripts(&self) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        let mut r = conn.query("SELECT id, name, trigger_type, code, active FROM _scripts", ()).await?;
+        // Added target_collection to SELECT
+        let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts", ()).await?;
         let mut v = Vec::new();
-        while let Some(row) = r.next().await? { v.push(script_models::Script { id: row.get(0)?, name: row.get(1)?, trigger_type: row.get(2)?, code: row.get(3)?, active: row.get(4)? }); }
+        while let Some(row) = r.next().await? { 
+            v.push(script_models::Script { 
+                id: row.get(0)?, 
+                name: row.get(1)?, 
+                trigger_type: row.get(2)?, 
+                code: row.get(3)?, 
+                active: row.get(4)?,
+                target_collection: row.get(5)? // Added field mapping
+            }); 
+        }
         Ok(v)
     }
+
+    // 3. Update create_script
     async fn create_script(&self, req: script_models::CreateScriptReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        let mut rows = conn.query("INSERT INTO _scripts (name, trigger_type, code) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, created_at=CURRENT_TIMESTAMP RETURNING id", params![req.name, req.trigger_type, req.code]).await?;
+        // Added target_collection to INSERT and UPDATE
+        let mut rows = conn.query(
+            "INSERT INTO _scripts (name, trigger_type, code, target_collection) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, target_collection=excluded.target_collection, created_at=CURRENT_TIMESTAMP RETURNING id", 
+            params![req.name, req.trigger_type, req.code, req.target_collection]
+        ).await?;
         if let Some(row) = rows.next().await? { Ok(row.get(0)?) } else { Err("Failed".into()) }
     }
+
     async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("DELETE FROM _scripts WHERE id = ?1", params![id]).await?; Ok(()) }
+
+    // 4. Update get_script_by_name
     async fn get_script_by_name(&self, name: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        let mut r = conn.query("SELECT id, name, trigger_type, code, active FROM _scripts WHERE name = ?1", params![name]).await?;
-        if let Some(row) = r.next().await? { Ok(Some(script_models::Script { id: row.get(0)?, name: row.get(1)?, trigger_type: row.get(2)?, code: row.get(3)?, active: row.get(4)? })) } else { Ok(None) }
+        // Added target_collection to SELECT
+        let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts WHERE name = ?1", params![name]).await?;
+        if let Some(row) = r.next().await? { 
+            Ok(Some(script_models::Script { 
+                id: row.get(0)?, 
+                name: row.get(1)?, 
+                trigger_type: row.get(2)?, 
+                code: row.get(3)?, 
+                active: row.get(4)?,
+                target_collection: row.get(5)? // Added field mapping
+            })) 
+        } else { Ok(None) }
     }
+
+    // 5. Update get_scripts_by_trigger
     async fn get_scripts_by_trigger(&self, t: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        let mut r = conn.query("SELECT id, name, trigger_type, code, active FROM _scripts WHERE trigger_type = ?1 AND active = 1", params![t]).await?;
+        // Added target_collection to SELECT
+        let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts WHERE trigger_type = ?1 AND active = 1", params![t]).await?;
         let mut v = Vec::new();
-        while let Some(row) = r.next().await? { v.push(script_models::Script { id: row.get(0)?, name: row.get(1)?, trigger_type: row.get(2)?, code: row.get(3)?, active: row.get(4)? }); }
+        while let Some(row) = r.next().await? { 
+            v.push(script_models::Script { 
+                id: row.get(0)?, 
+                name: row.get(1)?, 
+                trigger_type: row.get(2)?, 
+                code: row.get(3)?, 
+                active: row.get(4)?,
+                target_collection: row.get(5)? // Added field mapping
+            }); 
+        }
         Ok(v)
     }
     async fn list_templates(&self) -> std::result::Result<Vec<models::Template>, Box<dyn std::error::Error + Send + Sync>> {
@@ -851,52 +1090,86 @@ impl Db for TinyBase {
     async fn get_dashboard_stats(&self) -> std::result::Result<DashboardData, Box<dyn std::error::Error + Send + Sync>> {
         let data_conn = self.get_data()?;
         let log_conn = self.get_log()?;
+        let sys_conn = self.get_sys()?;
 
+        // 1. Collections Count
         let mut row = data_conn.query("SELECT COUNT(*) FROM collections", ()).await?;
         let collections_count: i64 = if let Some(r) = row.next().await? { r.get(0)? } else { 0 };
 
+        // 2. Records Count
         let mut row = data_conn.query("SELECT COUNT(*) FROM records", ()).await?;
         let total_records: i64 = if let Some(r) = row.next().await? { r.get(0)? } else { 0 };
 
-        let db_size_mb = match std::fs::metadata("data.db") {
-            Ok(meta) => meta.len() as f64 / 1024.0 / 1024.0,
-            Err(_) => 0.0,
-        };
+        // 3. DB Size (Calculate via SQL to support Tenants/Sandboxes dynamically)
+        // We sum up Data + Logs + System DB sizes
+        let mut total_bytes: i64 = 0;
+        
+        for conn in [&data_conn, &log_conn, &sys_conn] {
+            let mut p_count = conn.query("PRAGMA page_count", ()).await?;
+            let count: i64 = if let Some(r) = p_count.next().await? { r.get(0)? } else { 0 };
+            
+            let mut p_size = conn.query("PRAGMA page_size", ()).await?;
+            let size: i64 = if let Some(r) = p_size.next().await? { r.get(0)? } else { 0 };
+            
+            total_bytes += count * size;
+        }
 
-        // DB Logs only - Optimized
-        let sql_chart = "SELECT strftime('%Y-%m-%d', timestamp) as day_date, COUNT(*) as req_count, SUM(CASE WHEN level = 'error' THEN 1 ELSE 0 END) as err_count FROM _audit_logs WHERE timestamp >= date('now', '-7 days') GROUP BY day_date";
+        let db_size_mb = (total_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
+
+        // 4. Chart Data (Using _system_logs for traffic analysis)
+        let sql_chart = "
+            SELECT 
+                strftime('%Y-%m-%d', timestamp) as day_date, 
+                COUNT(*) as req_count, 
+                SUM(CASE WHEN level = 'ERROR' OR level = 'error' THEN 1 ELSE 0 END) as err_count 
+            FROM _system_logs 
+            WHERE timestamp >= date('now', '-7 days') 
+            GROUP BY day_date
+        ";
+        
         let mut rows = log_conn.query(sql_chart, ()).await?;
         let mut daily_stats: HashMap<String, (i64, i64)> = HashMap::new();
-        let mut total_reqs = 0;
+        let mut total_requests = 0;
 
         while let Some(row) = rows.next().await? {
             let date_str: String = row.get(0)?;
             let reqs: i64 = row.get(1)?;
             let errs: i64 = row.get(2)?;
-            total_reqs += reqs;
+            total_requests += reqs;
             daily_stats.insert(date_str, (reqs, errs));
         }
 
         let mut chart_data: Vec<ChartPoint> = Vec::new();
         let now = Utc::now();
+        // Generate last 7 days points (filling 0s if no logs)
         for i in (0..7).rev() {
             let date = now - chrono::Duration::days(i);
             let date_key = date.format("%Y-%m-%d").to_string();
-            let day_name = date.format("%a").to_string();
+            let day_name = date.format("%a").to_string(); // Mon, Tue...
             let (reqs, errs) = daily_stats.get(&date_key).unwrap_or(&(0, 0));
             chart_data.push(ChartPoint { name: day_name, requests: *reqs, errors: *errs });
         }
 
-        let mut recent_rows = log_conn.query("SELECT id, level, message, source, meta, timestamp FROM _audit_logs ORDER BY timestamp DESC LIMIT 5", ()).await?;
+        // 5. Recent Logs (From _system_logs)
+        // We select the most recent 10 logs
+        let mut recent_rows = log_conn.query(
+            "SELECT id, level, message, target, timestamp FROM _system_logs ORDER BY timestamp DESC LIMIT 10", 
+            ()
+        ).await?;
+        
         let mut recent_logs = Vec::new();
         while let Some(row) = recent_rows.next().await? {
-            let meta_str: Option<String> = row.get(4)?;
-            let meta = meta_str.map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null));
-            recent_logs.push(serde_json::json!({ "id": row.get::<i64>(0)?.to_string(), "level": row.get::<String>(1)?, "message": row.get::<String>(2)?, "source": row.get::<String>(3)?, "meta": meta, "timestamp": row.get::<String>(5)? }));
+            recent_logs.push(serde_json::json!({ 
+                "id": row.get::<i64>(0)?.to_string(), 
+                "level": row.get::<String>(1)?, 
+                "message": row.get::<String>(2)?, 
+                "source": row.get::<String>(3)?, // target mapped to source for UI compatibility
+                "timestamp": row.get::<String>(4)? 
+            }));
         }
 
         Ok(DashboardData {
-            stats: DashboardStats { total_requests: total_reqs, db_size_mb: (db_size_mb * 100.0).round() / 100.0, collections_count, total_records },
+            stats: DashboardStats { total_requests, db_size_mb, collections_count, total_records },
             chart: chart_data,
             recent_logs,
         })
@@ -1006,9 +1279,18 @@ pub async fn a_new_database_connection(vector_provider: Arc<dyn VectorProvider>)
     ))
 }
 
+// --- OPTIMIZATION: PRAGMAS ---
 async fn apply_pragmas(db: &Database) -> Result<()> {
     let conn = db.connect()?;
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -20000;").await.map(|_| ())
+    conn.execute_batch("
+        PRAGMA journal_mode = WAL;          -- Write-Ahead Logging (Crucial for concurrency)
+        PRAGMA synchronous = NORMAL;        -- Faster writes, safe enough for WAL
+        PRAGMA busy_timeout = 5000;         -- Wait 5s before failing if locked
+        PRAGMA temp_store = MEMORY;         -- Temp tables in RAM
+        PRAGMA cache_size = -64000;         -- 64MB Cache
+        PRAGMA wal_autocheckpoint = 1000;   -- Checkpoint every 1000 pages
+        PRAGMA mmap_size = 30000000000;     -- Memory Map large DBs (Fast Reads)
+    ").await.map(|_| ())
 }
 
 async fn setup_core(db: &Database) -> Result<()> {
@@ -1037,16 +1319,25 @@ async fn setup_data(db: &Database) -> Result<()> {
 
 async fn setup_logs(db: &Database) -> Result<()> {
     let conn = db.connect()?;
+    // Audit Logs (Business Logic)
     conn.execute("CREATE TABLE IF NOT EXISTS _audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, message TEXT NOT NULL, source TEXT NOT NULL, meta JSON, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
+    // System Logs (Technical/Debug Logs from Tracing)
+    conn.execute("CREATE TABLE IF NOT EXISTS _system_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        level TEXT NOT NULL, 
+        target TEXT NOT NULL, 
+        message TEXT NOT NULL, 
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )", ()).await?;
     Ok(())
 }
 
 async fn setup_sys(db: &Database) -> Result<()> {
     let conn = db.connect()?;
     conn.execute("CREATE TABLE IF NOT EXISTS _ai_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE NOT NULL, name TEXT NOT NULL, model TEXT NOT NULL, system_prompt TEXT, template TEXT NOT NULL, config JSON, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
-    conn.execute("CREATE TABLE IF NOT EXISTS _ai_sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, messages JSON, current_manifest JSON, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
+    conn.execute("CREATE TABLE IF NOT EXISTS _ai_sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, messages JSON, current_manifest JSON, pending_manifest JSON, diff_summary TEXT, last_error TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS _plugins (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, manifest JSON NOT NULL, description TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
-    conn.execute("CREATE TABLE IF NOT EXISTS _scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, trigger_type TEXT NOT NULL, code TEXT NOT NULL, active BOOLEAN DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
+    conn.execute("CREATE TABLE IF NOT EXISTS _scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, trigger_type TEXT NOT NULL, code TEXT NOT NULL, active BOOLEAN DEFAULT 1, target_collection TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS _templates (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE NOT NULL, content TEXT NOT NULL, script_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     Ok(())
 }
@@ -1087,7 +1378,15 @@ impl Db for Mutex<Connection> {
     async fn update_record(&self, _c: i64, _r: i64, _d: &Value) -> std::result::Result<Record, Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
     async fn delete_record(&self, _c: i64, _r: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn search_records(&self, _c: i64, _q: &str) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn instant_search(&self, _c: i64, _q: &str) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn instant_search(&self, _c: i64, _q: &str, _l: usize) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn index_record_search(&self, _c: i64, _r: i64, _d: &serde_json::Value, _s: &crate::schema::CollectionSchema
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
+        Ok(()) 
+    }
+    async fn delete_record_search(&self, _c: i64, _r: i64
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
+        Ok(()) 
+    }
     async fn reindex_collection(&self, _id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { Ok(()) }
     async fn create_user(&self, _e: &str, _p: &str, _r: &str) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
     async fn get_user_by_email(&self, _e: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
@@ -1108,6 +1407,7 @@ impl Db for Mutex<Connection> {
     async fn save_setting(&self, _k: &str, _v: serde_json::Value, _e: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn log_audit_event(&self, _l: &str, _m: &str, _s: &str, _meta: Option<serde_json::Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn list_audit_logs(&self) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn log_system_event(&self, _level: &str, _target: &str, _message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn list_ai_actions(&self) -> std::result::Result<Vec<ai_models::AiAction>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
     async fn get_ai_action(&self, _slug: &str) -> std::result::Result<Option<ai_models::AiAction>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     async fn create_ai_action(&self, _a: ai_models::CreateActionReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }

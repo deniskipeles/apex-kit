@@ -202,6 +202,60 @@ impl SearchManager {
         Ok(())
     }
 
+    /// Optimized method for re-indexing: Adds multiple documents and commits ONCE.
+    pub fn index_batch(&self, collection_id: i64, records: &[(i64, serde_json::Value)], schema: &CollectionSchema) -> Result<(), String> {
+        let mut lock = self.writers.lock().unwrap();
+        let writer = lock.get_mut(&collection_id).ok_or("Index not loaded")?;
+        
+        let index_schema = writer.index().schema();
+        let id_field = index_schema.get_field("record_id").map_err(|_| "Field not found")?;
+
+        for (record_id, data) in records {
+            let mut doc = TantivyDocument::default();
+            doc.add_i64(id_field, *record_id);
+
+            for (name, def) in &schema.fields {
+                if def.indexed {
+                    if let Ok(field) = index_schema.get_field(name) {
+                        if let Some(val) = data.get(name) {
+                            // ... (Copy your field mapping logic from index_record here) ...
+                            // START COPY
+                            match def.r#type {
+                                FieldType::String | FieldType::Text => {
+                                    if let Some(s) = val.as_str() { doc.add_text(field, s); }
+                                },
+                                FieldType::Number => {
+                                    if let Some(n) = val.as_f64() { doc.add_f64(field, n); }
+                                },
+                                FieldType::Boolean => {
+                                    if let Some(b) = val.as_bool() { doc.add_u64(field, if b { 1 } else { 0 }); }
+                                },
+                                FieldType::GeoPoint => {
+                                    if let Some(obj) = val.as_object() {
+                                        let lat = obj.get("lat").and_then(|v| v.as_f64());
+                                        let lng = obj.get("lng").or_else(|| obj.get("lon")).and_then(|v| v.as_f64());
+                                        if let (Some(l), Some(g)) = (lat, lng) {
+                                            if let Ok(f_lat) = index_schema.get_field(&format!("{}_lat", name)) { doc.add_f64(f_lat, l); }
+                                            if let Ok(f_lng) = index_schema.get_field(&format!("{}_lng", name)) { doc.add_f64(f_lng, g); }
+                                        }
+                                    }
+                                },
+                                _ => {}
+                            }
+                            // END COPY
+                        }
+                    }
+                }
+            }
+            writer.add_document(doc).map_err(|e| e.to_string())?;
+        }
+
+        // ONE COMMIT FOR THE WHOLE BATCH
+        writer.commit().map_err(|e| e.to_string())?;
+        
+        Ok(())
+    }
+
     pub fn delete_record(&self, collection_id: i64, record_id: i64) -> Result<(), String> {
         let mut lock = self.writers.lock().unwrap();
         // If index isn't loaded, we can't delete from it, but that's fine (it might not exist)
@@ -261,9 +315,36 @@ impl SearchManager {
         if default_fields.is_empty() { return Ok(vec![]); }
 
         let trimmed = query_str.trim();
-        let clean_query = if trimmed.is_empty() { "*".to_string() } else { format!("{}*", trimmed) };
+        
+        // --- SMART QUERY CONSTRUCTION ---
+        let clean_query = if trimmed.is_empty() {
+            "*".to_string()
+        } else {
+            // Logic:
+            // 1. "shne*" -> Prefix search (standard autocomplete)
+            // 2. "shne~1" -> Fuzzy search (1 edit distance) if word > 3 chars
+            // 3. "shne~2" -> Fuzzy search (2 edit distance) if word > 6 chars
+            let len = trimmed.len();
+            if len <= 3 {
+                // Short words: Exact or Prefix only (Fuzzy on short words is too noisy)
+                format!("{}*", trimmed)
+            } else if len <= 6 {
+                // Medium words: Allow 1 typo
+                format!("{}* OR {}~1", trimmed, trimmed)
+            } else {
+                // Long words: Allow 2 typos
+                format!("{}* OR {}~2", trimmed, trimmed)
+            }
+        };
+        // --------------------------------
+
         let query_parser = QueryParser::for_index(index, default_fields);
-        let query = match query_parser.parse_query(&clean_query) { Ok(q) => q, Err(_) => return Ok(vec![]) };
+        
+        // Use the new clean_query
+        let query = match query_parser.parse_query(&clean_query) { 
+            Ok(q) => q, 
+            Err(_) => return Ok(vec![]) 
+        };
 
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit)).map_err(|e| e.to_string())?;
         let id_field = schema.get_field("record_id").unwrap();

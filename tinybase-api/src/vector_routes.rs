@@ -3,15 +3,15 @@ use axum::{
     Extension,
 };
 use serde::{ Deserialize };
-use tinybase_core::{auth::Claims, jobs::Job}; // Import Job
-use crate::{AppState, AppError, RecordResponse};
+use tinybase_core::{auth::Claims, jobs::Job}; 
+use crate::{AppState, AppError, RecordResponse, DatabaseConnection, IdPath};
 use std::collections::HashMap;
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct VectorSearchReq {
     pub vector: Vec<f32>,
     pub limit: Option<usize>,
-    pub field: String, // Which field to search against (e.g. "description_vec")
+    pub field: String, 
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -28,13 +28,14 @@ pub struct TextVectorSearchReq {
 )]
 pub async fn search_vector(
     auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
+    DatabaseConnection(db): DatabaseConnection, // FIXED: Use Extractor
+    State(_state): State<AppState>, // Still need State for vector_provider
+    Path(path): Path<IdPath>, // FIXED: Use IdPath
     Json(payload): Json<VectorSearchReq>,
 ) -> Result<Json<Vec<RecordResponse>>, AppError> {
     // 1. Auth Check (Read Policy)
     let claims = auth.map(|Extension(c)| c);
-    let collection = state.db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
+    let collection = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Collection not found".into()))?;
     
     let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
@@ -42,9 +43,15 @@ pub async fn search_vector(
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
-    // 2. Perform Search
+    // 2. Perform Search using DB method which delegates to provider
+    // Note: State.vector_provider is the global/root one.
+    // If we are in a tenant, the TenantManager has already configured the DB to use the tenant provider.
+    // However, `db.search_vector` implementation in `CachedDb` calls `inner.search_vector` -> `TinyBase::search_vector` -> `vector_provider.search`.
+    // The `TinyBase` instance inside `CachedDb` was constructed with the correct provider (Global or Tenant).
+    // So we just call `db.search_vector`.
+
     let limit = payload.limit.unwrap_or(10).min(100);
-    let records = state.db.search_vector(id, &payload.field, payload.vector, limit)
+    let records = db.search_vector(path.id, &payload.field, payload.vector, limit)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
@@ -60,13 +67,14 @@ pub async fn search_vector(
 )]
 pub async fn query_vector_search(
     auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection, // FIXED
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(path): Path<IdPath>, // FIXED
     Json(payload): Json<TextVectorSearchReq>,
 ) -> Result<Json<Vec<RecordResponse>>, AppError> {
     // 1. Auth Check (Read Policy)
     let claims = auth.map(|Extension(c)| c);
-    let collection = state.db.get_collection(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
+    let collection = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Collection not found".into()))?;
     
     let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
@@ -75,6 +83,8 @@ pub async fn query_vector_search(
     }
 
     // 2. Generate Vector from Query Text
+    // This uses the GLOBAL state.embedder because embedding logic is stateless/heavy and shared.
+    // TenantManager passes the SAME embedder instance to tenants anyway.
     let query_vector = state.vector_provider.embed(&payload.query_text).await
         .map_err(|e| AppError::UnknownError(format!("Embedding generation failed: {}", e)))?;
         
@@ -91,25 +101,28 @@ pub async fn query_vector_search(
     }
     
     // 4. Perform Search for *each* vectorizable field and aggregate scores
-    // Stores: { record_id: total_score }
     let mut record_scores: HashMap<i64, f32> = HashMap::new();
+
+    // We can't access `vector_provider` directly from `db` because `db` is `Arc<dyn Db>`.
+    // But `TinyBase` implements `search_vector`.
+    // We will use `db.search_vector` for each field.
 
     for field_name in vectorizable_fields {
         // Search the HNSW index
-        let results = state.vector_provider.search(id, &field_name, &query_vector, limit).await
+        let records = db.search_vector(path.id, &field_name, query_vector.clone(), limit).await
             .map_err(|e| AppError::UnknownError(format!("Vector search failed for {}: {}", field_name, e)))?;
 
-        // Aggregate scores (e.g., sum or average for unified score)
-        for (rec_id, score) in results {
-            // Using sum of scores as aggregation logic (Higher score is better in HNSW L2 distance)
-            // Note: score aggregation logic can vary (sum, max, min, average)
-            *record_scores.entry(rec_id).or_insert(0.0) += score;
+        // Aggregate scores (Dummy score for now since search_vector returns Records, not scores+ids)
+        // If exact scoring is needed, `Db` trait needs update to return scores. 
+        // For now, we just merge results.
+        for rec in records {
+            // Simple accumulation: If it appears in multiple fields, it's more relevant
+             *record_scores.entry(rec.id).or_insert(0.0) += 1.0; 
         }
     }
     
     // 5. Get top N aggregated records
     let mut sorted_records: Vec<(i64, f32)> = record_scores.into_iter().collect();
-    // Sort by score (descending)
     sorted_records.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     
     let top_ids: Vec<i64> = sorted_records.into_iter()
@@ -118,10 +131,9 @@ pub async fn query_vector_search(
         .collect();
 
     // 6. Fetch Records from DB
-    let records = state.db.get_records_by_ids(id, &top_ids).await
+    let records = db.get_records_by_ids(path.id, &top_ids).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // 7. Map Response (maintaining order from search results is complex, skipping for brevity)
     Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data }).collect()))
 }
 
@@ -132,8 +144,9 @@ pub async fn query_vector_search(
 )]
 pub async fn revectorize_collection_handler(
     auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection, // FIXED
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(path): Path<IdPath>, // FIXED
 ) -> Result<Json<serde_json::Value>, AppError> {
     // 1. Auth Check (Admins Only)
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
@@ -142,7 +155,7 @@ pub async fn revectorize_collection_handler(
     }
 
     // 2. Get Collection Schema
-    let collection = state.db.get_collection(id).await
+    let collection = db.get_collection(path.id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Collection not found".into()))?;
         
@@ -163,30 +176,31 @@ pub async fn revectorize_collection_handler(
 
     // 4. Iterate over all records in the collection
     let mut options = tinybase_core::query::QueryOptions::default();
-    options.limit = None; // Get all records
+    options.limit = None; 
     options.per_page = None;
     
-    // Using simple list_records with no limits (might be slow for huge DBs, 
-    // but correct for reindexing all data).
-    let all_records = state.db.list_records(id, options).await
+    let all_records = db.list_records(path.id, options).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?.items;
 
     let mut jobs_queued = 0;
     
     // 5. Queue Jobs
     for record in all_records {
-        // FIX: The compiler insists record.id is i64 here, so we trust it.
-        // If the core logic correctly unwrapped it for fetched records, we use it directly.
         let record_id: i64 = record.id; 
 
         for field_name in &vectorizable_fields {
             if let Some(text_content) = record.data.get(field_name).and_then(|v| v.as_str()) {
                 let job = Job::GenerateEmbedding {
-                    collection_id: id,
+                    collection_id: path.id,
                     record_id,
                     field_name: field_name.clone(),
                     text_content: text_content.to_string()
                 };
+                // NOTE: Queue is global, but the Job Handler will need to know WHICH TENANT context.
+                // Currently `Job::GenerateEmbedding` doesn't carry tenant_id.
+                // This means background jobs will fail for Tenants unless updated.
+                // For now, this works for Root App. 
+                // To fix for tenants, Job struct and Worker need updates (out of scope for this snippet request).
                 state.queue.enqueue(job).await;
                 jobs_queued += 1;
             }

@@ -7,13 +7,47 @@ import { PowerBase } from './sdk';
 const apiUrl = (import.meta as any).env.DEV
   ? (import.meta as any).env.VITE_API_URL?.trim() || 'http://127.0.0.1:5000'
   : (typeof window !== 'undefined' ? window.origin : 'http://127.0.0.1:5000').trim();
-export const pb = new PowerBase(apiUrl);
+// export const pb = new PowerBase(apiUrl);
+
+// // Load persisted token
+// const storedToken = localStorage.getItem(APEX_TOKEN);
+// if (storedToken) {
+//   pb.setToken(storedToken);
+// }
+const basePb = new PowerBase(apiUrl);
 
 // Load persisted token
 const storedToken = localStorage.getItem(APEX_TOKEN);
 if (storedToken) {
-  pb.setToken(storedToken);
+    basePb.setToken(storedToken);
 }
+
+// --- DYNAMIC CLIENT PROXY ---
+// This allows the entire app to automatically switch to Tenant Mode
+// if the URL path is /_dashboard/tenant/:id/...
+export const pb = new Proxy(basePb, {
+  get(target, prop, receiver) {
+      if (typeof window !== 'undefined') {
+          const path = window.location.pathname;
+
+          // 1. Check for TENANT URL
+          const tenantMatch = path.match(/^\/_dashboard\/tenant\/([^/]+)/);
+          if (tenantMatch && tenantMatch[1]) {
+              const tenantInstance = target.tenant(tenantMatch[1]);
+              return Reflect.get(tenantInstance, prop, receiver);
+          }
+
+          // 2. Check for SANDBOX URL (NEW)
+          const sandboxMatch = path.match(/^\/_dashboard\/sandbox\/([^/]+)/);
+          if (sandboxMatch && sandboxMatch[1]) {
+              const sandboxInstance = target.sandbox(sandboxMatch[1]);
+              return Reflect.get(sandboxInstance, prop, receiver);
+          }
+      }
+      return Reflect.get(target, prop, receiver);
+  }
+});
+
 
 
 // --- HELPER: Transform Backend Collection to Frontend Interface ---
@@ -154,7 +188,7 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
 
 export const apiClient = {
   apiUrl: apiUrl,
-  stripHtmlTags: pb.utils.stripHtmlTags,
+  stripHtmlTags: basePb.utils.stripHtmlTags,
   getAdminDashboardStats: pb.admins.getDashboardStats,
   searchVector: (collectionId: string | number, field: string, vector: Array<number>, limit?: number) => pb.collection(collectionId).searchVector(field, vector, limit),
   searchTextVector: (collectionId: string | number, queryText: string, limit?: number) => pb.collection(collectionId).searchTextVector(queryText, limit),
@@ -175,6 +209,12 @@ export const apiClient = {
     return res;
   },
 
+  // Explicit Admin methods for Root
+  root: {
+      createTenant: (id: string) => basePb.admins.createTenant(id), // Always use basePb for creating tenants
+      // deleteTenant: (id: string) => basePb.admins.deleteTenant(id),
+      listTenants: () => basePb.admins.listTenants(),
+  },
 
   auth: {
     login: async (email: string, password: string) => {
@@ -272,7 +312,9 @@ export const apiClient = {
     },
     delete: async (id: string): Promise<void> => {
       return pb.admins.deleteCollection(id);
-    }
+    },
+    revectorize: (id: string) => pb.admins.revectorizeCollection(id),
+    reIndex: (id: string) => pb.admins.reIndex(id)
   },
 
   records: {
@@ -348,6 +390,14 @@ export const apiClient = {
     },
     delete: async (id: string): Promise<void> => {
       console.warn("Use recordsService.delete(collectionId, recordId) instead");
+    },
+
+    searchTextVector: async (collectionId: string, query: string, limit = 10) => {
+        return await pb.collection(collectionId).searchTextVector(query, limit);
+    },
+    
+    searchVector: async (collectionId: string, field: string, vector: number[], limit = 10) => {
+        return await pb.collection(collectionId).searchVector(field, vector, limit);
     }
   },
 
@@ -362,7 +412,7 @@ export const apiClient = {
           name: f.original_name, // Map original_name -> name
           size: f.size,
           mimeType: f.mime_type, // Map snake_case -> camelCase
-          url: `${pb.baseUrl}/api/v1/storage/file/${f.filename}`, // Construct public URL
+          url: pb.files.getFileUrl(f.filename), // Construct public URL
           created: f.created_at,
           updated: f.created_at
         }));
@@ -445,6 +495,30 @@ export const apiClient = {
     },
     run: async (slug: string, variables: Record<string, string>) => {
       return await pb.ai.run(slug, variables);
+    },
+    listSessions: async (): Promise<Array<object>> => {
+      const res = await pb.ai.listSessions();
+      return res;
+    },
+    createSession: async (name: string, initialPrompt?: string, model?: string): Promise<object> => {
+      const res = await pb.ai.createSession(name, initialPrompt, model);
+      return res;
+    },
+    chat: async (id: string, prompt: string, model: string): Promise<object> => {
+      const res = await pb.ai.chat(id, prompt, model);
+      return res;
+    },
+    applySessionChanges: async (id: string): Promise<any> => {
+      const res = await pb.ai.applySessionChanges(id);
+      return res;
+    },
+    publishSession: async (id: string): Promise<any> => {
+      const res = await pb.ai.publishSession(id);
+      return res;
+    },
+    listPlugins: async (): Promise<Plugin[]> => {
+      const res = await pb.ai.listPlugins();
+      return res;
     }
   },
 

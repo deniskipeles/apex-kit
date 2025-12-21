@@ -164,11 +164,25 @@ impl Db for CachedDb {
         self.inner.search_records(collection_id, query).await
     }
 
-    async fn instant_search(&self, collection_id: i64, query: &str) -> Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.instant_search(collection_id, query).await
+    async fn instant_search(&self, collection_id: i64, query: &str, limit: usize) -> Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.instant_search(collection_id, query, limit).await
     }
 
-    // Methods for VECTORS
+    async fn index_record_search(&self, c: i64, r: i64, d: &Value, s: &CollectionSchema) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.index_record_search(c, r, d, s).await
+    }
+    async fn delete_record_search(&self, c: i64, r: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.delete_record_search(c, r).await
+    }
+    // Add reindex_collection 
+    async fn reindex_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        // Pass through to inner (TinyBase)
+        self.inner.reindex_collection(id).await
+    }
+
+
+    // --- Vectorization ---
+
     async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.save_vector(collection_id, record_id, field_name, vector).await
     }
@@ -179,12 +193,6 @@ impl Db for CachedDb {
     
     async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn StdError + Send + Sync>> {
         self.inner.search_vector(collection_id, field, vector, limit).await
-    }
-
-    // FIX: Add reindex_collection to match trait
-    async fn reindex_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
-        // Pass through to inner (TinyBase)
-        self.inner.reindex_collection(id).await
     }
 
     // --- Users ---
@@ -309,6 +317,10 @@ impl Db for CachedDb {
 
     async fn list_audit_logs(&self) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.list_audit_logs().await
+    }
+
+    async fn log_system_event(&self, level: &str, target: &str, message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.log_system_event(level, target, message).await
     }
 
     // --- AI Actions ---

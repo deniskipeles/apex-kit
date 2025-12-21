@@ -1,3 +1,4 @@
+// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-api/src/ai_routes.rs ===========================
 use axum::{
     extract::{Path, State, Json},
     Extension,
@@ -9,7 +10,7 @@ use tinybase_core::{
     ai_models::{AiAction, CreateActionReq},
     security::EncryptedValue
 };
-use crate::{AppState, AppError, settings::AiConfigDto};
+use crate::{AppState, AppError, settings::AiConfigDto, DatabaseConnection}; // Added DatabaseConnection
 use regex::Regex;
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -44,10 +45,11 @@ fn parse_data_uri(uri: &str) -> Option<(String, String)> {
 )]
 pub async fn list_actions(
     Extension(claims): Extension<Claims>,
-    State(state): State<AppState>
+    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
+    State(_state): State<AppState>
 ) -> Result<Json<Vec<AiAction>>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    let actions = state.db.list_ai_actions().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let actions = db.list_ai_actions().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(actions))
 }
 
@@ -59,11 +61,12 @@ pub async fn list_actions(
 )]
 pub async fn create_action(
     Extension(claims): Extension<Claims>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
+    State(_state): State<AppState>,
     Json(payload): Json<CreateActionReq>
 ) -> Result<Json<serde_json::Value>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    let id = state.db.create_ai_action(payload).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let id = db.create_ai_action(payload).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -74,17 +77,16 @@ pub async fn create_action(
 )]
 pub async fn delete_action(
     Extension(claims): Extension<Claims>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
+    State(_state): State<AppState>,
     Path(id): Path<i64>
 ) -> Result<Json<serde_json::Value>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    state.db.delete_ai_action(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    db.delete_ai_action(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(json!({ "success": true })))
 }
 
 // --- EXECUTION (PUBLIC/AUTH) ---
-
-// --- EXECUTION (PUBLIC/AUTH) - UPDATED FOR MULTIMODAL ---
 
 #[utoipa::path(
     post,
@@ -93,18 +95,20 @@ pub async fn delete_action(
     responses((status = 200, body = Value))
 )]
 pub async fn run_action(
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB to find action
+    State(state): State<AppState>, // Need State for Vault
     Path(slug): Path<String>,
     Json(payload): Json<ExecutePromptReq>,
 ) -> Result<Json<Value>, AppError> {
     
-    // 1. Get Action Config
-    let action = state.db.get_ai_action(&slug).await
+    // 1. Get Action Config (From Tenant/Sandbox DB)
+    let action = db.get_ai_action(&slug).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Action not found".into()))?;
 
-    // 2. Get API Key from Settings
-    let ai_settings_json = state.db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    // 2. Get API Key from Settings (From Tenant/Sandbox DB)
+    let ai_settings_json = db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
     let ai_config: AiConfigDto = if let Some(val) = ai_settings_json {
         serde_json::from_value(val).unwrap_or_default()
     } else {
@@ -117,6 +121,7 @@ pub async fn run_action(
 
     let api_key_str = ai_config.api_key.ok_or(AppError::UnknownError("API Key missing".into()))?;
     
+    // Decrypt using Global Vault
     let encrypted_val: EncryptedValue = serde_json::from_str(&api_key_str)
         .map_err(|_| AppError::UnknownError("Invalid encrypted key format".into()))?;
         
@@ -238,20 +243,20 @@ pub struct CodeEditReq {
 )]
 pub async fn edit_code(
     Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
     State(state): State<AppState>,
     Json(req): Json<CodeEditReq>,
 ) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
-    // 1. Get Config
-    // Reuse the get_ai_config logic or duplicate it here for now
-    let ai_settings = state.db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    // 1. Get Config (From Tenant/Sandbox DB)
+    let ai_settings = db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     let (api_key, _model) = match ai_settings {
         Some(val) => {
-            let conf: crate::settings::AiConfigDto = serde_json::from_value(val).unwrap_or_default();
+            let conf: AiConfigDto = serde_json::from_value(val).unwrap_or_default();
             if !conf.enabled { return Err(AppError::Forbidden("AI disabled".into())); }
             let raw = conf.api_key.ok_or(AppError::UnknownError("AI Key missing".into()))?;
-            let enc: tinybase_core::security::EncryptedValue = serde_json::from_str(&raw).map_err(|_| AppError::UnknownError("Bad key".into()))?;
+            let enc: EncryptedValue = serde_json::from_str(&raw).map_err(|_| AppError::UnknownError("Bad key".into()))?;
             let key = state.vault.decrypt(&enc).map_err(|_| AppError::UnknownError("Decrypt fail".into()))?;
             let modl = conf.model.unwrap_or("gemini-2.5-flash".to_string());
             (key, modl)

@@ -6,10 +6,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tinybase_core::auth::Claims;
-use crate::{AppState, AppError};
+use crate::{AppState, AppError, DatabaseConnection}; // Added DatabaseConnection
 use utoipa::ToSchema;
 
-// --- API Models ---
+// --- API Models (Unchanged) ---
 
 #[derive(Serialize, Deserialize, ToSchema, Default)]
 pub struct AppSettingsDto {
@@ -62,7 +62,7 @@ pub struct SecurityConfigDto {
 #[derive(Serialize, Deserialize, ToSchema, Clone, Default)]
 pub struct AiConfigDto {
     pub enabled: bool,
-    pub provider: String, // e.g., "gemini"
+    pub provider: String,
     pub model: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
@@ -81,19 +81,20 @@ pub struct AiConfigDto {
 )]
 pub async fn get_settings(
     auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
+    State(_state): State<AppState>, // Only need state if we need vault/etc not in DB
 ) -> Result<Json<AppSettingsDto>, AppError> {
     // 1. Auth Check
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
-    // 2. Fetch all setting groups
-    let general = state.db.get_setting("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?.unwrap_or(json!({}));
-    let smtp = state.db.get_setting("smtp").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let storage = state.db.get_setting("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let security = state.db.get_setting("security").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let cron_json = state.db.get_setting("cron_jobs").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let ai = state.db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    // 2. Fetch all setting groups from the injected DB (Root or Tenant)
+    let general = db.get_setting("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?.unwrap_or(json!({}));
+    let smtp = db.get_setting("smtp").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let storage = db.get_setting("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let security = db.get_setting("security").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let cron_json = db.get_setting("cron_jobs").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let ai = db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 3. Construct Response
     let mut response = AppSettingsDto {
@@ -164,14 +165,15 @@ pub async fn get_settings(
 )]
 pub async fn update_settings(
     auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
+    State(state): State<AppState>, // Still need State for Vault (Encryption)
     Json(payload): Json<AppSettingsDto>,
 ) -> Result<Json<AppSettingsDto>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
     // 1. Update General
-    let mut general = state.db.get_setting("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?.unwrap_or(json!({}));
+    let mut general = db.get_setting("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?.unwrap_or(json!({}));
     
     // Use references (&) to avoid consuming payload fields
     if let Some(v) = &payload.app_name { general["app_name"] = json!(v); }
@@ -181,11 +183,11 @@ pub async fn update_settings(
     if let Some(v) = &payload.app_logo { general["app_logo"] = json!(v); }
     if let Some(v) = &payload.log_retention_days { general["log_retention_days"] = json!(v); }
     
-    state.db.save_setting("general", general, false).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    db.save_setting("general", general, false).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 2. Update SMTP (Encrypt Password if changed)
     if let Some(new_smtp) = &payload.smtp {
-        let existing_json = state.db.get_setting("smtp").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        let existing_json = db.get_setting("smtp").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         let mut final_smtp = new_smtp.clone();
 
         if let Some(existing_val) = existing_json {
@@ -206,12 +208,12 @@ pub async fn update_settings(
              }
         }
 
-        state.db.save_setting("smtp", serde_json::to_value(final_smtp).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        db.save_setting("smtp", serde_json::to_value(final_smtp).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     // 3. Update Storage (Encrypt Secret Key if changed)
     if let Some(new_storage) = &payload.storage {
-        let existing_json = state.db.get_setting("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        let existing_json = db.get_setting("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         let mut final_storage = new_storage.clone();
 
         if let Some(existing_val) = existing_json {
@@ -232,24 +234,24 @@ pub async fn update_settings(
              }
         }
 
-        state.db.save_setting("storage", serde_json::to_value(final_storage).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        db.save_setting("storage", serde_json::to_value(final_storage).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     // 4. Update Security (CORS)
     if let Some(new_sec) = &payload.security {
-        state.db.save_setting("security", serde_json::to_value(new_sec).unwrap(), false)
+        db.save_setting("security", serde_json::to_value(new_sec).unwrap(), false)
             .await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     // 5. Update Cron Jobs
     if let Some(jobs) = &payload.cron_jobs {
-        state.db.save_setting("cron_jobs", serde_json::to_value(jobs).unwrap(), false)
+        db.save_setting("cron_jobs", serde_json::to_value(jobs).unwrap(), false)
             .await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     // 6. Update AI (Encrypt API Key if changed)
     if let Some(new_ai) = &payload.ai {
-        let existing_json = state.db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        let existing_json = db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         let mut final_ai = new_ai.clone();
 
         if let Some(existing_val) = existing_json {
@@ -270,9 +272,8 @@ pub async fn update_settings(
              }
         }
 
-        state.db.save_setting("ai", serde_json::to_value(final_ai).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        db.save_setting("ai", serde_json::to_value(final_ai).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     Ok(Json(payload))
 }
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/tinybase-api/src/settings.rs ends here ===========================

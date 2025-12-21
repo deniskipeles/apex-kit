@@ -189,7 +189,8 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
                 payload, 
                 state.db.clone(), 
                 state.embedder.clone(), 
-                state.vector_provider.clone()
+                state.vector_provider.clone(),
+                state.vault.clone()
             ).await.map_err(|e| format!("Script Error: {}", e))?;
 
             println!("{}", serde_json::to_string_pretty(&result).unwrap());

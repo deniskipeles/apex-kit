@@ -25,9 +25,10 @@ use async_graphql::dynamic::{Schema, Object, Field, TypeRef, FieldFuture};
 use tinybase_core::scripting::ScriptEngine;
 use moka::future::Cache;
 
-// Import ApexVector types (from local crate)
-use apex_vector::VectorEngine;
+use apex_vector::{VectorEngine, CandleEmbedder};
 use tinybase_core::VectorProvider;
+
+use tinybase_api::tenant_manager::TenantManager;
 
 // --- 1. Define Bridge (Real AI) ---
 // Bridges the ApexVector engine to the TinyBase Core trait
@@ -81,11 +82,13 @@ async fn main() {
     // 2. CLI Parsing (Arguments)
     let cli = Cli::parse();
 
-    // 3. Logging Initialization
-    // Initialize file-based logging (logs/ folder) + console output
-    // Returns a guard that must be kept alive for the duration of the process
-    let _guard = tinybase_api::logging::init_logging("logs", 7);
-
+    // --- LOGGING SETUP (FIXED) ---
+    // 1. Rotate logs if needed
+    tinybase_api::logging::rotate_logs_on_startup("logs.db", "logs");
+    
+    // 2. Initialize Tracing System (Called EXACTLY ONCE)
+    let log_rx = tinybase_api::logging::init_logging_system();
+    
     tracing::info!("System starting up...");
 
     // --- SECURITY BOOTSTRAP ---
@@ -98,7 +101,7 @@ async fn main() {
         println!(" 1. COPY this key immediately.");
         println!(" 2. ADD it to your .env file: TINYBASE_MASTER_KEY={}", new_key);
         println!("");
-        println!(" 3. RESTART the server.");
+        println!(" 3. TO BE USED ON SERVER RESTART.");
         println!("=======================================================\n");
         new_key
     });
@@ -112,18 +115,20 @@ async fn main() {
     let builder = PrometheusBuilder::new();
     let handle = builder.install_recorder().expect("failed to install Prometheus recorder");
 
-    // --- 4. Initialize AI Engine (With Graceful Fallback) ---
+    // --- 4. Initialize AI Engine (Split Result) ---
     tracing::info!("Initializing Apex Vector Engine...");
     
-    let vector_provider: Arc<dyn VectorProvider> = match VectorEngine::new().await {
+    // We split this so we can pass the specific `CandleEmbedder` struct to TenantManager
+    // but pass the generic `dyn VectorProvider` trait to the AppState/DB.
+    let (vector_provider, shared_embedder): (Arc<dyn VectorProvider>, Option<Arc<CandleEmbedder>>) = match VectorEngine::new().await {
         Ok(engine) => {
             tracing::info!("✅ Apex Vector Engine (Candle + HNSW) ready.");
-            Arc::new(ApexBridge { engine })
+            let embedder_ref = engine.embedder.clone(); // Keep a ref to the concrete struct
+            (Arc::new(ApexBridge { engine }), Some(embedder_ref))
         },
         Err(e) => {
-            // Log the error but DO NOT CRASH. Allows server to run as standard DB.
             tracing::error!("⚠️  Failed to init Vector Engine: {}. AI features will be disabled.", e);
-            Arc::new(FallbackVectorProvider)
+            (Arc::new(FallbackVectorProvider), None)
         }
     };
 
@@ -138,21 +143,21 @@ async fn main() {
 
     let cached_db = Arc::new(CachedDb::new(Arc::new(raw_db)));
 
-    // --- 5. HNSW INDEX RELOAD ---
-    // Reloads persisted vectors from SQLite into Memory for fast search
+    // 3. START LOG WORKER
+    // Now that DB is ready, start draining the log buffer into SQLite
+    let db_for_logs = cached_db.clone();
+    tokio::spawn(async move {
+        tinybase_api::logging::start_log_worker(log_rx, db_for_logs).await;
+    });
+
+    // --- 5. HNSW RELOAD ---
     let mut total_vectors_loaded = 0;
     tracing::info!("Reloading HNSW index from vectors database...");
-
     if let Ok(all_collections) = cached_db.list_collections().await {
         for col in &all_collections {
-            let col_id = col.id;
-            
-            // Get all stored vectors for this collection
-            if let Ok(vectors_to_load) = cached_db.get_vectors_for_collection(col_id).await {
+            if let Ok(vectors_to_load) = cached_db.get_vectors_for_collection(col.id).await {
                 for (rec_id, field_name, vector) in vectors_to_load {
-                    // Index each one into the in-memory HNSW index
-                    vector_provider.index(col_id, rec_id, &field_name, &vector).await
-                        .unwrap_or_else(|e| tracing::error!("HNSW Reload Error: {}", e));
+                    vector_provider.index(col.id, rec_id, &field_name, &vector).await.ok();
                     total_vectors_loaded += 1;
                 }
             }
@@ -173,11 +178,24 @@ async fn main() {
     let job_queue = jobs::start_background_worker(cached_db.clone(), vector_provider.clone(), vault.clone());
     let (tx, _rx) = broadcast::channel::<realtime::DbEvent>(100);
 
-    // --- 7. STORAGE BACKEND ---
-    tracing::info!("Initializing Dynamic Storage Backend (DB-backed configuration)");
+    // --- 7. STORAGE BACKEND (FIXED ARGUMENTS) ---
+    tracing::info!("Initializing Dynamic Storage Backend...");
     let storage: Arc<dyn StorageBackend> = Arc::new(
-        tinybase_api::storage::DynamicStorage::new(cached_db.clone(), vault.clone())
+        tinybase_api::storage::DynamicStorage::new(
+            cached_db.clone(), 
+            vault.clone(), 
+            None, // No FS override for root
+            "/api/v1/storage/file/".to_string() // Default public URL prefix
+        )
     );
+
+    // --- INIT TENANT MANAGER ---
+    // Capacity 500 active databases. Unused ones dropped after 1hr.
+    let tenant_manager = Arc::new(TenantManager::new(
+        shared_embedder, // This is Option<Arc<CandleEmbedder>>
+        vault.clone(), 
+        500
+    ));
 
     // --- 8. SCHEDULER & STATE ---
     // Init Scheduler
@@ -215,6 +233,7 @@ async fn main() {
     // 9. Construct AppState
     let state = AppState {
         db: cached_db.clone(),
+        tenant_manager,
         queue: job_queue,
         metrics: Some(handle),
         tx,
