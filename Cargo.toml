@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "tinybase-api", 
-    "tinybase-core",
+    "apexkit-api", 
+    "apexkit-core",
     "apex-vector",
 ]
 resolver = "2"

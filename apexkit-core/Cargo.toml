@@ -1,0 +1,60 @@
+[package]
+name = "apexkit-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+# Database
+libsql = { version = "0.9.29", features = ["replication"] }
+
+# Async & Runtime
+tokio = { version = "1.37.0", features = ["full"] }
+async-trait = "0.1.80"
+
+# Serialization
+serde = { version = "1.0.200", features = ["derive"] }
+serde_json = "1.0.117"
+
+# Utilities
+validator = { version = "0.18.1", features = ["derive"] }
+thiserror = "1.0.59"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8.5" # upgrade from 0.8
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
+moka = { version = "0.12", features = ["future"] } # Caching
+
+# OpenAPI Documentation
+utoipa = "5.4.0"
+
+# Storage & AWS
+aws-config = "1.1"
+aws-sdk-s3 = "1.1"
+aws-credential-types = "1.1" 
+
+# Email
+lettre = { version = "0.11", features = ["tokio1", "smtp-transport", "builder", "tokio1-native-tls"] }
+
+# Auth & Crypto
+bcrypt = "0.15"
+jsonwebtoken = "9.3.0"
+aes-gcm = "0.10"
+base64 = "0.21"
+secrecy = { version = "0.8", features = ["serde"] }
+zeroize = "1.7"
+openssl = { version = "0.10", features = ["vendored"] }
+
+# Search Engine
+tantivy = "0.22"
+
+# --- SCRIPTING ENGINE (Boa 0.21) ---
+# FIX: Removed features = ["intl"] to prevent "missing Intl provider" panic
+boa_engine = { version = "0.21.0" }
+boa_gc = "0.21.0"
+
+# HTTP Client (Added blocking feature for easier scripting)
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+# Validation Extensions
+regex = "1.10"
+url = "2.5"

@@ -1,19 +1,13 @@
 import { APEX_TOKEN } from '../constants';
 import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult, Script, Template, AiAction } from '../types';
-import { PowerBase } from './sdk';
+import { ApexKit as PowerBase, ApexKitRealtime } from './sdk';
 
 // const env = (import.meta as any).env;
 // Initialize SDK
 const apiUrl = (import.meta as any).env.DEV
   ? (import.meta as any).env.VITE_API_URL?.trim() || 'http://127.0.0.1:5000'
   : (typeof window !== 'undefined' ? window.origin : 'http://127.0.0.1:5000').trim();
-// export const pb = new PowerBase(apiUrl);
 
-// // Load persisted token
-// const storedToken = localStorage.getItem(APEX_TOKEN);
-// if (storedToken) {
-//   pb.setToken(storedToken);
-// }
 const basePb = new PowerBase(apiUrl);
 
 // Load persisted token
@@ -48,7 +42,7 @@ export const pb = new Proxy(basePb, {
   }
 });
 
-
+export const realtime = new ApexKitRealtime(pb.baseUrl, pb.getToken());
 
 // --- HELPER: Transform Backend Collection to Frontend Interface ---
 const transformCollection = (col: any): Collection => {

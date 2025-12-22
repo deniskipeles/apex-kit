@@ -1,12 +1,12 @@
 /**
- * PowerBase Client SDK v1.4.0
- * A vanilla JavaScript client for the Tinybase API.
+ * ApexKit Client SDK v1.4.0
+ * A vanilla JavaScript client for the ApexKit API.
  * Compatible with modern Browsers and Node.js (v18+).
  */
-export class PowerBase {
+export class ApexKit {
     /**
-     * Initialize the PowerBase client.
-     * @param {string} baseUrl - The URL of your Tinybase API (e.g., 'http://127.0.0.1:5000').
+     * Initialize the ApexKit client.
+     * @param {string} baseUrl - The URL of your ApexKit API (e.g., 'http://127.0.0.1:5000').
      */
     constructor(baseUrl) {
         // Ensure no trailing slash for consistent path building
@@ -19,12 +19,12 @@ export class PowerBase {
      * Creates a new client instance pointed at a specific Sandbox session.
      * All subsequent API calls on the returned instance will be routed to that sandbox.
      * @param {string} uuid - The Sandbox Session ID.
-     * @returns {PowerBase} A new SDK instance.
+     * @returns {ApexKit} A new SDK instance.
      */
     sandbox(uuid) {
         // Construct the sandbox URL: http://host/sandbox/{uuid}
         const sandboxUrl = `${this.baseUrl}/sandbox/${uuid}`;
-        const instance = new PowerBase(sandboxUrl);
+        const instance = new ApexKit(sandboxUrl);
         
         // Copy auth state to the sandbox instance
         instance.token = this.token;
@@ -38,12 +38,12 @@ export class PowerBase {
      * Creates a new client instance pointed at a specific Tenant.
      * All subsequent API calls on the returned instance will be routed to that tenant.
      * @param {string} tenantId - The Tenant ID.
-     * @returns {PowerBase} A new SDK instance.
+     * @returns {ApexKit} A new SDK instance.
      */
     tenant(tenantId) {
         // Construct the tenant URL: http://host/tenant/{tenantId}
         const tenantUrl = `${this.baseUrl}/tenant/${tenantId}`;
-        const instance = new PowerBase(tenantUrl);
+        const instance = new ApexKit(tenantUrl);
         
         // Copy auth state to the tenant instance
         instance.token = this.token;
@@ -758,5 +758,139 @@ export class PowerBase {
                 return doc.body.textContent || '';
             }
         }
+    }
+}
+
+/**
+ * ============================================
+ * ApexKit Realtime — Usage Guide
+ * ============================================
+ *
+ * This example demonstrates how to:
+ *  1. Establish a realtime connection
+ *  2. Subscribe to filtered events
+ *  3. Listen and react to updates
+ *
+ * --------------------------------------------
+ * 1. Start the realtime connection
+ * --------------------------------------------
+ *
+ * @example
+ * const realtime = new ApexKitRealtime(pb.baseUrl, pb.getToken());
+ * realtime.connect();
+ *
+ * --------------------------------------------
+ * 2. Subscribe to specific data changes
+ * --------------------------------------------
+ *
+ * Subscribe to updates on the `tickets` collection,
+ * but only receive events where the ticket priority
+ * is set to `"high"`.
+ *
+ * @example
+ * realtime.subscribe({
+ *   collectionId: 5,           // Collection ID for 'tickets'
+ *   eventType: "Update",       // Event type to listen for
+ *   dataFilter: {              // Mongo-style filter
+ *     priority: "high"
+ *   }
+ * });
+ *
+ * --------------------------------------------
+ * 3. Listen for realtime events
+ * --------------------------------------------
+ *
+ * Handle incoming events and update the UI
+ * or trigger notifications when changes occur.
+ *
+ * @example
+ * realtime.onEvent((event) => {
+ *   if (event.event === "Update") {
+ *     console.log("Ticket Updated:", event.payload.data);
+ *     // Refresh UI or show a toast notification
+ *   }
+ * });
+ *
+ * ============================================
+ */
+
+export class ApexKitRealtime {
+    constructor(url, token) {
+        this.url = url.replace("http", "ws") + "/ws"; // Auto-switch protocol
+        this.token = token;
+        this.socket = null;
+        this.reconnectInterval = 3000;
+        this.listeners = [];
+        this.isConnected = false;
+        
+        // Default filter (Listen to nothing until subscribed)
+        this.currentFilter = {}; 
+    }
+
+    connect() {
+        this.socket = new WebSocket(this.url);
+
+        this.socket.onopen = () => {
+            console.log("[ApexKit] Realtime Connected");
+            this.isConnected = true;
+            // 1. Authenticate (If you implement Auth Handshake later)
+            // 2. Resend subscription if reconnecting
+            if (this.currentFilter) {
+                this.subscribe(this.currentFilter);
+            }
+        };
+
+        this.socket.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                // msg format: { event: "Insert", payload: { ... } }
+                this.notify(msg);
+            } catch (e) {
+                if (event.data === "Pong") return; // Heartbeat
+                console.error("WS Parse Error", e);
+            }
+        };
+
+        this.socket.onclose = () => {
+            this.isConnected = false;
+            console.log("[ApexKit] Disconnected. Retrying...");
+            setTimeout(() => this.connect(), this.reconnectInterval);
+        };
+    }
+
+    /**
+     * Send a filter to the server to narrow down events.
+     * Matches the Rust `ClientMessage::Subscribe` struct.
+     */
+    subscribe(filter) {
+        this.currentFilter = filter;
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(JSON.stringify({
+                type: "Subscribe",
+                payload: {
+                    collection_id: filter.collectionId, // Optional
+                    record_id: filter.recordId,         // Optional
+                    event_type: filter.eventType,       // "Insert", "Update", "Delete"
+                    filter: filter.dataFilter           // The Mongo-style JSON filter
+                }
+            }));
+        }
+    }
+
+    unsubscribe() {
+        this.currentFilter = {};
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(JSON.stringify({ type: "Unsubscribe" }));
+        }
+    }
+
+    // Internal observer pattern
+    onEvent(callback) {
+        this.listeners.push(callback);
+        return () => this.listeners = this.listeners.filter(l => l !== callback);
+    }
+
+    notify(msg) {
+        this.listeners.forEach(cb => cb(msg));
     }
 }
