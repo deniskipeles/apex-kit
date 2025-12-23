@@ -8,6 +8,9 @@ const mapToFrontend = (apiData: any): AppSettings => {
         appUrl: apiData.app_url || 'http://localhost:3000',
         allowPublicRegistration: apiData.allow_public_registration || false,
         theme: apiData.theme || 'system',
+        appLogo: apiData.app_logo || '',     
+        logoWidth: apiData.logo_width || '', 
+        logoHeight: apiData.logo_height || '',
         smtp: {
             enabled: apiData.smtp?.enabled || false,
             host: apiData.smtp?.host || '',
@@ -51,6 +54,10 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
     if (settings.appUrl) payload.app_url = settings.appUrl;
     if (settings.allowPublicRegistration !== undefined) payload.allow_public_registration = settings.allowPublicRegistration;
     if (settings.theme) payload.theme = settings.theme;
+     // Map Logo Fields back to API
+     if (settings.appLogo !== undefined) payload.app_logo = settings.appLogo;
+     if (settings.logoWidth !== undefined) payload.logo_width = settings.logoWidth;
+     if (settings.logoHeight !== undefined) payload.logo_height = settings.logoHeight;
 
     if (settings.smtp) {
         payload.smtp = {

@@ -22,6 +22,8 @@ pub struct AppSettingsDto {
     pub cron_jobs: Option<Vec<apexkit_core::models::CronJob>>,
     pub ai: Option<AiConfigDto>,
     pub app_logo: Option<String>,
+    pub logo_width: Option<String>,
+    pub logo_height: Option<String>,
     pub log_retention_days: Option<u64>,
 }
 
@@ -101,12 +103,14 @@ pub async fn get_settings(
         app_url: general.get("app_url").and_then(|v| v.as_str()).map(String::from),
         allow_public_registration: general.get("allow_public_registration").and_then(|v| v.as_bool()),
         theme: general.get("theme").and_then(|v| v.as_str()).map(String::from),
+        app_logo: general.get("app_logo").and_then(|v| v.as_str()).map(String::from),
+        logo_width: general.get("logo_width").and_then(|v| v.as_str()).map(String::from),
+        logo_height: general.get("logo_height").and_then(|v| v.as_str()).map(String::from),
         smtp: None,
         storage: None,
         security: None,
         cron_jobs: None,
         ai: None,
-        app_logo: None,
         log_retention_days: None,
     };
 
@@ -180,6 +184,8 @@ pub async fn update_settings(
     if let Some(v) = &payload.allow_public_registration { general["allow_public_registration"] = json!(v); }
     if let Some(v) = &payload.theme { general["theme"] = json!(v); }
     if let Some(v) = &payload.app_logo { general["app_logo"] = json!(v); }
+    if let Some(v) = &payload.logo_width { general["logo_width"] = json!(v); }
+    if let Some(v) = &payload.logo_height { general["logo_height"] = json!(v); }
     if let Some(v) = &payload.log_retention_days { general["log_retention_days"] = json!(v); }
     
     db.save_setting("general", general, false).await.map_err(|e| AppError::UnknownError(e.to_string()))?;

@@ -434,7 +434,9 @@ export const apiClient = {
     },
     delete: async (id: string): Promise<void> => {
       await pb.files.delete(id);
-    }
+    },
+    getFileUrl: (filename: string) => pb.files.getFileUrl(filename)
+  
   },
 
   scripts: {

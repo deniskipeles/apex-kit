@@ -162,11 +162,13 @@ pub trait Db: Send + Sync {
 
     // VECTORS
     // Retrieve all vectors for a collection (for HNSW reload on startup)
-    async fn get_vectors_for_collection(&self, collection_id: i64) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_vectors_for_collection(&self, collection_id: i64, model: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>>;
 
     async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>>;
     // Save vector to persistence layer (used by job worker)
-    async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>, model: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
+    // Check if vector exists
+    async fn has_vector(&self, collection_id: i64, record_id: i64, field_name: &str, model: &str) -> std::result::Result<bool, Box<dyn StdError + Send + Sync>>;
 }
 
 fn row_to_collection(row: &Row) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
@@ -1175,34 +1177,48 @@ impl Db for ApexKit {
     }
 
     // VECTORS: Implement save_vector
-    async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>, model: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         let vec_json = serde_json::to_string(&vector)?;
         let map_err = |e: String| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
         };
         
-        // 1. Delete existing doc for this field
-        self.vector_batcher.execute(
-            "DELETE FROM vectors WHERE collection_id=?1 AND record_id=?2 AND field_name=?3".into(),
-            vec![collection_id.into(), record_id.into(), field_name.into()]
-        ).await.map_err(map_err)?;
-        
-        // 2. Insert new vector
+        // OPTIMIZATION: Use UPSERT (Insert or Replace)
+        // This relies on the UNIQUE constraint we added: UNIQUE(collection_id, record_id, field_name, model)
         self.vector_batcher.insert(
-            "INSERT INTO vectors (collection_id, record_id, field_name, vector) VALUES (?1, ?2, ?3, ?4)".into(),
-            vec![collection_id.into(), record_id.into(), field_name.into(), vec_json.into()]
+            "INSERT INTO vectors (collection_id, record_id, field_name, vector, model) 
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(collection_id, record_id, field_name, model) 
+             DO UPDATE SET vector = excluded.vector, created_at = CURRENT_TIMESTAMP".into(),
+            vec![
+                collection_id.into(), 
+                record_id.into(), 
+                field_name.into(), 
+                vec_json.into(), 
+                model.into()
+            ]
         ).await.map_err(map_err)?;
 
         Ok(())
     }
+    // Check vector existence
+    async fn has_vector(&self, collection_id: i64, record_id: i64, field_name: &str, model: &str) -> std::result::Result<bool, Box<dyn StdError + Send + Sync>> {
+        let conn = self.get_vector()?;
+        let mut rows = conn.query(
+            "SELECT 1 FROM vectors WHERE collection_id = ?1 AND record_id = ?2 AND field_name = ?3 AND model = ?4", 
+            params![collection_id, record_id, field_name, model]
+        ).await?;
+        
+        Ok(rows.next().await?.is_some())
+    }
 
     // VECTORS: Implement get_vectors_for_collection
-    async fn get_vectors_for_collection(&self, collection_id: i64) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn std::error::Error + Send + Sync>> {
-        // FIX: Corrected method call to self.get_vector()?
+    // Filter by model so we don't load incompatible vectors into HNSW
+    async fn get_vectors_for_collection(&self, collection_id: i64, model: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> {
         let conn = self.get_vector()?; 
         let mut rows = conn.query(
-            "SELECT record_id, field_name, vector FROM vectors WHERE collection_id = ?1", 
-            params![collection_id]
+            "SELECT record_id, field_name, vector FROM vectors WHERE collection_id = ?1 AND model = ?2", 
+            params![collection_id, model.to_string()]
         ).await?;
         
         let mut vectors = Vec::new();
@@ -1211,10 +1227,9 @@ impl Db for ApexKit {
             let field_name: String = row.get(1)?;
             let vector_json_str: String = row.get(2)?;
             
-            // Deserialize the vector JSON string
-            let vector: Vec<f32> = serde_json::from_str(&vector_json_str)?;
-            
-            vectors.push((record_id, field_name, vector));
+            if let Ok(vector) = serde_json::from_str::<Vec<f32>>(&vector_json_str) {
+                vectors.push((record_id, field_name, vector));
+            }
         }
         Ok(vectors)
     }
@@ -1344,21 +1359,29 @@ async fn setup_sys(db: &Database) -> Result<()> {
 // --- TABLE SETUP ---
 async fn setup_vectors(db: &Database) -> Result<()> {
     let conn = db.connect()?;
-    // UPDATED SCHEMA: Links vector to specific data point
+    
+    // 1. Create Table with updated UNIQUE constraint
+    // Note: If table exists with old constraint, this SQL won't run. 
+    // In production, you'd need a migration script to recreate the table.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS vectors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             collection_id INTEGER NOT NULL,
             record_id INTEGER NOT NULL,
             field_name TEXT NOT NULL,
-            vector BLOB NOT NULL, -- JSON String of float array
+            vector BLOB NOT NULL,
+            model TEXT NOT NULL DEFAULT 'unknown',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(collection_id, record_id, field_name) -- One vector per field per record
+            -- UPDATED CONSTRAINT: Now includes model
+            UNIQUE(collection_id, record_id, field_name, model) 
         )", 
         ()
     ).await?;
     
-    // Index for fast lookups/deletion
+    // Migration helper: Try to create a unique index if the table was created without the named constraint previously
+    // This allows multiple models for same record
+    let _ = conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_vec_unique_model ON vectors(collection_id, record_id, field_name, model)", ()).await;
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vec_record ON vectors(record_id)", ()).await?;
     Ok(())
 }
@@ -1435,6 +1458,13 @@ impl Db for Mutex<Connection> {
         Ok(DashboardData { stats: DashboardStats { total_requests: 0, db_size_mb: 0.0, collections_count: 0, total_records: 0 }, chart: vec![], recent_logs: vec![] })
     }
     async fn search_vector(&self, _c: i64, _f: &str, _v: Vec<f32>, _l: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn save_vector(&self, _collection_id: i64, _record_id: i64, _field_name: &str, _vector: Vec<f32>) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { Ok(()) }
-    async fn get_vectors_for_collection(&self, _c: i64) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> { Ok(vec![]) }
+    async fn has_vector(&self, _c: i64, _r: i64, _f: &str, _m: &str) -> std::result::Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false) 
+    }
+    async fn save_vector(&self, _c: i64, _r: i64, _f: &str, _v: Vec<f32>, _m: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { 
+        Ok(()) 
+    }
+    async fn get_vectors_for_collection(&self, _c: i64, _m: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> { 
+        Ok(vec![]) 
+    }
 }

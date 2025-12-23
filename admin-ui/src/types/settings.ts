@@ -72,6 +72,9 @@ export interface AppSettings {
   appUrl: string;
   allowPublicRegistration: boolean;
   theme: 'light' | 'dark' | 'system';
+  appLogo?: string;   
+  logoWidth?: string; 
+  logoHeight?: string;
   smtp: SmtpConfig;
   storage: StorageConfig;
   backups: BackupConfig;

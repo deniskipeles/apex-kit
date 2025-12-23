@@ -6,6 +6,7 @@ use serde::{ Deserialize };
 use apexkit_core::{auth::Claims, jobs::Job}; 
 use crate::{AppState, AppError, RecordResponse, DatabaseConnection, IdPath};
 use std::collections::HashMap;
+use apexkit_core::realtime::EventScope;
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct VectorSearchReq {
@@ -18,6 +19,14 @@ pub struct VectorSearchReq {
 pub struct TextVectorSearchReq {
     pub query_text: String,
     pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct RevectorizeOptions {
+    /// If true, overwrites existing vectors for this model (Hard). 
+    /// If false, skips records that already have a vector for this model (Soft).
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[utoipa::path(
@@ -58,7 +67,6 @@ pub async fn search_vector(
     // 3. Map Response
     Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data }).collect()))
 }
-
 #[utoipa::path(
     post,
     path = "/api/v1/collections/{id}/search-text-vector",
@@ -84,7 +92,6 @@ pub async fn query_vector_search(
 
     // 2. Generate Vector from Query Text
     // This uses the GLOBAL state.embedder because embedding logic is stateless/heavy and shared.
-    // TenantManager passes the SAME embedder instance to tenants anyway.
     let query_vector = state.vector_provider.embed(&payload.query_text).await
         .map_err(|e| AppError::UnknownError(format!("Embedding generation failed: {}", e)))?;
         
@@ -103,36 +110,41 @@ pub async fn query_vector_search(
     // 4. Perform Search for *each* vectorizable field and aggregate scores
     let mut record_scores: HashMap<i64, f32> = HashMap::new();
 
-    // We can't access `vector_provider` directly from `db` because `db` is `Arc<dyn Db>`.
-    // But `ApexKit` implements `search_vector`.
-    // We will use `db.search_vector` for each field.
-
     for field_name in vectorizable_fields {
         // Search the HNSW index
         let records = db.search_vector(path.id, &field_name, query_vector.clone(), limit).await
             .map_err(|e| AppError::UnknownError(format!("Vector search failed for {}: {}", field_name, e)))?;
 
-        // Aggregate scores (Dummy score for now since search_vector returns Records, not scores+ids)
-        // If exact scoring is needed, `Db` trait needs update to return scores. 
-        // For now, we just merge results.
+        // Aggregate scores 
+        // Note: Currently simple accumulation. Ideally search_vector should return (id, score) tuples.
         for rec in records {
-            // Simple accumulation: If it appears in multiple fields, it's more relevant
              *record_scores.entry(rec.id).or_insert(0.0) += 1.0; 
         }
     }
     
     // 5. Get top N aggregated records
-    let mut sorted_records: Vec<(i64, f32)> = record_scores.into_iter().collect();
-    sorted_records.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut sorted_records_tuples: Vec<(i64, f32)> = record_scores.iter().map(|(&k, &v)| (k, v)).collect();
+    // Sort Descending (Highest score first)
+    sorted_records_tuples.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     
-    let top_ids: Vec<i64> = sorted_records.into_iter()
+    let top_ids: Vec<i64> = sorted_records_tuples.iter()
         .take(limit)
-        .map(|(id, _)| id)
+        .map(|(id, _)| *id)
         .collect();
 
     // 6. Fetch Records from DB
-    let records = db.get_records_by_ids(path.id, &top_ids).await
+    // Note: SQL `WHERE id IN (...)` does NOT guarantee order, so we must sort again manually.
+    let mut records = db.get_records_by_ids(path.id, &top_ids).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    // 7. Re-Sort Records by Score (Descending)
+    // We use the `record_scores` map to look up the score for each record and sort.
+    records.sort_by(|a, b| {
+        let score_a = record_scores.get(&a.id).unwrap_or(&0.0);
+        let score_b = record_scores.get(&b.id).unwrap_or(&0.0);
+        // Compare B to A for descending order
+        score_b.partial_cmp(score_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data }).collect()))
 }
@@ -140,28 +152,37 @@ pub async fn query_vector_search(
 #[utoipa::path(
     post,
     path = "/api/v1/admin/collections/{id}/revectorize",
+    request_body = RevectorizeOptions, // Update docs
     responses((status = 202, description = "Revectorization jobs queued"))
 )]
 pub async fn revectorize_collection_handler(
     auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection, // FIXED
+    scope: Option<Extension<EventScope>>,
+    DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>,
-    Path(path): Path<IdPath>, // FIXED
+    Path(path): Path<IdPath>, 
+    // Accept JSON body for options, use default if missing
+    Json(options): Json<RevectorizeOptions>, 
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // 1. Auth Check (Admins Only)
+    
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { 
-        return Err(AppError::Forbidden("Admins only".into())); 
-    }
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
-    // 2. Get Collection Schema
+    // Helper logic to extract tenant ID (Duplicated here to avoid visibility issues across modules)
+    let current_tenant = scope.as_ref().map(|Extension(s)| match s {
+        EventScope::Tenant(id) => Some(id.clone()),
+        EventScope::Sandbox(id) => Some(id.clone()),
+        EventScope::Root => None,
+    }).flatten();
+
+    let current_model = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+
     let collection = db.get_collection(path.id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Collection not found".into()))?;
         
     let schema = collection.schema.clone().unwrap_or_default();
     
-    // 3. Identify Vectorizable Fields
     let vectorizable_fields: Vec<String> = schema.fields.iter()
         .filter(|(_, def)| def.vectorize)
         .map(|(name, _)| name.clone())
@@ -170,46 +191,56 @@ pub async fn revectorize_collection_handler(
     if vectorizable_fields.is_empty() {
         return Ok(Json(serde_json::json!({
             "success": true,
-            "message": format!("Collection {} has no vectorizable fields defined.", collection.name)
+            "message": "No vector fields found."
         })));
     }
 
-    // 4. Iterate over all records in the collection
-    let mut options = apexkit_core::query::QueryOptions::default();
-    options.limit = None; 
-    options.per_page = None;
+    let mut query_opts = apexkit_core::query::QueryOptions::default();
+    query_opts.limit = Some(100_000); 
+    query_opts.per_page = None;
     
-    let all_records = db.list_records(path.id, options).await
+    let all_records = db.list_records(path.id, query_opts).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?.items;
 
     let mut jobs_queued = 0;
+    let mut skipped = 0;
     
-    // 5. Queue Jobs
     for record in all_records {
         let record_id: i64 = record.id; 
 
         for field_name in &vectorizable_fields {
             if let Some(text_content) = record.data.get(field_name).and_then(|v| v.as_str()) {
+                
+                // --- HARD vs SOFT LOGIC ---
+                if !options.force {
+                    // Soft Mode: Check if exists
+                    let exists = db.has_vector(path.id, record_id, field_name, &current_model).await
+                        .unwrap_or(false);
+                        
+                    if exists {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+
                 let job = Job::GenerateEmbedding {
+                    tenant_id: current_tenant.clone(),
                     collection_id: path.id,
                     record_id,
                     field_name: field_name.clone(),
-                    text_content: text_content.to_string()
+                    text_content: text_content.to_string(),
+                    model: current_model.clone()
                 };
-                // NOTE: Queue is global, but the Job Handler will need to know WHICH TENANT context.
-                // Currently `Job::GenerateEmbedding` doesn't carry tenant_id.
-                // This means background jobs will fail for Tenants unless updated.
-                // For now, this works for Root App. 
-                // To fix for tenants, Job struct and Worker need updates (out of scope for this snippet request).
                 state.queue.enqueue(job).await;
                 jobs_queued += 1;
             }
         }
     }
-
     Ok(Json(serde_json::json!({ 
         "success": true, 
-        "message": format!("Queued {} vectorization jobs for collection {}.", jobs_queued, collection.name),
-        "jobs_queued": jobs_queued
+        "message": format!("Queued {} jobs for model '{}'. Skipped {} existing.", jobs_queued, current_model, skipped),
+        "jobs_queued": jobs_queued,
+        "skipped": skipped,
+        "mode": if options.force { "hard (overwrite)" } else { "soft (skip existing)" }
     })))
 }

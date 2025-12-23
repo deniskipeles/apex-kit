@@ -1,4 +1,3 @@
-// =========================== apex-vector/src/index.rs ===========================
 use hnsw_rs::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};

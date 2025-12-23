@@ -838,6 +838,18 @@ async fn list_records(
     Ok(Json(RecordListResponse{ items: res.items.into_iter().map(|r| RecordResponse{id: r.id, data: r.data}).collect(), total: res.total }))
 }
 
+// Helpers to get model and tenant
+fn get_current_model() -> String {
+    std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string())
+}
+fn get_tenant_id_from_scope(scope: Option<&EventScope>) -> Option<String> {
+    match scope {
+        Some(EventScope::Tenant(id)) => Some(id.clone()),
+        Some(EventScope::Sandbox(id)) => Some(id.clone()),
+        _ => None,
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/collections/{id}/records",
@@ -874,7 +886,7 @@ async fn create_record(
         collection_id: path.id, 
         record_id: rid, 
         data: data_to_save.clone(), 
-        scope: event_scope 
+        scope: event_scope.clone()
     });
 
     // --- Audit Log ---
@@ -893,14 +905,18 @@ async fn create_record(
     // --- ASYNC JOBS ---
     if let Some(schema) = col.schema {
         // A. Vector Embeddings
+        let current_tenant = get_tenant_id_from_scope(Some(&event_scope)); // Get scope
+        let model_name = get_current_model(); // Get config
         for (field_name, def) in &schema.fields {
             if def.vectorize {
                 if let Some(text_val) = data_to_save.get(field_name).and_then(|v| v.as_str()) {
                     let job = Job::GenerateEmbedding {
                         collection_id: path.id,
                         record_id: rid,
+                        tenant_id: current_tenant.clone(),
                         field_name: field_name.clone(),
-                        text_content: text_val.to_string()
+                        text_content: text_val.to_string(),
+                        model: model_name.clone()
                     };
                     state.queue.enqueue(job).await;
                 }
@@ -913,7 +929,8 @@ async fn create_record(
                 collection_id: path.id,
                 record_id: rid,
                 data: data_to_save.clone(),
-                schema: schema.clone()
+                schema: schema.clone(),
+                tenant_id: current_tenant.clone()
             };
             state.queue.enqueue(job).await;
         }
@@ -947,7 +964,7 @@ async fn update_record(
     let r = db.update_record(path.id, path.record_id, &data_updates).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    let _ = state.tx.send(DbEvent::Update { collection_id: path.id, record_id: path.record_id, data: r.data.clone(), scope: event_scope });
+    let _ = state.tx.send(DbEvent::Update { collection_id: path.id, record_id: path.record_id, data: r.data.clone(), scope: event_scope.clone() });
     
     // --- Audit Log ---
     let log_meta = serde_json::json!({
@@ -965,6 +982,8 @@ async fn update_record(
     // --- ASYNC JOBS ---
     if let Some(schema) = col.schema {
         // A. Vector Embeddings
+        let current_tenant = get_tenant_id_from_scope(Some(&event_scope)); // Get scope
+        let model_name = get_current_model();
         for (field_name, def) in &schema.fields {
             if def.vectorize {
                 // Check if the field exists in the UPDATED data (r.data)
@@ -974,7 +993,9 @@ async fn update_record(
                         collection_id: path.id,
                         record_id: path.record_id,
                         field_name: field_name.clone(),
-                        text_content: text_val.to_string()
+                        text_content: text_val.to_string(),
+                        tenant_id: current_tenant.clone(),
+                        model: model_name.clone() 
                     };
                     state.queue.enqueue(job).await;
                 }
@@ -987,7 +1008,8 @@ async fn update_record(
                 collection_id: path.id,
                 record_id: path.record_id,
                 data: r.data.clone(),
-                schema: schema.clone()
+                schema: schema.clone(),
+                tenant_id: current_tenant.clone()
             };
             state.queue.enqueue(job).await;
         }
@@ -1017,7 +1039,7 @@ async fn delete_record(
     db.delete_record(path.id, path.record_id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    let _ = state.tx.send(DbEvent::Delete { collection_id: path.id, record_id: path.record_id, scope: event_scope });
+    let _ = state.tx.send(DbEvent::Delete { collection_id: path.id, record_id: path.record_id, scope: event_scope.clone() });
     
     // --- ADDED: Audit Log ---
     let log_meta = serde_json::json!({
@@ -1036,7 +1058,9 @@ async fn delete_record(
     // Remove from Search Index
     if let Some(schema) = col.schema {
         if schema.fields.values().any(|f| f.indexed) {
+            let current_tenant = get_tenant_id_from_scope(Some(&event_scope));
             let job = Job::DeleteFromIndex {
+                tenant_id: current_tenant,
                 collection_id: path.id,
                 record_id: path.record_id,
             };

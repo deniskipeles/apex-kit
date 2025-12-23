@@ -3,11 +3,11 @@ use std::sync::Arc;
 use apexkit_api::{app_router, AppState, cli::{self, Cli}};
 use clap::Parser;
 use apexkit_core::{
-    a_new_database_connection, jobs, cache::CachedDb, realtime, 
+    a_new_database_connection, jobs::{self, JobContext}, cache::CachedDb, realtime, 
     storage::{StorageBackend}, 
     security::{MasterKey, Vault},
     ai_models::CreateActionReq,
-    Db,
+    Db, VectorProvider,
 };
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -24,8 +24,7 @@ use async_graphql::dynamic::{Schema, Object, Field, TypeRef, FieldFuture};
 use apexkit_core::scripting::ScriptEngine;
 use moka::future::Cache;
 
-use apex_vector::{VectorEngine, CandleEmbedder};
-use apexkit_core::VectorProvider;
+use apex_vector::{VectorEngine, CandleEmbedder, EmbeddingModelConfig};
 
 use apexkit_api::tenant_manager::TenantManager;
 
@@ -73,6 +72,38 @@ impl VectorProvider for FallbackVectorProvider {
     }
 }
 
+// --- 3. Job Context Resolver ---
+// Routes background jobs to the correct DB/Provider (Root or Tenant)
+struct GlobalJobContext {
+    root_db: Arc<dyn Db>,
+    root_vector_provider: Arc<dyn VectorProvider>,
+    tenant_manager: Arc<TenantManager>,
+}
+
+#[async_trait::async_trait]
+impl JobContext for GlobalJobContext {
+    async fn resolve(&self, tenant_id: Option<&str>) -> Option<(Arc<dyn Db>, Arc<dyn VectorProvider>)> {
+        match tenant_id {
+            Some(id) => {
+                // Try to load Tenant Context (DB + Provider)
+                // Assuming TenantManager has been updated to return the context or provider
+                let db_result = self.tenant_manager.get_tenant(id.to_string()).await;
+                let provider_result = self.tenant_manager.get_vector_provider(id).await;
+
+                if let (Ok(db), Some(provider)) = (db_result, provider_result) {
+                    Some((db, provider))
+                } else {
+                    None
+                }
+            },
+            None => {
+                // Root App
+                Some((self.root_db.clone(), self.root_vector_provider.clone()))
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // 1. Load .env file
@@ -81,7 +112,7 @@ async fn main() {
     // 2. CLI Parsing (Arguments)
     let cli = Cli::parse();
 
-    // --- LOGGING SETUP (FIXED) ---
+    // --- LOGGING SETUP ---
     // 1. Rotate logs if needed
     apexkit_api::logging::rotate_logs_on_startup("logs.db", "logs");
     
@@ -117,9 +148,21 @@ async fn main() {
     // --- 4. Initialize AI Engine (Split Result) ---
     tracing::info!("Initializing Apex Vector Engine...");
     
+    // Configurable Model via Env Var
+    let active_model_name = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+    
+    let model_config = match active_model_name.as_str() {
+        "bge-small" => EmbeddingModelConfig::bge_small_en_v1_5(),
+        "bge-base" => EmbeddingModelConfig::bge_base_en_v1_5(),
+        "gte-small" => EmbeddingModelConfig::gte_small(),
+        _ => EmbeddingModelConfig::default(), // Default: all-MiniLM-L6-v2
+    };
+
+    tracing::info!("Active Vector Model: {}", active_model_name);
+
     // We split this so we can pass the specific `CandleEmbedder` struct to TenantManager
     // but pass the generic `dyn VectorProvider` trait to the AppState/DB.
-    let (vector_provider, shared_embedder): (Arc<dyn VectorProvider>, Option<Arc<CandleEmbedder>>) = match VectorEngine::new().await {
+    let (vector_provider, shared_embedder): (Arc<dyn VectorProvider>, Option<Arc<CandleEmbedder>>) = match VectorEngine::new(Some(model_config)).await {
         Ok(engine) => {
             tracing::info!("✅ Apex Vector Engine (Candle + HNSW) ready.");
             let embedder_ref = engine.embedder.clone(); // Keep a ref to the concrete struct
@@ -151,10 +194,12 @@ async fn main() {
 
     // --- 5. HNSW RELOAD ---
     let mut total_vectors_loaded = 0;
-    tracing::info!("Reloading HNSW index from vectors database...");
+    tracing::info!("Reloading HNSW index from vectors database for model '{}'...", active_model_name);
+    
     if let Ok(all_collections) = cached_db.list_collections().await {
         for col in &all_collections {
-            if let Ok(vectors_to_load) = cached_db.get_vectors_for_collection(col.id).await {
+            // FIX: Pass the model name to filter vectors from DB
+            if let Ok(vectors_to_load) = cached_db.get_vectors_for_collection(col.id, &active_model_name).await {
                 for (rec_id, field_name, vector) in vectors_to_load {
                     vector_provider.index(col.id, rec_id, &field_name, &vector).await.ok();
                     total_vectors_loaded += 1;
@@ -174,10 +219,27 @@ async fn main() {
         tracing::error!("Failed to seed AI actions: {}", e);
     }
 
-    let job_queue = jobs::start_background_worker(cached_db.clone(), vector_provider.clone(), vault.clone());
+    // --- INIT TENANT MANAGER ---
+    // Capacity 500 active databases. Unused ones dropped after 1hr.
+    let tenant_manager = Arc::new(TenantManager::new(
+        shared_embedder, // This is Option<Arc<CandleEmbedder>>
+        vault.clone(), 
+        500
+    ));
+
+    // --- 7. JOB SYSTEM ---
+    // Create the Context Resolver for the background worker
+    let job_context = Arc::new(GlobalJobContext {
+        root_db: cached_db.clone(),
+        root_vector_provider: vector_provider.clone(),
+        tenant_manager: tenant_manager.clone(),
+    });
+
+    // Start Worker
+    let job_queue = jobs::start_background_worker(job_context, vault.clone());
     let (tx, _rx) = broadcast::channel::<realtime::DbEvent>(100);
 
-    // --- 7. STORAGE BACKEND (FIXED ARGUMENTS) ---
+    // --- 8. STORAGE BACKEND ---
     tracing::info!("Initializing Dynamic Storage Backend...");
     let storage: Arc<dyn StorageBackend> = Arc::new(
         apexkit_api::storage::DynamicStorage::new(
@@ -188,15 +250,7 @@ async fn main() {
         )
     );
 
-    // --- INIT TENANT MANAGER ---
-    // Capacity 500 active databases. Unused ones dropped after 1hr.
-    let tenant_manager = Arc::new(TenantManager::new(
-        shared_embedder, // This is Option<Arc<CandleEmbedder>>
-        vault.clone(), 
-        500
-    ));
-
-    // --- 8. SCHEDULER & STATE ---
+    // --- 9. SCHEDULER & STATE ---
     // Init Scheduler
     let scheduler = apexkit_api::scheduler::SchedulerService::new().await;
     let scheduler_arc = Arc::new(RwLock::new(scheduler));
@@ -229,7 +283,7 @@ async fn main() {
     // Initialize EmbedderService (Wrapper for external APIs like OpenAI/Gemini if used in scripts)
     let embedder = Arc::new(apexkit_core::embeddings::EmbedderService::new());
 
-    // 9. Construct AppState
+    // 10. Construct AppState
     let state = AppState {
         db: cached_db.clone(),
         tenant_manager,
@@ -247,7 +301,7 @@ async fn main() {
         vector_provider: vector_provider.clone(),
     };
 
-    // 10. Build Real Schema
+    // 11. Build Real Schema
     let gql_schema = apexkit_api::graphql::build_schema(
         state.clone(),
         relation_loader
@@ -262,7 +316,7 @@ async fn main() {
     // Load Cron Jobs from DB
     scheduler_arc.read().await.load_jobs(state.clone()).await;
 
-    // --- 11. EXECUTE CLI COMMANDS ---
+    // --- 12. EXECUTE CLI COMMANDS ---
     // We check for CLI commands *after* State is built so the CLI has access
     // to the DB, Vault, and Script Engine.
     if let Some(command) = cli.command {
@@ -276,7 +330,7 @@ async fn main() {
     }
     // --- END CLI EXECUTION ---
 
-    // --- 12. SERVER START ---
+    // --- 13. SERVER START ---
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
             .per_second(600) // Increased for dashboard usage

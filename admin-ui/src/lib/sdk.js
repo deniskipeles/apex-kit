@@ -311,7 +311,7 @@ export class ApexKit {
              * @param {number|string} collectionId - The ID of the collection.
              * @returns {Promise<object>} Status message and number of jobs queued.
              */
-            revectorizeCollection: (collectionId) => this._request(`/admin/collections/${collectionId}/revectorize`, { method: 'POST', body: JSON.stringify({}) }),
+            revectorizeCollection: (collectionId) => this._request(`/admin/collections/${collectionId}/revectorize`, { method: 'POST', body: {force: false} }),
 
             /**
              * Import data from a File (CSV or JSON).

@@ -5,6 +5,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use std::sync::Arc;
 use crate::{Db, VectorProvider, security::{ Vault, EncryptedValue }, schema::CollectionSchema};
 use serde_json::Value;
+use async_trait::async_trait;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Job {
@@ -15,14 +16,17 @@ pub enum Job {
     
     // --- Vectorization Job ---
     GenerateEmbedding { 
+        tenant_id: Option<String>, // <--- NEW FIELD
         collection_id: i64, 
         record_id: i64, 
         field_name: String, 
-        text_content: String 
+        text_content: String,
+        model: String,
     },
 
-    // --- Async Search Indexing (High Throughput) ---
+    // --- Async Search Indexing ---
     IndexRecord {
+        tenant_id: Option<String>, // <--- NEW FIELD
         collection_id: i64,
         record_id: i64,
         data: Value,
@@ -30,9 +34,16 @@ pub enum Job {
     },
     
     DeleteFromIndex {
+        tenant_id: Option<String>, // <--- NEW FIELD
         collection_id: i64,
         record_id: i64
     }
+}
+
+// New Trait to resolve DB context dynamically
+#[async_trait]
+pub trait JobContext: Send + Sync {
+    async fn resolve(&self, tenant_id: Option<&str>) -> Option<(Arc<dyn Db>, Arc<dyn VectorProvider>)>;
 }
 
 #[derive(Clone)]
@@ -46,84 +57,91 @@ impl JobQueue {
     }
 
     pub async fn enqueue(&self, job: Job) {
-        // We use a larger buffer in the channel, but if it's full, 
-        // we log an error rather than crashing or blocking indefinitely in critical paths.
         if let Err(e) = self.sender.send(job).await {
             eprintln!("Failed to enqueue job: {}", e);
         }
     }
 }
 
-// Updated to accept dependencies needed for processing
+// Updated Worker Signature
 pub fn start_background_worker(
-    db: Arc<dyn Db>, 
-    vector_provider: Arc<dyn VectorProvider>,
+    context_resolver: Arc<dyn JobContext>, // <--- CHANGED from (Db, Provider)
     vault: Arc<Vault>,
 ) -> JobQueue {
-    // Increased buffer size to handle bursts of write requests (e.g. imports)
     let (tx, mut rx) = mpsc::channel(1000);
 
     tokio::spawn(async move {
         println!("Background worker started...");
         
         while let Some(job) = rx.recv().await {
-            let db_clone = db.clone(); 
+            let resolver = context_resolver.clone();
             let vault_clone = vault.clone();
-            let vector_provider = vector_provider.clone();
 
-            // Spawn a new task for each job to ensure concurrency.
-            // If one email takes 2 seconds, it shouldn't block indexing.
             tokio::spawn(async move {
                 match job {
-                    // --- Email Jobs ---
-                    Job::SendWelcomeEmail { email, .. } => {
-                        send_email(db_clone, vault_clone, &email, "Welcome to ApexKit!", "Thanks for signing up!").await;
+                    // --- Email Jobs (Assume Root DB for now, or expand Job to include tenant for settings) ---
+                    // For simplicity, we use None (Root) for email settings lookup unless passed
+                    Job::SendWelcomeEmail { email, user_id: _ } => {
+                        if let Some((db, _)) = resolver.resolve(None).await {
+                            send_email(db, vault_clone, &email, "Welcome to ApexKit!", "Thanks for signing up!").await;
+                        }
                     }
                     Job::SendPasswordReset { email, token } => {
-                        let body = format!("Click here to reset your password: http://localhost:5000/reset-password?token={}", token);
-                        send_email(db_clone, vault_clone, &email, "Reset Password", &body).await;
+                        if let Some((db, _)) = resolver.resolve(None).await {
+                            let body = format!("Reset: http://localhost:5000/reset-password?token={}", token);
+                            send_email(db, vault_clone, &email, "Reset Password", &body).await;
+                        }
                     }
                     Job::SendVerification { email, token } => {
-                        let body = format!("Verify your email: http://localhost:5000/verify?token={}", token);
-                        send_email(db_clone, vault_clone, &email, "Verify Email", &body).await;
+                        if let Some((db, _)) = resolver.resolve(None).await {
+                            let body = format!("Verify: http://localhost:5000/verify?token={}", token);
+                            send_email(db, vault_clone, &email, "Verify Email", &body).await;
+                        }
                     }
 
                     // --- Vector Generation ---
-                    Job::GenerateEmbedding { collection_id, record_id, field_name, text_content } => {
-                        // println!("[Job] Processing vector for {}.{} (Record {})", collection_id, field_name, record_id);
-                        
-                        match vector_provider.embed(&text_content).await {
-                            Ok(vec) => {
-                                // 1. Index in HNSW (Memory)
-                                if let Err(e) = vector_provider.index(collection_id, record_id, &field_name, &vec).await {
-                                    eprintln!("[Job] Failed to index vector to HNSW: {}", e);
+                    Job::GenerateEmbedding { tenant_id, collection_id, record_id, field_name, text_content, model } => {
+                        // Resolve the specific Tenant DB and Vector Provider
+                        if let Some((db, vector_provider)) = resolver.resolve(tenant_id.as_deref()).await {
+                            match vector_provider.embed(&text_content).await {
+                                Ok(vec) => {
+                                    // 1. Index in HNSW (Memory - Tenant Isolated)
+                                    if let Err(e) = vector_provider.index(collection_id, record_id, &field_name, &vec).await {
+                                        eprintln!("[Job] Failed to index vector: {}", e);
+                                    }
+                                    
+                                    // 2. Persist to DB (Tenant Isolated)
+                                    if let Err(e) = db.save_vector(collection_id, record_id, &field_name, vec, &model).await {
+                                        eprintln!("[Job] Failed to persist vector: {}", e);
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("[Job] Failed to generate embedding: {}", e);
                                 }
-                                
-                                // 2. Persist to DB
-                                if let Err(e) = db_clone.save_vector(collection_id, record_id, &field_name, vec).await {
-                                    eprintln!("[Job] Failed to persist vector to DB: {}", e);
-                                }
-                            },
-                            Err(e) => {
-                                eprintln!("[Job] Failed to generate embedding: {}", e);
+                            }
+                        } else {
+                            eprintln!("[Job] Failed to resolve context for tenant: {:?}", tenant_id);
+                        }
+                    }
+
+                    // --- Search Indexing ---
+                    Job::IndexRecord { tenant_id, collection_id, record_id, data, schema } => {
+                        if let Some((db, _)) = resolver.resolve(tenant_id.as_deref()).await {
+                            if let Err(e) = db.index_record_search(collection_id, record_id, &data, &schema).await {
+                                eprintln!("[Job] Search Indexing failed for {}: {}", record_id, e);
                             }
                         }
                     }
 
-                    // --- Search Indexing (Tantivy) ---
-                    Job::IndexRecord { collection_id, record_id, data, schema } => {
-                        if let Err(e) = db_clone.index_record_search(collection_id, record_id, &data, &schema).await {
-                            eprintln!("[Job] Search Indexing failed for {}: {}", record_id, e);
+                    Job::DeleteFromIndex { tenant_id, collection_id, record_id } => {
+                        if let Some((db, _)) = resolver.resolve(tenant_id.as_deref()).await {
+                            if let Err(e) = db.delete_record_search(collection_id, record_id).await {
+                                eprintln!("[Job] Search Index Deletion failed for {}: {}", record_id, e);
+                            }
                         }
                     }
 
-                    Job::DeleteFromIndex { collection_id, record_id } => {
-                        if let Err(e) = db_clone.delete_record_search(collection_id, record_id).await {
-                            eprintln!("[Job] Search Index Deletion failed for {}: {}", record_id, e);
-                        }
-                    }
-
-                    _ => {} // Handle others
+                    _ => {} 
                 }
             });
         }

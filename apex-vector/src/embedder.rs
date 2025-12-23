@@ -1,10 +1,53 @@
-// =========================== apex-vector/src/embedder.rs ===========================
 use anyhow::{Error as E, Result};
 use candle_core::{Device, Tensor, DType};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer};
+
+#[derive(Clone, Debug)]
+pub struct EmbeddingModelConfig {
+    pub repo_id: String,
+    pub revision: String,
+    pub config_file: String,
+    pub tokenizer_file: String,
+    pub weights_file: String,
+}
+
+impl Default for EmbeddingModelConfig {
+    fn default() -> Self {
+        Self {
+            repo_id: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            revision: "main".to_string(),
+            config_file: "config.json".to_string(),
+            tokenizer_file: "tokenizer.json".to_string(),
+            weights_file: "model.safetensors".to_string(),
+        }
+    }
+}
+
+impl EmbeddingModelConfig {
+    pub fn bge_small_en_v1_5() -> Self {
+        Self {
+            repo_id: "BAAI/bge-small-en-v1.5".to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn bge_base_en_v1_5() -> Self {
+        Self {
+            repo_id: "BAAI/bge-base-en-v1.5".to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn gte_small() -> Self {
+        Self {
+            repo_id: "thenlper/gte-small".to_string(),
+            ..Default::default()
+        }
+    }
+}
 
 pub struct CandleEmbedder {
     model: BertModel,
@@ -13,18 +56,18 @@ pub struct CandleEmbedder {
 }
 
 impl CandleEmbedder {
-    pub fn new() -> Result<Self> {
+    pub fn new(config: EmbeddingModelConfig) -> Result<Self> {
         let device = Device::Cpu;
 
         let api = Api::new()?;
         let repo = api.repo(Repo::new(
-            "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            config.repo_id,
             RepoType::Model,
         ));
 
-        let config_filename = repo.get("config.json")?;
-        let tokenizer_filename = repo.get("tokenizer.json")?;
-        let weights_filename = repo.get("model.safetensors")?;
+        let config_filename = repo.get(&config.config_file)?;
+        let tokenizer_filename = repo.get(&config.tokenizer_file)?;
+        let weights_filename = repo.get(&config.weights_file)?;
 
         let config_str = std::fs::read_to_string(config_filename)?;
         let config: Config = serde_json::from_str(&config_str)?;

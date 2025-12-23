@@ -105,7 +105,7 @@ impl SqlBuilder {
 
         // 4. Pagination
         let (limit, offset) = if options.limit.is_some() || options.offset.is_some() {
-            let l = options.limit.unwrap_or(30).min(100);
+            let l = options.limit.unwrap_or(30); 
             let o = options.offset.unwrap_or(0);
             (l, o)
         } else {
@@ -121,7 +121,7 @@ impl SqlBuilder {
     }
 }
 
-// ... (Rest of file: smart_split, ExpandPart, parse_expand_part, build_recursive_select remain unchanged)
+
 pub fn smart_split(input: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
