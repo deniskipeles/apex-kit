@@ -28,6 +28,7 @@ target
 tantivy_indexes/
 sandboxes/
 tenants/
+uploads/
 
 # ============================
 # Build artifacts
