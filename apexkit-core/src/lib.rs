@@ -13,6 +13,8 @@ use chrono::Utc;
 use std::collections::{HashMap, BTreeMap};
 use std::error::Error as StdError;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering}; 
+use crate::schema::FieldType;
 
 const COMPOSITE_SEPARATOR: &str = "__::__";
 
@@ -48,6 +50,8 @@ pub struct Collection {
 pub struct Record {
     pub id: i64,
     pub data: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expand: Option<Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -85,19 +89,24 @@ pub trait Db: Send + Sync {
     async fn search_records(&self, collection_id: i64, query: &str) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>>;
     async fn reindex_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
     async fn instant_search(&self, collection_id: i64, query: &str, limit: usize) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>>;
-    // --- NEW: Search Helpers exposed for Job Worker ---
+    async fn recover_indexes(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    // --- Search Helpers exposed for Job Worker ---
     async fn index_record_search(&self, collection_id: i64, record_id: i64, data: &Value, schema: &CollectionSchema) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
     async fn delete_record_search(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
 
     // --- Users (Auth) ---
     async fn create_user(&self, email: &str, password_hash: &str, role: &str) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>>;
     async fn get_user_by_email(&self, email: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn list_users(&self) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_users(&self, query: Option<String>, limit: i64, offset: i64) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn count_users(&self, query: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
+    // Batch fetch for GraphQL Dataloader
+    async fn get_users_by_ids(&self, ids: &[i64]) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>>;
     async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     // --- Storage Metadata ---
     async fn create_file_metadata(&self, filename: &str, original_name: &str, mime_type: &str, size: i64, user_id: Option<i64>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
     async fn list_files(&self, limit: i64, offset: i64) -> std::result::Result<Vec<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn count_files(&self) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>; 
     async fn get_file_metadata(&self, id: i64) -> std::result::Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>>;
     async fn delete_file_metadata(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -181,27 +190,29 @@ fn row_to_collection(row: &Row) -> std::result::Result<Collection, Box<dyn std::
 fn row_to_record(
     row: &Row,
 ) -> std::result::Result<Record, Box<dyn std::error::Error + Send + Sync>> {
-    // We check the type of the value returned by LibSQL.
-    // Index 1 is the 'data' column.
-    let val = row.get_value(1).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-    let data: serde_json::Value = match val {
-        // Case 1: Standard (Text) - Returned when using json() or if column is TEXT
+    // Column 0: ID
+    let id = row.get(0)?;
+    
+    // Column 1: Data (JSON)
+    let val_data = row.get_value(1).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let data: serde_json::Value = match val_data {
         libsql::Value::Text(s) => serde_json::from_str(&s)?,
-        
-        // Case 2: Binary (Blob) - Returned if column is JSONB and we forgot json()
-        // We try to parse it as UTF-8 JSON. If it's valid JSON text stored as blob, this works.
-        // If it's internal SQLite binary JSONB, this will fail gracefully instead of panic.
-        libsql::Value::Blob(b) => serde_json::from_slice(&b).map_err(|_| "Failed to parse JSONB blob directly (driver requires json() wrapper in SQL)".to_string())?,
-        
-        // Case 3: Null/Other
+        libsql::Value::Blob(b) => serde_json::from_slice(&b).unwrap_or(serde_json::json!({})),
         _ => serde_json::json!({}),
     };
 
-    Ok(Record {
-        id: row.get(0)?,
-        data,
-    })
+    // Column 2: Expand (JSON) - Optional
+    let expand = if let Ok(val_expand) = row.get_value(2) {
+        match val_expand {
+            libsql::Value::Text(s) => Some(serde_json::from_str(&s)?),
+            libsql::Value::Blob(b) => Some(serde_json::from_slice(&b).unwrap_or(serde_json::json!({}))),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(Record { id, data, expand })
 }
 
 // --- The Orchestrator: ApexKit ---
@@ -225,6 +236,12 @@ pub struct ApexKit {
     // Abstract interface for vectors
     // Core doesn't know about Candle, it just knows "VectorProvider"
     pub vector_provider: Arc<dyn VectorProvider>, 
+}
+
+// Helper struct to normalize access between Root Records and Nested JSON Objects
+struct ExpandableItem<'a> {
+    data: &'a Value,
+    expand: &'a mut Option<Value>,
 }
 
 impl ApexKit {
@@ -294,7 +311,7 @@ impl ApexKit {
         ))
     }
 
-    // FIX 2: Add setter for SearchManager (used by TenantManager)
+    // Add setter for SearchManager (used by TenantManager)
     pub fn set_search_manager(&mut self, manager: Arc<SearchManager>) {
         self.search = manager;
     }
@@ -362,6 +379,349 @@ impl ApexKit {
             }
         }
         Ok(())
+    }
+
+    // --- HELPER FOR OWNER EXPANSION ---
+    async fn populate_owners_in_memory(
+        &self,
+        records: &mut [Record],
+        collection_id: i64,
+        expand_opt: Option<&String>
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        
+        let expand_str = match expand_opt {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        // 1. Build Expansion Tree: ["comments.commented_by"] -> { "comments": ["commented_by"] }
+        let tree = crate::query::build_expand_tree(expand_str);
+
+        // 2. Normalize Root Records into ExpandableItems
+        let mut root_items: Vec<ExpandableItem> = records.iter_mut()
+            .map(|r| ExpandableItem { data: &r.data, expand: &mut r.expand })
+            .collect();
+
+        // 3. Start Recursive Hydration
+        self.hydrate_owners_recursive(&mut root_items, collection_id, &tree).await?;
+
+        Ok(())
+    }
+
+    // NEW: Recursive Helper
+    fn hydrate_owners_recursive<'a>(
+        &'a self,
+        items: &'a mut Vec<ExpandableItem<'a>>, // List of items at this level
+        collection_id: i64,
+        tree: &'a HashMap<String, Vec<String>> // Expansion requests for this level
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
+        Box::pin(async move {
+            if items.is_empty() || tree.is_empty() { return Ok(()); }
+
+            // A. Get Schema
+            let col = match self.get_collection(collection_id).await? {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+            let schema = col.schema.unwrap_or_default();
+            
+            // B. Identify Fields for this level
+            let mut owner_fields = Vec::new();
+            let mut relation_fields = Vec::new(); // (field_name, target_collection_id)
+
+            // Resolve target collections for relations
+            let all_collections = self.list_collections().await?;
+            let col_map: HashMap<String, i64> = all_collections.iter().map(|c| (c.name.clone(), c.id)).collect();
+            let id_map: HashMap<String, i64> = all_collections.iter().map(|c| (c.id.to_string(), c.id)).collect();
+
+            for (field_name, sub_paths) in tree {
+                if let Some(def) = schema.fields.get(field_name) {
+                    if def.r#type == FieldType::Owner {
+                        owner_fields.push(field_name);
+                    }
+                }
+                
+                // Check if it's a relation to recurse into
+                // Logic adapted from query.rs to find target collection
+                let mut target_col_id = None;
+                
+                if let Some(rel_def) = schema.relations.get(field_name) {
+                    // Forward Relation
+                    let target = &rel_def.target_collection;
+                    target_col_id = col_map.get(target).or_else(|| id_map.get(target)).cloned();
+                } else if let Some(target_id) = col_map.get(field_name) {
+                    // Reverse Relation (usually field name matches target collection name)
+                    // We optimistically check if there's a collection with this name
+                    target_col_id = Some(*target_id);
+                }
+
+                if let Some(tid) = target_col_id {
+                    relation_fields.push((field_name, tid, sub_paths));
+                }
+            }
+
+            // --- PHASE 1: HYDRATE OWNERS (CURRENT LEVEL) ---
+            if !owner_fields.is_empty() {
+                 // Ensure expand object exists
+                for item in items.iter_mut() {
+                    if item.expand.is_none() {
+                        *item.expand = Some(serde_json::json!({}));
+                    }
+                }
+
+                let mut user_ids = std::collections::HashSet::new();
+                for item in items.iter() {
+                    if let Some(obj) = item.data.as_object() {
+                        for field in &owner_fields {
+                            if let Some(val) = obj.get(*field) {
+                                if let Some(uid) = val.as_i64() { user_ids.insert(uid); }
+                                else if let Some(s) = val.as_str() { if let Ok(uid) = s.parse::<i64>() { user_ids.insert(uid); } }
+                            }
+                        }
+                    }
+                }
+
+                if !user_ids.is_empty() {
+                    let ids_vec: Vec<i64> = user_ids.into_iter().collect();
+                    let users = self.get_users_by_ids(&ids_vec).await?;
+                    let user_map: HashMap<i64, User> = users.into_iter().map(|u| (u.id, u)).collect();
+
+                    for item in items.iter_mut() {
+                        let mut updates = Vec::new();
+                        if let Some(obj) = item.data.as_object() {
+                            for field in &owner_fields {
+                                if let Some(val) = obj.get(*field) {
+                                    let uid_opt = val.as_i64().or_else(|| val.as_str().and_then(|s| s.parse::<i64>().ok()));
+                                    if let Some(uid) = uid_opt {
+                                        if let Some(user) = user_map.get(&uid) {
+                                            updates.push(((*field).clone(), serde_json::json!({
+                                                "id": user.id,
+                                                "email": user.email,
+                                                "role": user.role
+                                            })));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(expand_obj) = item.expand.as_mut().and_then(|v| v.as_object_mut()) {
+                            for (f, v) in updates { expand_obj.insert(f, v); }
+                        }
+                    }
+                }
+            }
+
+            // --- PHASE 2: RECURSE INTO RELATIONS ---
+            for (rel_name, _target_id, sub_paths_list) in &relation_fields {
+                if sub_paths_list.is_empty() { continue; }
+                
+                // Build subtree for next level
+                let sub_tree = crate::query::build_expand_tree_from_list(sub_paths_list);
+                if sub_tree.is_empty() { continue; }
+
+                // Gather all child items across all parent items
+                // Structure: parent.expand[rel_name] is Array of Objects
+                // Each Object is { "data": ..., "expand": ... }
+                // We need to construct `ExpandableItem`s pointing to these inner fields
+                
+                // We have to split this into two steps to avoid mutable borrow conflict.
+                // 1. Collect references? No, cannot collect mutable refs easily across iterator.
+                // We must iterate and recurse within the loop or collect a list of pointers.
+                // Rust makes "collecting mutable pointers to children" hard.
+                
+                // Strategy: Iterate parents, get mutable reference to list, iterate list, recurse?
+                // No, async recursion in loop is fine.
+                
+                // Problem: `items` is already borrowed mutably.
+                // We can iterate `items` and collect `&mut Value` of children.
+                
+                let _child_expandables: Vec<ExpandableItem> = Vec::new();
+                
+                for item in items.iter_mut() {
+                    if let Some(expand_val) = item.expand {
+                         if let Some(rel_data) = expand_val.get_mut(rel_name) {
+                             // This is likely an Array of Records (from JSON SQL)
+                             if let Some(arr) = rel_data.as_array_mut() {
+                                 for child_rec_json in arr {
+                                     // Child record structure from SQL: { "id":..., "data": {...}, "expand": {...} }
+                                     // We need to point to "data" and "expand" inside this object.
+                                     // We can't take two &mut from the same object easily in one go safely without split_at_mut tricks or raw pointers, 
+                                     // OR we can rely on `serde_json::Value` being dynamic.
+                                     
+                                     // Hack: We can't construct ExpandableItem easily with two mut refs to same parent object.
+                                     // Wait, `ExpandableItem` takes `&Value` for data (immutable) and `&mut Option<Value>` for expand.
+                                     // `child_rec_json` owns both.
+                                     
+                                     // We need to extract them safely.
+                                     // `child_rec_json` is `Value::Object`.
+                                     
+                                     if let Some(_child_obj) = child_rec_json.as_object_mut() {
+                                         // We need to borrow `data` immutably and `expand` mutably.
+                                         // Rust won't let us borrow `child_obj` twice.
+                                         // Workaround: Temporarily take `data` out? No.
+                                         // Workaround: Use raw pointers? Unsafe.
+                                         
+                                         // Safe Workaround: 
+                                         // Since we only READ data to find IDs, and WRITE expand to store Users.
+                                         // We can just pass the whole `child_rec_json` to a slightly different recursive helper?
+                                         // Or refactor `ExpandableItem`?
+                                         
+                                         // Let's refactor: The recursive function receives `&mut [Value]` where each Value is the {id, data, expand} object.
+                                         // It parses it internally.
+                                         
+                                         // Let's modify logic to assume `ExpandableItem` wraps the *Container* (the record object itself).
+                                         // But root records are struct `Record`, children are `Value`.
+                                         // That's the mismatch.
+                                     }
+                                 }
+                             } else if rel_data.is_object() {
+                                 // Single relation
+                                 // Same logic
+                             }
+                         }
+                    }
+                }
+            }
+            
+            // To fix the borrow checker/structure mismatch:
+            // I will implement the recursion logic specifically for `Value` (JSON) objects below.
+            // And calling it from here for the children.
+            
+            for (rel_name, target_id, sub_paths_list) in relation_fields {
+                let sub_tree = crate::query::build_expand_tree_from_list(sub_paths_list);
+                if sub_tree.is_empty() { continue; }
+
+                for item in items.iter_mut() {
+                    if let Some(expand_val) = item.expand {
+                        if let Some(rel_val) = expand_val.get_mut(rel_name) {
+                            if let Some(arr) = rel_val.as_array_mut() {
+                                // Recursion for Array
+                                self.hydrate_json_values_recursive(arr, target_id, &sub_tree).await?;
+                            } else if rel_val.is_object() {
+                                // Recursion for Single Object
+                                let _single = vec![rel_val.clone()]; // Clone to put in vec? expensive.
+                                // Actually `rel_val` is `&mut Value`.
+                                let slice = std::slice::from_mut(rel_val);
+                                self.hydrate_json_values_recursive(slice, target_id, &sub_tree).await?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    // Helper for Nested JSON Arrays (recursive)
+    fn hydrate_json_values_recursive<'a>(
+        &'a self,
+        json_records: &'a mut [Value], // These are { "id":.., "data":.., "expand":.. } objects
+        collection_id: i64,
+        tree: &'a HashMap<String, Vec<String>>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
+        Box::pin(async move {
+            // Convert JSON objects to ExpandableItems on the fly
+            // We can't create ExpandableItem references easily here due to splitting borrows.
+            // So we implement the logic directly for this structure.
+            
+            if json_records.is_empty() { return Ok(()); }
+            
+            // A. Get Schema
+            let col = match self.get_collection(collection_id).await? { Some(c) => c, None => return Ok(()), };
+            let schema = col.schema.unwrap_or_default();
+
+            // ... (Same field identification logic as above) ...
+            let mut owner_fields = Vec::new();
+            let mut relation_fields = Vec::new();
+            let all_collections = self.list_collections().await?;
+            let col_map: HashMap<String, i64> = all_collections.iter().map(|c| (c.name.clone(), c.id)).collect();
+            let id_map: HashMap<String, i64> = all_collections.iter().map(|c| (c.id.to_string(), c.id)).collect();
+
+            for (field_name, sub_paths) in tree {
+                if let Some(def) = schema.fields.get(field_name) {
+                    if def.r#type == FieldType::Owner { owner_fields.push(field_name); }
+                }
+                let mut target_col_id = None;
+                if let Some(rel_def) = schema.relations.get(field_name) {
+                    target_col_id = col_map.get(&rel_def.target_collection).or_else(|| id_map.get(&rel_def.target_collection)).cloned();
+                } else if let Some(target_id) = col_map.get(field_name) {
+                    target_col_id = Some(*target_id);
+                }
+                if let Some(tid) = target_col_id { relation_fields.push((field_name, tid, sub_paths)); }
+            }
+
+            // Phase 1: Owners
+            if !owner_fields.is_empty() {
+                let mut user_ids = std::collections::HashSet::new();
+                for rec in json_records.iter() {
+                    // Access "data" field
+                    if let Some(data) = rec.get("data") {
+                        for field in &owner_fields {
+                            if let Some(val) = data.get(*field) {
+                                if let Some(uid) = val.as_i64() { user_ids.insert(uid); }
+                                else if let Some(s) = val.as_str() { if let Ok(uid) = s.parse::<i64>() { user_ids.insert(uid); } }
+                            }
+                        }
+                    }
+                }
+                
+                if !user_ids.is_empty() {
+                    let ids_vec: Vec<i64> = user_ids.into_iter().collect();
+                    let users = self.get_users_by_ids(&ids_vec).await?;
+                    let user_map: HashMap<i64, User> = users.into_iter().map(|u| (u.id, u)).collect();
+
+                    for rec in json_records.iter_mut() {
+                        let mut updates = Vec::new();
+                         if let Some(data) = rec.get("data") {
+                            for field in &owner_fields {
+                                if let Some(val) = data.get(*field) {
+                                     let uid_opt = val.as_i64().or_else(|| val.as_str().and_then(|s| s.parse::<i64>().ok()));
+                                     if let Some(uid) = uid_opt {
+                                        if let Some(user) = user_map.get(&uid) {
+                                            updates.push(((*field).clone(), serde_json::json!({ "id": user.id, "email": user.email, "role": user.role })));
+                                        }
+                                     }
+                                }
+                            }
+                         }
+                         
+                         if !updates.is_empty() {
+                             // Access/Init "expand" field on record object
+                             if rec.get("expand").is_none() || rec.get("expand").unwrap().is_null() {
+                                 if let Some(obj) = rec.as_object_mut() {
+                                     obj.insert("expand".to_string(), serde_json::json!({}));
+                                 }
+                             }
+                             if let Some(expand) = rec.get_mut("expand").and_then(|v| v.as_object_mut()) {
+                                 for (f, v) in updates { expand.insert(f, v); }
+                             }
+                         }
+                    }
+                }
+            }
+
+            // Phase 2: Recursion
+            for (rel_name, target_id, sub_paths_list) in relation_fields {
+                 let sub_tree = crate::query::build_expand_tree_from_list(sub_paths_list);
+                 if sub_tree.is_empty() { continue; }
+                 
+                 for rec in json_records.iter_mut() {
+                     if let Some(expand) = rec.get_mut("expand") {
+                         if let Some(rel_val) = expand.get_mut(rel_name) {
+                            if let Some(arr) = rel_val.as_array_mut() {
+                                self.hydrate_json_values_recursive(arr, target_id, &sub_tree).await?;
+                            } else if rel_val.is_object() {
+                                let slice = std::slice::from_mut(rel_val);
+                                self.hydrate_json_values_recursive(slice, target_id, &sub_tree).await?;
+                            }
+                         }
+                     }
+                 }
+            }
+
+            Ok(())
+        })
     }
 }
 
@@ -567,7 +927,7 @@ impl Db for ApexKit {
         
         // NOTE: Search Indexing is now handled by the API Layer via JobQueue (Async)
         
-        Ok(Record { id: record_id, data: merged_data })
+        Ok(Record { id: record_id, data: merged_data, expand: serde_json::json!({}).into() })
     }
 
     async fn delete_record(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -628,10 +988,12 @@ impl Db for ApexKit {
     async fn list_records(&self, collection_id: i64, options: QueryOptions) -> std::result::Result<ListResult, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_data()?;
         
+        // 1. Prepare Schema Maps for Expansion Logic
         let mut schema_map = HashMap::new();
         let mut id_map = HashMap::new();
         let mut current_col_name = String::new();
 
+        // Only fetch schemas if expansion is requested
         if let Some(ref ex) = options.expand {
             if !ex.trim().is_empty() {
                 let all_cols = self.list_collections().await?;
@@ -646,55 +1008,104 @@ impl Db for ApexKit {
                 }
             }
         }
-
-        let builder = query::SqlBuilder::new(collection_id, &current_col_name, options, &schema_map, &id_map);
         
-        // 1. Run Count Query (Clone params because we use them twice)
+        // Fallback: If name not found (no expand or collection fetch skipped), fetch just this one
+        if current_col_name.is_empty() {
+             if let Some(c) = self.get_collection(collection_id).await? {
+                 current_col_name = c.name;
+             } else {
+                 // Collection doesn't exist
+                 return Ok(ListResult { items: vec![], total: 0 });
+             }
+        }
+
+        // 2. Use SqlBuilder to construct the query
+        // This builder uses `build_expand_json_object` internally to create the 3rd column
+        let builder = query::SqlBuilder::new(collection_id, &current_col_name, options.clone(), &schema_map, &id_map);
+        
+        // 3. Count Query
         let mut count_rows = conn.query(&builder.count_sql, builder.params.clone()).await?;
         let total = if let Some(row) = count_rows.next().await? {
             row.get::<i64>(0)?
         } else { 0 };
 
-        // 2. Run Main Query
+        // 4. Main Data Query
         let mut rows = conn.query(&builder.base_sql, builder.params).await?;
         let mut records = Vec::new();
-        while let Some(row) = rows.next().await? { records.push(row_to_record(&row)?); }
+        while let Some(row) = rows.next().await? { 
+            // row_to_record expects: [0]=id, [1]=data, [2]=expand
+            records.push(row_to_record(&row)?); 
+        }
         
+        // 5. Hydrate Owner Fields (Application Layer Join)
+        self.populate_owners_in_memory(&mut records, collection_id, options.expand.as_ref()).await?;
+
         Ok(ListResult { items: records, total })
     }
 
     async fn get_record(&self, collection_id: i64, record_id: i64, expand: Option<String>) -> std::result::Result<Option<Record>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_data()?;
         
-        if expand.is_none() || expand.as_ref().unwrap().trim().is_empty() {
-            let mut rows = conn.query("SELECT id, json(data) FROM records WHERE collection_id = ?1 AND id = ?2", params![collection_id, record_id]).await?;
-            return match rows.next().await? { Some(row) => Ok(Some(row_to_record(&row)?)), None => Ok(None) };
-        }
-        let expand_str = expand.unwrap();
-        let all_cols = self.list_collections().await?;
-        
-        // FIX: Ensure variable names match usages below
-        let mut schema_map = HashMap::new(); 
-        let mut id_map = HashMap::new(); 
-        let mut current_col_name = String::new();
+        let mut record_opt = if expand.is_none() || expand.as_ref().unwrap().trim().is_empty() {
+            // Optimization: Simple Select if no expand
+            // We pass NULL as the 3rd column (expand) to satisfy row_to_record
+            let mut rows = conn.query(
+                "SELECT id, json(data), NULL FROM records WHERE collection_id = ?1 AND id = ?2", 
+                params![collection_id, record_id]
+            ).await?;
+            match rows.next().await? { Some(row) => Some(row_to_record(&row)?), None => None }
+        } else {
+            let expand_str = expand.clone().unwrap();
+            
+            // 1. Prepare Maps
+            let all_cols = self.list_collections().await?;
+            let mut schema_map = HashMap::new(); 
+            let mut id_map = HashMap::new(); 
+            let mut current_col_name = String::new();
 
-        for c in all_cols {
-            if c.id == collection_id { current_col_name = c.name.clone(); }
-            if let Some(s) = c.schema { 
-                // FIX: Use schema_map, not map
-                schema_map.insert(c.name.clone(), s.clone()); 
-                schema_map.insert(c.id.to_string(), s); 
+            for c in all_cols {
+                if c.id == collection_id { current_col_name = c.name.clone(); }
+                if let Some(s) = c.schema { 
+                    schema_map.insert(c.name.clone(), s.clone()); 
+                    schema_map.insert(c.id.to_string(), s); 
+                }
+                id_map.insert(c.name.clone(), c.id); 
+                id_map.insert(c.id.to_string(), c.id);
             }
-            // FIX: Use id_map, not ids
-            id_map.insert(c.name.clone(), c.id); 
-            id_map.insert(c.id.to_string(), c.id);
+
+            // 2. Build Expansion SQL Segment
+            // We use the helper directly since we aren't using SqlBuilder (which adds WHERE/LIMIT stuff we don't need for single ID)
+            let paths = crate::query::smart_split(&expand_str);
+            let expand_json_sql = crate::query::build_expand_json_object(
+                paths, 
+                "records", 
+                0, 
+                &current_col_name, 
+                collection_id, 
+                &schema_map, 
+                &id_map
+            );
+
+            // 3. Construct Full Query
+            // Columns: id, data, expand
+            let sql = format!(
+                "SELECT id, json(data), {} FROM records WHERE collection_id = ?1 AND id = ?2", 
+                expand_json_sql
+            );
+            
+            let mut rows = conn.query(&sql, params![collection_id, record_id]).await?;
+            match rows.next().await? { Some(row) => Some(row_to_record(&row)?), None => None }
+        };
+
+        // 4. Hydrate Owner Fields (Application Layer Join)
+        if let Some(rec) = &mut record_opt {
+             let mut single_vec = vec![rec.clone()];
+             self.populate_owners_in_memory(&mut single_vec, collection_id, expand.as_ref()).await?;
+             // Update the record with hydrated data
+             *rec = single_vec.pop().unwrap();
         }
 
-        let paths = crate::query::smart_split(&expand_str);
-        let expanded_json_sql = crate::query::build_recursive_select(paths, "records", 0, &current_col_name, collection_id, &schema_map, &id_map);
-        let sql = format!("SELECT id, {} as data FROM records WHERE collection_id = ?1 AND id = ?2", expanded_json_sql);
-        let mut rows = conn.query(&sql, params![collection_id, record_id]).await?;
-        match rows.next().await? { Some(row) => Ok(Some(row_to_record(&row)?)), None => Ok(None) }
+        Ok(record_opt)
     }
 
     async fn search_records(&self, collection_id: i64, query: &str) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
@@ -708,6 +1119,82 @@ impl Db for ApexKit {
         let mut records = Vec::new();
         while let Some(row) = rows.next().await? { records.push(row_to_record(&row)?); }
         Ok(records)
+    }
+
+    async fn recover_indexes(&self) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        let collections = self.list_collections().await?;
+        let available_cores = std::thread::available_parallelism()?.get();
+        let max_concurrency = (available_cores / 2).max(1); 
+        
+        println!("[Recovery] Starting Index Recovery. Utilizing {}/{} cores.", max_concurrency, available_cores);
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+        let recovered_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for col in collections {
+            let db = self.clone(); 
+            let sem = semaphore.clone();
+            let counter = recovered_count.clone();
+
+            let handle = tokio::spawn(async move {
+                // Wrap logic in an inner async block that returns Option<()>
+                // This allows using '?' to exit early if DB queries fail
+                let task_logic = async {
+                    let _permit = sem.acquire().await.ok()?;
+                    
+                    // 1. Get DB Count
+                    let db_count_res = {
+                        if let Ok(conn) = db.get_data() {
+                            let stmt = conn.prepare("SELECT COUNT(*) FROM records WHERE collection_id = ?").await.ok()?;
+                            let mut rows = stmt.query(params![col.id]).await.ok()?;
+                            if let Some(row) = rows.next().await.ok()? {
+                                Some(row.get::<i64>(0).unwrap_or(0) as u64)
+                            } else { Some(0) }
+                        } else { None }
+                    };
+
+                    let db_count = db_count_res.unwrap_or(0);
+                    if db_count == 0 { return Some(()); } 
+
+                    // 2. Get Index Count
+                    if let Some(schema) = &col.schema {
+                        if !schema.fields.values().any(|f| f.indexed) { return Some(()); }
+                        let _ = db.search.load_index(col.id, schema);
+                    }
+                    
+                    let idx_count = db.search.get_doc_count(col.id).unwrap_or(0);
+
+                    // 3. Compare & Re-index
+                    if db_count != idx_count {
+                        println!("[Recovery] Collection '{}' (ID: {}) mismatch. DB: {}, Index: {}. Re-indexing...", col.name, col.id, db_count, idx_count);
+                        if let Err(e) = db.reindex_collection(col.id).await {
+                            eprintln!("[Recovery] Failed to re-index collection {}: {}", col.id, e);
+                        } else {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Some(())
+                };
+
+                // Run the inner logic
+                task_logic.await;
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        let count = recovered_count.load(Ordering::Relaxed);
+        if count > 0 {
+            println!("[Recovery] Successfully recovered {} collections.", count);
+        } else {
+            println!("[Recovery] Indexes healthy.");
+        }
+
+        Ok(())
     }
 
     async fn reindex_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
@@ -771,11 +1258,45 @@ impl Db for ApexKit {
         let mut r = conn.query("SELECT id, email, password_hash, role FROM users WHERE email = ?1", params![email]).await?;
         if let Some(row) = r.next().await? { Ok(Some(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)? })) } else { Ok(None) }
     }
-    async fn list_users(&self) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_users(&self, query: Option<String>, limit: i64, offset: i64) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
-        let mut rows = conn.query("SELECT id, email, password_hash, role FROM users", ()).await?;
+        let sql = if let Some(q) = query {
+            // Simple LIKE search on email
+            format!("SELECT id, email, password_hash, role FROM users WHERE email LIKE '%{}%' ORDER BY id DESC LIMIT {} OFFSET {}", q, limit, offset)
+        } else {
+            format!("SELECT id, email, password_hash, role FROM users ORDER BY id DESC LIMIT {} OFFSET {}", limit, offset)
+        };
+        
+        let mut rows = conn.query(&sql, ()).await?;
         let mut users = Vec::new();
-        while let Some(row) = rows.next().await? { users.push(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)? }); }
+        while let Some(row) = rows.next().await? { 
+            users.push(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)? }); 
+        }
+        Ok(users)
+    }
+    // IMPLEMENTATION: count_users
+    async fn count_users(&self, query: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core()?;
+        let sql = if let Some(q) = query {
+            format!("SELECT COUNT(*) FROM users WHERE email LIKE '%{}%'", q)
+        } else {
+            "SELECT COUNT(*) FROM users".to_string()
+        };
+        let mut row = conn.query(&sql, ()).await?;
+        if let Some(r) = row.next().await? { Ok(r.get(0)?) } else { Ok(0) }
+    }
+    // IMPLEMENTATION: get_users_by_ids
+    async fn get_users_by_ids(&self, ids: &[i64]) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
+        if ids.is_empty() { return Ok(vec![]); }
+        let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, email, password_hash, role FROM users WHERE id IN ({})", id_list);
+        
+        let conn = self.get_core()?;
+        let mut rows = conn.query(&sql, ()).await?;
+        let mut users = Vec::new();
+        while let Some(row) = rows.next().await? { 
+            users.push(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)? }); 
+        }
         Ok(users)
     }
     async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core()?.execute("DELETE FROM users WHERE id = ?1", params![id]).await?; Ok(()) }
@@ -823,6 +1344,11 @@ impl Db for ApexKit {
         let mut files = Vec::new();
         while let Some(row) = rows.next().await? { files.push(models::StoredFile { id: row.get(0)?, filename: row.get(1)?, original_name: row.get(2)?, mime_type: row.get(3)?, size: row.get(4)?, created_at: row.get(5)? }); }
         Ok(files)
+    }
+    async fn count_files(&self) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_data()?;
+        let mut row = conn.query("SELECT COUNT(*) FROM _storage_files", ()).await?;
+        if let Some(r) = row.next().await? { Ok(r.get(0)?) } else { Ok(0) }
     }
     async fn get_file_metadata(&self, id: i64) -> std::result::Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_data()?;
@@ -1401,6 +1927,7 @@ impl Db for Mutex<Connection> {
     async fn delete_record(&self, _c: i64, _r: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn search_records(&self, _c: i64, _q: &str) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
     async fn instant_search(&self, _c: i64, _q: &str, _l: usize) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn recover_indexes(&self) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { Ok(()) }
     async fn index_record_search(&self, _c: i64, _r: i64, _d: &serde_json::Value, _s: &crate::schema::CollectionSchema
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
         Ok(()) 
@@ -1412,10 +1939,13 @@ impl Db for Mutex<Connection> {
     async fn reindex_collection(&self, _id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { Ok(()) }
     async fn create_user(&self, _e: &str, _p: &str, _r: &str) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
     async fn get_user_by_email(&self, _e: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn list_users(&self) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn list_users(&self, _q: Option<String>, _l: i64, _o: i64) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn count_users(&self, _q: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(0) }
+    async fn get_users_by_ids(&self, _ids: &[i64]) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
     async fn delete_user(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn create_file_metadata(&self, _f: &str, _o: &str, _m: &str, _s: i64, _u: Option<i64>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }
     async fn list_files(&self, _l: i64, _o: i64) -> std::result::Result<Vec<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn count_files(&self) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(0) }
     async fn get_file_metadata(&self, _id: i64) -> std::result::Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     async fn delete_file_metadata(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn get_user_by_oauth(&self, _p: &str, _pid: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }

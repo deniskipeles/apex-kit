@@ -24,17 +24,33 @@ pub struct WriteManager {
 
 impl WriteManager {
     pub fn new(db: Arc<Database>) -> Self {
-        let (tx, rx) = mpsc::channel(1000); // Buffer up to 1000 pending writes
+        // Default to 1000, but allow tuning via ENV for high-end devices
+        let batch_size = std::env::var("DB_BATCH_SIZE")
+            .unwrap_or("1000".to_string())
+            .parse::<usize>()
+            .unwrap_or(1000);
+
+        // Default to 10ms, but allow tuning via ENV for non shared CPUs
+        let flush_ms = std::env::var("DB_FLUSH_MS")
+            .unwrap_or("10".to_string())
+            .parse::<u64>()
+            .unwrap_or(10);
+
+        let (tx, rx) = mpsc::channel(batch_size); 
         
-        // Spawn background worker
         tokio::spawn(async move {
-            Self::background_task(db, rx).await;
+            Self::background_task(db, rx, batch_size, flush_ms).await;
         });
 
         Self { sender: tx }
     }
 
-    async fn background_task(db: Arc<Database>, mut rx: mpsc::Receiver<WriteRequest>) {
+    async fn background_task(
+        db: Arc<Database>, 
+        mut rx: mpsc::Receiver<WriteRequest>,
+        max_batch_size: usize,
+        flush_ms: u64
+    ) {
         // Connect once
         let conn = match db.connect() {
             Ok(c) => c,
@@ -43,10 +59,10 @@ impl WriteManager {
                 return;
             }
         };
-
-        let mut buffer = Vec::with_capacity(100);
-        let max_batch_size = 100;
-        let flush_interval = Duration::from_millis(10); // Wait max 10ms for a batch
+        
+        // Dynamic capacity
+        let mut buffer = Vec::with_capacity(max_batch_size);
+        let flush_interval = Duration::from_millis(flush_ms);  // Wait max 10ms for a batch
 
         loop {
             // 1. Collect Batch

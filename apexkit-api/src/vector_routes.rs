@@ -65,7 +65,7 @@ pub async fn search_vector(
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 3. Map Response
-    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data }).collect()))
+    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data, expand: r.expand }).collect()))
 }
 #[utoipa::path(
     post,
@@ -146,7 +146,7 @@ pub async fn query_vector_search(
         score_b.partial_cmp(score_a).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data }).collect()))
+    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data, expand: r.expand }).collect()))
 }
 
 #[utoipa::path(

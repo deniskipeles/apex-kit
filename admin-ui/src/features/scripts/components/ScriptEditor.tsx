@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/admin-ui/src/features/scripts/components/ScriptEditor.tsx ===========================
 import React, { useState, useEffect } from 'react';
 import { Save, Code, Database } from 'lucide-react';
 import { Button, Input, Label, Select, Switch } from '../../../components/ui/Elements';
@@ -24,6 +23,10 @@ const TRIGGER_TYPES = [
     { value: 'after_update', label: 'After Update', group: 'Hooks' },
     { value: 'before_delete', label: 'Before Delete', group: 'Hooks' },
     { value: 'after_delete', label: 'After Delete', group: 'Hooks' },
+    { value: 'before_user_create', label: 'Before User Create', group: 'User Hooks' },
+    { value: 'after_user_create', label: 'After User Create', group: 'User Hooks' },
+    { value: 'before_user_delete', label: 'Before User Delete', group: 'User Hooks' },
+    { value: 'after_user_delete', label: 'After User Delete', group: 'User Hooks' },
 ];
 
 const DEFAULT_CODE = {
@@ -75,7 +78,10 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
         }
     };
 
-    const isHookType = (type: string) => ['before_create', 'after_create', 'before_update', 'after_update', 'before_delete', 'after_delete'].includes(type);
+    const isHookType = (type: string) => [
+        'before_create', 'after_create', 'before_update', 'after_update', 'before_delete', 'after_delete',
+        'before_user_create', 'after_user_create', 'before_user_delete', 'after_user_delete'
+    ].includes(type);
 
     const handleTriggerChange = (type: string) => {
         let newCode = formData.code;
@@ -170,6 +176,7 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
                                 withTypes={true} // Enables $db, $http auto-complete from TinyBase types
                                 height="100%"
                                 label="SERVER SCRIPT"
+                                collections={collections}
                             />
                         </div>
                     </div>

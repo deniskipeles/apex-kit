@@ -263,10 +263,16 @@ export class ApexKit {
 
             // --- Users ---
             /**
-             * List all registered users (Admin only).
-             * @returns {Promise<Array<object>>}
+             * List all registered users (Admin only). with pagination, sorting, and filtering.
+             * @param {object} [options={}] 
+             * @param {number} [options.page]
+             * @param {number} [options.per_page]
+             * @param {string} [options.sort] - e.g. "-created"
+             * @param {object|string} [options.filter] - e.g. { "status": "active" }
+             * @param {string} [options.expand] - e.g. "author,comments"
+             * @returns {Promise<{items: Array<object>, total: number}>} Object containing items array and total count.
              */
-            listUsers: () => this._request('/admin/users'),
+            listUsers: (options = {}) => this._request(`/admin/users`, { method: 'GET', params: options }),
 
             /**
              * Delete a user by ID (Admin only).
@@ -556,7 +562,7 @@ export class ApexKit {
              * @param {string} query 
              * @returns {Promise<Array<object>>}
              */
-            search: (query) => this._request(`/collections/${collectionId}/search`, { method: 'GET', params: { q: query } }),
+            recordsSearch: (query) => this._request(`/collections/${collectionId}/search`, { method: 'GET', params: { q: query } }),
 
             /**
              * Perform an ultra-fast Instant Search via Tantivy Index (No SQL).

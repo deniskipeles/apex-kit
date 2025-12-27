@@ -1,6 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Database, User, Edit, Trash2, Fingerprint } from 'lucide-react';
-import { Button, Card, CardHeader, CardTitle, CardContent, Badge, Skeleton } from '../../../components/ui/Elements';
+import { 
+    Plus, Database, User, Edit, Trash2, Fingerprint, 
+    BrainCircuit, Search, Layers, ArrowRight 
+} from 'lucide-react';
+import { Button, Card, CardHeader, CardTitle, CardContent, Badge, Skeleton, Input } from '../../../components/ui/Elements';
 import { collectionsService } from '../services/collectionsService';
 import { Collection } from '../../../types';
 import { useCollectionsStore } from '../../../store/useCollectionsStore';
@@ -16,7 +19,11 @@ interface CollectionsListPageProps {
 export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPageProps) => {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
   const [collectionToDelete, setCollectionToDelete] = useState<Collection | null>(null);
+  const [isReindexing, setIsReindexing] = useState(false);
+  const [isRevectorizing, setIsRevectorizing] = useState(false);
+  
   const { setActiveCollection } = useCollectionsStore();
   const { toast } = useToast();
 
@@ -28,6 +35,7 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     setLoading(true);
     collectionsService.list()
       .then(setCollections)
+      .catch(() => toast('Failed to load collections', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -49,89 +57,199 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     }
   };
 
-  const reIndexAll = async () => {
-    const completedIndexing = false;
-    let collectionsCounter = 0;
-    while (collectionsCounter < collections.length) {
-      const collection = collections[collectionsCounter];
-      if (collection) {
-        const res = await apiClient.reIndex(collection.id);
-        if (res.success) toast(res?.message + " " + collection.name, "success");
-        if (!res.success) toast(res?.message + " " + collection.name, "error");
-      }
-      collectionsCounter = collectionsCounter + 1;
+  const handleReIndexAll = async () => {
+    setIsReindexing(true);
+    let count = 0;
+    try {
+        for (const col of collections) {
+            // Only re-index if it has indexed fields
+            if (col.schema.some(f => f.indexed)) {
+                await apiClient.reIndex(col.id);
+                count++;
+            }
+        }
+        toast(`Triggered re-indexing for ${count} collections`, 'success');
+    } catch (e) {
+        toast('Bulk re-indexing encountered errors', 'error');
+    } finally {
+        setIsReindexing(false);
     }
-  }
+  };
+
+  const handleRevectorizeAll = async () => {
+    setIsRevectorizing(true);
+    let count = 0;
+    try {
+        for (const col of collections) {
+            // Only vectorizable collections
+            if (col.schema.some(f => f.vectorize)) {
+                await apiClient.revectorizeCollection(col.id);
+                count++;
+            }
+        }
+        toast(`Vectorization jobs started for ${count} collections`, 'success');
+    } catch (e) {
+        toast('Bulk vectorization failed', 'error');
+    } finally {
+        setIsRevectorizing(false);
+    }
+  };
+
+  const filteredCollections = collections.filter(c => 
+      c.name.toLowerCase().includes(search.toLowerCase())
+  );
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
-        <div>
-          <h2 className="text-3xl font-bold tracking-tight">Collections</h2>
-          <p className="text-muted-foreground">Manage your data schema and access rules.</p>
+    <div className="space-y-8 pb-20 max-w-7xl mx-auto">
+      {/* Header & Actions */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+        <div className="space-y-1">
+            <h2 className="text-3xl font-extrabold tracking-tight flex items-center gap-3">
+               <Layers className="h-8 w-8 text-primary" /> Data Collections
+            </h2>
+            <p className="text-muted-foreground text-sm md:text-base">
+                Define schemas, manage records, and configure AI search capabilities.
+            </p>
         </div>
-        <Button onClick={() => { setActiveCollection(null); onCreate(); }}>
-          <Plus className="mr-2 h-4 w-4" /> New Collection
-        </Button>
-        <Button onClick={() => { reIndexAll() }}>
-          <Fingerprint className="mr-2 h-4 w-4" /> Re-Index All
-        </Button>
+        
+        <div className="flex flex-col sm:flex-row gap-3">
+             <div className="relative">
+                <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                <Input 
+                    placeholder="Search collections..." 
+                    className="pl-9 w-full sm:w-64 bg-background/50" 
+                    value={search}
+                    onChange={(e: any) => setSearch(e.target.value)}
+                />
+            </div>
+            <Button onClick={() => { setActiveCollection(null); onCreate(); }} className="shadow-lg hover:shadow-primary/25 transition-all">
+                <Plus className="mr-2 h-4 w-4" /> New Collection
+            </Button>
+        </div>
       </div>
 
+      {/* Maintenance Toolbar */}
+      <div className="flex flex-wrap gap-2 p-1 bg-secondary/10 rounded-lg border border-border/50 w-fit">
+          <Button 
+             variant="ghost" 
+             size="sm" 
+             onClick={handleReIndexAll} 
+             isLoading={isReindexing}
+             className="text-xs text-muted-foreground hover:text-foreground"
+          >
+             <Fingerprint className="mr-2 h-3.5 w-3.5" /> Re-Index Search
+          </Button>
+          <div className="w-px bg-border my-1"></div>
+          <Button 
+             variant="ghost" 
+             size="sm" 
+             onClick={handleRevectorizeAll} 
+             isLoading={isRevectorizing}
+             className="text-xs text-muted-foreground hover:text-foreground hover:bg-purple-500/10 hover:text-purple-400"
+          >
+             <BrainCircuit className="mr-2 h-3.5 w-3.5" /> Re-Vectorize All
+          </Button>
+      </div>
+
+      {/* Grid */}
       {loading ? (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          {[1, 2, 3].map(i => <Skeleton key={i} className="h-32 w-full" />)}
+        <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+          {[1, 2, 3, 4, 5, 6].map(i => <Skeleton key={i} className="h-40 w-full rounded-xl" />)}
+        </div>
+      ) : filteredCollections.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20 text-center border-2 border-dashed border-border rounded-xl bg-secondary/5">
+             <div className="h-20 w-20 bg-secondary/30 rounded-full flex items-center justify-center mb-4">
+                <Database className="h-10 w-10 text-muted-foreground/50" />
+            </div>
+            <h3 className="text-xl font-semibold mb-2">No Collections Found</h3>
+            <p className="text-muted-foreground max-w-md mb-6">
+                {search ? `No matches for "${search}"` : "Get started by creating your first data collection."}
+            </p>
+            {!search && (
+                <Button variant="outline" onClick={() => { setActiveCollection(null); onCreate(); }}>
+                    Create Collection
+                </Button>
+            )}
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {collections.map(col => (
-            <Card key={col.id} className="group relative overflow-hidden hover:border-primary/50 transition-colors">
-              <CardHeader>
-                <div className="flex justify-between items-start">
-                  <CardTitle className="flex items-center gap-2">
-                    {col.type === 'auth' ? <User className="h-4 w-4 text-orange-400" /> : <Database className="h-4 w-4 text-primary" />}
-                    {col.name}
-                  </CardTitle>
-                  <div className="flex gap-1 items-center">
-                    <Badge variant="secondary" className="uppercase text-[10px] mr-1">{col.type}</Badge>
+        <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+          {filteredCollections.map(col => {
+            const hasVectors = col.schema.some(f => f.vectorize);
+            const fieldCount = col.schema.length;
+            const isAuth = col.type === 'auth';
 
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7 text-muted-foreground hover:text-primary"
-                      onClick={(e) => { e.stopPropagation(); handleEdit(col); }}
-                      title="Edit Schema"
-                    >
-                      <Edit className="h-3.5 w-3.5" />
-                    </Button>
-
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7 text-muted-foreground hover:text-destructive"
-                      onClick={(e) => { e.stopPropagation(); setCollectionToDelete(col); }}
-                      title="Delete Collection"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </Button>
-                  </div>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <div className="text-sm text-muted-foreground space-y-1">
-                  <p>{col.schema.length} fields defined</p>
-                  <p className="text-xs opacity-70">Updated {new Date(col.updated).toLocaleDateString()}</p>
-                </div>
-              </CardContent>
-            </Card>
-          ))}
+            return (
+                <Card 
+                    key={col.id} 
+                    className="group relative overflow-hidden transition-all duration-300 hover:shadow-xl hover:border-primary/50 hover:-translate-y-1 bg-card/50 backdrop-blur-sm"
+                >
+                  <CardHeader className="pb-3">
+                    <div className="flex justify-between items-start">
+                      <div className="flex items-center gap-3">
+                        <div className={`p-2 rounded-lg ${isAuth ? 'bg-orange-500/10 text-orange-500' : 'bg-primary/10 text-primary'}`}>
+                            {isAuth ? <User className="h-5 w-5" /> : <Database className="h-5 w-5" />}
+                        </div>
+                        <div>
+                            <CardTitle className="text-lg font-bold">{col.name}</CardTitle>
+                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">
+                                {col.type}
+                            </span>
+                        </div>
+                      </div>
+                      
+                      <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                          onClick={(e) => { e.stopPropagation(); setCollectionToDelete(col); }}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </div>
+                  </CardHeader>
+                  
+                  <CardContent>
+                    <div className="space-y-4">
+                        {/* Stats */}
+                        <div className="flex gap-2">
+                             <Badge variant="secondary" className="text-[10px] font-mono">
+                                 {fieldCount} Fields
+                             </Badge>
+                             {hasVectors && (
+                                 <Badge variant="secondary" className="text-[10px] font-mono bg-purple-500/10 text-purple-400 border-purple-500/20">
+                                     <BrainCircuit className="h-3 w-3 mr-1" /> AI Ready
+                                 </Badge>
+                             )}
+                        </div>
+                        
+                        {/* Action */}
+                        <Button 
+                            variant="outline" 
+                            className="w-full justify-between group-hover:border-primary/30 group-hover:bg-primary/5"
+                            onClick={() => handleEdit(col)}
+                        >
+                            <span className="text-xs">Edit Schema</span>
+                            <ArrowRight className="h-3 w-3 text-muted-foreground group-hover:text-primary transition-colors" />
+                        </Button>
+                    </div>
+                    
+                    {/* Timestamp Footer */}
+                    <div className="absolute bottom-2 right-3 text-[9px] text-muted-foreground/30 font-mono">
+                        Updated {new Date(col.updated).toLocaleDateString()}
+                    </div>
+                  </CardContent>
+                </Card>
+            );
+          })}
         </div>
       )}
 
       <ConfirmDialog
         isOpen={!!collectionToDelete}
         title={`Delete ${collectionToDelete?.name}?`}
-        description="This will permanently delete the collection and all its records. This action cannot be undone."
+        description="This will permanently delete the collection, all its records, and search indexes. This action cannot be undone."
         confirmText="Delete Collection"
         variant="destructive"
         onConfirm={handleDelete}

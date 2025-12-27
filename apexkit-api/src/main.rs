@@ -1,12 +1,13 @@
 use axum::{serve, middleware};
 use std::sync::Arc;
-use apexkit_api::{app_router, AppState, cli::{self, Cli}};
+use apexkit_api::{app_router, AppState, GlobalJobContext, cli::{self, Cli}};
 use clap::Parser;
 use apexkit_core::{
-    a_new_database_connection, jobs::{self, JobContext}, cache::CachedDb, realtime, 
+    a_new_database_connection, jobs::{self}, cache::CachedDb, realtime, 
     storage::{StorageBackend}, 
     security::{MasterKey, Vault},
     ai_models::CreateActionReq,
+    script_models::CreateScriptReq,
     Db, VectorProvider,
 };
 use tokio::net::TcpListener;
@@ -27,6 +28,7 @@ use moka::future::Cache;
 use apex_vector::{VectorEngine, CandleEmbedder, EmbeddingModelConfig};
 
 use apexkit_api::tenant_manager::TenantManager;
+use apexkit_api::sandbox_manager::SandboxManager;
 
 // --- 1. Define Bridge (Real AI) ---
 // Bridges the ApexVector engine to the ApexKit Core trait
@@ -69,38 +71,6 @@ impl VectorProvider for FallbackVectorProvider {
     }
     async fn index(&self, _c: i64, _r: i64, _f: &str, _v: &[f32]) -> Result<(), String> {
         Ok(())
-    }
-}
-
-// --- 3. Job Context Resolver ---
-// Routes background jobs to the correct DB/Provider (Root or Tenant)
-struct GlobalJobContext {
-    root_db: Arc<dyn Db>,
-    root_vector_provider: Arc<dyn VectorProvider>,
-    tenant_manager: Arc<TenantManager>,
-}
-
-#[async_trait::async_trait]
-impl JobContext for GlobalJobContext {
-    async fn resolve(&self, tenant_id: Option<&str>) -> Option<(Arc<dyn Db>, Arc<dyn VectorProvider>)> {
-        match tenant_id {
-            Some(id) => {
-                // Try to load Tenant Context (DB + Provider)
-                // Assuming TenantManager has been updated to return the context or provider
-                let db_result = self.tenant_manager.get_tenant(id.to_string()).await;
-                let provider_result = self.tenant_manager.get_vector_provider(id).await;
-
-                if let (Ok(db), Some(provider)) = (db_result, provider_result) {
-                    Some((db, provider))
-                } else {
-                    None
-                }
-            },
-            None => {
-                // Root App
-                Some((self.root_db.clone(), self.root_vector_provider.clone()))
-            }
-        }
     }
 }
 
@@ -208,6 +178,13 @@ async fn main() {
         }
     }
     tracing::info!("HNSW index reload complete. {} vectors loaded.", total_vectors_loaded); 
+    // --- AUTOMATIC INDEX RECOVERY (SEARCH & DB SYNC) ---
+    // This runs the "Half Core" parallel check for Tantivy Indexes vs SQLite
+    if let Err(e) = cached_db.recover_indexes().await { // Note: You need to expose this via Db trait or cast back
+        // Since recover_indexes is on ApexKit (inner), we might need to call it on raw_db directly
+        // assuming raw_db is ApexKit.
+        tracing::error!("Index Recovery Failed: {}", e);
+   }
 
     // --- 6. SEEDING DEFAULTS ---
     if let Err(e) = seed_admin(cached_db.as_ref()).await {
@@ -219,20 +196,29 @@ async fn main() {
         tracing::error!("Failed to seed AI actions: {}", e);
     }
 
+    // Seed Default Scripts
+    if let Err(e) = seed_default_scripts(cached_db.as_ref()).await {
+        tracing::error!("Failed to seed default scripts: {}", e);
+    }
+
     // --- INIT TENANT MANAGER ---
     // Capacity 500 active databases. Unused ones dropped after 1hr.
     let tenant_manager = Arc::new(TenantManager::new(
-        shared_embedder, // This is Option<Arc<CandleEmbedder>>
-        vault.clone(), 
+        shared_embedder.clone(), // This is Option<Arc<CandleEmbedder>>
+        // vault.clone(), 
         500
     ));
 
+    // --- INIT SANDBOX MANAGER ---
+    // Pass the shared embedder (Option<Arc<CandleEmbedder>>)
+    let sandbox_manager = Arc::new(SandboxManager::new(shared_embedder.clone()));
+
     // --- 7. JOB SYSTEM ---
-    // Create the Context Resolver for the background worker
     let job_context = Arc::new(GlobalJobContext {
         root_db: cached_db.clone(),
         root_vector_provider: vector_provider.clone(),
         tenant_manager: tenant_manager.clone(),
+        sandbox_manager: sandbox_manager.clone(), // <--- PASS IT
     });
 
     // Start Worker
@@ -287,6 +273,7 @@ async fn main() {
     let state = AppState {
         db: cached_db.clone(),
         tenant_manager,
+        sandbox_manager,
         queue: job_queue,
         metrics: Some(handle),
         tx,
@@ -407,6 +394,31 @@ async fn seed_ai_actions(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::
             tracing::info!("Seeding AI Action: {}", action.name);
             db.create_ai_action(action).await?;
         }
+    }
+    Ok(())
+}
+
+async fn seed_default_scripts(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let script_name = "apex-auth-roles";
+    
+    if db.get_script_by_name(script_name).await?.is_none() {
+        tracing::info!("Seeding default script: {}", script_name);
+        
+        let code = r#"
+export default async function(req) {
+    // Defines the roles available in the User Management UI
+    return new Response({ 
+        roles: ["user", "admin", "editor"] 
+    });
+}
+"#.trim().to_string();
+
+        db.create_script(CreateScriptReq {
+            name: script_name.to_string(),
+            trigger_type: "manual".to_string(),
+            target_collection: None,
+            code,
+        }).await?;
     }
     Ok(())
 }

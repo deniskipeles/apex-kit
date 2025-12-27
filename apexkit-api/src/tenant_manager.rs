@@ -6,11 +6,9 @@ use apex_vector::{CandleEmbedder, VectorIndex};
 use std::time::Duration;
 use apexkit_core::cache::CachedDb;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, error};
 
 // --- 1. Isolated Vector Provider ---
-// This struct mixes the SHARED embedder (heavy, read-only) 
-// with an ISOLATED index (light, read-write, per tenant)
 struct TenantVectorProvider {
     embedder: Option<Arc<CandleEmbedder>>, 
     index: Arc<VectorIndex>,
@@ -22,7 +20,6 @@ impl VectorProvider for TenantVectorProvider {
         if let Some(embedder) = &self.embedder {
             let embedder = embedder.clone();
             let t = text.to_string();
-            // Use blocking task for heavy compute to avoid blocking the async runtime
             tokio::task::spawn_blocking(move || {
                 embedder.embed(&t).map_err(|e| e.to_string())
             }).await.map_err(|e| e.to_string())?
@@ -42,7 +39,6 @@ impl VectorProvider for TenantVectorProvider {
 }
 
 // --- 2. Context Container ---
-// Holds both the DB connection and the specific Vector Provider for a tenant.
 #[derive(Clone)]
 pub struct TenantContext {
     pub db: Arc<dyn Db>,
@@ -52,14 +48,12 @@ pub struct TenantContext {
 // --- 3. Tenant Manager ---
 #[derive(Clone)]
 pub struct TenantManager {
-    // Cache stores the full context (DB + Provider)
     cache: Cache<String, TenantContext>,
     shared_embedder: Option<Arc<CandleEmbedder>>,
-    vault: Arc<apexkit_core::security::Vault>,
 }
 
 impl TenantManager {
-    pub fn new(shared_embedder: Option<Arc<CandleEmbedder>>, vault: Arc<apexkit_core::security::Vault>, capacity: u64) -> Self {
+    pub fn new(shared_embedder: Option<Arc<CandleEmbedder>>, capacity: u64) -> Self {
         let _ = std::fs::create_dir_all("tenants");
         Self {
             cache: Cache::builder()
@@ -67,19 +61,16 @@ impl TenantManager {
                 .time_to_idle(Duration::from_secs(3600)) // Evict inactive tenants after 1 hour
                 .build(),
             shared_embedder,
-            vault,
         }
     }
 
     /// RETRIEVES an existing tenant's DB. Fails if not found on disk.
-    /// Used by API Middlewares.
     pub async fn get_tenant(&self, tenant_id: String) -> Result<Arc<dyn Db>, String> {
         let ctx = self.get_tenant_context(&tenant_id).await?;
         Ok(ctx.db)
     }
 
     /// RETRIEVES the specific Vector Provider for a tenant.
-    /// Used by Background Jobs (Worker).
     pub async fn get_vector_provider(&self, tenant_id: &str) -> Option<Arc<dyn VectorProvider>> {
         self.get_tenant_context(tenant_id).await.ok().map(|c| c.vector_provider)
     }
@@ -118,7 +109,7 @@ impl TenantManager {
         std::fs::create_dir_all(&format!("{}/uploads", base_path)).ok();
         std::fs::create_dir_all(&format!("{}/indexes", base_path)).ok();
 
-        // Initialize Filesystem (This creates .db files and runs migrations via Core)
+        // Initialize Filesystem
         let ctx = self.load_tenant(&tenant_id).await?;
         
         // Cache it immediately
@@ -139,7 +130,6 @@ impl TenantManager {
         });
 
         // 2. Initialize Database (Uses ApexKit Core Factory)
-        // This connects to existing files or creates empty ones
         let mut apexkit = ApexKit::init_filesystem(&base_path, tenant_vector_provider.clone())
             .await
             .map_err(|e| format!("Failed to init tenant DB: {}", e))?;
@@ -149,40 +139,44 @@ impl TenantManager {
         let search_manager = Arc::new(SearchManager::new(&search_path));
         apexkit.set_search_manager(search_manager);
 
-        // 4. Wrap in CachedDB for performance
+        // 4. Wrap in CachedDB
         let db_arc: Arc<dyn Db> = Arc::new(CachedDb::new(Arc::new(apexkit.clone())));
         
-        // 5. Hydrate Vector Index (Background) from SQLite to HNSW
-        let db_clone_for_hydration = db_arc.clone();
-        let vec_provider_for_hydration = tenant_vector_provider.clone(); // Use concrete type
-        
-        // FIX: Get current model to load correct vectors
+        // 5. Hydrate Indexes (Background Task)
+        let db_clone = db_arc.clone();
+        let vec_provider_clone = tenant_vector_provider.clone();
         let active_model = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+        
+        // Use owned string for static async block
+        let tid = tenant_id.to_string();
 
         tokio::spawn(async move {
-            // Load collections
-            if let Ok(cols) = db_clone_for_hydration.list_collections().await {
+            // A. Hydrate Vector Index (HNSW - Memory Only) from SQLite
+            if let Ok(cols) = db_clone.list_collections().await {
                 for col in cols {
-                    // Load vectors ONLY for the active model
-                    // Using get_vectors_for_collection(id, model_name)
-                    if let Ok(vecs) = db_clone_for_hydration.get_vectors_for_collection(col.id, &active_model).await {
+                    if let Ok(vecs) = db_clone.get_vectors_for_collection(col.id, &active_model).await {
                          for (rid, field, vec) in vecs {
-                             // Insert into in-memory HNSW index
-                             let _ = vec_provider_for_hydration.index(col.id, rid, &field, &vec).await;
+                             let _ = vec_provider_clone.index(col.id, rid, &field, &vec).await;
                          }
                     }
                 }
             }
+            
+            // B. Recover Tantivy Index (Consistency Check)
+            // This handles cases where the server crashed and the search index (on disk) 
+            // became out of sync with the SQLite DB.
+            info!("Tenant '{}': Checking search index consistency...", tid);
+            if let Err(e) = db_clone.recover_indexes().await {
+                 error!("Tenant '{}' index recovery failed: {}", tid, e);
+            }
         });
 
-        // Return the Context struct containing both
         Ok(TenantContext {
             db: db_arc,
             vector_provider: tenant_vector_provider
         })
     }
 
-    /// Returns a list of all active Tenant IDs (folder names)
     pub async fn list_tenants(&self) -> Result<Vec<String>, String> {
         let mut tenants = Vec::new();
         let path = Path::new("tenants");

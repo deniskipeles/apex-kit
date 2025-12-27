@@ -1,7 +1,7 @@
 
-export interface AdminUser {
+export interface AuthUser {
   id: string;
   email: string;
-  avatar?: string;
+  role: string;
   lastActive: string;
 }

@@ -94,6 +94,7 @@ pub enum DataCmd {
 }
 
 /// Helper function to execute CLI commands
+/// Helper function to execute CLI commands
 pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(), String> {
     match command {
         // --- USER COMMANDS ---
@@ -105,7 +106,9 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
                 handle_reset_password(state, email, new_password).await
             }
             UserCmd::List => {
-                let users = state.db.list_users().await.map_err(|e| e.to_string())?;
+                // FIX: Update call to include pagination args (None, 1000, 0)
+                let users = state.db.list_users(None, 1000, 0).await.map_err(|e| e.to_string())?;
+                
                 println!("{:<5} {:<30} {:<10}", "ID", "EMAIL", "ROLE");
                 println!("{:-<50}", "");
                 for u in users {
@@ -115,7 +118,7 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
             }
         },
 
-        // --- CONFIG COMMANDS ---
+        // ... (Rest of the file remains unchanged) ...
         Commands::Config(cmd) => match cmd {
             ConfigCmd::Set { key, value } => {
                 let encrypted = state.vault.encrypt(&value).map_err(|e| e.to_string())?;
@@ -199,6 +202,7 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
     }
 }
 
+// ... (Rest of file: handle_create_user, handle_reset_password) ...
 async fn handle_create_user(state: AppState, email: String, password: Option<String>, role: String) -> Result<(), String> {
     if !email.contains('@') { return Err("Invalid email format.".into()); }
     
@@ -240,9 +244,6 @@ async fn handle_reset_password(state: AppState, email: String, new_password: Opt
     // IMPORTANT: In a real implementation, you must ensure `db.update_user_password` exists in the trait.
     // Since we can't easily modify the trait in this single file context without editing lib.rs/cache.rs,
     // We will simulate success message but warn implementation is needed.
-    
-    // Attempting to delete and recreate is a dangerous workaround for CLI, but works if no foreign keys block it.
-    // A better way is to assume the trait has a method to run raw SQL or specific update.
     
     println!("❌ DB Trait update required to change password directly via CLI without SQL access.");
     println!("   Hash to set manually in DB: {}", hash);

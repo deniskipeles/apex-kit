@@ -42,6 +42,23 @@ export default defineConfig(({ mode }) => {
         alias: {
           '@': path.resolve(__dirname, '.'),
         }
+      },
+      build: {
+        chunkSizeWarningLimit: 1600,
+        rollupOptions: {
+            output: {
+                manualChunks: {
+                    // 1. React & Routing
+                    'vendor-react': ['react', 'react-dom', 'react-router-dom', 'zustand'],
+                    // 2. UI Components & Icons
+                    'vendor-ui': ['lucide-react', 'recharts'],
+                    // 3. Utilities (Markdown, Sanitization)
+                    'vendor-utils': ['dompurify', 'marked', 'turndown', 'turndown-plugin-gfm'],
+                    // 4. Monaco Wrapper (The heavy editor logic)
+                    'monaco-wrapper': ['@monaco-editor/react']
+                }
+            }
+        }
       }
     };
 });

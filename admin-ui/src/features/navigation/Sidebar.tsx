@@ -100,7 +100,7 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
             {/* Exit Context Button */}
             {contextType !== 'root' && (
                 <button 
-                    onClick={() => { window.location.href = '/_dashboard/'; }} 
+                    onClick={() => { window.location.href = '/_dashboard'; }} 
                     className="w-full flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-destructive/10 hover:text-destructive mb-6 border border-dashed border-border transition-colors group"
                 >
                     <ArrowLeft className="h-4 w-4 group-hover:-translate-x-1 transition-transform" /> 

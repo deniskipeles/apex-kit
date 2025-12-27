@@ -19,6 +19,9 @@ export const recordsService = {
   instantSearch: (collectionId: string, query: string) => {
     return apiClient.records.instantSearch(collectionId, query);
   },
+  searchRecords: (collectionId: string, query: string) => {
+    return apiClient.records.recordsSearch(collectionId, query);
+  },
   getOne: async (collectionId: string, recordId: string, expand = '') => {
     return await apiClient.records.getOne(collectionId, recordId, expand);
   },

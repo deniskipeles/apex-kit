@@ -1,10 +1,28 @@
+// =========================== /teamspace/studios/this_studio/apex/apex-kit/apexkit-api/src/graphql.rs ===========================
 use async_graphql::{dynamic::*, Value as GqlValue};
 use async_graphql::dataloader::*;
-use apexkit_core::{Db, schema::{FieldType, RelationType}, Record, ListResult}; // Added ListResult
+use apexkit_core::{Db, schema::{FieldType, RelationType}, Record, ListResult, auth::User}; 
 use crate::AppState;
 use std::sync::Arc;
 use std::collections::HashMap;
 
+// ... (UserLoader, RelationLoader, RelationKey structs remain the same) ...
+// --- 1. USER DATALOADER ---
+pub struct UserLoader {
+    db: Arc<dyn Db>,
+}
+
+impl Loader<i64> for UserLoader {
+    type Value = User;
+    type Error = String;
+
+    async fn load(&self, keys: &[i64]) -> Result<HashMap<i64, Self::Value>, Self::Error> {
+        let users = self.db.get_users_by_ids(keys).await.map_err(|e| e.to_string())?;
+        Ok(users.into_iter().map(|u| (u.id, u)).collect())
+    }
+}
+
+// --- 2. RELATION DATALOADER ---
 pub struct RelationLoader {
     db: Arc<dyn Db>,
 }
@@ -89,17 +107,95 @@ impl Loader<RelationKey> for RelationLoader {
     }
 }
 
-pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader>>) -> Result<Schema, SchemaError> {
+// --- 3. SCHEMA BUILDER ---
+
+pub async fn build_schema(
+    state: AppState, 
+    loader: Arc<DataLoader<RelationLoader>>
+) -> Result<Schema, SchemaError> {
+    
+    // Initialize User Loader
+    let user_loader = DataLoader::new(
+        UserLoader { db: state.db.clone() },
+        tokio::spawn
+    );
+
     let mut schema_builder = Schema::build("Query", None, None);
-    // Register custom JSON scalar for 'where' arguments
     schema_builder = schema_builder.register(Scalar::new("JSON"));
 
+    // --- DEFINE USER TYPE ---
+    let mut user_object = Object::new("User");
+    user_object = user_object
+        .field(Field::new("id", TypeRef::named_nn(TypeRef::ID), |ctx| {
+            FieldFuture::new(async move {
+                let u = ctx.parent_value.try_downcast_ref::<User>().unwrap();
+                Ok(Some(GqlValue::from(u.id.to_string())))
+            })
+        }))
+        .field(Field::new("email", TypeRef::named_nn(TypeRef::STRING), |ctx| {
+            FieldFuture::new(async move {
+                let u = ctx.parent_value.try_downcast_ref::<User>().unwrap();
+                Ok(Some(GqlValue::from(u.email.clone())))
+            })
+        }))
+        .field(Field::new("role", TypeRef::named_nn(TypeRef::STRING), |ctx| {
+            FieldFuture::new(async move {
+                let u = ctx.parent_value.try_downcast_ref::<User>().unwrap();
+                Ok(Some(GqlValue::from(u.role.clone())))
+            })
+        }));
+    
+    schema_builder = schema_builder.register(user_object);
+
+    // --- DEFINE USER LIST TYPE ---
+    let mut user_list_object = Object::new("UserList");
+    user_list_object = user_list_object
+        .field(Field::new("total", TypeRef::named_nn(TypeRef::INT), |ctx| {
+            FieldFuture::new(async move {
+                let total = ctx.parent_value.try_downcast_ref::<(i64, Vec<User>)>().unwrap().0;
+                Ok(Some(GqlValue::from(total)))
+            })
+        }))
+        .field(Field::new("items", TypeRef::named_nn_list("User"), |ctx| {
+            FieldFuture::new(async move {
+                let items = &ctx.parent_value.try_downcast_ref::<(i64, Vec<User>)>().unwrap().1;
+                Ok(Some(FieldValue::list(items.iter().map(|u| FieldValue::owned_any(u.clone())))))
+            })
+        }));
+    
+    schema_builder = schema_builder.register(user_list_object);
+
+    // --- ROOT QUERY ---
     let mut query_root = Object::new("Query");
 
     query_root = query_root.field(Field::new("status", TypeRef::named(TypeRef::STRING), |_| {
         FieldFuture::new(async { Ok(Some(GqlValue::from("ApexKit is running"))) })
     }));
 
+    // Add 'users' query to Root
+    query_root = query_root.field(Field::new("users", TypeRef::named("UserList"), move |ctx| {
+        let state = ctx.data::<AppState>().unwrap().clone();
+        FieldFuture::new(async move {
+            let limit = ctx.args.get("limit").and_then(|v| v.i64().ok()).unwrap_or(20);
+            let offset = ctx.args.get("offset").and_then(|v| v.i64().ok()).unwrap_or(0);
+            
+            // FIX: Convert Result<&str> to Option<String>
+            let search = ctx.args.get("search")
+                .and_then(|v| v.string().ok())
+                .map(|s| s.to_string());
+
+            let total = state.db.count_users(search.clone()).await.map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            let items = state.db.list_users(search, limit, offset).await.map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+            Ok(Some(FieldValue::owned_any((total, items))))
+        })
+    })
+    .argument(InputValue::new("limit", TypeRef::named(TypeRef::INT)))
+    .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
+    .argument(InputValue::new("search", TypeRef::named(TypeRef::STRING))));
+
+
+    // --- DYNAMIC COLLECTIONS ---
     let collections = state.db.list_collections().await.unwrap_or_default();
     let col_id_to_name: HashMap<String, String> = collections.iter()
         .map(|c| (c.id.to_string(), c.name.clone()))
@@ -108,14 +204,11 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
     for col in &collections {
         let type_name = capitalize(&col.name);
         
-        // 1. Define the Single Item Object (e.g., "Post")
         let mut object = Object::new(&type_name);
 
         object = object.field(Field::new("id", TypeRef::named_nn(TypeRef::ID), |ctx| {
             FieldFuture::new(async move { 
-                let record = ctx.parent_value.try_downcast_ref::<Record>()
-                    .map(|r| r.clone())
-                    .map_err(|_| async_graphql::Error::new("Internal Type Error"))?;
+                let record = ctx.parent_value.try_downcast_ref::<Record>().unwrap();
                 Ok(Some(GqlValue::from(record.id.to_string()))) 
             })
         }));
@@ -123,6 +216,31 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
         if let Some(schema) = &col.schema {
             for (field_name, def) in &schema.fields {
                 let name_clone = field_name.clone();
+
+                // === SPECIAL HANDLER: OWNER FIELDS ===
+                if def.r#type == FieldType::Owner {
+                     let field = Field::new(field_name, TypeRef::named("User"), move |ctx| {
+                        let name = name_clone.clone(); 
+                        FieldFuture::new(async move { 
+                            let record = ctx.parent_value.try_downcast_ref::<Record>().unwrap();
+                            let user_id = record.data.get(&name)
+                                .and_then(|v| v.as_i64())
+                                .or_else(|| record.data.get(&name).and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()));
+                            
+                            if let Some(uid) = user_id {
+                                let loader = ctx.data::<DataLoader<UserLoader>>().unwrap();
+                                let user = loader.load_one(uid).await.map_err(|e| async_graphql::Error::new(e))?;
+                                Ok(user.map(FieldValue::owned_any))
+                            } else {
+                                Ok(None)
+                            }
+                        })
+                    });
+                    object = object.field(field);
+                    continue; 
+                }
+
+                // === STANDARD FIELDS ===
                 let gql_type = match def.r#type {
                     FieldType::Number => TypeRef::FLOAT,
                     FieldType::Boolean => TypeRef::BOOLEAN,
@@ -132,9 +250,7 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
                 let field = Field::new(field_name, TypeRef::named(gql_type), move |ctx| {
                     let name = name_clone.clone(); 
                     FieldFuture::new(async move { 
-                        let record = ctx.parent_value.try_downcast_ref::<Record>()
-                            .map(|r| r.clone())
-                            .map_err(|_| async_graphql::Error::new("Internal Type Error"))?;
+                        let record = ctx.parent_value.try_downcast_ref::<Record>().unwrap();
                         let val = record.data.get(&name).cloned();
                         map_json_to_gql(val) 
                     })
@@ -142,6 +258,7 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
                 object = object.field(field);
             }
 
+            // === RELATIONS ===
             for (rel_name, rel_def) in &schema.relations {
                 let raw_target = &rel_def.target_collection;
                 let resolved_target_name = col_id_to_name.get(raw_target).unwrap_or(raw_target);
@@ -187,15 +304,12 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
             }
         }
         
-        // Register the Item Type (e.g., "Post")
         schema_builder = schema_builder.register(object);
 
-        // 2. Define the List Wrapper Object (e.g., "PostList")
-        // This holds { items: [Post], total: Int }
+        // 2. Define the List Wrapper Object
         let list_type_name = format!("{}List", type_name);
         let mut list_object = Object::new(&list_type_name);
 
-        // Field: total
         list_object = list_object.field(Field::new("total", TypeRef::named_nn(TypeRef::INT), |ctx| {
             FieldFuture::new(async move {
                 let res = ctx.parent_value.try_downcast_ref::<ListResult>()
@@ -204,27 +318,21 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
             })
         }));
 
-        // Field: items
         let items_type_name = type_name.clone();
         list_object = list_object.field(Field::new("items", TypeRef::named_nn_list(&items_type_name), move |ctx| {
             FieldFuture::new(async move {
                 let res = ctx.parent_value.try_downcast_ref::<ListResult>()
                     .map_err(|_| async_graphql::Error::new("Internal List Error"))?;
-                
-                // Convert Vec<Record> to Vec<FieldValue>
                 let items: Vec<FieldValue> = res.items.iter()
                     .map(|r| FieldValue::owned_any(r.clone()))
                     .collect();
-                
                 Ok(Some(FieldValue::list(items)))
             })
         }));
 
-        // Register the List Type
         schema_builder = schema_builder.register(list_object);
 
-        // 3. Define the Root Query Field (e.g., "posts")
-        // Now returns "PostList" instead of "[Post]"
+        // 3. Define the Root Query Field
         let col_id = col.id;
         let query_name = col.name.clone();
         let list_type_name_ref = list_type_name.clone();
@@ -232,11 +340,9 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
         let list_field = Field::new(query_name, TypeRef::named(&list_type_name_ref), move |ctx| {
             let state = ctx.data::<AppState>().unwrap().clone();
             FieldFuture::new(async move {
-                // Extract Pagination Arguments
                 let limit = ctx.args.get("limit").and_then(|v| v.u64().ok());
                 let offset = ctx.args.get("offset").and_then(|v| v.u64().ok());
                 
-                // Extract 'where' filter
                 let filter_str = match ctx.args.get("where") {
                     Some(accessor) => {
                         match accessor.deserialize::<serde_json::Value>() {
@@ -257,10 +363,7 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
                 
                 options.filter = filter_str;
 
-                // Returns ListResult struct { items, total }
                 let result = state.db.list_records(col_id, options).await.map_err(|e| async_graphql::Error::new(e.to_string()))?;
-                
-                // Pass the whole ListResult struct as the parent value for the sub-fields
                 Ok(Some(FieldValue::owned_any(result)))
             })
         })
@@ -275,6 +378,7 @@ pub async fn build_schema(state: AppState, loader: Arc<DataLoader<RelationLoader
         .register(query_root)
         .data(state)
         .data(loader)
+        .data(user_loader) 
         .finish()
 }
 

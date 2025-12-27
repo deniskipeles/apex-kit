@@ -1,6 +1,8 @@
 
-import { Collection, AppRecord, SystemLog, AdminUser, StoredFile } from './types';
+import { Collection, AppRecord, SystemLog, AuthUser, StoredFile } from './types';
 
+export const APEX_NUMBER_OF_RECORD_FIELDS = 10
+export const APEX_TRUNCATION_SIZE = 25
 export const APEX_USER = "apex-user"
 export const APEX_TOKEN = "apex-token"
 export const APEX_AUTH = "apex-auth"
@@ -22,7 +24,7 @@ export const MOCK_COLLECTIONS: Collection[] = [];
 
 export const MOCK_RECORDS: AppRecord[] = [];
 
-export const MOCK_ADMIN_USERS: AdminUser[] = [];
+export const MOCK_ADMIN_USERS: AuthUser[] = [];
 
 export const MOCK_LOGS: SystemLog[] = [];
 

@@ -11,7 +11,7 @@ use apexkit_core::{
     ai_models::{AiSession, ChatMessage, CreateSessionReq, ChatReq, Plugin},
     Db, 
 };
-use crate::{AppState, AppError, sandbox_manager::SandboxManager};
+use crate::{AppState, AppError};
 use tracing::{info, error};
 use std::sync::Arc;
 
@@ -186,8 +186,8 @@ pub async fn start_session(
     let id = uuid::Uuid::new_v4().to_string();
     info!("AI Architect: Initializing Sandbox Session '{}'", id);
 
-    // 1. Create Physical Sandbox DB
-    let _ = SandboxManager::create_sandbox(&id).await
+    // 1. Create Physical Sandbox DB -> USE STATE MANAGER
+    let _ = state.sandbox_manager.create_sandbox(&id).await
         .map_err(|e| AppError::UnknownError(e))?;
 
     // 2. Create Session Record in MAIN DB
@@ -249,8 +249,8 @@ pub async fn apply_changes(
         .ok_or(AppError::NotFound("Session not found".into()))?;
 
     if let Some(pending) = &session.pending_manifest {
-        // 1. Load Sandbox DB
-        let sandbox_db = SandboxManager::get_sandbox(&id).await
+        // 1. Load Sandbox DB -> USE STATE MANAGER
+        let sandbox_db = state.sandbox_manager.get_sandbox(&id).await
             .map_err(|_| AppError::NotFound("Sandbox not initialized".into()))?;
 
         // 2. Deploy to Sandbox
@@ -316,8 +316,8 @@ pub async fn publish_plugin(
 
     state.db.save_plugin(&plugin).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
-    // 4. Cleanup Sandbox
-    SandboxManager::cleanup_sandbox(&id);
+    // 4. Cleanup Sandbox -> USE STATE MANAGER
+    state.sandbox_manager.cleanup_sandbox(&id);
     
     info!("AI Architect: Plugin '{}' published successfully.", plugin.name);
 

@@ -279,10 +279,12 @@ pub async fn list_files(
     let limit = params.per_page.unwrap_or(20).min(100);
     let offset = (page - 1) * limit;
 
+    // 1. Get items
     let files = db.list_files(limit, offset).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    let total = files.len() as i64; 
+    // 2. Get real total count
+    let total = db.count_files().await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     Ok(Json(FileListResponse { items: files, total }))
 }

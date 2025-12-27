@@ -64,7 +64,7 @@ export const FilesPage = () => {
   };
 
   const columns = [
-      { field: 'preview', headerName: '', width: '50px', renderCell: (f: StoredFile) => <div className="h-8 w-8 rounded overflow-hidden"><FileThumbnail url={f.url} mimeType={f.mimeType} /></div> },
+      { field: 'preview', headerName: '', width: '50px', renderCell: (f: StoredFile) => <div className="h-8 w-8 rounded overflow-hidden"><FileThumbnail url={f.url+"?thumb=100x100"} mimeType={f.mimeType} /></div> },
       { field: 'name', headerName: 'Name', renderCell: (f: StoredFile) => <span className="font-medium truncate max-w-[200px] block" title={f.name}>{f.name}</span> },
       { field: 'mimeType', headerName: 'Type', width: '120px', renderCell: (f: StoredFile) => <span className="text-xs text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded">{f.mimeType.split('/')[1] || 'file'}</span> },
       { field: 'size', headerName: 'Size', width: '100px', renderCell: (f: StoredFile) => <span className="text-sm text-muted-foreground">{formatFileSize(f.size)}</span> },

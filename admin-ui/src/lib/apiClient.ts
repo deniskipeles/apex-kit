@@ -1,5 +1,5 @@
 import { APEX_TOKEN } from '../constants';
-import { Collection, AppRecord, SystemLog, AdminUser, StoredFile, InstantResult, Script, Template, AiAction } from '../types';
+import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction } from '../types';
 import { ApexKit as PowerBase, ApexKitRealtime } from './sdk';
 
 // const env = (import.meta as any).env;
@@ -229,24 +229,26 @@ export const apiClient = {
   },
 
   users: {
-    list: async (): Promise<AdminUser[]> => {
+    list: async (page = 1, perPage = 20, search = ''): Promise<{ items: AuthUser[], total: number }> => {
       try {
         // Call the new Admin API
-        const res = await pb.admins.listUsers();
+        const res = await pb.admins.listUsers({page, per_page:perPage, sort:"", filter:search});
 
-        // Map to AdminUser type
-        return res.map((u: any) => ({
+        // Map backend response to AuthUser type
+        const items = res.items.map((u: any) => ({
           id: u.id.toString(),
           email: u.email,
-          lastActive: new Date().toISOString(), // API doesn't track this yet, simulate
-          avatar: ''
+          role: u.role,
+          lastActive: new Date().toISOString(),
         }));
+
+        return { items, total: res.total };
       } catch (e) {
         console.error("Error fetching users", e);
-        return [];
+        return { items: [], total: 0 };
       }
     },
-    create: async (data: Partial<AdminUser>): Promise<AdminUser> => {
+    create: async (data: Partial<AuthUser>): Promise<AuthUser> => {
       // Use Auth Register endpoint to create user
       // Note: We assume a default password if not provided, or require it in UI
       const password = (data as any).password || 'password123';
@@ -256,10 +258,11 @@ export const apiClient = {
       return {
         id: res.user.id.toString(),
         email: res.user.email,
+        role: res.user.role,
         lastActive: new Date().toISOString()
       };
     },
-    update: async (id: string, data: Partial<AdminUser>): Promise<AdminUser> => {
+    update: async (id: string, data: Partial<AuthUser>): Promise<AuthUser> => {
       // Backend doesn't have user update yet (e.g. changing email/password as admin)
       // We return the data to optimistic update the UI so it doesn't crash
       return {
@@ -267,7 +270,7 @@ export const apiClient = {
         email: data.email || '',
         lastActive: new Date().toISOString(),
         ...data
-      } as AdminUser;
+      } as AuthUser;
     },
     delete: async (id: string): Promise<void> => {
       await pb.admins.deleteUser(id);
@@ -345,6 +348,16 @@ export const apiClient = {
         return await pb.collection(collectionId).instantSearch(query);
       } catch (e) {
         console.error("Instant search failed", e);
+        return [];
+      }
+    },
+    recordsSearch: async (collectionId: string | number, query: string): Promise<InstantResult[]> => {
+      if (!query) return [];
+      try {
+        // Call the SDK
+        return await pb.collection(collectionId).recordsSearch(query);
+      } catch (e) {
+        console.error("Records search failed", e);
         return [];
       }
     },

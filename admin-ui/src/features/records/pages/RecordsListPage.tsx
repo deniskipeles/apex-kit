@@ -2,9 +2,9 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   Plus, Edit, Trash2, FileText, Link as LinkIcon, Check, X as XIcon, 
   Database, MoreVertical, Filter, ChevronDown, Code, Fingerprint, 
-  Upload, Download, Zap, RefreshCw, MoreHorizontal 
+  Upload, Download, Zap, MoreHorizontal, ArrowRight
 } from 'lucide-react';
-import { Button, Badge, Input, Label } from '../../../components/ui/Elements'; // Assuming Label/Input exist in Elements
+import { Button, Badge, Skeleton } from '../../../components/ui/Elements';
 import { DataGrid } from '../../../components/data/DataGrid';
 import { Pagination } from '../../../components/data/Pagination';
 import { PreviewPanel } from '../../../components/preview/PreviewPanel';
@@ -17,11 +17,11 @@ import { AppRecord, Collection } from '../../../types';
 import { Overlay } from '../../../components/overlay/Overlay';
 import { usePagination } from '../../../hooks/usePagination';
 import { InstantSearchInput } from '../../../components/search/InstantSearchInput';
-import { apiClient, pb } from '@/src/lib/apiClient';
+import { apiClient } from '@/src/lib/apiClient';
 import { useToast } from '@/src/components/feedback/Toast';
-import { Dialog } from '../../../components/ui/Dialog'; // For Import Modal
-import { APP_CONFIG } from '@/src/config/app.config';
-import { APEX_TOKEN } from '@/src/constants';
+import { Dialog } from '../../../components/ui/Dialog'; 
+import { Input, Label } from '../../../components/form/FormPrimitives';
+import { APEX_NUMBER_OF_RECORD_FIELDS, APEX_TRUNCATION_SIZE } from '@/src/constants';
 
 // --- HELPER: Mobile Collection Selector ---
 const MobileCollectionSelect = ({ collections, active, onSelect }: { collections: Collection[], active: string, onSelect: (name: string) => void }) => {
@@ -29,13 +29,13 @@ const MobileCollectionSelect = ({ collections, active, onSelect }: { collections
   const triggerRef = useRef(null);
 
   return (
-    <div className="md:hidden w-full">
-      <button ref={triggerRef} onClick={() => setIsOpen(true)} className="flex w-full items-center justify-between gap-2 rounded-md border border-border bg-background px-3 py-2 text-sm font-bold shadow-sm">
+    <div className="md:hidden w-full relative">
+      <button ref={triggerRef} onClick={() => setIsOpen(!isOpen)} className="flex w-full items-center justify-between gap-2 rounded-md border border-border bg-background px-3 py-2 text-sm font-bold shadow-sm">
         <span className="truncate flex items-center gap-2"><Database className="h-4 w-4 text-primary" /> {active || 'Select Collection'}</span>
         <ChevronDown className="h-4 w-4 opacity-50" />
       </button>
       <Overlay isOpen={isOpen} onClose={() => setIsOpen(false)} anchorRef={triggerRef} width="100%" align="start">
-        <div className="flex flex-col rounded-md border bg-popover p-1 shadow-xl max-h-[300px] overflow-y-auto">
+        <div className="flex flex-col rounded-md border border-border bg-popover p-1 shadow-xl max-h-[300px] overflow-y-auto">
           {collections.map(c => (
             <button key={c.id} onClick={() => { onSelect(c.name); setIsOpen(false); }} className={`w-full rounded-sm px-3 py-2.5 text-left text-sm truncate flex items-center gap-2 ${active === c.name ? 'bg-accent font-semibold text-primary' : 'hover:bg-accent'}`}>
               {c.name}
@@ -47,7 +47,7 @@ const MobileCollectionSelect = ({ collections, active, onSelect }: { collections
   );
 };
 
-// --- HELPER: Action Menu (Responsive) ---
+// --- HELPER: Action Menu ---
 const ActionMenu = ({ 
   onReindex, onRevectorize, onImport, onExport 
 }: { 
@@ -77,90 +77,140 @@ const ActionMenu = ({
 };
 
 export const RecordsListPage = () => {
+  // State
   const [records, setRecords] = useState<AppRecord[]>([]);
   const [cols, setCols] = useState<Collection[]>([]);
   const [activeCol, setActiveCol] = useState('');
   const [collection, setCollection] = useState<Collection | null>(null);
+  
   const [viewMode, setViewMode] = useState<'list' | 'create' | 'edit'>('list');
   const [selectedRec, setSelectedRec] = useState<AppRecord | null>(null);
   const [previewRec, setPreviewRec] = useState<AppRecord | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   
-  // Modal States
+  // Search & Filter State
+  const [searchText, setSearchText] = useState('');
+  const [activeFilters, setActiveFilters] = useState<any>({});
+  
+  // Modals
   const [isFilterOpen, setIsFilterOpen] = useState(false);
   const [isApiDocsOpen, setIsApiDocsOpen] = useState(false);
   const [isImportOpen, setIsImportOpen] = useState(false);
 
-  // Pagination State
+  // Pagination
   const { page, setPage, perPage } = usePagination(1, 20);
   const [totalItems, setTotalItems] = useState(0);
 
   const { toast } = useToast();
 
-  // --- DATA LOADING ---
+  // 1. Initial Load: Fetch Collections
+  useEffect(() => {
+    const init = async () => {
+        try {
+            const c = await collectionsService.list();
+            setCols(c);
+            if (c.length > 0 && !activeCol) {
+                setActiveCol(c[0].name); 
+                setCollection(c[0]);
+            }
+        } catch (e) {
+            toast('Failed to load collections', 'error');
+        }
+    };
+    init();
+  }, []); // Run once
 
-  const fetchCollections = useCallback(async () => {
-    const c = await collectionsService.list();
-    setCols(c);
-    if (c.length > 0 && !activeCol) {
-      setActiveCol(c[0].name);
-    }
-  }, [activeCol]);
+  // 2. Main Data Fetcher
+  const loadData = useCallback(async () => {
+      if (!activeCol) return;
+      
+      const targetCol = cols.find(c => c.name === activeCol);
+      if (!targetCol) return;
+      
+      setCollection(targetCol); 
+      setIsLoading(true);
 
-  const onApplyFilters = async (filters: any) => {
-    fetchRecords(filters);
-    setIsFilterOpen(false);
-  }
-
-  const fetchRecords = useCallback(async (filters:any = null) => {
-    if (!activeCol) return;
-    setIsLoading(true);
-    const target = cols.find(c => c.name === activeCol);
-    if (target) {
-      setCollection(target);
       try {
-        const expandStr = target.schema
-          .filter(f => f.type === 'relation')
-          .map(f => f.name)
-          .join(',');
+          // A. Standard List (Pagination + Filtering)
+          if (!searchText) {
+              const expandStr = targetCol.schema
+                  .filter(f => f.type === 'relation' || f.type === "owner")
+                  .map(f => f.name)
+                  .join(',');
 
-        const res = await recordsService.list(target.id, page, perPage, expandStr, filters, "-id");
-        setRecords(res.items);
-        setTotalItems(res.totalItems);
-      } catch (error) {
-        console.error("Failed to fetch records", error);
-        toast("Failed to fetch records: " + error, "error");
+              const res = await recordsService.list(targetCol.id, page, perPage, expandStr, activeFilters, "-id");
+              setRecords(res.items);
+              setTotalItems(res.totalItems);
+          } 
+          // B. Deep Search (Enter Key Hit)
+          else {
+               // Note: This hits the DB search logic (e.g. SQL LIKE or Vector if implemented in backend)
+               const res = await recordsService.searchRecords(targetCol.id, searchText);
+               setRecords(res); 
+               setTotalItems(res.length); // Assuming flat list return for search
+          }
+      } catch (e) {
+          console.error(e);
+          toast('Failed to load records', 'error');
+      } finally {
+          setIsLoading(false);
       }
-    }
-    setIsLoading(false);
-  }, [activeCol, cols, page, perPage]);
+  }, [activeCol, cols, page, perPage, searchText, activeFilters]);
 
-  useEffect(() => { setPage(1); }, [activeCol, setPage]);
-  useEffect(() => { fetchCollections(); }, [fetchCollections]);
-  useEffect(() => { fetchRecords(); }, [fetchRecords]);
+  // 3. Trigger Load
+  useEffect(() => {
+      loadData();
+  }, [loadData]);
 
-  // --- ACTIONS ---
+  // --- Handlers ---
+
+  const handleCollectionChange = (name: string) => {
+      if (name === activeCol) return;
+      setActiveCol(name);
+      setPage(1); 
+      setSearchText(''); 
+      setActiveFilters({}); 
+  };
+
+  // Called by InstantSearchInput on Enter
+  const handleDeepSearch = (query: string) => {
+      setSearchText(query); 
+      setPage(1);
+  };
+
+  // Called by InstantSearchInput on selection
+  const handleInstantSelect = async (recordId: string) => {
+      if (!collection) return;
+      try {
+          const rec = await recordsService.getOne(collection.id, recordId);
+          setPreviewRec(rec);
+      } catch (e) {
+          console.error(e);
+      }
+  };
+
+  const handleApplyFilters = (filters: any) => {
+      setActiveFilters(filters);
+      setPage(1);
+      setIsFilterOpen(false);
+  };
 
   const handleSave = async (data: any) => {
     if (!collection) return;
-    if (viewMode === 'edit' && selectedRec) {
-      await recordsService.update(collection.id, selectedRec.id, data);
-    } else {
-      await recordsService.create(collection.id, data);
-    }
-    fetchRecords();
-    setViewMode('list');
-  };
-
-  const handleInstantSelect = async (recordId: string) => {
-    if (!collection) return;
     try {
-      const record = await recordsService.getOne(collection.id, recordId)
-      setPreviewRec(record);
-    } catch (e) { console.error(e); }
+        if (viewMode === 'edit' && selectedRec) {
+          await recordsService.update(collection.id, selectedRec.id, data);
+          toast('Record updated', 'success');
+        } else {
+          await recordsService.create(collection.id, data);
+          toast('Record created', 'success');
+        }
+        loadData();
+        setViewMode('list');
+    } catch (e) {
+        toast('Operation failed', 'error');
+    }
   };
-
-  // --- MAINTENANCE & DATA ACTIONS ---
 
   const handleReIndex = async () => {
     if (!collection) return;
@@ -168,39 +218,24 @@ export const RecordsListPage = () => {
         const res = await apiClient.reIndex(collection.id);
         toast(res.message || 'Re-index started', 'success');
     } catch (e: any) {
-        toast(e.message || 'Re-index failed', 'error');
+        toast('Re-index failed', 'error');
     }
   }
 
   const handleReVectorize = async () => {
       if (!collection) return;
       try {
-          // Direct fetch since not in typed client yet
           const res = await apiClient.revectorizeCollection(collection.id);
-          if(res.success) toast('AI Vectorization started in background \n' + res.message, 'success');
+          if(res.success) toast('AI Vectorization started', 'success');
           else toast('Failed to start vectorization', 'error');
       } catch (e) {
-          toast('Error triggering vectorization process: \n'+e, 'error');
+          toast('Error triggering vectorization', 'error');
       }
-  };
-
-  const handleExport = async (format = 'json') => {
-      if (!collection) return;
-      // Use fetch to handle auth header, then blob download
-      await apiClient.exportData(collection.id, format as 'json' | 'csv')
-        .then(blob => {
-            const a = document.createElement('a');
-            a.href = window.URL.createObjectURL(blob);
-            a.download = `${collection.name}.json`;
-            a.click();
-        })
-        .catch(() => toast('Export failed', 'error'));
   };
 
   const handleImport = async (e: React.FormEvent) => {
       e.preventDefault();
       if (!collection) return;
-      
       const form = e.target as HTMLFormElement;
       const fileInput = form.elements.namedItem('file') as HTMLInputElement;
       if (!fileInput.files?.length) return;
@@ -211,13 +246,25 @@ export const RecordsListPage = () => {
               const json = await res.json();
               toast(`Imported ${json.records_imported} records`, 'success');
               setIsImportOpen(false);
-              fetchRecords();
+              loadData();
           } else {
               toast('Import failed', 'error');
           }
       } catch (err) {
           toast('Network error during import', 'error');
       }
+  };
+
+  const handleExport = async () => {
+      if (!collection) return;
+      await apiClient.exportData(collection.id, 'json')
+        .then(blob => {
+            const a = document.createElement('a');
+            a.href = window.URL.createObjectURL(blob);
+            a.download = `${collection.name}.json`;
+            a.click();
+        })
+        .catch(() => toast('Export failed', 'error'));
   };
 
   // --- COLUMNS DEF ---
@@ -228,7 +275,7 @@ export const RecordsListPage = () => {
         <span className="font-mono text-[10px] text-muted-foreground bg-secondary/50 px-1.5 py-0.5 rounded truncate border border-transparent hover:border-primary/20" title={r.id}>#{r.id}</span>
       )
     },
-    ...(collection?.schema.slice(0, 5).map(f => ({
+    ...(collection?.schema.slice(0, APEX_NUMBER_OF_RECORD_FIELDS).map(f => ({
       field: f.name,
       headerName: f.name,
       width: '150px',
@@ -239,8 +286,30 @@ export const RecordsListPage = () => {
         switch (f.type) {
           case 'bool': return val ? <Badge variant="success" className="h-5 px-1.5 text-[10px] gap-1"><Check className="h-3 w-3" /> True</Badge> : <Badge variant="secondary" className="h-5 px-1.5 text-[10px] gap-1 opacity-70"><XIcon className="h-3 w-3" /> False</Badge>;
           case 'date': return <span className="text-xs font-medium text-foreground/80">{new Date(val).toLocaleDateString()}</span>;
-          case 'relation': return <Badge variant="outline" className="font-mono text-[10px] h-5 border-primary/20 text-primary bg-primary/5 truncate max-w-[120px]">{String(val)}</Badge>;
-          case 'json': return <code className="text-[10px] font-mono bg-muted px-1.5 py-0.5 rounded text-muted-foreground border border-border truncate max-w-[120px] block">{JSON.stringify(val).substring(0, 25)}...</code>;
+          case 'relation': 
+          case 'owner': {
+            const expanded = r.expand?.[f.name];
+            let label = String(val);
+            // Try to find a human-readable label from the expanded data
+            if (expanded) {
+                const getDisplay = (obj: any) => obj.data?.title || obj.data?.name || obj.data?.email || obj.data?.slug || obj.email || obj.id;
+                if (Array.isArray(expanded)) {
+                    if (expanded.length > 0) {
+                        const first = getDisplay(expanded[0]);
+                        label = expanded.length > 1 ? `${first} (+${expanded.length - 1})` : first;
+                    }
+                } else {
+                  label = getDisplay(expanded);
+                }
+              }
+
+            return (
+                <Badge variant="outline" className="font-mono text-[10px] h-5 border-primary/20 text-primary bg-primary/5 truncate max-w-[120px]" title={`ID: ${val}`}>
+                    {label}
+                </Badge>
+            );
+          }
+          case 'json': return <code className="text-[10px] font-mono bg-muted px-1.5 py-0.5 rounded text-muted-foreground border border-border truncate max-w-[120px] block">{JSON.stringify(val).substring(0, APEX_TRUNCATION_SIZE)}...</code>;
           case 'url': return <a href={String(val)} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="text-primary hover:underline text-xs flex items-center gap-1 truncate max-w-[150px]"><LinkIcon className="h-3 w-3 flex-shrink-0" /> <span className="truncate">{String(val).replace(/(^\w+:|^)\/\//, '')}</span></a>;
           case 'file': return <div className="flex items-center gap-1.5 text-xs bg-secondary/30 px-2 py-1 rounded-md w-fit border border-transparent hover:border-primary/20 transition-colors"><FileText className="h-3 w-3 text-primary" /> <span className="truncate max-w-[100px] font-medium">{String(val)}</span></div>;
           case 'text': return <span className="text-xs text-muted-foreground line-clamp-1 max-w-[200px]" title={String(apiClient.stripHtmlTags(val))}>{String(apiClient.stripHtmlTags(val))}</span>;
@@ -255,50 +324,73 @@ export const RecordsListPage = () => {
   return (
     <div className="flex flex-col h-[calc(100vh-64px)] w-full md:flex-row bg-background/50">
       
-      {/* Sidebar: Collections List */}
+      {/* SIDEBAR: Collections List (Desktop) */}
       <div className="w-60 border-r bg-background/50 backdrop-blur supports-[backdrop-filter]:bg-background/60 hidden md:flex flex-col flex-shrink-0">
-        <div className="h-14 flex items-center px-4 border-b"><h3 className="text-xs font-bold uppercase text-muted-foreground tracking-wider flex items-center gap-2"><Database className="h-3.5 w-3.5" /> Collections</h3></div>
-        <div className="flex-1 overflow-y-auto p-3 space-y-1">
-          {cols.map(c => <button key={c.id} onClick={() => setActiveCol(c.name)} className={`w-full text-left px-3 py-2 rounded-md text-sm font-medium transition-all flex items-center justify-between group ${activeCol === c.name ? 'bg-primary/10 text-primary shadow-sm' : 'hover:bg-secondary/80 text-muted-foreground hover:text-foreground'}`}><span className="truncate">{c.name}</span>{activeCol === c.name && <div className="h-1.5 w-1.5 rounded-full bg-primary shadow-[0_0_8px_rgba(var(--primary))]"></div>}</button>)}
+        <div className="h-14 flex items-center px-4 border-b">
+            <h3 className="text-xs font-bold uppercase text-muted-foreground tracking-wider flex items-center gap-2">
+                <Database className="h-3.5 w-3.5" /> Collections
+            </h3>
         </div>
-        <div className="p-3 border-t"><Button variant="outline" className="w-full text-xs justify-start" size="sm"><Plus className="mr-2 h-3 w-3" /> New Collection</Button></div>
+        <div className="flex-1 overflow-y-auto p-3 space-y-1 custom-scrollbar">
+          {cols.map(c => (
+            <button 
+                key={c.id} 
+                onClick={() => handleCollectionChange(c.name)} 
+                className={`w-full text-left px-3 py-2 rounded-md text-sm font-medium transition-all flex items-center justify-between group ${activeCol === c.name ? 'bg-primary/10 text-primary shadow-sm' : 'hover:bg-secondary/80 text-muted-foreground hover:text-foreground'}`}
+            >
+                <span className="truncate">{c.name}</span>
+                {activeCol === c.name && <div className="h-1.5 w-1.5 rounded-full bg-primary shadow-[0_0_8px_rgba(var(--primary))]"></div>}
+            </button>
+          ))}
+        </div>
+        <div className="p-3 border-t">
+            <Button variant="outline" className="w-full text-xs justify-start" size="sm" onClick={() => { setActiveCol(''); setViewMode('create'); /* Or handle collection creation explicitly */ }}>
+                <Plus className="mr-2 h-3 w-3" /> New Collection
+            </Button>
+        </div>
       </div>
 
-      {/* Main Content */}
+      {/* MAIN CONTENT */}
       <div className="flex-1 flex flex-col overflow-hidden relative min-w-0">
         
-        {/* Toolbar */}
+        {/* TOOLBAR */}
         <div className="h-auto min-h-16 border-b px-4 py-3 flex flex-col lg:flex-row lg:items-center justify-between gap-3 bg-background/80 backdrop-blur-md z-30">
           <div className="flex-1 w-full lg:w-auto">
             <div className="hidden md:block">
-              <div className="flex items-center gap-3"><h2 className="font-bold text-lg truncate">{collection?.name}</h2>{totalItems > 0 && <Badge variant="secondary" className="text-[10px] h-5 px-1.5 font-mono flex-shrink-0">{totalItems} total</Badge>}</div>
-              <span className="text-[10px] text-muted-foreground mt-0.5">Manage records for the {collection?.name} collection</span>
+              <div className="flex items-center gap-3">
+                  <h2 className="font-bold text-lg truncate">{collection?.name || 'Select Collection'}</h2>
+                  {totalItems > 0 && <Badge variant="secondary" className="text-[10px] h-5 px-1.5 font-mono flex-shrink-0">{totalItems} total</Badge>}
+              </div>
             </div>
             <div className="md:hidden w-full">
-              <MobileCollectionSelect collections={cols} active={activeCol} onSelect={setActiveCol} />
+              <MobileCollectionSelect collections={cols} active={activeCol} onSelect={handleCollectionChange} />
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 self-start sm:self-end lg:self-auto w-full lg:w-auto justify-end">
+            
+            {/* UNIFIED SEARCH INPUT */}
             {collection && (
-              <div className="w-full sm:w-auto flex-1 sm:flex-none min-w-[200px]">
-                <InstantSearchInput collectionId={collection.id} onSelect={handleInstantSelect} />
+              <div className="w-full sm:w-auto flex-1 sm:flex-none min-w-[240px]">
+                <InstantSearchInput 
+                    collectionId={collection.id} 
+                    onSelect={handleInstantSelect} 
+                    onSearch={handleDeepSearch} // Connect Deep Search
+                    placeholder="Search records..."
+                />
               </div>
             )}
             
-            {/* Desktop: Expanded Actions */}
             <div className="hidden xl:flex gap-2">
                 <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => setIsFilterOpen(true)}><Filter className="mr-2 h-3 w-3" /> Filter</Button>
                 <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => setIsImportOpen(true)}><Upload className="mr-2 h-3 w-3" /> Import</Button>
                 <Button variant="outline" size="sm" className="h-8 text-xs" onClick={handleExport}><Download className="mr-2 h-3 w-3" /> Export</Button>
             </div>
 
-            {/* Mobile/Tablet: Icon Only Filter */}
             <div className="xl:hidden">
                <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setIsFilterOpen(true)}><Filter className="h-3.5 w-3.5" /></Button>
             </div>
 
-            {/* Responsive "More" Menu */}
             <ActionMenu 
                 onReindex={handleReIndex} 
                 onRevectorize={handleReVectorize} 
@@ -310,11 +402,17 @@ export const RecordsListPage = () => {
           </div>
         </div>
 
-        {/* Grid */}
+        {/* GRID */}
         <div className="flex-1 flex flex-col overflow-hidden p-0 sm:p-4 md:p-6 bg-background sm:bg-secondary/5">
-          <div className="flex-1 overflow-hidden">
-            <DataGrid data={records} columns={columns} keyField="id" isLoading={isLoading} onRowClick={(row) => setPreviewRec(row)} />
+          <div className="flex-1 overflow-hidden relative">
+             {isLoading ? (
+                 <div className="absolute inset-0 flex items-center justify-center bg-background/50 z-10">
+                     <div className="h-8 w-8 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
+                 </div>
+             ) : null}
+             <DataGrid data={records} columns={columns} keyField="id" isLoading={isLoading && records.length === 0} onRowClick={(row) => setPreviewRec(row)} />
           </div>
+          
           <div className="flex-shrink-0 pt-4 px-4 sm:px-0 flex justify-between items-center border-t border-border mt-2 bg-background sm:bg-transparent">
             <Button
               variant="ghost"
@@ -325,10 +423,12 @@ export const RecordsListPage = () => {
               <Code className="h-4 w-4" />
               <span className="hidden sm:inline">API Docs</span>
             </Button>
+            
+            {/* Pagination works for both list and search */}
             <Pagination
-              page={page}
-              totalPages={Math.ceil(totalItems / perPage) || 1}
-              onPageChange={setPage}
+                page={page}
+                totalPages={Math.ceil(totalItems / perPage) || 1}
+                onPageChange={setPage}
             />
           </div>
         </div>
@@ -336,18 +436,46 @@ export const RecordsListPage = () => {
 
       {/* --- MODALS & PANELS --- */}
 
-      {(viewMode === 'create' || viewMode === 'edit') && collection && <RecordForm collection={collection} record={selectedRec || undefined} onSave={handleSave} onCancel={() => setViewMode('list')} />}
+      {(viewMode === 'create' || viewMode === 'edit') && collection && 
+          <RecordForm 
+              collection={collection} 
+              record={selectedRec || undefined} 
+              onSave={handleSave} 
+              onCancel={() => setViewMode('list')} 
+          />
+      }
 
-      <RecordFilters isOpen={isFilterOpen} onClose={() => setIsFilterOpen(false)} collection={collection} onApplyFilters={(filters: any) => onApplyFilters(filters)} />
+      <RecordFilters 
+          isOpen={isFilterOpen} 
+          onClose={() => setIsFilterOpen(false)} 
+          collection={collection} 
+          onApplyFilters={handleApplyFilters} 
+      />
 
-      {collection && <ApiDocsModal isOpen={isApiDocsOpen} onClose={() => setIsApiDocsOpen(false)} collection={collection} />}
+      <ApiDocsModal 
+          isOpen={isApiDocsOpen} 
+          onClose={() => setIsApiDocsOpen(false)} 
+          collection={collection || undefined} 
+          context="collection"
+      />
 
-      <PreviewPanel isOpen={!!previewRec} onClose={() => setPreviewRec(null)} title="Record Details" actions={
-          <>
-            <Button className="flex-1" variant="outline" onClick={() => { setSelectedRec(previewRec); setPreviewRec(null); setViewMode('edit'); }}><Edit className="mr-2 h-4 w-4" /> Edit</Button>
-            <Button variant="destructive" size="icon" onClick={() => { recordsService.delete(previewRec!.collectionId, previewRec!.id).then(() => { fetchRecords(); setSelectedRec(null); setPreviewRec(null) }); }}><Trash2 className="h-4 w-4" /></Button>
-          </>
-        }>
+      <PreviewPanel 
+          isOpen={!!previewRec} 
+          onClose={() => setPreviewRec(null)} 
+          title="Record Details" 
+          actions={
+              <>
+                <Button className="flex-1" variant="outline" onClick={() => { setSelectedRec(previewRec); setPreviewRec(null); setViewMode('edit'); }}>
+                    <Edit className="mr-2 h-4 w-4" /> Edit
+                </Button>
+                <Button variant="destructive" size="icon" onClick={() => { 
+                    if(previewRec) recordsService.delete(previewRec.collectionId, previewRec.id).then(() => { loadData(); setPreviewRec(null); }); 
+                }}>
+                    <Trash2 className="h-4 w-4" />
+                </Button>
+              </>
+          }
+      >
         <div className="space-y-6">
           <div className="grid grid-cols-2 gap-4 p-4 bg-secondary/10 rounded-lg border border-border">
             <div><span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">Created</span><p className="text-xs font-mono mt-1">{previewRec && new Date(previewRec.created).toLocaleString()}</p></div>

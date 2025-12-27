@@ -167,6 +167,10 @@ impl Db for CachedDb {
         self.inner.instant_search(collection_id, query, limit).await
     }
 
+    async fn recover_indexes(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.recover_indexes().await
+    }
+
     async fn index_record_search(&self, c: i64, r: i64, d: &Value, s: &CollectionSchema) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.index_record_search(c, r, d, s).await
     }
@@ -216,8 +220,16 @@ impl Db for CachedDb {
         self.inner.get_user_by_email(email).await
     }
 
-    async fn list_users(&self) -> Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.list_users().await
+    async fn list_users(&self, query: Option<String>, limit: i64, offset: i64) -> Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_users(query, limit, offset).await
+    }
+
+    async fn count_users(&self, query: Option<String>) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.count_users(query).await
+    }
+
+    async fn get_users_by_ids(&self, ids: &[i64]) -> Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_users_by_ids(ids).await
     }
 
     // FIX: Updated return type
@@ -240,6 +252,10 @@ impl Db for CachedDb {
 
     async fn list_files(&self, limit: i64, offset: i64) -> Result<Vec<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.list_files(limit, offset).await
+    }
+
+    async fn count_files(&self) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.count_files().await
     }
 
     async fn get_file_metadata(&self, id: i64) -> Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> {

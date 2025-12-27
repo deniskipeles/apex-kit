@@ -1,6 +1,6 @@
 use serde::{Deserialize};
 use std::collections::HashMap;
-use crate::schema::{CollectionSchema, FieldType};
+use crate::schema::{CollectionSchema, FieldType, RelationType};
 use crate::filter::FilterNode;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -31,8 +31,27 @@ impl Default for QueryOptions {
 #[derive(Debug)]
 pub struct SqlBuilder {
     pub base_sql: String,
-    pub count_sql: String, // New field for the COUNT(*) query
+    pub count_sql: String,
     pub params: Vec<libsql::Value>,
+}
+
+// Helper for parsing "a.b, c" -> Tree
+pub fn build_expand_tree(input: &str) -> HashMap<String, Vec<String>> {
+    let parts = smart_split(input);
+    build_expand_tree_from_list(&parts)
+}
+
+// Helper for parsing Vec<String> -> Tree
+pub fn build_expand_tree_from_list(paths: &[String]) -> HashMap<String, Vec<String>> {
+    let mut tree: HashMap<String, Vec<String>> = HashMap::new();
+    for path in paths {
+        if let Some((root, rest)) = path.split_once('.') {
+            tree.entry(root.to_string()).or_default().push(rest.to_string());
+        } else {
+            tree.entry(path.clone()).or_default();
+        }
+    }
+    tree
 }
 
 impl SqlBuilder {
@@ -44,14 +63,10 @@ impl SqlBuilder {
         name_to_id: &HashMap<String, i64>
     ) -> Self {
         let mut params: Vec<libsql::Value> = vec![];
-        
-        // Init params with collection_id (param #1)
         params.push(collection_id.into());
 
-        // Base WHERE clause
         let mut where_clause = "WHERE collection_id = ?".to_string();
 
-        // 2. Filter Logic
         if let Some(filter_str) = options.filter {
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&filter_str) {
                 let filter_node = FilterNode::parse(&json_val);
@@ -62,14 +77,17 @@ impl SqlBuilder {
             }
         }
 
-        // Generate Count SQL (before adding sort/limit)
         let count_sql = format!("SELECT COUNT(*) FROM records {}", where_clause);
 
-        // 1. Construct the SELECT clause for Data
-        let select_clause = if let Some(expand_str) = &options.expand {
+        // --- SELECT CLAUSE ---
+        // Column 1: ID
+        // Column 2: Data (as JSON string)
+        // Column 3: Expand (as JSON string or NULL)
+        
+        let expand_col_sql = if let Some(expand_str) = &options.expand {
             if !expand_str.trim().is_empty() {
                 let paths = smart_split(expand_str);
-                let expanded_json_sql = build_recursive_select(
+                build_expand_json_object(
                     paths, 
                     "records", 
                     0, 
@@ -77,19 +95,17 @@ impl SqlBuilder {
                     collection_id, 
                     schemas, 
                     name_to_id
-                );
-                format!("records.id, {} as data", expanded_json_sql)
+                )
             } else {
-                "records.id, json(records.data) as data".to_string()
+                "NULL".to_string()
             }
         } else {
-            "records.id, json(records.data) as data".to_string()
+            "NULL".to_string()
         };
 
-        // Combine into Main Query
-        let mut sql = format!("SELECT {} FROM records {}", select_clause, where_clause);
+        // Note: json(records.data) ensures we get text instead of blob from JSONB columns
+        let mut sql = format!("SELECT records.id, json(records.data), {} FROM records {}", expand_col_sql, where_clause);
 
-        // 3. Sorting
         if let Some(sort) = options.sort {
             let desc = sort.starts_with('-');
             let field = if desc { &sort[1..] } else { &sort };
@@ -103,7 +119,6 @@ impl SqlBuilder {
             sql.push_str(" ORDER BY records.id DESC");
         }
 
-        // 4. Pagination
         let (limit, offset) = if options.limit.is_some() || options.offset.is_some() {
             let l = options.limit.unwrap_or(30); 
             let o = options.offset.unwrap_or(0);
@@ -120,7 +135,6 @@ impl SqlBuilder {
         Self { base_sql: sql, count_sql, params }
     }
 }
-
 
 pub fn smart_split(input: &str) -> Vec<String> {
     let mut parts = Vec::new();
@@ -175,7 +189,9 @@ fn parse_expand_part(input: &str) -> ExpandPart {
     ExpandPart { name: input.to_string(), limit: None, offset: None }
 }
 
-pub fn build_recursive_select(
+/// Recursively builds the SQL for the `expand` column.
+/// Returns a string representing a SQL expression (e.g., `json_object(...)` or `NULL`).
+pub fn build_expand_json_object(
     paths: Vec<String>, 
     parent_alias: &str, 
     depth: usize,
@@ -194,10 +210,10 @@ pub fn build_recursive_select(
     }
 
     if tree.is_empty() {
-        return format!("json_object('id', {}.id, 'data', json({}.data))", parent_alias, parent_alias);
+        return "NULL".to_string();
     }
 
-    let mut expand_objects = Vec::new();
+    let mut expand_fields = Vec::new();
     let rel_alias = format!("r{}", depth);
     let target_alias = format!("t{}", depth);
 
@@ -216,110 +232,139 @@ pub fn build_recursive_select(
             format!(" ORDER BY {}.id DESC", rel_alias) 
         } else { "".to_string() };
 
+        // SKIP Owner fields (Handled in Rust application layer)
         if let Some(field_def) = schema.fields.get(&relation_name) {
             if field_def.r#type == FieldType::Owner {
-                let subquery = format!(
-                    "(SELECT json_object('id', u.id, 'email', u.email, 'role', u.role) \
-                      FROM users u \
-                      WHERE u.id = CAST(json_extract({}.data, '$.{}') AS INTEGER))",
-                    parent_alias, relation_name
-                );
-                expand_objects.push(format!("'{}', json({})", relation_name, subquery));
                 continue;
             }
         }
 
+        // Determine if Forward or Reverse Relation
+        let mut target_col_id = 0;
+        let mut target_col_name = String::new();
+        let mut reverse_lookup = false;
+        let mut forward_relation_type = RelationType::Many; 
+        let mut actual_rel_name_in_db = relation_name.clone(); // For reverse lookups, this changes
+
+        // 1. Check Forward Relation (Defined in current schema)
         if let Some(rel_def) = schema.relations.get(&relation_name) {
-            let target_col_name = rel_def.target_collection.clone();
-            
-            let target_exists = schemas.contains_key(&target_col_name) || 
-                                name_to_id.contains_key(&target_col_name) ||
-                                schemas.keys().any(|k| k == &target_col_name);
+            target_col_name = rel_def.target_collection.clone();
+            target_col_id = *name_to_id.get(&target_col_name).unwrap_or(&0);
+            forward_relation_type = rel_def.relation_type.clone();
+        } 
+        // 2. Check Reverse Relation (Defined in target schema pointing to us)
+        else if let Some(reverse_schema) = schemas.get(&relation_name) {
+            // Find relation in target that points to us
+            // Logic: Target collection is the one named 'relation_name' (e.g., 'comments')
+            target_col_name = relation_name.clone();
+            target_col_id = *name_to_id.get(&target_col_name).unwrap_or(&0);
 
-            if !target_exists {
-                let err_obj = format!("json_object('error', 'Target collection \"{}\" schema not found')", target_col_name);
-                expand_objects.push(format!("'{}', json({})", relation_name, err_obj));
-                continue;
+            for (r_name, r_def) in &reverse_schema.relations {
+                if r_def.target_collection == current_col_name || r_def.target_collection == current_col_id.to_string() {
+                    reverse_lookup = true;
+                    actual_rel_name_in_db = r_name.clone(); // e.g. 'post_id'
+                    break;
+                }
             }
+        }
 
-            let target_col_id = *name_to_id.get(&target_col_name).unwrap_or(&0);
+        if target_col_id == 0 {
+             // Schema mismatch or not found, return error object in JSON structure
+             let err_obj = format!("json_object('error', 'Relation \"{}\" not found or schema missing')", relation_name);
+             expand_fields.push(format!("'{}', {}", relation_name, err_obj));
+             continue;
+        }
 
-            let inner_select = build_recursive_select(sub_paths, &target_alias, depth + 1, &target_col_name, target_col_id, schemas, name_to_id);
+        // Build Nested Expansion Object (Recursion)
+        // This generates the 'expand' JSON object for the Child record
+        let nested_expand_sql = build_expand_json_object(
+            sub_paths, 
+            &target_alias, 
+            depth + 1, 
+            &target_col_name, 
+            target_col_id, 
+            schemas, 
+            name_to_id
+        );
 
-            let subquery = format!(
-                "(SELECT json_group_array(json(sub_data)) FROM ( \
-                    SELECT {} as sub_data \
-                    FROM _relations {} \
-                    JOIN records {} ON {}.target_rec_id = {}.id \
-                    WHERE {}.origin_rec_id = {}.id \
-                    AND {}.rel_name = '{}' \
-                    {} {} {} \
-                ))",
-                inner_select,
+        // Build Full Target Record JSON Structure
+        let target_record_json = format!(
+            "json_object('id', {}.id, 'data', json({}.data), 'expand', {})",
+            target_alias, target_alias, nested_expand_sql
+        );
+
+        // Construct Subquery based on cardinality and direction
+        let subquery = if !reverse_lookup && forward_relation_type == RelationType::One {
+             // Case A: Forward One-to-One -> Return Single Object
+             format!(
+                "(SELECT {} FROM _relations {} \
+                  JOIN records {} ON {}.target_rec_id = {}.id \
+                  WHERE {}.origin_rec_id = {}.id \
+                  AND {}.rel_name = '{}' \
+                  LIMIT 1)",
+                target_record_json,
                 rel_alias, target_alias,
                 rel_alias, target_alias,
                 rel_alias, parent_alias,
-                rel_alias, relation_name,
+                rel_alias, relation_name
+            )
+        } else {
+             // Case B: One-to-Many (Forward List or Reverse List) -> Return Array
+             let join_condition = if reverse_lookup {
+                 // Reverse: We are the 'Target' of the link in _relations
+                 // The 'Origin' is the child record we want to fetch
+                 // Link: Comment (Origin) -> Post (Target)
+                 format!(
+                    "WHERE {}.target_rec_id = {}.id \
+                     AND {}.origin_col_id = {} \
+                     AND {}.target_col_id = {} \
+                     AND {}.rel_name = '{}'",
+                    rel_alias, parent_alias,
+                    rel_alias, target_col_id,   // Origin Col = Child (Comment)
+                    rel_alias, current_col_id,  // Target Col = Parent (Post)
+                    rel_alias, actual_rel_name_in_db // Relation Name (post_id)
+                 )
+             } else {
+                 // Forward Many: We are 'Origin'
+                 format!(
+                    "WHERE {}.origin_rec_id = {}.id \
+                     AND {}.rel_name = '{}'",
+                    rel_alias, parent_alias,
+                    rel_alias, relation_name
+                 )
+             };
+
+             // Join logic
+             let join_target = if reverse_lookup {
+                 // We want the Origin Record (the child)
+                 format!("JOIN records {} ON {}.origin_rec_id = {}.id", target_alias, rel_alias, target_alias)
+             } else {
+                 // We want the Target Record
+                 format!("JOIN records {} ON {}.target_rec_id = {}.id", target_alias, rel_alias, target_alias)
+             };
+
+             format!(
+                "(SELECT json_group_array(json(sub)) FROM ( \
+                    SELECT {} as sub \
+                    FROM _relations {} \
+                    {} \
+                    {} \
+                    {} {} {} \
+                ))",
+                target_record_json,
+                rel_alias,
+                join_target,
+                join_condition,
                 order_clause, limit_clause, offset_clause
-            );
+            )
+        };
 
-            expand_objects.push(format!("'{}', json({})", relation_name, subquery));
-            continue;
-        }
-
-        if let Some(reverse_schema) = schemas.get(&relation_name) {
-            let mut reverse_field_name = None;
-            for (r_name, r_def) in &reverse_schema.relations {
-                if r_def.target_collection == current_col_name || 
-                   r_def.target_collection == current_col_id.to_string() {
-                    reverse_field_name = Some(r_name.clone());
-                    break; 
-                }
-            }
-
-            if let Some(r_field) = reverse_field_name {
-                let target_col_name = relation_name.clone(); 
-                let target_col_id = *name_to_id.get(&target_col_name).unwrap_or(&0);
-                
-                let inner_select = build_recursive_select(sub_paths, &target_alias, depth + 1, &target_col_name, target_col_id, schemas, name_to_id);
-
-                let subquery = format!(
-                    "(SELECT json_group_array(json(sub_data)) FROM ( \
-                        SELECT {} as sub_data \
-                        FROM _relations {} \
-                        JOIN records {} ON {}.origin_rec_id = {}.id \
-                        WHERE {}.target_rec_id = {}.id \
-                        AND {}.target_col_id = {} \
-                        AND {}.origin_col_id = {} \
-                        AND {}.rel_name = '{}' \
-                        {} {} {} \
-                    ))",
-                    inner_select,
-                    rel_alias,                          
-                    target_alias,                       
-                    rel_alias, target_alias,            
-                    rel_alias, parent_alias,            
-                    rel_alias, current_col_id,          
-                    rel_alias, target_col_id,           
-                    rel_alias, r_field,                 
-                    order_clause, limit_clause, offset_clause
-                );
-
-                expand_objects.push(format!("'{}', json({})", relation_name, subquery));
-                continue;
-            }
-        }
-
-        let error_obj = format!(
-            "json_object('error', 'Relation \"{}\" not defined in schema for \"{}\" or valid reverse lookup found')", 
-            relation_name, current_col_name
-        );
-        expand_objects.push(format!("'{}', json({})", relation_name, error_obj));
+        expand_fields.push(format!("'{}', {}", relation_name, subquery));
     }
 
-    format!(
-        "json_patch(json({}.data), json_object('expand', json_object({})))",
-        parent_alias,
-        expand_objects.join(", ")
-    )
+    if expand_fields.is_empty() {
+        return "NULL".to_string();
+    }
+
+    format!("json_object({})", expand_fields.join(", "))
 }

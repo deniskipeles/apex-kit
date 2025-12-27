@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { User, Search, X, Loader2, ChevronDown, Check } from 'lucide-react';
 import { Button, Input } from './FormPrimitives';
 import { usersService } from '../../features/users/services/usersService';
-import { AdminUser } from '../../types';
+import { AuthUser } from '../../types';
 
 interface UserPickerModalProps {
   isOpen: boolean;
@@ -14,7 +14,7 @@ interface UserPickerModalProps {
 }
 
 const UserPickerModal = ({ isOpen, onClose, onSelect, currentValue, zIndex }: UserPickerModalProps) => {
-  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [users, setUsers] = useState<AuthUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
 
@@ -22,7 +22,7 @@ const UserPickerModal = ({ isOpen, onClose, onSelect, currentValue, zIndex }: Us
     if (isOpen) {
       setLoading(true);
       usersService.list().then(res => {
-          setUsers(res);
+          setUsers(res.items);
           setLoading(false);
       });
     }
