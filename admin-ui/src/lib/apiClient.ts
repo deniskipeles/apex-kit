@@ -1,6 +1,6 @@
 import { APEX_TOKEN } from '../constants';
 import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction } from '../types';
-import { ApexKit as PowerBase, ApexKitRealtime } from './sdk';
+import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
 
 // const env = (import.meta as any).env;
 // Initialize SDK
@@ -182,6 +182,7 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
 
 export const apiClient = {
   apiUrl: apiUrl,
+  logoUrl: apiUrl+"/logo?thumb=100x100",
   stripHtmlTags: basePb.utils.stripHtmlTags,
   getAdminDashboardStats: pb.admins.getDashboardStats,
   searchVector: (collectionId: string | number, field: string, vector: Array<number>, limit?: number) => pb.collection(collectionId).searchVector(field, vector, limit),
@@ -406,6 +407,22 @@ export const apiClient = {
     searchVector: async (collectionId: string, field: string, vector: number[], limit = 10) => {
         return await pb.collection(collectionId).searchVector(field, vector, limit);
     }
+  },
+
+  testS3Connection: async (config: any) => {
+    // Map camelCase (frontend) to snake_case (backend)
+    const payload = {
+        bucket: config.bucket,
+        region: config.region,
+        endpoint: config.endpoint,
+        access_key: config.accessKey,
+        secret_key: config.secretKey
+    };
+    return await pb.admins.testS3StorageConnection(payload);
+  },
+
+  migrateStorage: async (source: string, destination: string) => {
+      return await pb.admins.migrateStorage(source, destination);
   },
 
   files: {

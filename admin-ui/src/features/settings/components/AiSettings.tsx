@@ -44,7 +44,7 @@ export const AiSettings = ({ settings, onChange:onChangeValue }: AiSettingsProps
             </div>
 
             <div className="rounded-md bg-secondary/10 p-4 text-sm text-muted-foreground flex flex-col gap-2">
-                <p>TinyBase currently supports Google Gemini models. You need a valid API key to use AI Actions.</p>
+                <p>ApexKit currently supports Google Gemini models. You need a valid API key to use AI Actions.</p>
                 <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-primary hover:underline inline-flex items-center gap-1 w-fit">
                     Get API Key <ExternalLink className="h-3 w-3" />
                 </a>

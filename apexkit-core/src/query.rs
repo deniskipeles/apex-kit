@@ -1,9 +1,9 @@
-use serde::{Deserialize};
+use serde::{Deserialize, Serialize}; // Added Serialize
 use std::collections::HashMap;
 use crate::schema::{CollectionSchema, FieldType, RelationType};
 use crate::filter::FilterNode;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)] // Added Serialize
 pub struct QueryOptions {
     pub page: Option<u64>,
     pub per_page: Option<u64>,

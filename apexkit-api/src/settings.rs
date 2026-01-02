@@ -37,7 +37,7 @@ pub struct SmtpConfigDto {
     pub from_email: String,
 }
 
-#[derive(Serialize, Deserialize, ToSchema, Clone)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Default)]
 pub struct StorageConfigDto {
     pub active_driver: String,
     pub s3: S3ConfigDto,
@@ -90,12 +90,12 @@ pub async fn get_settings(
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
     // 2. Fetch all setting groups from the injected DB (Root or Tenant)
-    let general = db.get_setting("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?.unwrap_or(json!({}));
-    let smtp = db.get_setting("smtp").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let storage = db.get_setting("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let security = db.get_setting("security").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let cron_json = db.get_setting("cron_jobs").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let ai = db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let general = db.get_config("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?.unwrap_or(json!({}));
+    let smtp = db.get_config("smtp").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let storage = db.get_config("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let security = db.get_config("security").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let cron_json = db.get_config("cron_jobs").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let ai = db.get_config("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 3. Construct Response
     let mut response = AppSettingsDto {
@@ -176,7 +176,7 @@ pub async fn update_settings(
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
     // 1. Update General
-    let mut general = db.get_setting("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?.unwrap_or(json!({}));
+    let mut general = db.get_config("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?.unwrap_or(json!({}));
     
     // Use references (&) to avoid consuming payload fields
     if let Some(v) = &payload.app_name { general["app_name"] = json!(v); }
@@ -188,11 +188,11 @@ pub async fn update_settings(
     if let Some(v) = &payload.logo_height { general["logo_height"] = json!(v); }
     if let Some(v) = &payload.log_retention_days { general["log_retention_days"] = json!(v); }
     
-    db.save_setting("general", general, false).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    db.set_config("general", &general, false).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 2. Update SMTP (Encrypt Password if changed)
     if let Some(new_smtp) = &payload.smtp {
-        let existing_json = db.get_setting("smtp").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        let existing_json = db.get_config("smtp").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         let mut final_smtp = new_smtp.clone();
 
         if let Some(existing_val) = existing_json {
@@ -213,12 +213,12 @@ pub async fn update_settings(
              }
         }
 
-        db.save_setting("smtp", serde_json::to_value(final_smtp).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        db.set_config("smtp", &serde_json::to_value(final_smtp).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     // 3. Update Storage (Encrypt Secret Key if changed)
     if let Some(new_storage) = &payload.storage {
-        let existing_json = db.get_setting("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        let existing_json = db.get_config("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         let mut final_storage = new_storage.clone();
 
         if let Some(existing_val) = existing_json {
@@ -239,24 +239,24 @@ pub async fn update_settings(
              }
         }
 
-        db.save_setting("storage", serde_json::to_value(final_storage).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        db.set_config("storage", &serde_json::to_value(final_storage).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     // 4. Update Security (CORS)
     if let Some(new_sec) = &payload.security {
-        db.save_setting("security", serde_json::to_value(new_sec).unwrap(), false)
+        db.set_config("security", &serde_json::to_value(new_sec).unwrap(), false)
             .await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     // 5. Update Cron Jobs
     if let Some(jobs) = &payload.cron_jobs {
-        db.save_setting("cron_jobs", serde_json::to_value(jobs).unwrap(), false)
+        db.set_config("cron_jobs", &serde_json::to_value(jobs).unwrap(), false)
             .await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     // 6. Update AI (Encrypt API Key if changed)
     if let Some(new_ai) = &payload.ai {
-        let existing_json = db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        let existing_json = db.get_config("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         let mut final_ai = new_ai.clone();
 
         if let Some(existing_val) = existing_json {
@@ -277,7 +277,7 @@ pub async fn update_settings(
              }
         }
 
-        db.save_setting("ai", serde_json::to_value(final_ai).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        db.set_config("ai", &serde_json::to_value(final_ai).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     Ok(Json(payload))

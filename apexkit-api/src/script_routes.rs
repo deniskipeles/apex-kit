@@ -8,6 +8,8 @@ use apexkit_core::{auth::Claims, script_models::{Script, CreateScriptReq}, Db};
 use crate::{AppState, AppError, DatabaseConnection};
 use std::sync::Arc;
 use tracing::info;
+// use axum_extra::extract::Host;
+use crate::BaseUrl;
 
 // --- PATH DTOS ---
 // These allow Axum to pick specific params by name and ignore 
@@ -68,6 +70,7 @@ async fn run_script_core(
     script_name: String,
     payload: Value,
     source: &str,
+    base_url: Option<String>
 ) -> Result<Json<Value>, AppError> {
     info!("[ScriptRunner] Running '{}' in {}", script_name, source);
     
@@ -85,7 +88,9 @@ async fn run_script_core(
         db, 
         state.embedder.clone(), 
         state.vector_provider.clone(),
-        state.vault.clone()
+        state.vault.clone(),
+        base_url,
+        Some(state.tx.clone()) 
     ).await.map_err(|e| AppError::UnknownError(format!("Script Execution Error: {}", e)))?;
 
     Ok(Json(result))
@@ -95,22 +100,24 @@ async fn run_script_core(
 
 #[utoipa::path(post, path = "/api/v1/run/{script_name}", request_body = Value, responses((status = 200, body = Value)))]
 pub async fn run_script(
+    BaseUrl(base_url): BaseUrl,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     Path(path): Path<ScriptNamePath>, // FIX: Use struct
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    run_script_core(db, state, path.script_name, payload, "API").await
+    run_script_core(db, state, path.script_name, payload, "API", Some(base_url)).await
 }
 
 // Sandbox Handler
 // With the Struct-based Path, this is actually identical to run_script now, 
 // but kept distinct if you want different logging/logic later.
 pub async fn run_sandbox_script(
+    BaseUrl(base_url): BaseUrl,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     Path(path): Path<ScriptNamePath>, // FIX: Use struct (auto-ignores session_id)
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    run_script_core(db, state, path.script_name, payload, "Sandbox").await
+    run_script_core(db, state, path.script_name, payload, "Sandbox", Some(base_url)).await
 }

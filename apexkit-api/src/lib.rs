@@ -1,6 +1,6 @@
 use axum::{
-    extract::{Path, State, Query, Request, FromRef},
-    http::{StatusCode, request::Parts}, 
+    extract::{Path, State, Query, Request, FromRef, ConnectInfo},
+    http::{StatusCode, HeaderMap, request::Parts}, 
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -10,6 +10,7 @@ use axum_extra::headers::{Authorization, authorization::Bearer, HeaderMapExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::fmt; 
+use std::net::SocketAddr;
 use apexkit_core::{
     schema::CollectionSchema,
     validation::{validate_record, ValidationError},
@@ -21,6 +22,7 @@ use apexkit_core::{
     storage::StorageBackend, 
     security::Vault,
     Db,
+    VectorProvider,
 };
 use tokio::sync::{broadcast, RwLock};
 use utoipa::{OpenApi, ToSchema, IntoParams};
@@ -38,15 +40,15 @@ use apexkit_core::scripting::ScriptEngine;
 use crate::sandbox_manager::SandboxManager;
 use crate::graphql::RelationLoader;
 use std::collections::HashMap;
-use axum_extra::extract::Host;
+// use axum_extra::extract::Host;
 use crate::tenant_manager::TenantManager;
 use apexkit_core::realtime::EventScope;
 use axum::response::sse::{Event, Sse};
 use futures::stream::{Stream};
 use std::convert::Infallible;
-use apexkit_core::models::DashboardData;
 use apexkit_core::jobs::JobContext;
-use apexkit_core::VectorProvider;
+use serde_json::{json, Value};
+use apexkit_core::models::DashboardData;
 
 // --- Module Registrations ---
 pub mod websocket;
@@ -88,28 +90,30 @@ pub struct AppState {
     pub css_cache: Arc<RwLock<String>>,
     pub thumb_cache: Cache<String, Arc<Vec<u8>>>, 
     pub embedder: Arc<apexkit_core::embeddings::EmbedderService>,
-    pub vector_provider: Arc<dyn apexkit_core::VectorProvider>,
+    pub vector_provider: Arc<dyn VectorProvider>,
 }
 
 // --- DTOs ---
 
-#[derive(Serialize, ToSchema)] pub struct CollectionResponse { id: i64, name: String, schema: Option<CollectionSchema> }
-#[derive(Deserialize, ToSchema, Validate)] pub struct UpdateCollection { #[validate(length(min = 1, max = 50))] name: Option<String>, schema: Option<CollectionSchema> }
+#[derive(Serialize, ToSchema, Deserialize)] pub struct CollectionResponse { id: i64, name: String, schema: Option<CollectionSchema> }
+#[derive(Deserialize, ToSchema, Validate, Serialize)] pub struct UpdateCollection { #[validate(length(min = 1, max = 50))] name: Option<String>, schema: Option<CollectionSchema> }
 #[derive(Deserialize, ToSchema, Validate)] pub struct CreateCollectionReq { #[validate(length(min = 1, max = 50))] name: String, schema: Option<CollectionSchema> }
-#[derive(Serialize, ToSchema)] 
+#[derive(Serialize, ToSchema, Deserialize)] 
 pub struct RecordResponse { 
     id: i64, 
     data: serde_json::Value, 
     #[serde(skip_serializing_if = "Option::is_none")]
-    expand: Option<serde_json::Value> 
+    expand: Option<serde_json::Value>,
+    pub created: String,
+    pub updated: String,
 }
 #[derive(Deserialize, ToSchema, Validate)] pub struct AuthRequest { #[validate(email)] email: String, #[validate(length(min = 6))] password: String }
 #[derive(Serialize, ToSchema)] pub struct AuthResponse { token: String, user: UserDto }
-#[derive(Serialize, ToSchema)] pub struct UserDto { id: i64, email: String, role: String }
+#[derive(Serialize, ToSchema, Deserialize)] pub struct UserDto { id: i64, email: String, role: String, pub metadata: Option<serde_json::Value>, }
 #[derive(Serialize, ToSchema)] struct ProblemDetail { error: String, message: String, details: Option<serde_json::Value>, status: u16 }
 #[derive(Deserialize, ToSchema)] pub struct RelationRequest { target_collection_id: i64, target_record_id: i64, relation_name: String }
 #[derive(Deserialize, ToSchema, IntoParams)] pub struct SearchQuery { pub q: String, pub limit: Option<usize> }
-#[derive(Serialize, ToSchema)] pub struct RecordListResponse { items: Vec<RecordResponse>, total: i64 }
+#[derive(Serialize, ToSchema, Deserialize)] pub struct RecordListResponse { items: Vec<RecordResponse>, total: i64 }
 
 // --- Path Structs for Nested Routes ---
 #[derive(Deserialize)]
@@ -161,16 +165,15 @@ impl IntoResponse for AppError {
     }
 }
 
-// --- DB EXTRACTOR ---
-pub struct DatabaseConnection(pub Arc<dyn Db>);
+// --- EXTRACTORS ---
 
+pub struct DatabaseConnection(pub Arc<dyn Db>);
 impl<S> axum::extract::FromRequestParts<S> for DatabaseConnection
 where
     AppState: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = (StatusCode, String);
-
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         if let Some(db) = parts.extensions.get::<Arc<dyn Db>>() {
             return Ok(DatabaseConnection(db.clone()));
@@ -178,6 +181,145 @@ where
         let app_state = AppState::from_ref(state);
         Ok(DatabaseConnection(app_state.db))
     }
+}
+
+pub struct StorageConnection(pub Arc<dyn StorageBackend>);
+impl<S> axum::extract::FromRequestParts<S> for StorageConnection
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(s) = parts.extensions.get::<Arc<dyn StorageBackend>>() {
+            return Ok(StorageConnection(s.clone()));
+        }
+        let app_state = AppState::from_ref(state);
+        Ok(StorageConnection(app_state.storage))
+    }
+}
+
+// --- HELPER: Audit Metadata Extraction ---
+pub fn extract_log_meta(headers: &HeaderMap, addr: Option<SocketAddr>, details: serde_json::Value) -> serde_json::Value {
+    let mut meta = details;
+    
+    // 1. IP Resolution
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .or_else(|| addr.map(|a| a.ip().to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // 2. Client Info
+    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let referer = headers.get("referer").and_then(|v| v.to_str().ok()).unwrap_or("-");
+
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("ip".into(), json!(ip));
+        obj.insert("user_agent".into(), json!(ua));
+        obj.insert("referer".into(), json!(referer));
+    }
+    meta
+}
+
+// --- HELPER: Void Hooks (Notify/Block) ---
+pub async fn trigger_void_hook(
+    state: &AppState,
+    trigger: &str,
+    data: Value,
+    auth: Option<&Claims>
+) -> Result<(), AppError> {
+    let scripts = state.db.get_scripts_by_trigger(trigger).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    if scripts.is_empty() { return Ok(()); }
+
+    let ctx = json!({
+        "trigger": trigger,
+        "data": data,
+        "auth": auth.map(|c| json!({ "id": c.uid, "email": c.sub, "role": c.role })),
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    });
+
+    for script in scripts {
+        state.script_engine.run_hook(&script.code, ctx.clone(), state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), None, Some(state.tx.clone()))
+            .await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))?;
+    }
+    Ok(())
+}
+
+// --- HELPER: Filter Hooks (Modify Data) ---
+pub async fn trigger_filter_hook(
+    state: &AppState,
+    trigger: &str,
+    data: Value,
+    auth: Option<&Claims>
+) -> Result<Value, AppError> {
+    let scripts = state.db.get_scripts_by_trigger(trigger).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    if scripts.is_empty() { return Ok(data); }
+
+    let mut current_data = data;
+
+    for script in scripts {
+        let ctx = json!({
+            "trigger": trigger,
+            "data": current_data,
+            "auth": auth.map(|c| json!({ "id": c.uid, "email": c.sub, "role": c.role }))
+        });
+
+        if let Some(res) = state.script_engine.run_hook(&script.code, ctx, state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), None, Some(state.tx.clone()))
+            .await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))? 
+        {
+            current_data = res;
+        }
+    }
+    Ok(current_data)
+}
+
+// --- HELPER: Record Hooks (Existing) ---
+async fn trigger_hooks(
+    state: &AppState,
+    trigger: &str,
+    collection: &apexkit_core::Collection, 
+    record_id: Option<i64>,
+    data: &serde_json::Value,
+    auth: Option<&Claims>,
+    base_url: Option<String>
+) -> Result<Option<serde_json::Value>, AppError> {
+    
+    let scripts = state.db.get_scripts_by_trigger(trigger).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    let mut current_data = data.clone();
+    let mut modified = false;
+
+    for script in scripts {
+        if let Some(target) = &script.target_collection {
+            if target != &collection.name { continue; }
+        }
+
+        let event_context = serde_json::json!({
+            "record": { "id": record_id, "data": current_data },
+            "collection": { "id": collection.id, "name": collection.name, "schema": collection.schema },
+            "auth": auth.map(|c| serde_json::json!({ "id": c.uid, "email": c.sub, "role": c.role })),
+            "trigger": trigger
+        });
+
+        match state.script_engine.run_hook(
+            &script.code, event_context, state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), base_url.clone(), Some(state.tx.clone())
+        ).await {
+            Ok(Some(new_data)) => { current_data = new_data; modified = true; },
+            Ok(None) => {},
+            Err(err_msg) => {
+                return Err(AppError::Validation(vec![ValidationError::ConstraintViolation("_hook".to_string(), err_msg)]));
+            }
+        }
+    }
+
+    if modified { Ok(Some(current_data)) } else { Ok(None) }
 }
 
 // --- MIDDLEWARE ---
@@ -193,14 +335,10 @@ async fn auth_middleware(State(_state): State<AppState>, mut req: Request, next:
 
 async fn metrics_middleware(req: Request, next: Next) -> Response {
     let _start = Instant::now();
-    let response = next.run(req).await;
-    response
+    next.run(req).await
 }
 
-// --- 3. Job Context Resolver ---
-// This struct ties together the Root, Tenants, and Sandboxes for the background worker.
-// --- 3. Job Context Resolver ---
-// CHANGE: Added 'pub' to struct and all fields so main.rs can instantiate it.
+// --- JOB CONTEXT ---
 pub struct GlobalJobContext {
     pub root_db: Arc<dyn Db>,
     pub root_vector_provider: Arc<dyn VectorProvider>,
@@ -213,28 +351,19 @@ impl JobContext for GlobalJobContext {
     async fn resolve(&self, scope_id: Option<&str>) -> Option<(Arc<dyn Db>, Arc<dyn VectorProvider>)> {
         match scope_id {
             Some(id) => {
-                // 1. Try Tenant
-                if let Ok(ctx) = self.tenant_manager.get_tenant_context(id).await {
-                    return Some((ctx.db, ctx.vector_provider));
-                }
-                
-                // 2. Try Sandbox
+                if let Ok(ctx) = self.tenant_manager.get_tenant_context(id).await { return Some((ctx.db, ctx.vector_provider)); }
                 if let Ok(db) = self.sandbox_manager.get_sandbox(id).await {
-                     if let Some(prov) = self.sandbox_manager.get_vector_provider(id).await {
-                        return Some((db, prov));
-                    }
+                     if let Some(prov) = self.sandbox_manager.get_vector_provider(id).await { return Some((db, prov)); }
                 }
                 None
             },
-            None => {
-                // Root App
-                Some((self.root_db.clone(), self.root_vector_provider.clone()))
-            }
+            None => Some((self.root_db.clone(), self.root_vector_provider.clone()))
         }
     }
 }
 
-// Use HashMap<String, String> to safely handle routes with different numbers of parameters
+// --- TENANT/SANDBOX MIDDLEWARES ---
+
 async fn sandbox_lifecycle_middleware(
     Path(params): Path<HashMap<String, String>>,
     State(state): State<AppState>,
@@ -242,30 +371,1217 @@ async fn sandbox_lifecycle_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     let session_id = params.get("session_id").ok_or(StatusCode::NOT_FOUND)?;
-
-    // Use State Manager
     match state.sandbox_manager.get_sandbox(session_id).await {
         Ok(sandbox_db) => {
             req.extensions_mut().insert(sandbox_db);
-
-            // Inject Storage
             let storage_path = format!("sandboxes/session_{}/uploads", session_id);
-            let public_url = "/api/v1/storage/file/".to_string(); 
-            let storage: Arc<dyn StorageBackend> = Arc::new(
-                apexkit_core::storage::LocalStorage::new(&storage_path, &public_url).await
-            );
+            let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
             req.extensions_mut().insert(storage);
-
-            // Inject Scope
             req.extensions_mut().insert(EventScope::Sandbox(session_id.to_string()));
-
             Ok(next.run(req).await)
         }
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
 }
 
-// --- OPENAPI DOCS ---
+async fn tenant_resolver_middleware(
+    path_params: Option<Path<HashMap<String, String>>>,
+    BaseUrl(base_url): BaseUrl,
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> std::result::Result<Response, StatusCode> {
+    let mut tenant_id = String::new();
+    
+    // Parse host from base_url (format: "scheme://host:port")
+    // Split scheme:// first, then take the host part
+    let host_str = base_url.split("://").nth(1).unwrap_or("").split(':').next().unwrap_or("");
+    let host_parts: Vec<&str> = host_str.split('.').collect();
+
+    if host_parts.len() >= 2 && host_parts[0] != "localhost" && host_parts[0] != "www" && host_parts[0] != "api" {
+        tenant_id = host_parts[0].to_string();
+    }
+    if let Some(Path(params)) = path_params {
+        if let Some(id) = params.get("tenant_id") { tenant_id = id.clone(); }
+    }
+
+    if tenant_id.is_empty() {
+        req.extensions_mut().insert(EventScope::Root);
+        return Ok(next.run(req).await);
+    }
+
+    match state.tenant_manager.get_tenant(tenant_id.clone()).await {
+        Ok(tenant_db) => {
+            req.extensions_mut().insert(tenant_db.clone());
+            let storage_path = format!("tenants/{}/uploads", tenant_id);
+            let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
+            req.extensions_mut().insert(storage);
+            req.extensions_mut().insert(EventScope::Tenant(tenant_id));
+            Ok(next.run(req).await)
+        }
+        Err(_) => {
+            req.extensions_mut().insert(EventScope::Root);
+            Ok(next.run(req).await)
+        }
+    }
+}
+
+// --- DYNAMIC DOCS HELPERS ---
+async fn tenant_openapi_json(Path(params): Path<HashMap<String, String>>) -> Json<utoipa::openapi::OpenApi> {
+    let tenant_id = params.get("tenant_id").map(|s| s.as_str()).unwrap_or("");
+    let mut doc = ApiDoc::openapi();
+    doc.servers = Some(vec![Server::new(format!("/tenant/{}", tenant_id))]);
+    Json(doc)
+}
+async fn tenant_scalar_html(Path(params): Path<HashMap<String, String>>) -> impl IntoResponse {
+    let tenant_id = params.get("tenant_id").map(|s| s.as_str()).unwrap_or("");
+    let html = format!(r#"<!DOCTYPE html><html><head><title>ApexKit API (Tenant)</title><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><style>body {{ margin: 0; }}</style></head><body><script id="api-reference" data-url="/tenant/{}/scalar/openapi.json"></script><script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script></body></html>"#, tenant_id);
+    axum::response::Html(html)
+}
+async fn sandbox_openapi_json(Path(params): Path<HashMap<String, String>>) -> Json<utoipa::openapi::OpenApi> {
+    let session_id = params.get("session_id").map(|s| s.as_str()).unwrap_or("");
+    let mut doc = ApiDoc::openapi();
+    doc.servers = Some(vec![Server::new(format!("/sandbox/{}", session_id))]);
+    Json(doc)
+}
+async fn sandbox_scalar_html(Path(params): Path<HashMap<String, String>>) -> impl IntoResponse {
+    let session_id = params.get("session_id").map(|s| s.as_str()).unwrap_or("");
+    let html = format!(r#"<!DOCTYPE html><html><head><title>ApexKit API (Sandbox)</title><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><style>body {{ margin: 0; }}</style></head><body><script id="api-reference" data-url="/sandbox/{}/scalar/openapi.json"></script><script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script></body></html>"#, session_id);
+    axum::response::Html(html)
+}
+
+// =========================================================
+// 1. COLLECTIONS HANDLERS
+// =========================================================
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/collections",
+    responses((status = 200, body = Vec<CollectionResponse>))
+)]
+pub async fn list_collections(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap
+) -> Result<Json<Vec<CollectionResponse>>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    
+    // [TRIGGER] Before List
+    trigger_void_hook(&state, "before_list_collections", json!({}), claims.as_ref()).await?;
+
+    let cols = db.list_collections().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let resp = cols.into_iter().map(|c| CollectionResponse { id: c.id, name: c.name, schema: c.schema }).collect::<Vec<_>>();
+
+    // [TRIGGER] After List
+    let filtered_json = trigger_filter_hook(&state, "after_list_collections", json!(resp), claims.as_ref()).await?;
+    let final_resp: Vec<CollectionResponse> = serde_json::from_value(filtered_json).map_err(|_| AppError::UnknownError("Script returned invalid collection format".into()))?;
+
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "count": final_resp.len() }));
+    let _ = db.log_audit_event("info", "Collections Listed", "api", Some(meta)).await;
+
+    Ok(Json(final_resp))
+}
+
+#[utoipa::path(get, path = "/api/v1/collections/{id}")]
+pub async fn get_collection(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<IdPath>
+) -> Result<Json<CollectionResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+
+    // [TRIGGER] Before Get
+    trigger_void_hook(&state, "before_get_collection", json!({ "id": path.id }), claims.as_ref()).await?;
+
+    let c = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Not found".into()))?;
+    let resp = CollectionResponse{id: c.id, name: c.name, schema: c.schema};
+
+    // [TRIGGER] After Get
+    let filtered_json = trigger_filter_hook(&state, "after_get_collection", json!(resp), claims.as_ref()).await?;
+    let final_resp: CollectionResponse = serde_json::from_value(filtered_json).unwrap_or(resp);
+
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "collection_id": path.id, "name": final_resp.name }));
+    let _ = db.log_audit_event("info", "Collection Accessed", "api", Some(meta)).await;
+
+    Ok(Json(final_resp))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/collections",
+    request_body = CreateCollectionReq,
+    responses((status = 201, body = CollectionResponse))
+)]
+pub async fn create_collection(
+    auth: Option<Extension<Claims>>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateCollectionReq>
+) -> Result<(StatusCode, Json<CollectionResponse>), AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    if !matches!(claims, Some(ref c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+    
+    // [TRIGGER]
+    trigger_void_hook(&state, "before_collection_create", json!({ "name": payload.name, "schema": payload.schema }), claims.as_ref()).await?;
+
+    let id = db.create_collection(&payload.name, &payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "name": payload.name, "id": id }));
+    let _ = db.log_audit_event("info", "Collection Created", "api", Some(meta)).await;
+
+    // [TRIGGER]
+    let _ = trigger_void_hook(&state, "after_collection_create", json!({ "id": id, "name": payload.name }), claims.as_ref()).await;
+
+    Ok((StatusCode::CREATED, Json(CollectionResponse{id, name: payload.name, schema: payload.schema})))
+}
+
+#[utoipa::path(patch, path = "/api/v1/collections/{id}")]
+pub async fn update_collection(
+    auth: Option<Extension<Claims>>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<IdPath>, 
+    Json(payload): Json<UpdateCollection>
+) -> Result<Json<CollectionResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    if !matches!(claims, Some(ref c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+
+    // [TRIGGER]
+    trigger_void_hook(&state, "before_collection_update", json!({ "id": path.id, "updates": payload }), claims.as_ref()).await?;
+
+    let c = db.update_collection(path.id, payload.name, payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "id": path.id, "name": c.name }));
+    let _ = db.log_audit_event("info", "Collection Updated", "api", Some(meta)).await;
+
+    // [TRIGGER]
+    let _ = trigger_void_hook(&state, "after_collection_update", json!({ "id": c.id }), claims.as_ref()).await;
+
+    Ok(Json(CollectionResponse{id: c.id, name: c.name, schema: c.schema}))
+}
+
+#[utoipa::path(delete, path = "/api/v1/collections/{id}")]
+pub async fn delete_collection(
+    auth: Option<Extension<Claims>>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<IdPath>
+) -> Result<StatusCode, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    if !matches!(claims, Some(ref c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+    
+    // [TRIGGER]
+    trigger_void_hook(&state, "before_collection_delete", json!({ "id": path.id }), claims.as_ref()).await?;
+
+    db.delete_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "id": path.id }));
+    let _ = db.log_audit_event("warning", "Collection Deleted", "api", Some(meta)).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// =========================================================
+// 2. RECORDS HANDLERS
+// =========================================================
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/collections/{id}/records",
+    responses((status = 200, body = RecordListResponse))
+)]
+pub async fn list_records(
+    auth: Option<Extension<Claims>>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<IdPath>, 
+    Query(q): Query<QueryOptions>
+) -> Result<Json<RecordListResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    
+    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Read denied".into())); }
+
+    // [TRIGGER] Before List (Tunable Query)
+    let query_json = json!(q);
+    let modified_query_json = trigger_filter_hook(&state, "before_list_records", query_json, claims.as_ref()).await?;
+    let modified_q: QueryOptions = serde_json::from_value(modified_query_json).unwrap_or(q);
+
+    let res = db.list_records(path.id, modified_q.clone()).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    let mut response_data = RecordListResponse{ items: res.items.into_iter().map(|r| RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}).collect(), total: res.total };
+
+    // [TRIGGER] After List (Output Filter)
+    let filtered_json = trigger_filter_hook(&state, "after_list_records", json!(response_data), claims.as_ref()).await?;
+    response_data = serde_json::from_value(filtered_json).unwrap_or(response_data);
+
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "count": response_data.items.len(), "filter": modified_q.filter }));
+    let _ = db.log_audit_event("info", "Records Listed", "api", Some(meta)).await;
+
+    Ok(Json(response_data))
+}
+
+#[utoipa::path(get, path = "/api/v1/collections/{id}/records/{record_id}", responses((status = 200, body = RecordResponse)))]
+pub async fn get_record(
+    auth: Option<Extension<Claims>>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<RecordPath>, 
+    Query(q): Query<QueryOptions>
+) -> Result<Json<RecordResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    
+    // [TRIGGER] Before Get
+    trigger_void_hook(&state, "before_get_record", json!({ "collection": col.name, "id": path.record_id }), claims.as_ref()).await?;
+
+    let r = db.get_record(path.id, path.record_id, q.expand).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    
+    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !policies::check_access(policy, claims.as_ref(), Some(&r.data)) { return Err(AppError::Forbidden("Read denied".into())); }
+    
+    let response = RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated};
+
+    // [TRIGGER] After Get
+    let filtered_json = trigger_filter_hook(&state, "after_get_record", json!(response), claims.as_ref()).await?;
+    let final_resp = serde_json::from_value(filtered_json).unwrap_or(response);
+
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "id": path.record_id }));
+    let _ = db.log_audit_event("info", "Record Accessed", "api", Some(meta)).await;
+
+    Ok(Json(final_resp))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/collections/{id}/records",
+    request_body = apexkit_core::models::Record,
+    responses((status = 201, body = RecordResponse))
+)]
+pub async fn create_record(
+    BaseUrl(base_url): BaseUrl,
+    auth: Option<Extension<Claims>>,
+    State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>,
+    DatabaseConnection(db): DatabaseConnection, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<IdPath>, 
+    Json(p): Json<apexkit_core::models::Record>
+) -> Result<Json<RecordResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    
+    let policy = col.schema.as_ref().map(|s| s.policies.create.as_str()).unwrap_or("auth");
+    if !policies::check_access(policy, claims.as_ref(), None) { 
+        // [LOG] Failed
+        let meta = extract_log_meta(&headers, Some(addr), json!({ "error": "forbidden", "collection": col.name }));
+        let _ = db.log_audit_event("warning", "Create Record Denied", "api", Some(meta)).await;
+        return Err(AppError::Forbidden("Create denied".into())); 
+    }
+    
+    // [TRIGGER] Record-level Hook (legacy) AND System Hook (new)
+    let data_to_save = match trigger_hooks(&state, "before_create", &col, None, &p.data, claims.as_ref(), Some(base_url.clone())).await? { Some(d) => d, None => p.data };
+
+    if let Some(schema) = &col.schema { validate_record(schema, &data_to_save).map_err(AppError::Validation)?; }
+
+    let rid = db.create_record(path.id, &data_to_save).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [LOG] Success
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "record_id": rid, "user_id": claims.as_ref().map(|c| c.uid) }));
+    let _ = db.log_audit_event("info", "Record Created", "api", Some(meta)).await;
+
+    // ... (broadcast, hooks, jobs) ...
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let _ = state.tx.send(DbEvent::Insert { collection_id: path.id, record_id: rid, data: data_to_save.clone(), scope: event_scope.clone() });
+    
+    let _ = trigger_hooks(&state, "after_create", &col, Some(rid), &data_to_save, claims.as_ref(), Some(base_url)).await;
+
+    // Jobs (Vector/Index)
+    if let Some(schema) = col.schema {
+        let current_tenant = get_tenant_id_from_scope(Some(&event_scope)); 
+        let model_name = get_current_model();
+        for (field_name, def) in &schema.fields {
+            if def.vectorize {
+                if let Some(text_val) = data_to_save.get(field_name).and_then(|v| v.as_str()) {
+                    let job = Job::GenerateEmbedding { collection_id: path.id, record_id: rid, tenant_id: current_tenant.clone(), field_name: field_name.clone(), text_content: text_val.to_string(), model: model_name.clone() };
+                    state.queue.enqueue(job).await;
+                }
+            }
+        }
+        if schema.fields.values().any(|f| f.indexed) {
+            let job = Job::IndexRecord { collection_id: path.id, record_id: rid, data: data_to_save.clone(), schema: schema.clone(), tenant_id: current_tenant.clone() };
+            state.queue.enqueue(job).await;
+        }
+    }
+
+    Ok(Json(RecordResponse{id: rid, data: data_to_save, expand: None, created: chrono::Utc::now().to_rfc3339(), updated: chrono::Utc::now().to_rfc3339()}))
+}
+
+#[utoipa::path(patch, path = "/api/v1/collections/{id}/records/{record_id}")]
+pub async fn update_record(
+    BaseUrl(base_url): BaseUrl,
+    auth: Option<Extension<Claims>>, 
+    State(state): State<AppState>, 
+    scope: Option<Extension<EventScope>>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<RecordPath>, 
+    Json(p): Json<apexkit_core::models::Record>
+) -> Result<Json<RecordResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    let existing = db.get_record(path.id, path.record_id, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    
+    let policy = col.schema.as_ref().map(|s| s.policies.update.as_str()).unwrap_or("admin");
+    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) { return Err(AppError::Forbidden("Update denied".into())); }
+    
+    let data_updates = match trigger_hooks(&state, "before_update", &col, Some(path.record_id), &p.data, claims.as_ref(), Some(base_url.clone())).await? { Some(d) => d, None => p.data };
+    
+    let r = db.update_record(path.id, path.record_id, &data_updates).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "record_id": path.record_id, "user_id": claims.as_ref().map(|c| c.uid) }));
+    let _ = db.log_audit_event("info", "Record Updated", "api", Some(meta)).await;
+
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let _ = state.tx.send(DbEvent::Update { collection_id: path.id, record_id: path.record_id, data: r.data.clone(), scope: event_scope.clone() });
+    let _ = trigger_hooks(&state, "after_update", &col, Some(path.record_id), &r.data, claims.as_ref(), Some(base_url)).await;
+    
+    Ok(Json(RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}))
+}
+
+#[utoipa::path(delete, path = "/api/v1/collections/{id}/records/{record_id}")]
+pub async fn delete_record(
+    BaseUrl(base_url): BaseUrl,
+    auth: Option<Extension<Claims>>, 
+    State(state): State<AppState>, 
+    scope: Option<Extension<EventScope>>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<RecordPath>
+) -> Result<StatusCode, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    let existing = db.get_record(path.id, path.record_id, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    
+    let policy = col.schema.as_ref().map(|s| s.policies.delete.as_str()).unwrap_or("admin");
+    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) { return Err(AppError::Forbidden("Delete denied".into())); }
+    
+    let _ = trigger_hooks(&state, "before_delete", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url.clone())).await?;
+    
+    db.delete_record(path.id, path.record_id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "record_id": path.record_id, "user_id": claims.as_ref().map(|c| c.uid) }));
+    let _ = db.log_audit_event("warning", "Record Deleted", "api", Some(meta)).await;
+
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let _ = state.tx.send(DbEvent::Delete { collection_id: path.id, record_id: path.record_id, scope: event_scope.clone() });
+    let _ = trigger_hooks(&state, "after_delete", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url)).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get, path = "/api/v1/collections/{id}/search", params(SearchQuery), responses((status = 200, body = Vec<RecordResponse>)))]
+pub async fn search_records(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>, Query(q): Query<SearchQuery>) -> Result<Json<Vec<RecordResponse>>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Search denied".into())); }
+    let res = db.search_records(path.id, &q.q).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(res.into_iter().map(|r| RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}).collect()))
+}
+
+#[utoipa::path(
+    get, 
+    path = "/api/v1/collections/{id}/instant-search", 
+    params(SearchQuery), 
+    responses((status = 200, body = Vec<apexkit_core::models::InstantResult>))
+)]
+pub async fn instant_search_handler(
+    auth: Option<Extension<Claims>>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    Path(path): Path<IdPath>, 
+    Query(params): Query<SearchQuery>
+) -> Result<Json<Vec<apexkit_core::models::InstantResult>>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let collection = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound(format!("Collection {} not found", path.id)))?;
+    let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Search denied by policy".into())); }
+    let results = db.instant_search(path.id, &params.q, params.limit.unwrap_or(10)).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(results))
+}
+
+// =========================================================
+// 3. RELATIONS
+// =========================================================
+
+#[utoipa::path(post, path = "/api/v1/collections/{id}/records/{record_id}/relations", request_body = RelationRequest, responses((status = 201, description = "Relation created")))]
+pub async fn create_relation(
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<RecordPath>, 
+    auth: Option<Extension<Claims>>, // FIX: Auth before Json
+    Json(p): Json<RelationRequest>   // FIX: Json Last
+) -> Result<StatusCode, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    
+    // [TRIGGER]
+    trigger_void_hook(&state, "before_relation_create", json!({ "origin": path.id, "target_col": p.target_collection_id, "relation": p.relation_name }), claims.as_ref()).await?;
+
+    db.create_relation(path.id, path.record_id, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "relation": p.relation_name, "origin_id": path.record_id, "target_id": p.target_record_id }));
+    let _ = db.log_audit_event("info", "Relation Created", "api", Some(meta)).await;
+
+    // [TRIGGER]
+    let _ = trigger_void_hook(&state, "after_relation_create", json!({ "relation": p.relation_name }), claims.as_ref()).await;
+
+    Ok(StatusCode::CREATED)
+}
+
+#[utoipa::path(delete, path = "/api/v1/collections/{id}/records/{record_id}/relations", request_body = RelationRequest, responses((status = 204, description = "Relation deleted")))]
+pub async fn delete_relation(
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<RecordPath>, 
+    auth: Option<Extension<Claims>>, // FIX: Auth before Json
+    Json(p): Json<RelationRequest>   // FIX: Json Last
+) -> Result<StatusCode, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    
+    trigger_void_hook(&state, "before_relation_delete", json!({ "relation": p.relation_name }), claims.as_ref()).await?;
+
+    db.delete_relation(path.id, path.record_id, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "relation": p.relation_name }));
+    let _ = db.log_audit_event("info", "Relation Deleted", "api", Some(meta)).await;
+
+    let _ = trigger_void_hook(&state, "after_relation_delete", json!({ "relation": p.relation_name }), claims.as_ref()).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// =========================================================
+// 4. USERS / AUTH
+// =========================================================
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/login",
+    request_body = AuthRequest,
+    responses((status = 200, body = AuthResponse), (status = 401, body = ProblemDetail))
+)]
+pub async fn login(
+    DatabaseConnection(db): DatabaseConnection, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(p): Json<AuthRequest>
+) -> Result<Json<AuthResponse>, AppError> {
+    let base_meta = json!({ "email": p.email });
+
+    let user_opt = db.get_user_by_email(&p.email).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let u = match user_opt {
+        Some(u) => u,
+        None => {
+            let meta = extract_log_meta(&headers, Some(addr), base_meta);
+            let _ = db.log_audit_event("warning", "Login Failed (User Not Found)", "auth", Some(meta)).await;
+            return Err(AppError::Unauthorized("Bad creds".into()));
+        }
+    };
+
+    if !auth::verify_password(&p.password, &u.password_hash) {
+        let meta = extract_log_meta(&headers, Some(addr), base_meta);
+        let _ = db.log_audit_event("warning", "Login Failed (Bad Password)", "auth", Some(meta)).await;
+        return Err(AppError::Unauthorized("Bad creds".into())); 
+    }
+
+    let token = auth::create_jwt(u.id, &u.email, &u.role).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
+    
+    // [LOG] Success
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "email": u.email, "user_id": u.id }));
+    let _ = db.log_audit_event("info", "Login Success", "auth", Some(meta)).await;
+
+    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role, metadata: u.metadata}}))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/register",
+    request_body = AuthRequest,
+    responses((status = 200, body = AuthResponse))
+)]
+pub async fn register(
+    BaseUrl(_base_url): BaseUrl, 
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(p): Json<AuthRequest>
+) -> Result<Json<AuthResponse>, AppError> {
+    
+    // [TRIGGER] before_user_create
+    let input_data = json!({ "email": p.email, "role": "user" });
+    trigger_void_hook(&state, "before_user_create", input_data.clone(), None).await?;
+
+    let hash = auth::hash_password(&p.password).map_err(|_| AppError::UnknownError("Hash fail".into()))?;
+    let u = db.create_user(&p.email, &hash, "user", None).await.map_err(|_| AppError::UnknownError("User exists".into()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "email": u.email, "user_id": u.id }));
+    let _ = db.log_audit_event("info", "Register", "auth", Some(meta)).await;
+
+    // [TRIGGER] after_user_create
+    let user_json = json!({ "id": u.id, "email": u.email, "role": u.role });
+    let _ = trigger_void_hook(&state, "after_user_create", user_json, None).await;
+
+    let token = auth::create_jwt(u.id, &u.email, &u.role).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
+    
+    state.queue.enqueue(Job::SendWelcomeEmail { email: u.email.clone(), user_id: u.id }).await;
+    
+    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role, metadata: u.metadata}}))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/users",
+    params(UserListQuery),
+    responses((status = 200, body = UserListResponse))
+)]
+pub async fn list_users_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(params): Query<UserListQuery>,
+) -> Result<Json<UserListResponse>, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    
+    // [TRIGGER] Before List
+    let query_json = json!({ "search": params.search, "page": params.page });
+    let mod_q = trigger_filter_hook(&state, "before_list_users", query_json, Some(&claims)).await?;
+    
+    let search = mod_q.get("search").and_then(|s| s.as_str()).map(String::from);
+    let page = mod_q.get("page").and_then(|v| v.as_i64()).unwrap_or(1).max(1);
+    let limit = params.per_page.unwrap_or(20).min(100);
+    let offset = (page - 1) * limit;
+
+    let users = db.list_users(search.clone(), limit, offset).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let total = db.count_users(search).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    let response = UserListResponse {
+        items: users.into_iter().map(|u| UserDto { id: u.id, email: u.email, role: u.role, metadata: u.metadata }).collect(),
+        total
+    };
+
+    // [TRIGGER] After List
+    let final_json = trigger_filter_hook(&state, "after_list_users", json!(response), Some(&claims)).await?;
+    let final_resp: UserListResponse = serde_json::from_value(final_json).unwrap_or(response);
+
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "count": final_resp.items.len() }));
+    let _ = db.log_audit_event("info", "Users Listed", "admin", Some(meta)).await;
+
+    Ok(Json(final_resp))
+}
+
+#[utoipa::path(delete, path = "/api/v1/admin/users/{id}")]
+pub async fn delete_user_handler(
+    BaseUrl(_base_url): BaseUrl, // Fixed unused param
+    auth: Option<Extension<Claims>>, 
+    State(state): State<AppState>, 
+    DatabaseConnection(db): DatabaseConnection, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<IdPath>
+) -> Result<StatusCode, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    
+    // [TRIGGER] Before Delete
+    let user_json = json!({ "id": path.id });
+    trigger_void_hook(&state, "before_user_delete", user_json.clone(), Some(&claims)).await?;
+
+    db.delete_user(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "target_user_id": path.id }));
+    let _ = db.log_audit_event("warning", "User Deleted", "admin", Some(meta)).await;
+
+    // [TRIGGER] After Delete
+    let _ = trigger_void_hook(&state, "after_user_delete", user_json, Some(&claims)).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct UserListQuery {
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
+    pub search: Option<String>,
+}
+
+#[derive(Serialize, ToSchema, Deserialize)]
+pub struct UserListResponse {
+    pub items: Vec<UserDto>,
+    pub total: i64,
+}
+
+// =========================================================
+// 5. TENANTS
+// =========================================================
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/tenants",
+    responses((status = 200, body = Vec<String>))
+)]
+pub async fn list_tenants_handler(
+    auth: Option<Extension<Claims>>,
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap
+) -> Result<Json<Vec<String>>, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Only admins".into())); }
+
+    // [TRIGGER]
+    trigger_void_hook(&state, "before_list_tenants", json!({}), Some(&claims)).await?;
+
+    let tenants = state.tenant_manager.list_tenants().await.map_err(|e| AppError::UnknownError(e))?;
+
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "count": tenants.len() }));
+    // Note: This logs to ROOT DB because 'state.db' is usually root unless middleware overrides it,
+    // but tenants are a root concept anyway.
+    let _ = state.db.log_audit_event("info", "Tenants Listed", "admin", Some(meta)).await;
+
+    Ok(Json(tenants))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/tenants",
+    request_body = CreateTenantReq,
+    responses(
+        (status = 201, description = "Tenant created", body = TenantResponse),
+        (status = 409, description = "Tenant already exists"),
+        (status = 403, description = "Admin only")
+    )
+)]
+pub async fn create_tenant_handler(
+    auth: Option<Extension<Claims>>,
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateTenantReq>,
+) -> Result<(StatusCode, Json<TenantResponse>), AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Only admins can create tenants".into())); }
+
+    // [TRIGGER] Before
+    trigger_void_hook(&state, "before_tenant_create", json!({ "tenant_id": payload.tenant_id }), Some(&claims)).await?;
+
+    state.tenant_manager.create_tenant(payload.tenant_id.clone()).await.map_err(|e| AppError::UnknownError(e))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "tenant_id": payload.tenant_id, "admin": claims.sub }));
+    let _ = state.db.log_audit_event("info", "Tenant Created", "admin", Some(meta)).await;
+
+    // [TRIGGER] After
+    let _ = trigger_void_hook(&state, "after_tenant_create", json!({ "tenant_id": payload.tenant_id }), Some(&claims)).await;
+
+    Ok((StatusCode::CREATED, Json(TenantResponse {
+        tenant_id: payload.tenant_id,
+        status: "created".to_string()
+    })))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CreateTenantReq {
+    #[schema(example = "customer-1")]
+    pub tenant_id: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TenantResponse {
+    pub tenant_id: String,
+    pub status: String,
+}
+
+// =========================================================
+// 6. SYSTEM & OTHER HANDLERS
+// =========================================================
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/system/reload",
+    responses((status = 200, description = "System reloaded"))
+)]
+pub async fn reload_system(
+    auth: Option<Extension<Claims>>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    
+    // Reload logic
+    let relation_loader = async_graphql::dataloader::DataLoader::new(
+        crate::graphql::RelationLoader::new(state.db.clone()), 
+        tokio::spawn
+    );
+    let new_schema = crate::graphql::build_schema(
+        state.clone(), 
+        std::sync::Arc::new(relation_loader)
+    ).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    {
+        let mut lock = state.schema.write().await;
+        *lock = new_schema;
+    }
+    state.scheduler.read().await.load_jobs(state.clone()).await;
+    
+    Ok(Json(serde_json::json!({ "status": "ok", "message": "System reloaded successfully" })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/logs",
+    responses((status = 200, body = Vec<serde_json::Value>))
+)]
+pub async fn list_audit_logs(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    let logs = db.list_audit_logs().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(logs))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/dashboard",
+    responses((status = 200, body = DashboardData))
+)]
+pub async fn get_dashboard_stats_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Json<apexkit_core::models::DashboardData>, AppError> {
+    if !matches!(auth.map(|e| e.0.role), Some(r) if r == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+    let data = db.get_dashboard_stats().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(data))
+}
+
+#[utoipa::path(post, path = "/api/v1/admin/collections/{id}/reindex", responses((status = 200, description = "Reindexing started")))]
+pub async fn reindex_collection_handler(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>) -> Result<Json<serde_json::Value>, AppError> {
+    if !matches!(auth.map(|e| e.0.role), Some(r) if r == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+    db.reindex_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/styles.css",
+    responses((status = 200, description = "Purged Tailwind CSS", content_type = "text/css"))
+)]
+pub async fn serve_styles(
+    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Response, AppError> {
+    {
+        let cache = state.css_cache.read().await;
+        if !cache.is_empty() {
+            return Ok(Response::builder()
+                .header("Content-Type", "text/css")
+                .header("Cache-Control", "public, max-age=60") 
+                .body(axum::body::Body::from(cache.clone()))
+                .unwrap());
+        }
+    }
+
+    let css = css_compiler::compile_styles(db.clone()).await.map_err(|e| AppError::UnknownError(e))?;
+
+    {
+        let mut cache = state.css_cache.write().await;
+        *cache = css.clone();
+    }
+
+    Ok(Response::builder()
+        .header("Content-Type", "text/css")
+        .body(axum::body::Body::from(css))
+        .unwrap())
+}
+
+// [NEW] DTO for SSE Query Params
+#[derive(Deserialize)]
+pub struct SseQuery {
+    pub channel: Option<String>,
+    pub event: Option<String>,
+}
+
+// Helper to namespace channels (Same logic as websocket.rs to ensure security)
+fn namespaced_channel_sse(scope: &EventScope, channel: &str) -> String {
+    match scope {
+        EventScope::Root => format!("root::{}", channel),
+        EventScope::Tenant(id) => format!("tenant_{}::{}", id, channel),
+        EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, channel),
+        _ => channel.to_string(), // Should not happen for channels
+    }
+}
+
+// SSE Handler
+use tracing::{info, debug};
+
+#[utoipa::path(
+    get,
+    path = "/sse",
+    params(
+        ("channel" = Option<String>, Query, description = "Specific channel to listen to"),
+        ("event" = Option<String>, Query, description = "Specific event name to filter")
+    ),
+    responses((status = 200, description = "SSE Stream"))
+)]
+pub async fn sse_handler(
+    State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>, 
+    Query(params): Query<SseQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    
+    let client_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let mut rx = state.tx.subscribe();
+
+    // Calculate namespace
+    let target_channel = params.channel.clone().map(|c| namespaced_channel_sse(&client_scope, &c));
+    let target_event = params.event.clone();
+
+    // [LOG] Connection Details
+    info!(
+        "[SSE] New Connection. Scope: {:?}, Requested Channel: {:?} (Namespaced: {:?}), Event Filter: {:?}", 
+        client_scope, params.channel, target_channel, target_event
+    );
+
+    let stream = async_stream::stream! {
+        while let Ok(msg) = rx.recv().await {
+            
+            // [LOG] Trace every event received by the handler
+            debug!("[SSE] Received Broadcast: {:?}", msg);
+
+            let should_yield = match &msg {
+                // 1. Handle Custom Events (Channels)
+                DbEvent::Custom { event, scope, data: _ } => {
+                    // Check Event Name Filter
+                    if let Some(req_evt) = &target_event {
+                        if req_evt != event { 
+                            debug!("[SSE] Filtered out: Event name mismatch ('{}' != '{}')", req_evt, event);
+                            continue; 
+                        }
+                    }
+
+                    // Check Channel Scope
+                    if let EventScope::Channel(msg_channel) = scope {
+                        if let Some(req_channel) = &target_channel {
+                            if msg_channel == req_channel {
+                                debug!("[SSE] Match! Channel '{}' matches.", msg_channel);
+                                true
+                            } else {
+                                debug!("[SSE] Filtered out: Channel mismatch ('{}' != '{}')", req_channel, msg_channel);
+                                false
+                            }
+                        } else {
+                            // No channel requested?
+                            debug!("[SSE] Filtered out: Custom event received but client requested no channel.");
+                            false 
+                        }
+                    } else {
+                        // Custom event without channel (global scope?)
+                        let match_scope = scope == &client_scope;
+                        if !match_scope {
+                            debug!("[SSE] Filtered out: Scope mismatch ({:?} != {:?})", scope, client_scope);
+                        }
+                        match_scope
+                    }
+                },
+                
+                // 2. Handle Standard DB Events
+                DbEvent::Insert { scope, .. } | 
+                DbEvent::Update { scope, .. } | 
+                DbEvent::Delete { scope, .. } => {
+                    let match_scope = scope == &client_scope;
+                    if !match_scope {
+                         // Comment out if too noisy for standard ops
+                         // debug!("[SSE] Filtered out DB Event: Scope mismatch");
+                    }
+                    match_scope
+                }
+            };
+
+            if should_yield {
+                if let Ok(json_data) = serde_json::to_string(&msg) {
+                    info!("[SSE] Sending event to client"); // Log when we actually send
+                    yield Ok(Event::default().data(json_data));
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    responses((status = 200, description = "OK"))
+)]
+pub async fn health_check() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct AppVersions {
+    pub root: String,   // [NEW] The overall application binary version
+    pub api: String,    // The API layer version
+    pub core: String,   // The Core logic version
+    pub vector: String, // The Vector engine version
+}
+
+#[utoipa::path(
+    get,
+    path = "/version",
+    responses((status = 200, body = AppVersions))
+)]
+pub async fn get_versions_handler() -> Json<AppVersions> {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    
+    Json(AppVersions {
+        root: current_version.clone(), // The binary version IS the root version
+        api: current_version,
+        core: apexkit_core::VERSION.to_string(),
+        vector: apex_vector::VERSION.to_string(),
+    })
+}
+
+// Helpers for helpers
+pub fn get_current_model() -> String {
+    std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string())
+}
+pub fn get_tenant_id_from_scope(scope: Option<&EventScope>) -> Option<String> {
+    match scope {
+        Some(EventScope::Tenant(id)) => Some(id.clone()),
+        Some(EventScope::Sandbox(id)) => Some(id.clone()),
+        _ => None,
+    }
+}
+
+// Custom Extractor for Dynamic Base URL
+pub struct BaseUrl(pub String);
+
+impl<S> axum::extract::FromRequestParts<S> for BaseUrl
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> std::result::Result<Self, Self::Rejection> {
+        // 1. Determine Protocol (Trust Proxy headers or default to http)
+        let scheme = parts.headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("http");
+
+        // 2. Get Host
+        let host = parts.headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .ok_or((StatusCode::BAD_REQUEST, "Missing Host header".to_string()))?;
+
+        // 3. Construct canonical URL
+        Ok(BaseUrl(format!("{}://{}", scheme, host)))
+    }
+}
+
+// =========================================================
+// GRAPHQL HANDLERS
+// =========================================================
+async fn graphql_handler(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
+    let schema = state.schema.read().await;
+    schema.execute(req.into_inner()).await.into()
+}
+
+async fn sandbox_graphql_handler(DatabaseConnection(db): DatabaseConnection, State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
+    let relation_loader = Arc::new(DataLoader::new(RelationLoader::new(db.clone()), tokio::spawn));
+    let mut sandbox_state = state.clone();
+    sandbox_state.db = db;
+    match crate::graphql::build_schema(sandbox_state, relation_loader).await {
+        Ok(schema) => schema.execute(req.into_inner()).await.into(),
+        Err(e) => async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(e.to_string(), None)]).into()
+    }
+}
+
+async fn tenant_graphql_handler(DatabaseConnection(db): DatabaseConnection, State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
+    let relation_loader = Arc::new(DataLoader::new(RelationLoader::new(db.clone()), tokio::spawn));
+    let mut tenant_state = state.clone();
+    tenant_state.db = db;
+    match crate::graphql::build_schema(tenant_state, relation_loader).await {
+        Ok(schema) => schema.execute(req.into_inner()).await.into(),
+        Err(e) => async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(e.to_string(), None)]).into()
+    }
+}
+
+async fn graphql_playground() -> impl IntoResponse { axum::response::Html(async_graphql::http::playground_source(async_graphql::http::GraphQLPlaygroundConfig::new("/graphql"))) }
+async fn sandbox_graphql_playground(Path(params): Path<HashMap<String, String>>) -> impl IntoResponse { let id = params.get("session_id").map(|s| s.as_str()).unwrap_or(""); axum::response::Html(async_graphql::http::playground_source(async_graphql::http::GraphQLPlaygroundConfig::new(&format!("/sandbox/{}/graphql", id)))) }
+async fn tenant_graphql_playground(Path(params): Path<HashMap<String, String>>) -> impl IntoResponse { let id = params.get("tenant_id").map(|s| s.as_str()).unwrap_or(""); axum::response::Html(async_graphql::http::playground_source(async_graphql::http::GraphQLPlaygroundConfig::new(&format!("/tenant/{}/graphql", id)))) }
+
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    match &state.metrics {
+        Some(handle) => handle.render().into_response(),
+        None => (StatusCode::NOT_IMPLEMENTED, "Metrics not initialized").into_response(),
+    }
+}
+
+// =========================================================
+// ROUTER
+// =========================================================
+fn make_api_router() -> Router<AppState> {
+    Router::new()
+        .route("/auth/login", post(login))
+        .route("/auth/register", post(register))
+        .route("/auth/github", get(auth_advanced::github_login))
+        .route("/auth/github/callback", get(auth_advanced::github_callback))
+        .route("/auth/verify", get(auth_advanced::verify_email))
+        .route("/auth/verify/resend", post(auth_advanced::resend_verification))
+        .route("/collections", post(create_collection).get(list_collections))
+        .route("/collections/{id}", get(get_collection).patch(update_collection).delete(delete_collection))
+        .route("/collections/{id}/records", post(create_record).get(list_records))
+        .route("/collections/{id}/records/{record_id}", get(get_record).patch(update_record).delete(delete_record))
+        .route("/collections/{id}/search", get(search_records))
+        .route("/collections/{id}/instant-search", get(instant_search_handler))
+        .route("/collections/{id}/search-vector", post(vector_routes::search_vector))
+        .route("/collections/{id}/search-text-vector", post(vector_routes::query_vector_search))
+        .route("/collections/{id}/records/{record_id}/relations", post(create_relation).delete(delete_relation))
+        .route("/storage/upload", post(storage::upload_file))
+        .route("/storage/file/{filename}", get(storage::serve_file))
+        .route("/storage/files", get(storage::list_files))
+        .route("/storage/files/{id}", axum::routing::delete(storage::delete_file))
+        .route("/admin/storage/test", post(storage::test_s3_connection))
+        .route("/admin/storage/migrate", post(storage::migrate_storage))
+        .route("/admin/config", post(config_routes::set_config))
+        .route("/admin/settings", get(settings::get_settings).patch(settings::update_settings))
+        .route("/admin/system/reload", post(reload_system))
+        .route("/admin/users", get(list_users_handler))
+        .route("/admin/users/{id}", axum::routing::delete(delete_user_handler))
+        .route("/admin/logs", get(list_audit_logs))
+        .route("/admin/dashboard", get(get_dashboard_stats_handler))
+        .route("/admin/import-data", post(import_data_routes::import_data_handler))
+        .route("/admin/export-data/{id}", get(export_data_routes::export_data_handler))
+        .route("/admin/collections/{id}/reindex", post(reindex_collection_handler))
+        .route("/admin/collections/{id}/revectorize", post(vector_routes::revectorize_collection_handler))
+        .route("/admin/ai/actions", get(ai_routes::list_actions).post(ai_routes::create_action))
+        .route("/admin/ai/actions/{id}", axum::routing::delete(ai_routes::delete_action))
+        .route("/ai/run/{slug}", post(ai_routes::run_action))
+        .route("/admin/ai/sessions", post(ai_architect::start_session).get(ai_architect::list_sessions))
+        .route("/admin/ai/sessions/{id}/chat", post(ai_architect::continue_chat))
+        .route("/admin/ai/sessions/{id}/apply", post(ai_architect::apply_changes))
+        .route("/admin/ai/sessions/{id}/publish", post(ai_architect::publish_plugin))
+        .route("/admin/ai/plugins", get(ai_architect::list_plugins))
+        .route("/admin/ai/edit-code", post(ai_routes::edit_code))
+        .route("/admin/scripts", get(script_routes::list_scripts).post(script_routes::create_script))
+        .route("/admin/scripts/{id}", axum::routing::delete(script_routes::delete_script))
+        .route("/run/{script_name}", post(script_routes::run_script))
+        .route("/admin/templates", get(template_routes::list_templates).post(template_routes::create_template))
+        .route("/admin/templates/{id}", axum::routing::patch(template_routes::update_template).delete(template_routes::delete_template))
+        .route("/sse", get(sse_handler))
+}
+
+pub fn app_router(state: AppState) -> Router {
+    let core_api = make_api_router().layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+    let renderer_routes = Router::new().route("/render/{*slug}", get(renderer::render_view).post(renderer::render_view));
+    let scalar_router: Router<AppState> = Scalar::with_url("/scalar", ApiDoc::openapi()).into();
+
+    let sandbox_router = Router::new()
+        .nest("/api/v1", core_api.clone())
+        .merge(renderer_routes.clone())
+        .route("/graphql", post(sandbox_graphql_handler).get(sandbox_graphql_playground))
+        .route("/scalar", get(sandbox_scalar_html))
+        .route("/scalar/openapi.json", get(sandbox_openapi_json))
+        .route("/ws", get(websocket::websocket_handler))
+        .route("/logo", get(storage::serve_app_logo))
+        .layer(middleware::from_fn_with_state(state.clone(), sandbox_lifecycle_middleware));
+
+    let tenant_path_router = Router::new()
+        .nest("/api/v1", core_api.clone())
+        .merge(renderer_routes.clone())
+        .route("/graphql", post(tenant_graphql_handler).get(tenant_graphql_playground)) 
+        .route("/scalar", get(tenant_scalar_html))
+        .route("/scalar/openapi.json", get(tenant_openapi_json))
+        .route("/ws", get(websocket::websocket_handler)) 
+        .route("/logo", get(storage::serve_app_logo))
+        .layer(middleware::from_fn_with_state(state.clone(), tenant_resolver_middleware));
+
+    let root_and_subdomain_router = Router::new()
+        .nest("/api/v1", core_api.clone())
+        .merge(renderer_routes)
+        .merge(scalar_router)
+        .route("/graphql", post(graphql_handler).get(graphql_playground))
+        .route("/ws", get(websocket::websocket_handler)) 
+        .route("/logo", get(storage::serve_app_logo))
+        .layer(middleware::from_fn_with_state(state.clone(), tenant_resolver_middleware));
+
+    Router::new()
+        .merge(root_and_subdomain_router)
+        .nest("/sandbox/{session_id}", sandbox_router)
+        .nest("/tenant/{tenant_id}", tenant_path_router)
+        .route(
+            "/api/v1/admin/tenants", 
+            get(list_tenants_handler)
+                .post(create_tenant_handler)
+                .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        )
+        .route("/styles.css", get(serve_styles)) 
+        .route("/metrics", get(metrics_handler))
+        .route("/_dashboard", get(assets::dashboard_handler))
+        .route("/_dashboard/{*path}", get(assets::dashboard_handler))
+        .route("/static/{*path}", get(assets::serve_static_asset))
+        .route("/healthz", get(health_check)) 
+        .route("/version", get(get_versions_handler))
+        .route("/", get(assets::index_handler))
+        .layer(middleware::from_fn(metrics_middleware))
+        .with_state(state)
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -320,7 +1636,6 @@ async fn sandbox_lifecycle_middleware(
         apexkit_core::ai_models::Plugin,
         apexkit_core::ai_models::CreateSessionReq,
         apexkit_core::ai_models::ChatReq,
-        apexkit_core::models::DashboardData,
         apexkit_core::models::DashboardStats,
         apexkit_core::models::ChartPoint,
         import_data_routes::ImportRequestDto,
@@ -333,1203 +1648,3 @@ async fn sandbox_lifecycle_middleware(
     tags((name = "ApexKit", description = "ApexKit API"))
 )]
 struct ApiDoc;
-
-// --- UPDATED TENANT MIDDLEWARE ---
-// Handles BOTH:
-// 1. Path-based: /tenant/{id}/...
-// 2. Subdomain-based: {id}.domain.com/...
-// Handles Subdomains & Paths. Defaults to Root App if tenant not found.
-async fn tenant_resolver_middleware(
-    path_params: Option<Path<HashMap<String, String>>>,
-    Host(host): Host,
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    
-    let mut tenant_id = String::new();
-    let host_parts: Vec<&str> = host.split('.').collect();
-    if host_parts.len() >= 2 && host_parts[0] != "localhost" && host_parts[0] != "www" && host_parts[0] != "api" {
-        tenant_id = host_parts[0].to_string();
-    }
-    if let Some(Path(params)) = path_params {
-        if let Some(id) = params.get("tenant_id") {
-            tenant_id = id.clone();
-        }
-    }
-
-    if tenant_id.is_empty() {
-        // Root App -> Inject Root Scope explicitly for consistency
-        req.extensions_mut().insert(EventScope::Root);
-        return Ok(next.run(req).await);
-    }
-
-    match state.tenant_manager.get_tenant(tenant_id.clone()).await {
-        Ok(tenant_db) => {
-            req.extensions_mut().insert(tenant_db.clone());
-            
-            let storage_path = format!("tenants/{}/uploads", tenant_id);
-            let storage: Arc<dyn StorageBackend> = Arc::new(
-                apexkit_core::storage::LocalStorage::new(&storage_path, "/api/v1/storage/file/").await
-            );
-            req.extensions_mut().insert(storage);
-
-            // FIX: Inject Tenant Scope
-            req.extensions_mut().insert(EventScope::Tenant(tenant_id));
-
-            Ok(next.run(req).await)
-        }
-        Err(_) => {
-            tracing::warn!("Tenant '{}' not found. Defaulting to Root.", tenant_id);
-            req.extensions_mut().insert(EventScope::Root);
-            Ok(next.run(req).await)
-        }
-    }
-}
-
-
-// Dynamic OpenAPI JSON for Tenants
-async fn tenant_openapi_json(
-    Path(params): Path<HashMap<String, String>>,
-) -> Json<utoipa::openapi::OpenApi> {
-    let tenant_id = params.get("tenant_id").map(|s| s.as_str()).unwrap_or("");
-    let mut doc = ApiDoc::openapi();
-    doc.servers = Some(vec![
-        Server::new(format!("/tenant/{}", tenant_id)),
-    ]);
-    Json(doc)
-}
-
-// Dynamic Scalar HTML for Tenants
-async fn tenant_scalar_html(
-    Path(params): Path<HashMap<String, String>>
-) -> impl IntoResponse {
-    let tenant_id = params.get("tenant_id").map(|s| s.as_str()).unwrap_or("");
-    let spec_url = format!("/tenant/{}/scalar/openapi.json", tenant_id);
-    
-    let html = format!(
-r#"<!DOCTYPE html>
-<html>
-  <head>
-    <title>ApexKit API Reference (Tenant)</title>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style> body {{ margin: 0; }} </style>
-  </head>
-  <body>
-    <script id="api-reference" data-url="{}"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
-  </body>
-</html>"#,
-        spec_url
-    );
-    axum::response::Html(html)
-}
-
-// --- DTO ---
-#[derive(Deserialize, ToSchema)]
-pub struct CreateTenantReq {
-    #[schema(example = "customer-1")]
-    pub tenant_id: String,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct TenantResponse {
-    pub tenant_id: String,
-    pub status: String,
-}
-
-// --- HANDLER: Create Tenant ---
-#[utoipa::path(
-    post,
-    path = "/api/v1/admin/tenants",
-    request_body = CreateTenantReq,
-    responses(
-        (status = 201, description = "Tenant created", body = TenantResponse),
-        (status = 409, description = "Tenant already exists"),
-        (status = 403, description = "Admin only")
-    )
-)]
-pub async fn create_tenant_handler(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    Json(payload): Json<CreateTenantReq>,
-) -> Result<(StatusCode, Json<TenantResponse>), AppError> {
-    // 1. Admin Check
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { 
-        return Err(AppError::Forbidden("Only admins can create tenants".into())); 
-    }
-
-    // 2. Validate ID (Simple alphanumeric check)
-    if !payload.tenant_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-        return Err(AppError::InputValidation(validator::ValidationErrors::new())); // Or custom message
-    }
-
-    // 3. Create via Manager
-    state.tenant_manager.create_tenant(payload.tenant_id.clone()).await
-        .map_err(|e| AppError::UnknownError(e))?;
-
-    Ok((StatusCode::CREATED, Json(TenantResponse {
-        tenant_id: payload.tenant_id,
-        status: "created".to_string()
-    })))
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/admin/tenants",
-    responses((status = 200, body = Vec<String>))
-)]
-pub async fn list_tenants_handler(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-) -> Result<Json<Vec<String>>, AppError> {
-    // 1. Admin Check
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { 
-        return Err(AppError::Forbidden("Only admins can list tenants".into())); 
-    }
-
-    // 2. Fetch from Manager
-    let tenants = state.tenant_manager.list_tenants().await
-        .map_err(|e| AppError::UnknownError(e))?;
-
-    Ok(Json(tenants))
-}
-
-// 2. Dynamic OpenAPI JSON
-// Injects the "/sandbox/{id}" server URL into the spec so Scalar works
-async fn sandbox_openapi_json(
-    Path(params): Path<HashMap<String, String>>,
-) -> Json<utoipa::openapi::OpenApi> {
-    let session_id = params.get("session_id").map(|s| s.as_str()).unwrap_or("");
-    
-    let mut doc = ApiDoc::openapi();
-    
-    // Explicitly set the Server URL to the sandbox root
-    doc.servers = Some(vec![
-        Server::new(format!("/sandbox/{}", session_id)),
-    ]);
-    
-    Json(doc)
-}
-
-// 3. Dynamic Scalar HTML (FIXED)
-// Manually serves the HTML to avoid Axum version conflicts and trait issues
-async fn sandbox_scalar_html(
-    Path(params): Path<HashMap<String, String>>
-) -> impl IntoResponse {
-    let session_id = params.get("session_id").map(|s| s.as_str()).unwrap_or("");
-    let spec_url = format!("/sandbox/{}/scalar/openapi.json", session_id);
-    
-    // We manually construct the HTML that Scalar uses.
-    // This avoids the type errors with Scalar::new/with_url and Axum versions.
-    let html = format!(
-r#"<!DOCTYPE html>
-<html>
-  <head>
-    <title>ApexKit API Reference (Sandbox)</title>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-      body {{ margin: 0; }}
-    </style>
-  </head>
-  <body>
-    <script
-      id="api-reference"
-      data-url="{}"
-    ></script>
-    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
-  </body>
-</html>"#,
-        spec_url
-    );
-
-    axum::response::Html(html)
-}
-
-// --- STORAGE EXTRACTOR ---
-// Add this to lib.rs to allow handlers to receive dynamic storage
-pub struct StorageConnection(pub Arc<dyn StorageBackend>);
-
-impl<S> axum::extract::FromRequestParts<S> for StorageConnection
-where
-    AppState: FromRef<S>,
-    S: Send + Sync,
-{
-    type Rejection = (StatusCode, String);
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        // 1. Check for Tenant Storage override
-        if let Some(s) = parts.extensions.get::<Arc<dyn StorageBackend>>() {
-            return Ok(StorageConnection(s.clone()));
-        }
-        // 2. Fallback to Global
-        let app_state = AppState::from_ref(state);
-        Ok(StorageConnection(app_state.storage))
-    }
-}
-
-// FIX: Added missing sandbox playground handler
-async fn sandbox_graphql_playground(
-    Path(params): Path<HashMap<String, String>>
-) -> impl IntoResponse {
-    let session_id = params.get("session_id").map(|s| s.as_str()).unwrap_or("");
-    let endpoint = format!("/sandbox/{}/graphql", session_id);
-    axum::response::Html(async_graphql::http::playground_source(
-        async_graphql::http::GraphQLPlaygroundConfig::new(&endpoint)
-    ))
-}
-
-// FIX: Added missing tenant handlers
-async fn tenant_graphql_playground(
-    Path(params): Path<HashMap<String, String>>
-) -> impl IntoResponse {
-    let tenant_id = params.get("tenant_id").map(|s| s.as_str()).unwrap_or("");
-    let endpoint = format!("/tenant/{}/graphql", tenant_id);
-    axum::response::Html(async_graphql::http::playground_source(
-        async_graphql::http::GraphQLPlaygroundConfig::new(&endpoint)
-    ))
-}
-
-async fn tenant_graphql_handler(
-    DatabaseConnection(db): DatabaseConnection, 
-    State(state): State<AppState>,              
-    req: GraphQLRequest
-) -> GraphQLResponse {
-    let relation_loader = Arc::new(DataLoader::new(
-        RelationLoader::new(db.clone()), 
-        tokio::spawn
-    ));
-    let mut tenant_state = state.clone();
-    tenant_state.db = db;
-    match crate::graphql::build_schema(tenant_state, relation_loader).await {
-        Ok(schema) => schema.execute(req.into_inner()).await.into(),
-        Err(e) => {
-            let err = async_graphql::ServerError::new(e.to_string(), None);
-            async_graphql::Response::from_errors(vec![err]).into()
-        }
-    }
-}
-
-// --- ROUTER FACTORY ---
-fn make_api_router() -> Router<AppState> {
-    Router::new()
-        // Auth Routes (Now nested under /api/v1 automatically)
-        .route("/auth/login", post(login))
-        .route("/auth/register", post(register))
-        .route("/auth/github", get(auth_advanced::github_login))
-        .route("/auth/github/callback", get(auth_advanced::github_callback))
-        .route("/auth/verify", get(auth_advanced::verify_email))
-        .route("/auth/verify/resend", post(auth_advanced::resend_verification))
-
-        // Collections & Records
-        .route("/collections", post(create_collection).get(list_collections))
-        .route("/collections/{id}", get(get_collection).patch(update_collection).delete(delete_collection))
-        .route("/collections/{id}/records", post(create_record).get(list_records))
-        .route("/collections/{id}/records/{record_id}", get(get_record).patch(update_record).delete(delete_record))
-        .route("/collections/{id}/search", get(search_records))
-        .route("/collections/{id}/instant-search", get(instant_search_handler))
-        .route("/collections/{id}/search-vector", post(vector_routes::search_vector))
-        .route("/collections/{id}/search-text-vector", post(vector_routes::query_vector_search))
-        .route("/collections/{id}/records/{record_id}/relations", post(create_relation).delete(delete_relation))
-        
-        // Storage
-        .route("/storage/upload", post(storage::upload_file))
-        .route("/storage/file/{filename}", get(storage::serve_file))
-        .route("/storage/files", get(storage::list_files))
-        .route("/storage/files/{id}", axum::routing::delete(storage::delete_file))
-        
-        // Admin / Config
-        .route("/admin/config", post(config_routes::set_config))
-        .route("/admin/settings", get(settings::get_settings).patch(settings::update_settings))
-        .route("/admin/tenants", get(list_tenants_handler))
-        .route("/admin/system/reload", post(reload_system))
-        .route("/admin/users", get(list_users_handler))
-        .route("/admin/users/{id}", axum::routing::delete(delete_user_handler))
-        .route("/admin/logs", get(list_audit_logs))
-        .route("/admin/dashboard", get(get_dashboard_stats_handler))
-        .route("/admin/import-data", post(import_data_routes::import_data_handler))
-        .route("/admin/export-data/{id}", get(export_data_routes::export_data_handler))
-        .route("/admin/collections/{id}/reindex", post(reindex_collection_handler))
-        .route("/admin/collections/{id}/revectorize", post(vector_routes::revectorize_collection_handler))
-        
-        // AI
-        .route("/admin/ai/actions", get(ai_routes::list_actions).post(ai_routes::create_action))
-        .route("/admin/ai/actions/{id}", axum::routing::delete(ai_routes::delete_action))
-        .route("/ai/run/{slug}", post(ai_routes::run_action))
-        
-        // AI Architect
-        .route("/admin/ai/sessions", post(ai_architect::start_session).get(ai_architect::list_sessions))
-        .route("/admin/ai/sessions/{id}/chat", post(ai_architect::continue_chat))
-        .route("/admin/ai/sessions/{id}/apply", post(ai_architect::apply_changes))
-        .route("/admin/ai/sessions/{id}/publish", post(ai_architect::publish_plugin))
-        .route("/admin/ai/plugins", get(ai_architect::list_plugins))
-        .route("/admin/ai/edit-code", post(ai_routes::edit_code))
-
-        // Scripting
-        .route("/admin/scripts", get(script_routes::list_scripts).post(script_routes::create_script))
-        .route("/admin/scripts/{id}", axum::routing::delete(script_routes::delete_script))
-        .route("/run/{script_name}", post(script_routes::run_script))
-
-        // Templates
-        .route("/admin/templates", get(template_routes::list_templates).post(template_routes::create_template))
-        .route("/admin/templates/{id}", axum::routing::patch(template_routes::update_template).delete(template_routes::delete_template))
-
-        // Tenants
-        .route("/admin/tenants", post(create_tenant_handler)) 
-
-        // SSE
-        .route("/sse", get(sse_handler))
-}
-
-// --- MAIN ROUTER ---
-
-pub fn app_router(state: AppState) -> Router {
-    // 1. Core API (Reusable)
-    let core_api = make_api_router()
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
-
-    // 3. Renderer Routes (Public)
-    let renderer_routes = Router::new()
-        .route("/render/{*slug}", get(renderer::render_view).post(renderer::render_view));
-
-    // 4. Scalar Documentation (Production)
-    let scalar_router: Router<AppState> = Scalar::with_url("/scalar", ApiDoc::openapi()).into();
-
-    // =========================================================
-    // 5. THE SANDBOX FACTORY
-    // =========================================================
-    let sandbox_router = Router::new()
-        // A. Nest the full API (Includes /auth, /collections, etc)
-        .nest("/api/v1", core_api.clone())
-        // B. Merge Renderer
-        .merge(renderer_routes.clone())
-        // C. Sandbox GraphQL
-        .route("/graphql", post(sandbox_graphql_handler).get(sandbox_graphql_playground))
-        // D. Sandbox Scalar
-        .route("/scalar", get(sandbox_scalar_html))
-        .route("/scalar/openapi.json", get(sandbox_openapi_json))
-        // WebSocket for Sandbox
-        .route("/ws", get(websocket::websocket_handler))
-        // E. Middleware injection
-        .layer(middleware::from_fn_with_state(state.clone(), sandbox_lifecycle_middleware));
-
-    // =========================================================
-    // 6. THE TENANT FACTORY (Path-Based)
-    // =========================================================
-    // Handles /tenant/{tenant_id}/...
-    let tenant_path_router = Router::new()
-        .nest("/api/v1", core_api.clone())
-        .merge(renderer_routes.clone())
-        // Tenant graphql handler (it just needs a DB injection which tenant middleware provides)
-        .route("/graphql", post(tenant_graphql_handler).get(tenant_graphql_playground)) 
-        // Tenant Specific Scalar
-        .route("/scalar", get(tenant_scalar_html))
-        .route("/scalar/openapi.json", get(tenant_openapi_json))
-        // WebSocket for Tenant (Path-based)
-        .route("/ws", get(websocket::websocket_handler)) 
-        // Middleware: Injects Tenant DB & Storage based on {tenant_id} path param
-        .layer(middleware::from_fn_with_state(state.clone(), tenant_resolver_middleware));
-
-    // =========================================================
-    // 7. ROOT / SUBDOMAIN ROUTER
-    // =========================================================
-    // Handles root traffic OR subdomain traffic (tenant.app.com)
-    let root_and_subdomain_router = Router::new()
-        .nest("/api/v1", core_api.clone())
-        .merge(renderer_routes)
-        .merge(scalar_router)
-        .route("/graphql", post(graphql_handler).get(graphql_playground))
-        // WebSocket for Root & Subdomains
-        // Placed HERE so it sits behind the tenant_resolver_middleware
-        .route("/ws", get(websocket::websocket_handler)) 
-        // Middleware: Checks Host header. If subdomain found, injects Tenant DB.
-        // If no subdomain, passes through to Global DB.
-        .layer(middleware::from_fn_with_state(state.clone(), tenant_resolver_middleware));
-
-    // =========================================================
-    // 8. FINAL ASSEMBLY
-    // =========================================================
-    Router::new()
-        // Mount Root/Subdomain logic
-        .merge(root_and_subdomain_router)
-
-        // Mount Explicit Path Logic (Higher specificity)
-        .nest("/sandbox/{session_id}", sandbox_router)
-        .nest("/tenant/{tenant_id}", tenant_path_router)
-
-        // Global Static Assets & Utils (Shared)
-        .route("/styles.css", get(serve_styles)) 
-        .route("/metrics", get(metrics_handler))
-        .route("/_dashboard", get(assets::dashboard_handler))
-        .route("/_dashboard/{*path}", get(assets::dashboard_handler))
-        .route("/static/{*path}", get(assets::serve_static_asset))
-        .route("/logo", get(storage::serve_app_logo)) 
-        .route("/healthz", get(health_check)) 
-        .route("/", get(assets::index_handler))
-
-        .layer(middleware::from_fn(metrics_middleware))
-        .with_state(state)
-}
-
-// --- GRAPHQL HANDLERS ---
-
-async fn graphql_handler(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
-    let schema = state.schema.read().await;
-    schema.execute(req.into_inner()).await.into()
-}
-
-async fn sandbox_graphql_handler(
-    DatabaseConnection(db): DatabaseConnection, 
-    State(state): State<AppState>,              
-    req: GraphQLRequest
-) -> GraphQLResponse {
-    let relation_loader = Arc::new(DataLoader::new(
-        RelationLoader::new(db.clone()), 
-        tokio::spawn
-    ));
-    let mut sandbox_state = state.clone();
-    sandbox_state.db = db;
-    match crate::graphql::build_schema(sandbox_state, relation_loader).await {
-        Ok(schema) => schema.execute(req.into_inner()).await.into(),
-        Err(e) => {
-            let err = async_graphql::ServerError::new(e.to_string(), None);
-            async_graphql::Response::from_errors(vec![err]).into()
-        }
-    }
-}
-
-async fn graphql_playground() -> impl IntoResponse {
-    axum::response::Html(async_graphql::http::playground_source(
-        async_graphql::http::GraphQLPlaygroundConfig::new("/graphql")
-    ))
-}
-
-async fn metrics_handler(State(state): State<AppState>) -> Response {
-    match &state.metrics {
-        Some(handle) => handle.render().into_response(),
-        None => (StatusCode::NOT_IMPLEMENTED, "Metrics not initialized").into_response(),
-    }
-}
-
-// --- CRUD HANDLERS (With Macros) ---
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/collections",
-    responses((status = 200, body = Vec<CollectionResponse>))
-)]
-async fn list_collections(DatabaseConnection(db): DatabaseConnection) -> Result<Json<Vec<CollectionResponse>>, AppError> {
-    let cols = db.list_collections().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(cols.into_iter().map(|c| CollectionResponse { id: c.id, name: c.name, schema: c.schema }).collect()))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/collections",
-    request_body = CreateCollectionReq,
-    responses((status = 201, body = CollectionResponse))
-)]
-async fn create_collection(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Json(payload): Json<CreateCollectionReq>) -> Result<(StatusCode, Json<CollectionResponse>), AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    if !matches!(claims, Some(c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
-    
-    let id = db.create_collection(&payload.name, &payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(CollectionResponse{id, name: payload.name, schema: payload.schema})))
-}
-
-#[utoipa::path(get, path = "/api/v1/collections/{id}")]
-async fn get_collection(DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>) -> Result<Json<CollectionResponse>, AppError> {
-    let c = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Not found".into()))?;
-    Ok(Json(CollectionResponse{id: c.id, name: c.name, schema: c.schema}))
-}
-
-#[utoipa::path(patch, path = "/api/v1/collections/{id}")]
-async fn update_collection(DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>, Json(payload): Json<UpdateCollection>) -> Result<Json<CollectionResponse>, AppError> {
-    let c = db.update_collection(path.id, payload.name, payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(CollectionResponse{id: c.id, name: c.name, schema: c.schema}))
-}
-
-#[utoipa::path(delete, path = "/api/v1/collections/{id}")]
-async fn delete_collection(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>) -> Result<StatusCode, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    if !matches!(claims, Some(c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
-    db.delete_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/collections/{id}/records",
-    responses((status = 200, body = RecordListResponse))
-)]
-async fn list_records(
-    auth: Option<Extension<Claims>>, 
-    DatabaseConnection(db): DatabaseConnection, 
-    Path(path): Path<IdPath>, // <--- CHANGED: Uses struct to allow extra params
-    Query(q): Query<QueryOptions>
-) -> Result<Json<RecordListResponse>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
-    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Read denied".into())); }
-
-    let res = db.list_records(path.id, q).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(RecordListResponse{ items: res.items.into_iter().map(|r| RecordResponse{id: r.id, data: r.data, expand: r.expand}).collect(), total: res.total }))
-}
-
-// Helpers to get model and tenant
-fn get_current_model() -> String {
-    std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string())
-}
-fn get_tenant_id_from_scope(scope: Option<&EventScope>) -> Option<String> {
-    match scope {
-        Some(EventScope::Tenant(id)) => Some(id.clone()),
-        Some(EventScope::Sandbox(id)) => Some(id.clone()),
-        _ => None,
-    }
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/collections/{id}/records",
-    request_body = apexkit_core::models::Record,
-    responses((status = 201, body = RecordResponse))
-)]
-async fn create_record(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    scope: Option<Extension<EventScope>>,
-    DatabaseConnection(db): DatabaseConnection, 
-    Path(path): Path<IdPath>, 
-    Json(p): Json<apexkit_core::models::Record>
-) -> Result<Json<RecordResponse>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
-    
-    let policy = col.schema.as_ref().map(|s| s.policies.create.as_str()).unwrap_or("auth");
-    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Create denied".into())); }
-    
-    // Hook: Before Create
-    let data_to_save = match trigger_hooks(&state, "before_create", &col, None, &p.data, claims.as_ref()).await? {
-        Some(d) => d,
-        None => p.data
-    };
-
-    if let Some(schema) = &col.schema { validate_record(schema, &data_to_save).map_err(AppError::Validation)?; }
-
-    let rid = db.create_record(path.id, &data_to_save).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    // Broadcast
-    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    let _ = state.tx.send(DbEvent::Insert { 
-        collection_id: path.id, 
-        record_id: rid, 
-        data: data_to_save.clone(), 
-        scope: event_scope.clone()
-    });
-
-    // --- Audit Log ---
-    let log_meta = serde_json::json!({
-        "collection": col.name,
-        "record_id": rid,
-        "user_id": claims.as_ref().map(|c| c.uid),
-        "action": "create"
-    });
-    let _ = db.log_audit_event("info", "Record Created", "api", Some(log_meta)).await;
-    // ------------------------
-
-    // Hook: After Create
-    let _ = trigger_hooks(&state, "after_create", &col, Some(rid), &data_to_save, claims.as_ref()).await;
-
-    // --- ASYNC JOBS ---
-    if let Some(schema) = col.schema {
-        // A. Vector Embeddings
-        let current_tenant = get_tenant_id_from_scope(Some(&event_scope)); // Get scope
-        let model_name = get_current_model(); // Get config
-        for (field_name, def) in &schema.fields {
-            if def.vectorize {
-                if let Some(text_val) = data_to_save.get(field_name).and_then(|v| v.as_str()) {
-                    let job = Job::GenerateEmbedding {
-                        collection_id: path.id,
-                        record_id: rid,
-                        tenant_id: current_tenant.clone(),
-                        field_name: field_name.clone(),
-                        text_content: text_val.to_string(),
-                        model: model_name.clone()
-                    };
-                    state.queue.enqueue(job).await;
-                }
-            }
-        }
-        
-        // B. Full Text Search Indexing
-        if schema.fields.values().any(|f| f.indexed) {
-            let job = Job::IndexRecord {
-                collection_id: path.id,
-                record_id: rid,
-                data: data_to_save.clone(),
-                schema: schema.clone(),
-                tenant_id: current_tenant.clone()
-            };
-            state.queue.enqueue(job).await;
-        }
-    }
-
-    Ok(Json(RecordResponse{id: rid, data: data_to_save, expand: None}))
-}
-
-#[utoipa::path(patch, path = "/api/v1/collections/{id}/records/{record_id}")]
-async fn update_record(
-    auth: Option<Extension<Claims>>, 
-    State(state): State<AppState>, 
-    scope: Option<Extension<EventScope>>, 
-    DatabaseConnection(db): DatabaseConnection, 
-    Path(path): Path<RecordPath>, 
-    Json(p): Json<apexkit_core::models::Record>
-) -> Result<Json<RecordResponse>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
-    let existing = db.get_record(path.id, path.record_id, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
-    
-    let policy = col.schema.as_ref().map(|s| s.policies.update.as_str()).unwrap_or("admin");
-    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) { return Err(AppError::Forbidden("Update denied".into())); }
-    
-    // Hook: Before Update
-    let data_updates = match trigger_hooks(&state, "before_update", &col, Some(path.record_id), &p.data, claims.as_ref()).await? { 
-        Some(d) => d, 
-        None => p.data 
-    };
-    
-    let r = db.update_record(path.id, path.record_id, &data_updates).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    let _ = state.tx.send(DbEvent::Update { collection_id: path.id, record_id: path.record_id, data: r.data.clone(), scope: event_scope.clone() });
-    
-    // --- Audit Log ---
-    let log_meta = serde_json::json!({
-        "collection": col.name,
-        "record_id": path.record_id,
-        "user_id": claims.as_ref().map(|c| c.uid),
-        "action": "update"
-    });
-    let _ = db.log_audit_event("info", "Record Updated", "api", Some(log_meta)).await;
-    // ------------------------
-
-    // Hook: After Update
-    let _ = trigger_hooks(&state, "after_update", &col, Some(path.record_id), &r.data, claims.as_ref()).await;
-
-    // --- ASYNC JOBS ---
-    if let Some(schema) = col.schema {
-        // A. Vector Embeddings
-        let current_tenant = get_tenant_id_from_scope(Some(&event_scope)); // Get scope
-        let model_name = get_current_model();
-        for (field_name, def) in &schema.fields {
-            if def.vectorize {
-                // Check if the field exists in the UPDATED data (r.data)
-                // Optimization: We could check if it changed, but enqueuing is safe
-                if let Some(text_val) = r.data.get(field_name).and_then(|v| v.as_str()) {
-                    let job = Job::GenerateEmbedding {
-                        collection_id: path.id,
-                        record_id: path.record_id,
-                        field_name: field_name.clone(),
-                        text_content: text_val.to_string(),
-                        tenant_id: current_tenant.clone(),
-                        model: model_name.clone() 
-                    };
-                    state.queue.enqueue(job).await;
-                }
-            }
-        }
-        
-        // B. Full Text Search Indexing
-        if schema.fields.values().any(|f| f.indexed) {
-            let job = Job::IndexRecord {
-                collection_id: path.id,
-                record_id: path.record_id,
-                data: r.data.clone(),
-                schema: schema.clone(),
-                tenant_id: current_tenant.clone()
-            };
-            state.queue.enqueue(job).await;
-        }
-    }
-
-    Ok(Json(RecordResponse{id: r.id, data: r.data, expand: r.expand}))
-}
-
-#[utoipa::path(delete, path = "/api/v1/collections/{id}/records/{record_id}")]
-async fn delete_record(
-    auth: Option<Extension<Claims>>, 
-    State(state): State<AppState>, 
-    scope: Option<Extension<EventScope>>, 
-    DatabaseConnection(db): DatabaseConnection, 
-    Path(path): Path<RecordPath>
-) -> Result<StatusCode, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
-    let existing = db.get_record(path.id, path.record_id, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
-    
-    let policy = col.schema.as_ref().map(|s| s.policies.delete.as_str()).unwrap_or("admin");
-    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) { return Err(AppError::Forbidden("Delete denied".into())); }
-    
-    // Hook: Before Delete
-    let _ = trigger_hooks(&state, "before_delete", &col, Some(path.record_id), &existing.data, claims.as_ref()).await?;
-    
-    db.delete_record(path.id, path.record_id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    let _ = state.tx.send(DbEvent::Delete { collection_id: path.id, record_id: path.record_id, scope: event_scope.clone() });
-    
-    // --- ADDED: Audit Log ---
-    let log_meta = serde_json::json!({
-        "collection": col.name,
-        "record_id": path.record_id,
-        "user_id": claims.as_ref().map(|c| c.uid),
-        "action": "delete"
-    });
-    let _ = db.log_audit_event("warning", "Record Deleted", "api", Some(log_meta)).await;
-    // ------------------------
-
-    // Hook: After Delete
-    let _ = trigger_hooks(&state, "after_delete", &col, Some(path.record_id), &existing.data, claims.as_ref()).await;
-
-    // --- ASYNC JOBS ---
-    // Remove from Search Index
-    if let Some(schema) = col.schema {
-        if schema.fields.values().any(|f| f.indexed) {
-            let current_tenant = get_tenant_id_from_scope(Some(&event_scope));
-            let job = Job::DeleteFromIndex {
-                tenant_id: current_tenant,
-                collection_id: path.id,
-                record_id: path.record_id,
-            };
-            state.queue.enqueue(job).await;
-        }
-    }
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[utoipa::path(get, path = "/api/v1/collections/{id}/records/{record_id}", responses((status = 200, body = RecordResponse)))]
-async fn get_record(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<RecordPath>, Query(q): Query<QueryOptions>) -> Result<Json<RecordResponse>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
-    let r = db.get_record(path.id, path.record_id, q.expand).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
-    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), Some(&r.data)) { return Err(AppError::Forbidden("Read denied".into())); }
-    Ok(Json(RecordResponse{id: r.id, data: r.data, expand: r.expand}))
-}
-
-#[utoipa::path(get, path = "/api/v1/collections/{id}/search", params(SearchQuery), responses((status = 200, body = Vec<RecordResponse>)))]
-async fn search_records(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>, Query(q): Query<SearchQuery>) -> Result<Json<Vec<RecordResponse>>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
-    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Search denied".into())); }
-    let res = db.search_records(path.id, &q.q).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(res.into_iter().map(|r| RecordResponse{id: r.id, data: r.data, expand: r.expand}).collect()))
-}
-#[utoipa::path(get, path = "/api/v1/collections/{id}/instant-search", params(SearchQuery), responses((status = 200, body = Vec<apexkit_core::models::InstantResult>)))]
-pub async fn instant_search_handler(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>, Query(params): Query<SearchQuery>) -> Result<Json<Vec<apexkit_core::models::InstantResult>>, AppError> {
-    let claims = auth.map(|Extension(c)| c);
-    let collection = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound(format!("Collection {} not found", path.id)))?;
-    let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Search denied by policy".into())); }
-    let results = db.instant_search(path.id, &params.q, params.limit.unwrap_or(10)).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(results))
-}
-#[utoipa::path(post, path = "/api/v1/collections/{id}/records/{record_id}/relations", request_body = RelationRequest, responses((status = 201, description = "Relation created")))]
-async fn create_relation(DatabaseConnection(db): DatabaseConnection, Path(path): Path<RecordPath>, Json(p): Json<RelationRequest>) -> Result<StatusCode, AppError> {
-    db.create_relation(path.id, path.record_id, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(StatusCode::CREATED)
-}
-#[utoipa::path(delete, path = "/api/v1/collections/{id}/records/{record_id}/relations", request_body = RelationRequest, responses((status = 204, description = "Relation deleted")))]
-async fn delete_relation(DatabaseConnection(db): DatabaseConnection, Path(path): Path<RecordPath>, Json(p): Json<RelationRequest>) -> Result<StatusCode, AppError> {
-    db.delete_relation(path.id, path.record_id, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-#[utoipa::path(post, path = "/api/v1/collections/{id}/reindex", responses((status = 200, description = "Reindexing started")))]
-pub async fn reindex_collection_handler(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>) -> Result<Json<serde_json::Value>, AppError> {
-    if !matches!(auth.map(|e| e.0.role), Some(r) if r == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
-    db.reindex_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "success": true })))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/admin/system/reload",
-    responses((status = 200, description = "System reloaded"))
-)]
-pub async fn reload_system(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    let relation_loader = async_graphql::dataloader::DataLoader::new(
-        crate::graphql::RelationLoader::new(state.db.clone()), 
-        tokio::spawn
-    );
-    let new_schema = crate::graphql::build_schema(
-        state.clone(), 
-        std::sync::Arc::new(relation_loader)
-    ).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    {
-        let mut lock = state.schema.write().await;
-        *lock = new_schema;
-    }
-    state.scheduler.read().await.load_jobs(state.clone()).await;
-    Ok(Json(serde_json::json!({ "status": "ok", "message": "System reloaded successfully" })))
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/admin/logs",
-    responses((status = 200, body = Vec<serde_json::Value>))
-)]
-pub async fn list_audit_logs(
-    auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    let logs = db.list_audit_logs().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(logs))
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/admin/dashboard",
-    responses((status = 200, body = DashboardData))
-)]
-pub async fn get_dashboard_stats_handler(
-    auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection,
-) -> Result<Json<apexkit_core::models::DashboardData>, AppError> {
-    if !matches!(auth.map(|e| e.0.role), Some(r) if r == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
-    let data = db.get_dashboard_stats().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(data))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/auth/login",
-    request_body = AuthRequest,
-    responses((status = 200, body = AuthResponse), (status = 401, body = ProblemDetail))
-)]
-async fn login(DatabaseConnection(db): DatabaseConnection, Json(p): Json<AuthRequest>) -> Result<Json<AuthResponse>, AppError> {
-    let u = db.get_user_by_email(&p.email).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::Unauthorized("Bad creds".into()))?;
-    if !auth::verify_password(&p.password, &u.password_hash) { return Err(AppError::Unauthorized("Bad creds".into())); }
-    let token = auth::create_jwt(u.id, &u.email, &u.role).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
-    let _ = db.log_audit_event("info", "Login", "auth", Some(serde_json::json!({"email": u.email}))).await;
-    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role}}))
-}
-
-
-// 1. HELPER: Trigger User Hooks
-async fn trigger_user_hooks(
-    state: &AppState,
-    trigger: &str,           // "before_user_create", "after_user_create", etc.
-    user_data: serde_json::Value,
-    auth: Option<&Claims>
-) -> Result<Option<serde_json::Value>, AppError> {
-    
-    let scripts = state.db.get_scripts_by_trigger(trigger).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    let mut current_data = user_data;
-    let mut modified = false;
-
-    for script in scripts {
-        let event_context = serde_json::json!({
-            "user": current_data,
-            "trigger": trigger,
-            "auth": auth.map(|c| serde_json::json!({
-                "id": c.uid,
-                "email": c.sub,
-                "role": c.role
-            })),
-        });
-
-        match state.script_engine.run_hook(
-            &script.code, 
-            event_context, 
-            state.db.clone(), 
-            state.embedder.clone(), 
-            state.vector_provider.clone(),
-            state.vault.clone()
-        ).await {
-            Ok(Some(new_data)) => {
-                current_data = new_data;
-                modified = true;
-            },
-            Ok(None) => {},
-            Err(err_msg) => {
-                return Err(AppError::Validation(vec![
-                    ValidationError::ConstraintViolation("_script".into(), err_msg)
-                ]));
-            }
-        }
-    }
-
-    if modified { Ok(Some(current_data)) } else { Ok(None) }
-}
-
-// 2. UPDATE: Register Handler
-#[utoipa::path(
-    post,
-    path = "/api/v1/auth/register",
-    request_body = AuthRequest,
-    responses((status = 200, body = AuthResponse))
-)]
-async fn register(
-    DatabaseConnection(db): DatabaseConnection, 
-    State(state): State<AppState>, 
-    Json(p): Json<AuthRequest>
-) -> Result<Json<AuthResponse>, AppError> {
-    
-    // HOOK: before_user_create
-    let input_data = serde_json::json!({ "email": p.email, "role": "user" });
-    let _ = trigger_user_hooks(&state, "before_user_create", input_data, None).await?;
-
-    let hash = auth::hash_password(&p.password).map_err(|_| AppError::UnknownError("Hash fail".into()))?;
-    let u = db.create_user(&p.email, &hash, "user").await.map_err(|_| AppError::UnknownError("User exists".into()))?;
-    
-    // HOOK: after_user_create
-    let user_json = serde_json::json!({ "id": u.id, "email": u.email, "role": u.role });
-    let _ = trigger_user_hooks(&state, "after_user_create", user_json, None).await;
-
-    let token = auth::create_jwt(u.id, &u.email, &u.role).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
-    
-    state.queue.enqueue(Job::SendWelcomeEmail { email: u.email.clone(), user_id: u.id }).await;
-    let _ = db.log_audit_event("info", "Register", "auth", Some(serde_json::json!({"email": u.email}))).await;
-    
-    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role}}))
-}
-
-// 3. UPDATE: List Users Handler (Add Search/Pagination)
-#[derive(Deserialize, IntoParams)]
-pub struct UserListQuery {
-    pub page: Option<i64>,
-    pub per_page: Option<i64>,
-    pub search: Option<String>,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct UserListResponse {
-    pub items: Vec<UserDto>,
-    pub total: i64,
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/admin/users",
-    params(UserListQuery),
-    responses((status = 200, body = UserListResponse))
-)]
-pub async fn list_users_handler(
-    auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection,
-    Query(params): Query<UserListQuery>,
-) -> Result<Json<UserListResponse>, AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    
-    let page = params.page.unwrap_or(1).max(1);
-    let limit = params.per_page.unwrap_or(20).min(100);
-    let offset = (page - 1) * limit;
-
-    let users = db.list_users(params.search.clone(), limit, offset).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let total = db.count_users(params.search).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    Ok(Json(UserListResponse {
-        items: users.into_iter().map(|u| UserDto { id: u.id, email: u.email, role: u.role }).collect(),
-        total
-    }))
-}
-
-// 4. UPDATE: Delete User Handler (Hooks)
-#[utoipa::path(delete, path = "/api/v1/admin/users/{id}")]
-pub async fn delete_user_handler(
-    auth: Option<Extension<Claims>>, 
-    State(state): State<AppState>, // Need State for Hooks
-    DatabaseConnection(db): DatabaseConnection, 
-    Path(path): Path<IdPath>
-) -> Result<StatusCode, AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    
-    // HOOK: before_user_delete
-    let user_json = serde_json::json!({ "id": path.id });
-    let _ = trigger_user_hooks(&state, "before_user_delete", user_json.clone(), Some(&claims)).await?;
-
-    db.delete_user(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    // HOOK: after_user_delete
-    let _ = trigger_user_hooks(&state, "after_user_delete", user_json, Some(&claims)).await;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[utoipa::path(
-    get,
-    path = "/styles.css",
-    responses((status = 200, description = "Purged Tailwind CSS", content_type = "text/css"))
-)]
-pub async fn serve_styles(
-    State(state): State<AppState>,
-    DatabaseConnection(db): DatabaseConnection,
-) -> Result<Response, AppError> {
-    // 1. Return Cache if exists
-    {
-        let cache = state.css_cache.read().await;
-        if !cache.is_empty() {
-            return Ok(Response::builder()
-                .header("Content-Type", "text/css")
-                .header("Cache-Control", "public, max-age=60") 
-                .body(axum::body::Body::from(cache.clone()))
-                .unwrap());
-        }
-    }
-
-    // 2. Compile (Purge) using the correct DB (Prod or Sandbox)
-    let css = css_compiler::compile_styles(db.clone()).await
-        .map_err(|e| AppError::UnknownError(e))?;
-
-    // 3. Update Cache
-    {
-        let mut cache = state.css_cache.write().await;
-        *cache = css.clone();
-    }
-
-    Ok(Response::builder()
-        .header("Content-Type", "text/css")
-        .body(axum::body::Body::from(css))
-        .unwrap())
-}
-
-#[utoipa::path(
-    get,
-    path = "/sse",
-    responses((status = 200, description = "SSE Stream"))
-)]
-pub async fn sse_handler(
-    State(state): State<AppState>,
-    scope: Option<Extension<EventScope>>, // Injected by Tenant/Sandbox Middleware
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    
-    // 1. Determine Scope
-    let client_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    
-    // 2. Subscribe to the Broadcast Channel
-    let mut rx = state.tx.subscribe();
-
-    // 3. Create a Stream
-    let stream = async_stream::stream! {
-        while let Ok(msg) = rx.recv().await {
-            // 4. FILTER: Only yield events matching the client's scope
-            if is_event_allowed(&msg, &client_scope) {
-                if let Ok(json_data) = serde_json::to_string(&msg) {
-                    yield Ok(Event::default().data(json_data));
-                }
-            }
-        }
-    };
-
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
-}
-
-// Reuse logic to check scope
-fn is_event_allowed(event: &DbEvent, client_scope: &EventScope) -> bool {
-    let event_scope = match event {
-        DbEvent::Insert { scope, .. } => scope,
-        DbEvent::Update { scope, .. } => scope,
-        DbEvent::Delete { scope, .. } => scope,
-    };
-    event_scope == client_scope
-}
-
-
-// --- HELPER: HOOK EXECUTOR ---
-async fn trigger_hooks(
-    state: &AppState,
-    trigger: &str,           // e.g. "before_create"
-    // FIX: Changed type from models::Collection to Collection (The one defined in core/lib.rs)
-    collection: &apexkit_core::Collection, 
-    record_id: Option<i64>,  // Null for before_create
-    data: &serde_json::Value,// The payload or existing data
-    auth: Option<&Claims>    // The current user
-) -> Result<Option<serde_json::Value>, AppError> {
-    
-    let scripts = state.db.get_scripts_by_trigger(trigger).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    let mut current_data = data.clone();
-    let mut modified = false;
-
-    for script in scripts {
-        // Filter by collection if target is set
-        if let Some(target) = &script.target_collection {
-            if target != &collection.name { continue; }
-        }
-
-        // Construct 'e' Context
-        let event_context = serde_json::json!({
-            "record": {
-                "id": record_id,
-                "data": current_data
-            },
-            "collection": {
-                "id": collection.id,
-                "name": collection.name,
-                // schema might be heavy, include if necessary or just name/id
-                "schema": collection.schema 
-            },
-            "auth": auth.map(|c| serde_json::json!({
-                "id": c.uid,
-                "email": c.sub,
-                "role": c.role
-            })),
-            "trigger": trigger
-        });
-
-        match state.script_engine.run_hook(
-            &script.code, 
-            event_context, 
-            state.db.clone(), 
-            state.embedder.clone(), 
-            state.vector_provider.clone(),
-            state.vault.clone()
-        ).await {
-            Ok(Some(new_data)) => {
-                current_data = new_data;
-                modified = true;
-            },
-            Ok(None) => { /* Continue */ },
-            Err(err_msg) => {
-                // FIX: Use Enum variant ConstraintViolation instead of struct syntax
-                return Err(AppError::Validation(vec![
-                    ValidationError::ConstraintViolation(
-                        "_hook".to_string(), 
-                        err_msg
-                    )
-                ]));
-            }
-        }
-    }
-
-    if modified { Ok(Some(current_data)) } else { Ok(None) }
-}
-
-#[utoipa::path(
-    get,
-    path = "/healthz",
-    responses((status = 200, description = "OK"))
-)]
-async fn health_check() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
-}

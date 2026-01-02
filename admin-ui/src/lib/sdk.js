@@ -297,6 +297,26 @@ export class ApexKit {
             updateSettings: (settings) => this._request('/admin/settings', { method: 'PATCH', body: settings }),
 
             /**
+             * Test S3 Storage Configuration.
+             * @param {object} config - { bucket, region, endpoint, access_key, secret_key }
+             * @returns {Promise<object>} Success message or throws error.
+             */
+            testS3StorageConnection: (config) => this._request('/admin/storage/test', { 
+                method: 'POST', 
+                body: config 
+            }),
+
+            /**
+             * Migrate files between storage backends.
+             * @param {string} source - "local" | "s3"
+             * @param {string} destination - "local" | "s3"
+             */
+            migrateStorage: (source, destination) => this._request('/admin/storage/migrate', {
+                method: 'POST',
+                body: { source, destination }
+            }),
+
+            /**
              * Force a system reload.
              * Syncs GraphQL schema, Cron jobs, and caches.
              * @returns {Promise<object>} Status message.
@@ -772,55 +792,74 @@ export class ApexKit {
  * ApexKit Realtime — Usage Guide
  * ============================================
  *
- * This example demonstrates how to:
- *  1. Establish a realtime connection
- *  2. Subscribe to filtered events
- *  3. Listen and react to updates
+ * This client supports Database Change Events, Custom Ephemeral Events,
+ * and high-performance Instant Search over WebSockets.
  *
  * --------------------------------------------
- * 1. Start the realtime connection
+ * 1. Start the connection
  * --------------------------------------------
  *
  * @example
- * const realtime = new ApexKitRealtime(pb.baseUrl, pb.getToken());
+ * const realtime = new ApexKitRealtimeWSClient(pb.baseUrl, pb.getToken());
  * realtime.connect();
  *
  * --------------------------------------------
- * 2. Subscribe to specific data changes
+ * 2. Subscribe to Data Changes (DB)
  * --------------------------------------------
- *
- * Subscribe to updates on the `tickets` collection,
- * but only receive events where the ticket priority
- * is set to `"high"`.
  *
  * @example
  * realtime.subscribe({
- *   collectionId: 5,           // Collection ID for 'tickets'
- *   eventType: "Update",       // Event type to listen for
- *   dataFilter: {              // Mongo-style filter
- *     priority: "high"
- *   }
+ *   collectionId: 5,
+ *   eventType: "Update",
+ *   dataFilter: { priority: "high" }
  * });
  *
  * --------------------------------------------
- * 3. Listen for realtime events
+ * 3. Subscribe to Custom Channels (Chat/Signals)
  * --------------------------------------------
- *
- * Handle incoming events and update the UI
- * or trigger notifications when changes occur.
  *
  * @example
- * realtime.onEvent((event) => {
- *   if (event.event === "Update") {
- *     console.log("Ticket Updated:", event.payload.data);
- *     // Refresh UI or show a toast notification
- *   }
+ * realtime.subscribe({
+ *   channel: "room_123",       // Namespace: tenant_id::room_123
+ *   customEvent: "NewMessage"  // Optional: Filter specific event name
  * });
  *
+ * --------------------------------------------
+ * 4. Send a Signal (Client-to-Client Broadcast)
+ * --------------------------------------------
+ *
+ * @example
+ * realtime.sendSignal("room_123", "UserTyping", { user: "Alice" });
+ *
+ * --------------------------------------------
+ * 5. Instant Search (Request-Response)
+ * --------------------------------------------
+ *
+ * @example
+ * const results = await realtime.search(1, "search query", 5);
+ * console.log(results); // [{ id: 1, score: 2.5, snippet: {...} }]
+ *
+ * --------------------------------------------
+ * 6. Handle Events
+ * --------------------------------------------
+ *
+ * @example
+ * realtime.onEvent((msg) => {
+ *   // Handle DB Event
+ *   if (msg.event === "Insert") {
+ *      console.log("Record Created:", msg.payload.data);
+ *   }
+ *   
+ *   // Handle Custom Event
+ *   if (msg.event === "Custom") {
+ *      const { event, data } = msg.payload;
+ *      if (event === "UserTyping") console.log(`${data.user} is typing...`);
+ *   }
+ * });
  * ============================================
  */
 
-export class ApexKitRealtime {
+export class ApexKitRealtimeWSClient {
     constructor(url, token) {
         this.url = url.replace("http", "ws") + "/ws"; // Auto-switch protocol
         this.token = token;
@@ -831,6 +870,9 @@ export class ApexKitRealtime {
         
         // Default filter (Listen to nothing until subscribed)
         this.currentFilter = {}; 
+        
+        // Store pending search requests (ID -> Promise Resolve/Reject)
+        this.pendingRequests = new Map();
     }
 
     connect() {
@@ -839,9 +881,9 @@ export class ApexKitRealtime {
         this.socket.onopen = () => {
             console.log("[ApexKit] Realtime Connected");
             this.isConnected = true;
-            // 1. Authenticate (If you implement Auth Handshake later)
-            // 2. Resend subscription if reconnecting
-            if (this.currentFilter) {
+            
+            // Resend subscription if reconnecting
+            if (this.currentFilter && Object.keys(this.currentFilter).length > 0) {
                 this.subscribe(this.currentFilter);
             }
         };
@@ -849,8 +891,17 @@ export class ApexKitRealtime {
         this.socket.onmessage = (event) => {
             try {
                 const msg = JSON.parse(event.data);
-                // msg format: { event: "Insert", payload: { ... } }
+
+                // 1. Handle Search Responses (Request-Response Pattern)
+                // These have a 'request_id' and are not broadcast to general listeners
+                if (msg.request_id) {
+                    this._handleRequestResponse(msg);
+                    return;
+                }
+
+                // 2. Handle Standard Broadcasts (DB Events & Signals)
                 this.notify(msg);
+
             } catch (e) {
                 if (event.data === "Pong") return; // Heartbeat
                 console.error("WS Parse Error", e);
@@ -859,6 +910,11 @@ export class ApexKitRealtime {
 
         this.socket.onclose = () => {
             this.isConnected = false;
+            
+            // Clear pending search requests so they don't hang forever
+            this.pendingRequests.forEach((req) => req.reject(new Error("Socket closed")));
+            this.pendingRequests.clear();
+            
             console.log("[ApexKit] Disconnected. Retrying...");
             setTimeout(() => this.connect(), this.reconnectInterval);
         };
@@ -867,6 +923,14 @@ export class ApexKitRealtime {
     /**
      * Send a filter to the server to narrow down events.
      * Matches the Rust `ClientMessage::Subscribe` struct.
+     * 
+     * @param {Object} filter
+     * @param {number} [filter.collectionId] - Filter by Collection ID (DB Events)
+     * @param {number} [filter.recordId] - Filter by specific Record ID (DB Events)
+     * @param {string} [filter.eventType] - "Insert", "Update", "Delete" (DB Events)
+     * @param {Object} [filter.dataFilter] - MongoDB-style JSON filter (DB & Custom Events)
+     * @param {string} [filter.channel] - Channel name for Custom Events (e.g. "chat_room")
+     * @param {string} [filter.customEvent] - Specific Custom Event name (e.g. "Typing")
      */
     subscribe(filter) {
         this.currentFilter = filter;
@@ -874,13 +938,83 @@ export class ApexKitRealtime {
             this.socket.send(JSON.stringify({
                 type: "Subscribe",
                 payload: {
-                    collection_id: filter.collectionId, // Optional
-                    record_id: filter.recordId,         // Optional
-                    event_type: filter.eventType,       // "Insert", "Update", "Delete"
-                    filter: filter.dataFilter           // The Mongo-style JSON filter
+                    // Standard DB Filters
+                    collection_id: filter.collectionId, 
+                    record_id: filter.recordId,         
+                    event_type: filter.eventType,       
+                    filter: filter.dataFilter,
+                    
+                    // Custom Event Filters
+                    channel: filter.channel,
+                    custom_event: filter.customEvent
                 }
             }));
         }
+    }
+
+    /**
+     * Broadcast an ephemeral message to a specific channel.
+     * Useful for "typing" indicators, cursors, or notifications.
+     * 
+     * @param {string} channel - The channel name (e.g. "room_1")
+     * @param {string} eventName - The event label (e.g. "UserTyping")
+     * @param {Object} data - Arbitrary JSON payload
+     */
+    sendSignal(channel, eventName, data) {
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(JSON.stringify({
+                type: "Signal",
+                payload: {
+                    channel: channel,
+                    event: eventName,
+                    data: data
+                }
+            }));
+        } else {
+            console.warn("[ApexKit] Socket not open, cannot send signal.");
+        }
+    }
+
+    /**
+     * Perform an Instant Search over WebSocket.
+     * Returns a Promise that resolves with the results.
+     * 
+     * @param {number|string} collectionId - The collection to search
+     * @param {string} query - The search text
+     * @param {number} [limit=10] - Max results
+     * @returns {Promise<Array>} List of results
+     */
+    search(collectionId, query, limit = 10) {
+        return new Promise((resolve, reject) => {
+            if (!this.isConnected || !this.socket) {
+                return reject(new Error("Socket not connected"));
+            }
+
+            // Generate a unique ID for this request
+            const requestId = crypto.randomUUID();
+
+            // Set a timeout to prevent hanging promises (e.g., 5 seconds)
+            const timeout = setTimeout(() => {
+                if (this.pendingRequests.has(requestId)) {
+                    this.pendingRequests.delete(requestId);
+                    reject(new Error("Search request timed out"));
+                }
+            }, 5000);
+
+            // Store the promise handlers
+            this.pendingRequests.set(requestId, { resolve, reject, timeout });
+
+            // Send command
+            this.socket.send(JSON.stringify({
+                type: "Search",
+                payload: {
+                    collection_id: Number(collectionId),
+                    query: query,
+                    limit: limit,
+                    request_id: requestId
+                }
+            }));
+        });
     }
 
     unsubscribe() {
@@ -890,12 +1024,168 @@ export class ApexKitRealtime {
         }
     }
 
-    // Internal observer pattern
+    /**
+     * Register a callback for broadcast events.
+     * @param {Function} callback 
+     * @returns {Function} Unsubscribe closure
+     */
     onEvent(callback) {
         this.listeners.push(callback);
         return () => this.listeners = this.listeners.filter(l => l !== callback);
     }
 
+    /**
+     * Internal: Dispatch events to listeners
+     */
+    notify(msg) {
+        this.listeners.forEach(cb => cb(msg));
+    }
+
+    /**
+     * Internal: Handle Search Request/Response resolution
+     */
+    _handleRequestResponse(msg) {
+        const req = this.pendingRequests.get(msg.request_id);
+        if (req) {
+            clearTimeout(req.timeout); // Clear the failsafe timeout
+            this.pendingRequests.delete(msg.request_id);
+
+            if (msg.type === "Error") {
+                req.reject(new Error(msg.message));
+            } else {
+                req.resolve(msg.results); // Resolve with the data array
+            }
+        }
+    }
+}
+
+/**
+ * ============================================
+ * ApexKit SSE Client — Usage Guide
+ * ============================================
+ *
+ * Server-Sent Events are ideal for read-only streams where you don't
+ * need to send data back to the server (e.g., news feeds, logs).
+ *
+ * --------------------------------------------
+ * 1. Initialize & Connect
+ * --------------------------------------------
+ *
+ * @example
+ * const sse = new ApexKitRealtimeSSEClient('http://localhost:5000');
+ *
+ * // Connect to specific channel
+ * sse.connect({
+ *   channel: "room_123",       // Filters for tenant_id::room_123
+ *   eventName: "NewMessage"    // Optional: Filter specific event type
+ * });
+ *
+ * --------------------------------------------
+ * 2. Handle Events
+ * --------------------------------------------
+ *
+ * @example
+ * sse.onEvent((msg) => {
+ *   if (msg.type === "Custom") {
+ *      console.log("Custom Event:", msg.payload.data);
+ *   }
+ *   if (msg.type === "Insert") {
+ *      console.log("DB Insert:", msg.payload.data);
+ *   }
+ * });
+ *
+ * --------------------------------------------
+ * 3. Cleanup
+ * --------------------------------------------
+ *
+ * @example
+ * sse.disconnect();
+ * ============================================
+ */
+
+export class ApexKitRealtimeSSEClient {
+    /**
+     * @param {string} baseUrl - The API base URL (e.g., "http://localhost:5000/api/v1")
+     */
+    constructor(baseUrl) {
+        // Strip trailing slash and ensure we point to root if /api/v1 is passed
+        // The SSE endpoint is usually at /sse or /api/v1/sse depending on router setup.
+        // Based on your router, it is mapped at the root router level `/sse` but also nested.
+        // Assuming the `baseUrl` passed is the root (e.g. http://localhost:5000)
+        this.baseUrl = baseUrl.replace(/\/$/, "");
+        this.source = null;
+        this.listeners = [];
+    }
+
+    /**
+     * Start the EventSource connection.
+     * @param {Object} options
+     * @param {string} [options.channel] - The specific channel to subscribe to.
+     * @param {string} [options.eventName] - Filter by event name (e.g. "Typing").
+     */
+    connect({ channel, eventName } = {}) {
+        // Close existing if any
+        if (this.source) {
+            this.source.close();
+        }
+
+        // Build URL with Query Params
+        const params = new URLSearchParams();
+        if (channel) params.append("channel", channel);
+        if (eventName) params.append("event", eventName);
+
+        const url = `${this.baseUrl}/sse?${params.toString()}`;
+
+        console.log(`[ApexKit] SSE Connecting to ${url}...`);
+        
+        this.source = new EventSource(url, { withCredentials: true });
+
+        this.source.onopen = () => {
+            console.log("[ApexKit] SSE Connected");
+        };
+
+        this.source.onerror = (err) => {
+            // EventSource auto-reconnects, but we log errors
+            console.error("[ApexKit] SSE Connection Error/Reconnecting...", err);
+        };
+
+        this.source.onmessage = (event) => {
+            try {
+                // Parse the inner JSON data
+                const msg = JSON.parse(event.data);
+                this.notify(msg);
+            } catch (e) {
+                console.error("[ApexKit] SSE Parse Error", e);
+            }
+        };
+    }
+
+    /**
+     * Close the connection.
+     */
+    disconnect() {
+        if (this.source) {
+            this.source.close();
+            this.source = null;
+            console.log("[ApexKit] SSE Disconnected");
+        }
+    }
+
+    /**
+     * Register a callback for incoming events.
+     * @param {Function} callback - Receives the parsed JSON message
+     * @returns {Function} Unsubscribe function
+     */
+    onEvent(callback) {
+        this.listeners.push(callback);
+        return () => {
+            this.listeners = this.listeners.filter(l => l !== callback);
+        };
+    }
+
+    /**
+     * Internal: Dispatch events to listeners
+     */
     notify(msg) {
         this.listeners.forEach(cb => cb(msg));
     }

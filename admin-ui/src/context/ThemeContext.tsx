@@ -1,5 +1,6 @@
 
 import React, { createContext, useContext, useEffect, useState } from "react";
+import { APEX_THEME } from "../constants";
 
 type Theme = "dark" | "light" | "system";
 
@@ -24,7 +25,7 @@ const ThemeContext = createContext<ThemeContextState>(initialState);
 export function ThemeProvider({
   children,
   defaultTheme = "system",
-  storageKey = "tinybase-theme",
+  storageKey = APEX_THEME,
   ...props
 }: ThemeProviderProps) {
   const [theme, setTheme] = useState<Theme>(

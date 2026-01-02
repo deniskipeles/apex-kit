@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/admin-ui/src/features/records/components/RecordForm.tsx ===========================
 import React, { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { Save, X, AlertCircle } from 'lucide-react';

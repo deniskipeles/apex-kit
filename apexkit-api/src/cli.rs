@@ -3,6 +3,7 @@ use apexkit_core::{auth, security::MasterKey};
 use crate::AppState;
 use std::io::Write;
 use serde_json::{json};
+use apexkit_core::security::EncryptedValue;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "ApexKit CLI Manager", long_about = None)]
@@ -118,18 +119,26 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
             }
         },
 
-        // ... (Rest of the file remains unchanged) ...
         Commands::Config(cmd) => match cmd {
             ConfigCmd::Set { key, value } => {
                 let encrypted = state.vault.encrypt(&value).map_err(|e| e.to_string())?;
-                state.db.set_system_config(&key, &encrypted).await.map_err(|e| e.to_string())?;
+                let json_val = serde_json::to_value(&encrypted).unwrap();
+                
+                // UPDATED: set_system_config -> set_config
+                state.db.set_config(&key, &json_val, true).await.map_err(|e| e.to_string())?;
                 println!("✅ Config '{}' set successfully (Encrypted).", key);
                 Ok(())
             }
             ConfigCmd::Get { key } => {
-                if let Some(enc) = state.db.get_system_config(&key).await.map_err(|e| e.to_string())? {
-                    let val = state.vault.decrypt(&enc).map_err(|e| e.to_string())?;
-                    println!("{}", val);
+                // UPDATED: get_system_config -> get_config
+                if let Some(json_val) = state.db.get_config(&key).await.map_err(|e| e.to_string())? {
+                    // Try decrypt
+                    if let Ok(enc) = serde_json::from_value::<EncryptedValue>(json_val) {
+                        let val = state.vault.decrypt(&enc).map_err(|e| e.to_string())?;
+                        println!("{}", val);
+                    } else {
+                        println!("(Value is not encrypted or invalid format)");
+                    }
                     Ok(())
                 } else {
                     Err(format!("Config '{}' not found.", key))
@@ -193,7 +202,9 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
                 state.db.clone(), 
                 state.embedder.clone(), 
                 state.vector_provider.clone(),
-                state.vault.clone()
+                state.vault.clone(),
+                None,
+                Some(state.tx.clone())
             ).await.map_err(|e| format!("Script Error: {}", e))?;
 
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -217,7 +228,7 @@ async fn handle_create_user(state: AppState, email: String, password: Option<Str
     });
 
     let hash = auth::hash_password(&raw_password).map_err(|e| e.to_string())?;
-    let user = state.db.create_user(&email, &hash, &role).await.map_err(|e| e.to_string())?;
+    let user = state.db.create_user(&email, &hash, &role, None).await.map_err(|e| e.to_string())?;
 
     println!("✅ User created: {} (ID: {})", user.email, user.id);
     Ok(())

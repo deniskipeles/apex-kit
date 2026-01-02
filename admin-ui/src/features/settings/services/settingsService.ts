@@ -4,7 +4,7 @@ import { apiClient, pb } from '../../../lib/apiClient'; // Import pb
 // We map the API response (snake_case keys from Rust) to Frontend (camelCase)
 const mapToFrontend = (apiData: any): AppSettings => {
     return {
-        appName: apiData.app_name || 'TinyBase',
+        appName: apiData.app_name || 'ApexKit',
         appUrl: apiData.app_url || 'http://localhost:3000',
         allowPublicRegistration: apiData.allow_public_registration || false,
         theme: apiData.theme || 'system',

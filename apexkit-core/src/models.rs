@@ -35,6 +35,8 @@ pub struct Record {
     pub id: Option<i64>, 
     #[schema(value_type = Object)]
     pub data: Value,
+    pub created: String,
+    pub updated: String,
 }
 
 /// Represents a Collection definition

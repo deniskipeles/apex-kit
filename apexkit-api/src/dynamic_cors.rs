@@ -21,7 +21,7 @@ pub async fn cors_middleware(
         .unwrap_or("");
 
     // Load Settings
-    let security_setting = state.db.get_setting("security").await.unwrap_or(None);
+    let security_setting = state.db.get_config("security").await.unwrap_or(None);
     
     let config: SecurityConfigDto = if let Some(val) = security_setting {
         serde_json::from_value(val).unwrap_or_default()

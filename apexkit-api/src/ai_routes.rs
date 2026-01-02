@@ -11,6 +11,9 @@ use apexkit_core::{
 };
 use crate::{AppState, AppError, settings::AiConfigDto, DatabaseConnection}; // Added DatabaseConnection
 use regex::Regex;
+use axum::extract::ConnectInfo;
+use std::net::SocketAddr;
+use crate::{trigger_void_hook, extract_log_meta};
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct ExecutePromptReq {
@@ -94,11 +97,17 @@ pub async fn delete_action(
     responses((status = 200, body = Value))
 )]
 pub async fn run_action(
-    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB to find action
-    State(state): State<AppState>, // Need State for Vault
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>, // [NEW]
+    headers: axum::http::HeaderMap,             // [NEW]
     Path(slug): Path<String>,
     Json(payload): Json<ExecutePromptReq>,
 ) -> Result<Json<Value>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    // [TRIGGER] Before AI Run
+    trigger_void_hook(&state, "before_ai_run", json!({ "slug": slug, "vars": payload.variables }), claims.as_ref()).await?;
     
     // 1. Get Action Config (From Tenant/Sandbox DB)
     let action = db.get_ai_action(&slug).await
@@ -106,7 +115,7 @@ pub async fn run_action(
         .ok_or(AppError::NotFound("Action not found".into()))?;
 
     // 2. Get API Key from Settings (From Tenant/Sandbox DB)
-    let ai_settings_json = db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let ai_settings_json = db.get_config("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     let ai_config: AiConfigDto = if let Some(val) = ai_settings_json {
         serde_json::from_value(val).unwrap_or_default()
@@ -176,7 +185,11 @@ pub async fn run_action(
     let mut request_body = json!({
         "contents": [{
             "parts": content_parts
-        }]
+        }],
+        // You MUST include this to get groundingMetadata back
+        "tools": [
+            { "google_search": {} } 
+        ]
     });
 
     // Add System Instructions if present
@@ -220,6 +233,13 @@ pub async fn run_action(
     // Extract Metadata (Grounding/Search results)
     let metadata = response_json["candidates"][0]["groundingMetadata"].clone();
 
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "slug": slug }));
+    let _ = db.log_audit_event("info", "AI Action Run", "ai", Some(meta)).await;
+
+    // [TRIGGER] After AI Run
+    let _ = trigger_void_hook(&state, "after_ai_run", json!({ "slug": slug, "result": result, "metadata": metadata }), claims.as_ref()).await;
+
     Ok(Json(json!({ 
         "result": result,
         "metadata": metadata
@@ -249,7 +269,7 @@ pub async fn edit_code(
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
     // 1. Get Config (From Tenant/Sandbox DB)
-    let ai_settings = db.get_setting("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let ai_settings = db.get_config("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     let (api_key, _model) = match ai_settings {
         Some(val) => {
             let conf: AiConfigDto = serde_json::from_value(val).unwrap_or_default();

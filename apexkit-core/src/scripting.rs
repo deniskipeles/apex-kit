@@ -1,16 +1,22 @@
+// =========================== apexkit-core/src/scripting.rs ===========================
 use std::sync::Arc;
 use serde_json::Value as JsonValue;
 use crate::{Db, query::QueryOptions, embeddings::{EmbedderService, EmbedderProvider}, VectorProvider, security::Vault};
+use crate::jobs;
+use crate::realtime::{DbEvent, EventScope}; // Import Event types
+use tokio::sync::broadcast; // Import broadcast
+use regex::Regex;
 
 // Boa Imports
 use boa_engine::{
     Context, JsValue, Source, JsResult, NativeFunction, JsError,
-    object::ObjectInitializer, property::Attribute,
+    object::ObjectInitializer,
+    property::Attribute,
     JsString, JsArgs,
     builtins::promise::PromiseState
 };
 
-// --- JAVASCRIPT PRELUDE ---
+// ... JS_PRELUDE ...
 const JS_PRELUDE: &str = r#"
     class Headers {
         constructor(init = {}) {
@@ -31,6 +37,9 @@ const JS_PRELUDE: &str = r#"
             this.bodyData = init.body || input?.body || null;
             this.method = init.method || "GET";
             this.headers = new Headers(init.headers || {});
+            
+            // GraphQL helper: alias args to the body data for convenience
+            this.args = this.bodyData || {}; 
         }
         async json() { return this.bodyData; }
         async text() { return JSON.stringify(this.bodyData); }
@@ -51,13 +60,14 @@ const JS_PRELUDE: &str = r#"
 
 use std::cell::RefCell;
 thread_local! {
-    // Thread Local Context: Added Arc<Vault> at index 3
     static ACTIVE_DB_CONTEXT: RefCell<Option<(
         Arc<dyn Db>, 
         Arc<EmbedderService>, 
         Arc<dyn VectorProvider>, 
         Arc<Vault>, 
-        tokio::runtime::Handle
+        tokio::runtime::Handle,
+        Option<String>,
+        Option<broadcast::Sender<DbEvent>> // [NEW] Added Sender
     )>> = RefCell::new(None);
 }
 
@@ -69,7 +79,6 @@ impl ScriptEngine {
         Self
     }
 
-    /// Public API Endpoint Execution (Request -> Response)
     pub async fn run_script(
         &self, 
         code: &str, 
@@ -77,13 +86,15 @@ impl ScriptEngine {
         db: Arc<dyn Db>,
         embedder: Arc<EmbedderService>,
         vector_provider: Arc<dyn VectorProvider>,
-        vault: Arc<Vault> // <--- NEW ARGUMENT
+        vault: Arc<Vault>,
+        base_url: Option<String>,
+        tx: Option<broadcast::Sender<DbEvent>> // [NEW]
     ) -> Result<JsonValue, String> {
         
-        self.execute_js_task(code, db, embedder, vector_provider, vault, move |ctx| {
-            // 1. Prepare Request Object
+        self.execute_js_task(code, db, embedder, vector_provider, vault, base_url, tx, move |ctx| {
             let js_body = JsValue::from_json(&input_data, ctx).map_err(|e| e.to_string())?;
             
+            // Construct Request Object
             let request_cls = ctx.global_object().get(JsString::from("Request"), ctx).unwrap();
             let req_init = ObjectInitializer::new(ctx)
                 .property(JsString::from("method"), JsString::from("POST"), Attribute::all())
@@ -98,7 +109,7 @@ impl ScriptEngine {
                 )
                 .map_err(|e| format!("Failed to create Request: {}", e))?;
 
-            // 2. Call Handler
+            // Execute Handler
             let handler = ctx.global_object().get(JsString::from("__mainHandler"), ctx);
             let promise = match handler {
                 Ok(h) if h.is_callable() => {
@@ -107,22 +118,29 @@ impl ScriptEngine {
                 _ => return Err("No 'export default' function found in script".to_string())
             };
 
-            // 3. Resolve Promise
             let _ = ctx.run_jobs();
             let final_val = Self::resolve_promise(promise, ctx)?;
 
-            // 4. Extract Response Body
+            // [UPDATED] Flexible Return Handling
             if let Some(obj) = final_val.as_object() {
-                let body = obj.get(JsString::from("body"), ctx).unwrap_or_default();
-                let json = body.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
-                Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null))
+                // If it looks like a Response object (has 'body'), unwrap it.
+                if obj.has_property(JsString::from("body"), ctx).unwrap_or(false) {
+                    let body = obj.get(JsString::from("body"), ctx).unwrap_or_default();
+                    let json = body.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
+                    Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null))
+                } else {
+                    // Otherwise, return the plain object as JSON (DX Improvement for Resolvers)
+                    let json = final_val.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
+                    Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null))
+                }
             } else {
-                Err("Script must return a Response object".to_string())
+                // Return primitive (null, string, bool, etc)
+                let json = final_val.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
+                Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null))
             }
         }).await
     }
 
-    /// DB Event Hook Execution (EventContext -> ModifiedData/Bool)
     pub async fn run_hook(
         &self,
         code: &str,
@@ -130,7 +148,9 @@ impl ScriptEngine {
         db: Arc<dyn Db>,
         embedder: Arc<EmbedderService>,
         vector_provider: Arc<dyn VectorProvider>,
-        vault: Arc<Vault> // <--- NEW ARGUMENT
+        vault: Arc<Vault>,
+        base_url: Option<String>,
+        tx: Option<broadcast::Sender<DbEvent>> // [NEW]
     ) -> Result<Option<JsonValue>, String> {
 
         let wrapped_code = format!(
@@ -147,13 +167,11 @@ impl ScriptEngine {
             code
         );
 
-        self.execute_js_task(&wrapped_code, db, embedder, vector_provider, vault, move |ctx| {
-            // 1. Inject Event Data
+        self.execute_js_task(&wrapped_code, db, embedder, vector_provider, vault, base_url, tx, move |ctx| {
             let js_event = JsValue::from_json(&event_data, ctx).map_err(|e| e.to_string())?;
             
             ctx.register_global_property(JsString::from("__hook_context__"), js_event.clone(), Attribute::all()).unwrap();
 
-            // 2. Call Handler
             let handler = ctx.global_object().get(JsString::from("__mainHandler"), ctx);
             
             let promise = match handler {
@@ -163,11 +181,9 @@ impl ScriptEngine {
                 _ => return Ok(None) 
             };
 
-            // 3. Resolve
             let _ = ctx.run_jobs();
             let final_val = Self::resolve_promise(promise, ctx)?;
 
-            // 4. Process Hook Result
             if final_val.is_null() || final_val.is_undefined() {
                 return Ok(None);
             }
@@ -183,14 +199,15 @@ impl ScriptEngine {
         }).await
     }
 
-    /// The OUTER REUSABLE FUNCTION
     async fn execute_js_task<F, R>(
         &self,
         code: &str,
         db: Arc<dyn Db>,
         embedder: Arc<EmbedderService>,
         vector_provider: Arc<dyn VectorProvider>,
-        vault: Arc<Vault>, // <--- NEW ARGUMENT
+        vault: Arc<Vault>, 
+        base_url: Option<String>,
+        tx: Option<broadcast::Sender<DbEvent>>, // [NEW]
         task_logic: F
     ) -> Result<R, String>
     where
@@ -198,21 +215,26 @@ impl ScriptEngine {
         R: Send + 'static
     {
         let code_owned = code.to_string();
-        let processed_code = code_owned.replacen("export default", "globalThis.__mainHandler =", 1);
+        
+        // [FIX] Strip "export const graphql = ..." so Boa doesn't choke on it
+        // This removes the config block used by the API layer, allowing the engine to just see valid JS.
+        let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)").map_err(|e| e.to_string())?;
+        let code_cleaned = re_config.replace_all(&code_owned, "");
+
+        // [FIX] Replace "export default" with global assignment for entry point
+        let processed_code = code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
+        
         let handle = tokio::runtime::Handle::current();
 
         let result = tokio::task::spawn_blocking(move || -> Result<R, String> {
             let mut context = Context::default();
 
-            // 1. Setup Environment (Prelude + Globals + Env)
-            Self::setup_boa_environment(&mut context, &handle, db, embedder, vector_provider, vault)?;
+            Self::setup_boa_environment(&mut context, &handle, db, embedder, vector_provider, vault, base_url, tx)?;
 
-            // 2. Load User Code
             if let Err(e) = context.eval(Source::from_bytes(processed_code.as_bytes())) {
                  return Err(format!("Script Syntax Error: {}", e));
             }
 
-            // 3. Run Specific Logic
             task_logic(&mut context)
 
         }).await;
@@ -223,14 +245,15 @@ impl ScriptEngine {
         }
     }
 
-    /// Sets up the JS environment (Prelude + Globals + $env)
     fn setup_boa_environment(
         ctx: &mut Context,
         handle: &tokio::runtime::Handle,
         db: Arc<dyn Db>,
         embedder: Arc<EmbedderService>,
         vector_provider: Arc<dyn VectorProvider>,
-        vault: Arc<Vault>, // <--- NEW ARGUMENT
+        vault: Arc<Vault>,
+        base_url: Option<String>,
+        tx: Option<broadcast::Sender<DbEvent>>, // [NEW]
     ) -> Result<(), String> {
         
         ctx.eval(Source::from_bytes(JS_PRELUDE.as_bytes()))
@@ -241,8 +264,10 @@ impl ScriptEngine {
                 db.clone(), 
                 embedder.clone(), 
                 vector_provider.clone(), 
-                vault.clone(), // Store vault
-                handle.clone()
+                vault.clone(), 
+                handle.clone(),
+                base_url.clone(),
+                tx // Store tx
             )); 
         });
 
@@ -255,24 +280,49 @@ impl ScriptEngine {
             Ok(promise.into())
         };
 
-        // --- $env (NEW) ---
-        // Usage: const key = await $env.get("API_KEY");
+        // --- $env ---
         let env_get = NativeFunction::from_copy_closure(move |_, args, ctx| {
             let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
 
+            // Special Case: "APP_URL" handled by property, but keep method access too
+            if key == "APP_URL" {
+                let dynamic_url = ACTIVE_DB_CONTEXT.with(|c| {
+                     c.borrow().as_ref().and_then(|t| t.5.clone())
+                });
+                
+                if let Some(url) = dynamic_url {
+                    return return_promise(ctx, Ok(JsValue::from(JsString::from(url))));
+                }
+            }
+
             let (val, error) = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, vault, handle)) = &*c.borrow() {
+                if let Some((db, _, _, vault, handle, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        // 1. Fetch encrypted value from DB (Tenant aware)
-                        match db.get_system_config(&key).await {
-                            Ok(Some(encrypted)) => {
-                                // 2. Decrypt using Vault
-                                match vault.decrypt(&encrypted) {
-                                    Ok(secret) => (Some(secret), None),
-                                    Err(e) => (None, Some(format!("Decryption failed: {}", e)))
+                        match db.get_config(&key).await {
+                            Ok(Some(json_val)) => {
+                                // Try to interpret as EncryptedValue struct first
+                                if let Ok(enc) = serde_json::from_value::<crate::security::EncryptedValue>(json_val.clone()) {
+                                     match vault.decrypt(&enc) {
+                                        Ok(secret) => (Some(secret), None),
+                                        Err(e) => (None, Some(format!("Decryption failed: {}", e)))
+                                    }
+                                } else {
+                                    // Fallback: Return raw string if not an encrypted object
+                                    (json_val.as_str().map(|s| s.to_string()), None)
                                 }
                             },
-                            Ok(None) => (None, None), // Not found
+                            Ok(None) => {
+                                if key == "APP_URL" {
+                                    if let Ok(Some(gen_settings)) = db.get_config("general").await {
+                                        let url = gen_settings.get("app_url").and_then(|s| s.as_str()).map(|s| s.to_string());
+                                        (url, None)
+                                    } else {
+                                        (None, None)
+                                    }
+                                } else {
+                                    (None, None)
+                                }
+                            }, 
                             Err(e) => (None, Some(e.to_string()))
                         }
                     })
@@ -280,7 +330,6 @@ impl ScriptEngine {
             });
 
             if let Some(err) = error {
-                 // Or return null? Usually better to fail loudly for secrets.
                  return Err(JsError::from_opaque(JsString::from(err).into()));
             }
 
@@ -292,9 +341,33 @@ impl ScriptEngine {
             return_promise(ctx, Ok(result))
         });
 
-        let env_obj = ObjectInitializer::new(ctx)
-            .function(env_get, JsString::from("get"), 1)
-            .build();
+        // --- RESOLVE APP_URL PROPERTY ---
+        let resolved_app_url = if let Some(url) = base_url {
+             Some(url)
+        } else {
+             let db_clone = db.clone();
+             handle.block_on(async move {
+                 if let Ok(Some(gen_settings)) = db_clone.get_config("general").await {
+                     gen_settings.get("app_url").and_then(|s| s.as_str()).map(|s| s.to_string())
+                 } else {
+                     None
+                 }
+             })
+        };
+
+        // Build $env object
+        let mut env_init = ObjectInitializer::new(ctx);
+        env_init.function(env_get, JsString::from("get"), 1);
+        
+        if let Some(url) = resolved_app_url {
+            env_init.property(
+                JsString::from("APP_URL"), 
+                JsString::from(url), 
+                Attribute::all()
+            );
+        }
+
+        let env_obj = env_init.build();
         ctx.register_global_property(JsString::from("$env"), env_obj, Attribute::all()).unwrap();
 
         // 1. log()
@@ -342,7 +415,7 @@ impl ScriptEngine {
             let col = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
             let id = args.get_or_undefined(1).to_number(ctx).unwrap_or(0.0) as i64;
             let result = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle)) = &*c.borrow() { // Adjusted for Tuple Size
+                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -373,7 +446,7 @@ impl ScriptEngine {
                 } else { None }
             } else { None };
             let result_vec = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle)) = &*c.borrow() {
+                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -403,7 +476,7 @@ impl ScriptEngine {
             let col = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
             let data = args.get_or_undefined(1).to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
             let new_id = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle)) = &*c.borrow() {
+                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -428,7 +501,7 @@ impl ScriptEngine {
             let id = args.get_or_undefined(1).to_number(ctx).unwrap_or(0.0) as i64;
             let data = args.get_or_undefined(2).to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
             let updated_record = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle)) = &*c.borrow() {
+                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -454,7 +527,7 @@ impl ScriptEngine {
             let col = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
             let id = args.get_or_undefined(1).to_number(ctx).unwrap_or(0.0) as i64;
             let success = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle)) = &*c.borrow() {
+                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -485,7 +558,7 @@ impl ScriptEngine {
             let provider_str = args.get_or_undefined(1).as_string().map(|s| s.to_std_string_escaped()).unwrap_or("local".to_string());
 
             let (embedding, error) = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, embedder, vector_provider, _, handle)) = &*c.borrow() {
+                if let Some((db, embedder, vector_provider, _, handle, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         let provider_lower = provider_str.to_lowercase();
                         if provider_lower == "local" {
@@ -494,7 +567,7 @@ impl ScriptEngine {
                                 Err(e) => (None, Some(e))
                             }
                         } else {
-                            let settings = db.get_setting("ai").await.unwrap_or(None);
+                            let settings = db.get_config("ai").await.unwrap_or(None);
                             let mut api_key = None;
                             if let Some(val) = settings {
                                 if let Some(key) = val.get("api_key").and_then(|v| v.as_str()) {
@@ -530,6 +603,68 @@ impl ScriptEngine {
             .function(ai_embed, JsString::from("embed"), 2)
             .build();
         ctx.register_global_property(JsString::from("$ai"), ai_obj, Attribute::all()).unwrap();
+
+        // 6. $mail
+        let mail_send = NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let to = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+            let subject = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let body = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
+
+            let result = ACTIVE_DB_CONTEXT.with(|c| {
+                if let Some((db, _, _, vault, handle, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        jobs::send_email(db.clone(), vault.clone(), &to, &subject, &body).await
+                    })
+                } else {
+                    Err("Context lost".to_string())
+                }
+            });
+            match result {
+                Ok(_) => return_promise(ctx, Ok(JsValue::from(true))),
+                Err(e) => return_promise(ctx, Err(JsError::from_opaque(JsString::from(e).into())))
+            }
+        });
+        let mail_obj = ObjectInitializer::new(ctx)
+            .function(mail_send, JsString::from("send"), 3)
+            .build();
+        ctx.register_global_property(JsString::from("$mail"), mail_obj, Attribute::all()).unwrap();
+
+        // 7. [NEW] $realtime
+        let rt_send = NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let channel = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped(); // e.g. "chat_room"
+            let event_name = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped(); // e.g. "message"
+            let payload = args.get_or_undefined(2).to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
+
+            let result = ACTIVE_DB_CONTEXT.with(|c| {
+                if let Some((_, _, _, _, _, _, Some(tx))) = &*c.borrow() {
+                    // Create Custom Event
+                    let event = DbEvent::Custom {
+                        event: event_name,
+                        data: payload,
+                        scope: EventScope::Channel(channel)
+                    };
+                    // Send it
+                    if let Err(e) = tx.send(event) {
+                        Err(format!("Broadcast failed: {}", e))
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Err("Realtime context not available (tx missing)".to_string())
+                }
+            });
+
+            match result {
+                Ok(_) => return_promise(ctx, Ok(JsValue::from(true))),
+                Err(e) => return_promise(ctx, Err(JsError::from_opaque(JsString::from(e).into())))
+            }
+        });
+
+        let rt_obj = ObjectInitializer::new(ctx)
+            .function(rt_send, JsString::from("send"), 3)
+            .build();
+        
+        ctx.register_global_property(JsString::from("$realtime"), rt_obj, Attribute::all()).unwrap();
 
         Ok(())
     }

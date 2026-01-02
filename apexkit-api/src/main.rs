@@ -355,7 +355,7 @@ async fn seed_admin(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error
     let email = "admin@apexkit.io";
     if db.get_user_by_email(email).await?.is_none() {
         let hash = apexkit_core::auth::hash_password("password")?;
-        db.create_user(email, &hash, "admin").await?;
+        db.create_user(email, &hash, "admin", None).await?;
         tracing::info!("Seeded admin user: {}", email);
     }
     Ok(())

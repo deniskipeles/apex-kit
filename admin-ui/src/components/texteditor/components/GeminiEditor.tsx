@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/admin-ui/src/components/GeminiEditor.tsx ===========================
 import React, { useState, useRef, useEffect } from 'react';
 import { enhanceTextWithGemini, generateImageWithGemini, editImageWithGemini, GeminiResponse } from '../services/geminiService';
 import {

@@ -11,6 +11,7 @@ pub struct User {
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub role: String, // "admin" or "user"
+    pub metadata: Option<serde_json::Value>,
 }
 
 // ADDED Clone here

@@ -8,7 +8,7 @@ use aws_credential_types::Credentials;
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
-    async fn save(&self, filename: &str, data: &[u8]) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
+    async fn save(&self, filename: &str, data: &[u8], content_type: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
     async fn get(&self, filename: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
     async fn delete(&self, filename: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     fn get_public_url_base(&self) -> String;
@@ -35,7 +35,7 @@ impl LocalStorage {
 
 #[async_trait]
 impl StorageBackend for LocalStorage {
-    async fn save(&self, filename: &str, data: &[u8]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn save(&self, filename: &str, data: &[u8], _content_type: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let file_path = self.base_path.join(filename);
         let mut file = fs::File::create(file_path).await?;
         file.write_all(data).await?;
@@ -61,7 +61,7 @@ impl StorageBackend for LocalStorage {
     }
 }
 
-// --- AWS S3 Implementation ---
+// --- AWS S3 / R2 Implementation ---
 
 pub struct S3Storage {
     client: aws_sdk_s3::Client,
@@ -70,8 +70,15 @@ pub struct S3Storage {
 }
 
 impl S3Storage {
-    // UPDATED CONSTRUCTOR to take explicit credentials
-    pub async fn new_with_creds(bucket: &str, region: &str, public_url_base: &str, access_key: &str, secret_key: &str) -> Self {
+    // UPDATED: Now accepts 'endpoint' and applies it to the config
+    pub async fn new_with_creds(
+        bucket: &str, 
+        region: &str, 
+        endpoint: &str, // <--- Make sure this is passed correctly
+        public_url_base: &str, 
+        access_key: &str, 
+        secret_key: &str
+    ) -> Self {
         
         let creds = Credentials::new(
             access_key.to_string(),
@@ -81,18 +88,26 @@ impl S3Storage {
             "apexkit"
         );
 
-        let config = aws_config::defaults(BehaviorVersion::latest())
+        let shared_config = aws_config::defaults(BehaviorVersion::latest())
             .region(aws_config::Region::new(region.to_string()))
             .credentials_provider(creds)
             .load()
             .await;
             
-        // If endpoint is custom (e.g. MinIO), we need to adjust config, 
-        // but for simplicity with standard aws_config:
-        let client = aws_sdk_s3::Client::new(&config);
+        // --- CRITICAL FIX FOR R2/MINIO ---
+        // We must build a specific S3 config that overrides the endpoint URL.
+        // Without this, the SDK defaults to aws.amazon.com and fails auth/connection.
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&shared_config);
         
-        // Note: For MinIO/DigitalOcean, you might need to build config manually using aws_sdk_s3::Config::builder().endpoint_url(...)
-        // But let's stick to standard AWS behavior for now or assume public_url_base implies endpoint logic if expanded later.
+        if !endpoint.is_empty() {
+            s3_config_builder = s3_config_builder
+                .endpoint_url(endpoint)
+                // Force Path Style is often required for R2/MinIO/Localstack
+                // i.e. https://endpoint/bucket/file instead of https://bucket.endpoint/file
+                .force_path_style(true); 
+        }
+
+        let client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
         
         Self {
             client,
@@ -104,11 +119,12 @@ impl S3Storage {
 
 #[async_trait]
 impl StorageBackend for S3Storage {
-    async fn save(&self, filename: &str, data: &[u8]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn save(&self, filename: &str, data: &[u8], content_type: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         self.client.put_object()
             .bucket(&self.bucket)
             .key(filename)
             .body(ByteStream::from(data.to_vec()))
+            .content_type(content_type) // <--- CRITICAL FIX
             .send()
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;

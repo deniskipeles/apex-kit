@@ -541,7 +541,7 @@ async fn deploy_manifest(db: Arc<dyn Db>, manifest: &AppManifest) -> Result<(), 
 }
 
 async fn get_api_key(state: &AppState) -> Result<String, AppError> {
-    let ai_settings = state.db.get_setting("ai").await
+    let ai_settings = state.db.get_config("ai").await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     match ai_settings {

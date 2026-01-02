@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/admin-ui/src/features/ai/components/SandboxAiToolbar.tsx ===========================
 import React, { useState, useEffect, useRef } from 'react';
 import { 
     Sparkles, Play, Database, RefreshCw, 

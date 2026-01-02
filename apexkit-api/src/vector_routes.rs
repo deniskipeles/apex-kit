@@ -7,6 +7,9 @@ use apexkit_core::{auth::Claims, jobs::Job};
 use crate::{AppState, AppError, RecordResponse, DatabaseConnection, IdPath};
 use std::collections::HashMap;
 use apexkit_core::realtime::EventScope;
+use axum::extract::ConnectInfo;
+use std::net::SocketAddr;
+use crate::{trigger_void_hook, extract_log_meta};
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct VectorSearchReq {
@@ -65,7 +68,7 @@ pub async fn search_vector(
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 3. Map Response
-    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data, expand: r.expand }).collect()))
+    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated }).collect()))
 }
 #[utoipa::path(
     post,
@@ -146,13 +149,13 @@ pub async fn query_vector_search(
         score_b.partial_cmp(score_a).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data, expand: r.expand }).collect()))
+    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated }).collect()))
 }
 
 #[utoipa::path(
     post,
     path = "/api/v1/admin/collections/{id}/revectorize",
-    request_body = RevectorizeOptions, // Update docs
+    request_body = RevectorizeOptions, 
     responses((status = 202, description = "Revectorization jobs queued"))
 )]
 pub async fn revectorize_collection_handler(
@@ -160,19 +163,24 @@ pub async fn revectorize_collection_handler(
     scope: Option<Extension<EventScope>>,
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Path(path): Path<IdPath>, 
-    // Accept JSON body for options, use default if missing
     Json(options): Json<RevectorizeOptions>, 
 ) -> Result<Json<serde_json::Value>, AppError> {
     
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
-    // Helper logic to extract tenant ID (Duplicated here to avoid visibility issues across modules)
+    // [TRIGGER]
+    trigger_void_hook(&state, "on_vectorization_start", serde_json::json!({ "collection_id": path.id }), Some(&claims)).await?;
+
+    // Fix for E0004: Handle EventScope::Channel
     let current_tenant = scope.as_ref().map(|Extension(s)| match s {
         EventScope::Tenant(id) => Some(id.clone()),
         EventScope::Sandbox(id) => Some(id.clone()),
         EventScope::Root => None,
+        EventScope::Channel(_) => None, // Channels don't map to a DB storage tenant
     }).flatten();
 
     let current_model = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
@@ -195,6 +203,10 @@ pub async fn revectorize_collection_handler(
         })));
     }
 
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), serde_json::json!({ "collection_id": path.id, "force": options.force }));
+    let _ = db.log_audit_event("info", "Revectorization Started", "ai", Some(meta)).await;
+
     let mut query_opts = apexkit_core::query::QueryOptions::default();
     query_opts.limit = Some(100_000); 
     query_opts.per_page = None;
@@ -210,10 +222,7 @@ pub async fn revectorize_collection_handler(
 
         for field_name in &vectorizable_fields {
             if let Some(text_content) = record.data.get(field_name).and_then(|v| v.as_str()) {
-                
-                // --- HARD vs SOFT LOGIC ---
                 if !options.force {
-                    // Soft Mode: Check if exists
                     let exists = db.has_vector(path.id, record_id, field_name, &current_model).await
                         .unwrap_or(false);
                         

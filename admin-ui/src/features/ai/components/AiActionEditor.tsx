@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/tinybase/tinybase/admin-ui/src/features/ai/components/AiActionEditor.tsx ===========================
 import React, { useState, useEffect } from 'react';
 import { Save, Sparkles, Info } from 'lucide-react';
 import { Button, Input, Label, Select } from '../../../components/ui/Elements';

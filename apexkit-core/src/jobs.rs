@@ -16,7 +16,7 @@ pub enum Job {
     
     // --- Vectorization Job ---
     GenerateEmbedding { 
-        tenant_id: Option<String>, // <--- NEW FIELD
+        tenant_id: Option<String>, 
         collection_id: i64, 
         record_id: i64, 
         field_name: String, 
@@ -26,7 +26,7 @@ pub enum Job {
 
     // --- Async Search Indexing ---
     IndexRecord {
-        tenant_id: Option<String>, // <--- NEW FIELD
+        tenant_id: Option<String>,
         collection_id: i64,
         record_id: i64,
         data: Value,
@@ -34,7 +34,7 @@ pub enum Job {
     },
     
     DeleteFromIndex {
-        tenant_id: Option<String>, // <--- NEW FIELD
+        tenant_id: Option<String>,
         collection_id: i64,
         record_id: i64
     }
@@ -65,7 +65,7 @@ impl JobQueue {
 
 // Updated Worker Signature
 pub fn start_background_worker(
-    context_resolver: Arc<dyn JobContext>, // <--- CHANGED from (Db, Provider)
+    context_resolver: Arc<dyn JobContext>,
     vault: Arc<Vault>,
 ) -> JobQueue {
     let (tx, mut rx) = mpsc::channel(1000);
@@ -79,38 +79,39 @@ pub fn start_background_worker(
 
             tokio::spawn(async move {
                 match job {
-                    // --- Email Jobs (Assume Root DB for now, or expand Job to include tenant for settings) ---
-                    // For simplicity, we use None (Root) for email settings lookup unless passed
+                    // --- Email Jobs ---
                     Job::SendWelcomeEmail { email, user_id: _ } => {
                         if let Some((db, _)) = resolver.resolve(None).await {
-                            send_email(db, vault_clone, &email, "Welcome to ApexKit!", "Thanks for signing up!").await;
+                            if let Err(e) = send_email(db, vault_clone, &email, "Welcome to ApexKit!", "Thanks for signing up!").await {
+                                eprintln!("[Job] Welcome email failed: {}", e);
+                            }
                         }
                     }
                     Job::SendPasswordReset { email, token } => {
                         if let Some((db, _)) = resolver.resolve(None).await {
                             let body = format!("Reset: http://localhost:5000/reset-password?token={}", token);
-                            send_email(db, vault_clone, &email, "Reset Password", &body).await;
+                            if let Err(e) = send_email(db, vault_clone, &email, "Reset Password", &body).await {
+                                eprintln!("[Job] Reset password email failed: {}", e);
+                            }
                         }
                     }
                     Job::SendVerification { email, token } => {
                         if let Some((db, _)) = resolver.resolve(None).await {
                             let body = format!("Verify: http://localhost:5000/verify?token={}", token);
-                            send_email(db, vault_clone, &email, "Verify Email", &body).await;
+                            if let Err(e) = send_email(db, vault_clone, &email, "Verify Email", &body).await {
+                                eprintln!("[Job] Verification email failed: {}", e);
+                            }
                         }
                     }
 
                     // --- Vector Generation ---
                     Job::GenerateEmbedding { tenant_id, collection_id, record_id, field_name, text_content, model } => {
-                        // Resolve the specific Tenant DB and Vector Provider
                         if let Some((db, vector_provider)) = resolver.resolve(tenant_id.as_deref()).await {
                             match vector_provider.embed(&text_content).await {
                                 Ok(vec) => {
-                                    // 1. Index in HNSW (Memory - Tenant Isolated)
                                     if let Err(e) = vector_provider.index(collection_id, record_id, &field_name, &vec).await {
                                         eprintln!("[Job] Failed to index vector: {}", e);
                                     }
-                                    
-                                    // 2. Persist to DB (Tenant Isolated)
                                     if let Err(e) = db.save_vector(collection_id, record_id, &field_name, vec, &model).await {
                                         eprintln!("[Job] Failed to persist vector: {}", e);
                                     }
@@ -161,8 +162,9 @@ struct SmtpSettings {
     from_email: String,
 }
 
-async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str, body: &str) {
-    let settings_val = db.get_setting("smtp").await.unwrap_or(None);
+// UPDATED: Public and returns Result
+pub async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str, body: &str) -> Result<(), String> {
+    let settings_val = db.get_config("smtp").await.unwrap_or(None);
     
     let settings: SmtpSettings = if let Some(val) = settings_val {
         serde_json::from_value(val).unwrap_or_else(|_| SmtpSettings { 
@@ -174,28 +176,21 @@ async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str,
             from_email: "".into() 
         })
     } else {
-        println!("[Mock Email] SMTP not configured. To: {}, Subject: {}", to, subject);
-        return;
+        // Return error for script usage
+        return Err("SMTP settings not configured".to_string());
     };
     
     if !settings.enabled {
-        println!("[Mock Email] SMTP is disabled. To: {}, Subject: {}", to, subject);
-        return;
+        return Err("SMTP is disabled".to_string());
     }
 
     let decrypted_password = if let Some(encrypted_str) = settings.password {
         match serde_json::from_str::<EncryptedValue>(&encrypted_str) {
             Ok(enc_val) => match vault.decrypt(&enc_val) {
                 Ok(pwd) => Some(pwd),
-                Err(e) => {
-                    eprintln!("Failed to decrypt SMTP password: {}", e);
-                    return;
-                }
+                Err(e) => return Err(format!("Failed to decrypt SMTP password: {}", e)),
             },
-            Err(e) => {
-                eprintln!("Failed to deserialize encrypted password: {}", e);
-                None 
-            }
+            Err(e) => return Err(format!("Failed to deserialize encrypted password: {}", e)),
         }
     } else {
         None
@@ -204,14 +199,14 @@ async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str,
     let from_address = format!("{} <{}>", settings.from_email, settings.from_email);
 
     let email = Message::builder()
-        .from(from_address.parse().unwrap())
-        .to(to.parse().unwrap())
+        .from(from_address.parse().map_err(|e: lettre::address::AddressError| e.to_string())?)
+        .to(to.parse().map_err(|e: lettre::address::AddressError| e.to_string())?)
         .subject(subject)
         .body(body.to_string())
-        .unwrap();
+        .map_err(|e: lettre::error::Error| e.to_string())?;
 
     let mailer = SmtpTransport::relay(&settings.host)
-        .unwrap()
+        .map_err(|e| e.to_string())?
         .port(settings.port)
         .credentials(Credentials::new(
             settings.username.unwrap_or_default(), 
@@ -220,7 +215,13 @@ async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &str,
         .build();
 
     match mailer.send(&email) {
-        Ok(_) => println!("[SMTP] Email sent to {}", to),
-        Err(e) => eprintln!("[SMTP] Could not send email: {}", e),
+        Ok(_) => {
+            println!("[SMTP] Email sent to {}", to);
+            Ok(())
+        },
+        Err(e) => {
+            eprintln!("[SMTP] Could not send email: {}", e);
+            Err(e.to_string())
+        },
     }
 }

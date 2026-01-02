@@ -147,7 +147,7 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
                     <div className="flex gap-3 text-sm text-muted-foreground p-4 bg-secondary/10 rounded-lg border border-border border-dashed">
                         <Bot className="h-5 w-5 shrink-0" />
                         <div>
-                            <p>I am your TinyBase Architect. Describe what you want to build.</p>
+                            <p>I am your ApexKit Architect. Describe what you want to build.</p>
                             {startUrl && (
                                 <div className="mt-2">
                                     <a href={startUrl} target="_blank" rel="noreferrer" className="inline-flex items-center text-primary hover:underline">

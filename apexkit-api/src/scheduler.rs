@@ -25,7 +25,7 @@ impl SchedulerService {
                 tracing::info!("Running Log Retention Cleanup...");
                 
                 // Fetch settings to get retention days
-                let general = s.db.get_setting("general").await.unwrap_or(None);
+                let general = s.db.get_config("general").await.unwrap_or(None);
                 let mut days = 7; // Default
                 if let Some(val) = general {
                     if let Some(d) = val.get("log_retention_days").and_then(|v| v.as_u64()) {
@@ -48,12 +48,12 @@ impl SchedulerService {
             // In a production grade, we would track job IDs to update them.
             
             // 2. Fetch Settings
-            // let settings_json = state.db.get_setting("backups").await.unwrap_or(None);
+            // let settings_json = state.db.get_config("backups").await.unwrap_or(None);
             // Note: In your UI, CronJobs are likely inside a general settings blob or specific key.
             // Based on previous context, let's assume they are in a 'cron' setting or part of 'general'.
             // Let's assume they are stored in a key "cron_jobs".
         
-        let cron_setting = state.db.get_setting("cron_jobs").await.unwrap_or(None);
+        let cron_setting = state.db.get_config("cron_jobs").await.unwrap_or(None);
         
         if let Some(val) = cron_setting {
             if let Ok(jobs) = serde_json::from_value::<Vec<CronJob>>(val) {

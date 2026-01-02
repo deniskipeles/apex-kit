@@ -20,7 +20,7 @@ export const SettingsPage = () => {
              </div>
              <div className="grid gap-2">
                <Label>App URL</Label>
-               <Input defaultValue="https://app.tinybase.io" />
+               <Input defaultValue="https://app.apexkit.io" />
              </div>
            </CardContent>
          </Card>

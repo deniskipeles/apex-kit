@@ -8,6 +8,7 @@ use serde::Deserialize;
 // use std::env;
 use apexkit_core::{auth, jobs::Job};
 use crate::{AppState, AppError, AuthResponse, UserDto};
+use apexkit_core::security::EncryptedValue;
 
 // --- GitHub Models ---
 #[derive(Deserialize)]
@@ -29,9 +30,14 @@ struct GithubUser {
 
 // Helper to fetch and decrypt
 async fn get_secret(state: &AppState, key: &str) -> Result<String, AppError> {
-    let enc = state.db.get_system_config(key).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?
-        .ok_or_else(|| AppError::UnknownError(format!("Configuration '{}' missing from DB", key)))?;
+    let json_opt = state.db.get_config(key).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+        
+    let json_val = json_opt.ok_or_else(|| AppError::UnknownError(format!("Configuration '{}' missing", key)))?;
+    
+    // Deserialize JSON to EncryptedValue
+    let enc: EncryptedValue = serde_json::from_value(json_val)
+        .map_err(|_| AppError::UnknownError("Invalid secret format".into()))?;
     
     state.vault.decrypt(&enc).map_err(|_| AppError::UnknownError("Decryption failed".into()))
 }
@@ -97,7 +103,7 @@ pub async fn github_callback(
             let pwd = uuid::Uuid::new_v4().to_string(); // Random pwd
             let hash = auth::hash_password(&pwd).unwrap();
             
-            let u = state.db.create_user(&email, &hash, "user").await
+            let u = state.db.create_user(&email, &hash, "user", None).await
                 .map_err(|_| AppError::UnknownError("Email already taken".into()))?;
             
             state.db.link_oauth(u.id, "github", &provider_id).await
@@ -112,7 +118,7 @@ pub async fn github_callback(
 
     Ok(Json(AuthResponse {
         token,
-        user: UserDto { id: user.id, email: user.email, role: user.role },
+        user: UserDto { id: user.id, email: user.email, role: user.role, metadata: user.metadata },
     }))
 }
 

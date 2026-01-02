@@ -75,8 +75,8 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
         <div className="flex h-16 shrink-0 items-center px-6 border-b">
            {contextType === 'root' ? (
                <div className="flex items-center gap-2">
-                   <img src={apiClient.apiUrl+"/logo?thumb=100x100"} alt="Tinybase" className="h-6 w-auto text-primary" />
-                   <span className="font-bold text-lg tracking-tight">TinyBase</span>
+                   <img src={apiClient.logoUrl} alt="ApexKit" className="h-6 w-auto text-primary" />
+                   <span className="font-bold text-lg tracking-tight">ApexKit</span>
                </div>
            ) : (
                <div className="flex flex-col w-full justify-center h-full">

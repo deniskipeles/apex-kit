@@ -377,7 +377,7 @@ impl SearchManager {
 
             // If we generated any subqueries for this term, add them to the main AND group
             if !term_subqueries.is_empty() {
-                top_level_subqueries.push((Occur::Must, Box::new(BooleanQuery::new(term_subqueries))));
+                top_level_subqueries.push((Occur::Should, Box::new(BooleanQuery::new(term_subqueries))));
             }
         }
 

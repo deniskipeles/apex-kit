@@ -1,8 +1,10 @@
-pub mod embedder;
-pub mod index;
-
 use std::sync::Arc;
 use anyhow::Result;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod embedder;
+pub mod index;
 
 // Re-export common types
 pub use embedder::{CandleEmbedder, EmbeddingModelConfig};

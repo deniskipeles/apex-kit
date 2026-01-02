@@ -37,8 +37,11 @@ pub async fn set_config(
     let encrypted = state.vault.encrypt(&payload.value)
         .map_err(|e| AppError::UnknownError(e))?;
 
+    // Note: We wrap EncryptedValue in serde_json::to_value to match signature
+    let json_val = serde_json::to_value(&encrypted).map_err(|e| AppError::UnknownError(e.to_string()))?;
+
     // 2. Store in the Context-Specific DB (Root, Tenant, or Sandbox)
-    db.set_system_config(&payload.key, &encrypted).await
+    db.set_config(&payload.key, &json_val, true).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)

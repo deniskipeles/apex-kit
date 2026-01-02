@@ -4,7 +4,7 @@ use crate::schema::CollectionSchema;
 use async_trait::async_trait;
 use libsql::{params, Builder, Connection, Database, Result, Row};
 use search::SearchManager;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::ai_models::{AiSession, Plugin};
@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::schema::FieldType;
 
 const COMPOSITE_SEPARATOR: &str = "__::__";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // --- Modules ---
 pub mod auth;
@@ -52,6 +53,9 @@ pub struct Record {
     pub data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expand: Option<Value>,
+    // [NEW] Timestamps
+    pub created: String,
+    pub updated: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -63,7 +67,6 @@ pub struct ListResult {
 // Interface for Vector Operations
 #[async_trait]
 pub trait VectorProvider: Send + Sync {
-    // FIX: Fully qualified Result to avoid clash with libsql::Result
     async fn embed(&self, text: &str) -> std::result::Result<Vec<f32>, String>;
     async fn search(&self, col_id: i64, field: &str, vec: &[f32], limit: usize) -> std::result::Result<Vec<(i64, f32)>, String>;
     async fn index(&self, col_id: i64, rec_id: i64, field: &str, vec: &[f32]) -> std::result::Result<(), String>;
@@ -90,16 +93,17 @@ pub trait Db: Send + Sync {
     async fn reindex_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
     async fn instant_search(&self, collection_id: i64, query: &str, limit: usize) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>>;
     async fn recover_indexes(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    
     // --- Search Helpers exposed for Job Worker ---
     async fn index_record_search(&self, collection_id: i64, record_id: i64, data: &Value, schema: &CollectionSchema) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
     async fn delete_record_search(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
 
     // --- Users (Auth) ---
-    async fn create_user(&self, email: &str, password_hash: &str, role: &str) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>>;
+    // [UPDATED] Added metadata argument
+    async fn create_user(&self, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>>;
     async fn get_user_by_email(&self, email: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>>;
     async fn list_users(&self, query: Option<String>, limit: i64, offset: i64) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>>;
     async fn count_users(&self, query: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
-    // Batch fetch for GraphQL Dataloader
     async fn get_users_by_ids(&self, ids: &[i64]) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>>;
     async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -118,13 +122,10 @@ pub trait Db: Send + Sync {
     async fn set_user_verified(&self, user_id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     // --- Secure Config ---
-    async fn set_system_config(&self, key: &str, value: &security::EncryptedValue) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_system_config(&self, key: &str) -> std::result::Result<Option<security::EncryptedValue>, Box<dyn std::error::Error + Send + Sync>>;
-
-    // --- Settings (Robust JSON) ---
-    async fn get_setting(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn save_setting(&self, key: &str, value: serde_json::Value, encrypt: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
+    // --- Unified Configuration (System Secrets & App Settings) ---
+    async fn get_config(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn set_config(&self, key: &str, value: &serde_json::Value, encrypted: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    
     // --- Audit Logs ---
     async fn log_audit_event(&self, level: &str, message: &str, source: &str, meta: Option<serde_json::Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn list_audit_logs(&self) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>;
@@ -170,13 +171,10 @@ pub trait Db: Send + Sync {
     async fn get_dashboard_stats(&self) -> std::result::Result<DashboardData, Box<dyn std::error::Error + Send + Sync>>;
 
     // VECTORS
-    // Retrieve all vectors for a collection (for HNSW reload on startup)
     async fn get_vectors_for_collection(&self, collection_id: i64, model: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>>;
 
     async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>>;
-    // Save vector to persistence layer (used by job worker)
     async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>, model: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
-    // Check if vector exists
     async fn has_vector(&self, collection_id: i64, record_id: i64, field_name: &str, model: &str) -> std::result::Result<bool, Box<dyn StdError + Send + Sync>>;
 }
 
@@ -186,7 +184,7 @@ fn row_to_collection(row: &Row) -> std::result::Result<Collection, Box<dyn std::
     Ok(Collection { id: row.get(0)?, name: row.get(1)?, schema })
 }
 
-// OPTIMIZED row_to_record
+// [UPDATED] row_to_record to handle new timestamp columns
 fn row_to_record(
     row: &Row,
 ) -> std::result::Result<Record, Box<dyn std::error::Error + Send + Sync>> {
@@ -212,7 +210,11 @@ fn row_to_record(
         None
     };
 
-    Ok(Record { id, data, expand })
+    // [NEW] Columns 3 & 4: Timestamps
+    let created: String = row.get(3).unwrap_or_else(|_| "".to_string());
+    let updated: String = row.get(4).unwrap_or_else(|_| "".to_string());
+
+    Ok(Record { id, data, expand, created, updated })
 }
 
 // --- The Orchestrator: ApexKit ---
@@ -231,10 +233,7 @@ pub struct ApexKit {
     vector_batcher: batching::WriteManager,
 
     search: Arc<SearchManager>,
-    // Embedding Service
     pub embedder: Arc<embeddings::EmbedderService>,
-    // Abstract interface for vectors
-    // Core doesn't know about Candle, it just knows "VectorProvider"
     pub vector_provider: Arc<dyn VectorProvider>, 
 }
 
@@ -267,7 +266,6 @@ impl ApexKit {
     }
 
     /// Factory method to initialize a ApexKit instance from a specific folder path.
-    /// This handles connection opening and Schema Migration automatically.
     pub async fn init_filesystem(
         base_path: &str, 
         vector_provider: Arc<dyn VectorProvider>
@@ -293,7 +291,6 @@ impl ApexKit {
         apply_pragmas(&vec).await?;
 
         // 4. Run Migrations (Create Tables if not exist)
-        // These use the internal private setup_* functions in this file
         setup_core(&core).await?;
         setup_data(&data).await?;
         setup_logs(&log).await?;
@@ -311,7 +308,6 @@ impl ApexKit {
         ))
     }
 
-    // Add setter for SearchManager (used by TenantManager)
     pub fn set_search_manager(&mut self, manager: Arc<SearchManager>) {
         self.search = manager;
     }
@@ -394,42 +390,36 @@ impl ApexKit {
             _ => return Ok(()),
         };
 
-        // 1. Build Expansion Tree: ["comments.commented_by"] -> { "comments": ["commented_by"] }
         let tree = crate::query::build_expand_tree(expand_str);
 
-        // 2. Normalize Root Records into ExpandableItems
         let mut root_items: Vec<ExpandableItem> = records.iter_mut()
             .map(|r| ExpandableItem { data: &r.data, expand: &mut r.expand })
             .collect();
 
-        // 3. Start Recursive Hydration
         self.hydrate_owners_recursive(&mut root_items, collection_id, &tree).await?;
 
         Ok(())
     }
 
-    // NEW: Recursive Helper
+    // Recursive Helper
     fn hydrate_owners_recursive<'a>(
         &'a self,
-        items: &'a mut Vec<ExpandableItem<'a>>, // List of items at this level
+        items: &'a mut Vec<ExpandableItem<'a>>, 
         collection_id: i64,
-        tree: &'a HashMap<String, Vec<String>> // Expansion requests for this level
+        tree: &'a HashMap<String, Vec<String>>
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
         Box::pin(async move {
             if items.is_empty() || tree.is_empty() { return Ok(()); }
 
-            // A. Get Schema
             let col = match self.get_collection(collection_id).await? {
                 Some(c) => c,
                 None => return Ok(()),
             };
             let schema = col.schema.unwrap_or_default();
             
-            // B. Identify Fields for this level
             let mut owner_fields = Vec::new();
-            let mut relation_fields = Vec::new(); // (field_name, target_collection_id)
+            let mut relation_fields = Vec::new(); 
 
-            // Resolve target collections for relations
             let all_collections = self.list_collections().await?;
             let col_map: HashMap<String, i64> = all_collections.iter().map(|c| (c.name.clone(), c.id)).collect();
             let id_map: HashMap<String, i64> = all_collections.iter().map(|c| (c.id.to_string(), c.id)).collect();
@@ -441,17 +431,12 @@ impl ApexKit {
                     }
                 }
                 
-                // Check if it's a relation to recurse into
-                // Logic adapted from query.rs to find target collection
                 let mut target_col_id = None;
                 
                 if let Some(rel_def) = schema.relations.get(field_name) {
-                    // Forward Relation
                     let target = &rel_def.target_collection;
                     target_col_id = col_map.get(target).or_else(|| id_map.get(target)).cloned();
                 } else if let Some(target_id) = col_map.get(field_name) {
-                    // Reverse Relation (usually field name matches target collection name)
-                    // We optimistically check if there's a collection with this name
                     target_col_id = Some(*target_id);
                 }
 
@@ -462,7 +447,6 @@ impl ApexKit {
 
             // --- PHASE 1: HYDRATE OWNERS (CURRENT LEVEL) ---
             if !owner_fields.is_empty() {
-                 // Ensure expand object exists
                 for item in items.iter_mut() {
                     if item.expand.is_none() {
                         *item.expand = Some(serde_json::json!({}));
@@ -497,7 +481,8 @@ impl ApexKit {
                                             updates.push(((*field).clone(), serde_json::json!({
                                                 "id": user.id,
                                                 "email": user.email,
-                                                "role": user.role
+                                                "role": user.role,
+                                                "metadata": user.metadata
                                             })));
                                         }
                                     }
@@ -512,81 +497,6 @@ impl ApexKit {
             }
 
             // --- PHASE 2: RECURSE INTO RELATIONS ---
-            for (rel_name, _target_id, sub_paths_list) in &relation_fields {
-                if sub_paths_list.is_empty() { continue; }
-                
-                // Build subtree for next level
-                let sub_tree = crate::query::build_expand_tree_from_list(sub_paths_list);
-                if sub_tree.is_empty() { continue; }
-
-                // Gather all child items across all parent items
-                // Structure: parent.expand[rel_name] is Array of Objects
-                // Each Object is { "data": ..., "expand": ... }
-                // We need to construct `ExpandableItem`s pointing to these inner fields
-                
-                // We have to split this into two steps to avoid mutable borrow conflict.
-                // 1. Collect references? No, cannot collect mutable refs easily across iterator.
-                // We must iterate and recurse within the loop or collect a list of pointers.
-                // Rust makes "collecting mutable pointers to children" hard.
-                
-                // Strategy: Iterate parents, get mutable reference to list, iterate list, recurse?
-                // No, async recursion in loop is fine.
-                
-                // Problem: `items` is already borrowed mutably.
-                // We can iterate `items` and collect `&mut Value` of children.
-                
-                let _child_expandables: Vec<ExpandableItem> = Vec::new();
-                
-                for item in items.iter_mut() {
-                    if let Some(expand_val) = item.expand {
-                         if let Some(rel_data) = expand_val.get_mut(rel_name) {
-                             // This is likely an Array of Records (from JSON SQL)
-                             if let Some(arr) = rel_data.as_array_mut() {
-                                 for child_rec_json in arr {
-                                     // Child record structure from SQL: { "id":..., "data": {...}, "expand": {...} }
-                                     // We need to point to "data" and "expand" inside this object.
-                                     // We can't take two &mut from the same object easily in one go safely without split_at_mut tricks or raw pointers, 
-                                     // OR we can rely on `serde_json::Value` being dynamic.
-                                     
-                                     // Hack: We can't construct ExpandableItem easily with two mut refs to same parent object.
-                                     // Wait, `ExpandableItem` takes `&Value` for data (immutable) and `&mut Option<Value>` for expand.
-                                     // `child_rec_json` owns both.
-                                     
-                                     // We need to extract them safely.
-                                     // `child_rec_json` is `Value::Object`.
-                                     
-                                     if let Some(_child_obj) = child_rec_json.as_object_mut() {
-                                         // We need to borrow `data` immutably and `expand` mutably.
-                                         // Rust won't let us borrow `child_obj` twice.
-                                         // Workaround: Temporarily take `data` out? No.
-                                         // Workaround: Use raw pointers? Unsafe.
-                                         
-                                         // Safe Workaround: 
-                                         // Since we only READ data to find IDs, and WRITE expand to store Users.
-                                         // We can just pass the whole `child_rec_json` to a slightly different recursive helper?
-                                         // Or refactor `ExpandableItem`?
-                                         
-                                         // Let's refactor: The recursive function receives `&mut [Value]` where each Value is the {id, data, expand} object.
-                                         // It parses it internally.
-                                         
-                                         // Let's modify logic to assume `ExpandableItem` wraps the *Container* (the record object itself).
-                                         // But root records are struct `Record`, children are `Value`.
-                                         // That's the mismatch.
-                                     }
-                                 }
-                             } else if rel_data.is_object() {
-                                 // Single relation
-                                 // Same logic
-                             }
-                         }
-                    }
-                }
-            }
-            
-            // To fix the borrow checker/structure mismatch:
-            // I will implement the recursion logic specifically for `Value` (JSON) objects below.
-            // And calling it from here for the children.
-            
             for (rel_name, target_id, sub_paths_list) in relation_fields {
                 let sub_tree = crate::query::build_expand_tree_from_list(sub_paths_list);
                 if sub_tree.is_empty() { continue; }
@@ -595,12 +505,8 @@ impl ApexKit {
                     if let Some(expand_val) = item.expand {
                         if let Some(rel_val) = expand_val.get_mut(rel_name) {
                             if let Some(arr) = rel_val.as_array_mut() {
-                                // Recursion for Array
                                 self.hydrate_json_values_recursive(arr, target_id, &sub_tree).await?;
                             } else if rel_val.is_object() {
-                                // Recursion for Single Object
-                                let _single = vec![rel_val.clone()]; // Clone to put in vec? expensive.
-                                // Actually `rel_val` is `&mut Value`.
                                 let slice = std::slice::from_mut(rel_val);
                                 self.hydrate_json_values_recursive(slice, target_id, &sub_tree).await?;
                             }
@@ -616,22 +522,16 @@ impl ApexKit {
     // Helper for Nested JSON Arrays (recursive)
     fn hydrate_json_values_recursive<'a>(
         &'a self,
-        json_records: &'a mut [Value], // These are { "id":.., "data":.., "expand":.. } objects
+        json_records: &'a mut [Value], 
         collection_id: i64,
         tree: &'a HashMap<String, Vec<String>>
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
         Box::pin(async move {
-            // Convert JSON objects to ExpandableItems on the fly
-            // We can't create ExpandableItem references easily here due to splitting borrows.
-            // So we implement the logic directly for this structure.
-            
             if json_records.is_empty() { return Ok(()); }
             
-            // A. Get Schema
             let col = match self.get_collection(collection_id).await? { Some(c) => c, None => return Ok(()), };
             let schema = col.schema.unwrap_or_default();
 
-            // ... (Same field identification logic as above) ...
             let mut owner_fields = Vec::new();
             let mut relation_fields = Vec::new();
             let all_collections = self.list_collections().await?;
@@ -651,11 +551,9 @@ impl ApexKit {
                 if let Some(tid) = target_col_id { relation_fields.push((field_name, tid, sub_paths)); }
             }
 
-            // Phase 1: Owners
             if !owner_fields.is_empty() {
                 let mut user_ids = std::collections::HashSet::new();
                 for rec in json_records.iter() {
-                    // Access "data" field
                     if let Some(data) = rec.get("data") {
                         for field in &owner_fields {
                             if let Some(val) = data.get(*field) {
@@ -679,7 +577,12 @@ impl ApexKit {
                                      let uid_opt = val.as_i64().or_else(|| val.as_str().and_then(|s| s.parse::<i64>().ok()));
                                      if let Some(uid) = uid_opt {
                                         if let Some(user) = user_map.get(&uid) {
-                                            updates.push(((*field).clone(), serde_json::json!({ "id": user.id, "email": user.email, "role": user.role })));
+                                            updates.push(((*field).clone(), serde_json::json!({ 
+                                                "id": user.id, 
+                                                "email": user.email, 
+                                                "role": user.role,
+                                                "metadata": user.metadata
+                                            })));
                                         }
                                      }
                                 }
@@ -687,7 +590,6 @@ impl ApexKit {
                          }
                          
                          if !updates.is_empty() {
-                             // Access/Init "expand" field on record object
                              if rec.get("expand").is_none() || rec.get("expand").unwrap().is_null() {
                                  if let Some(obj) = rec.as_object_mut() {
                                      obj.insert("expand".to_string(), serde_json::json!({}));
@@ -701,7 +603,6 @@ impl ApexKit {
                 }
             }
 
-            // Phase 2: Recursion
             for (rel_name, target_id, sub_paths_list) in relation_fields {
                  let sub_tree = crate::query::build_expand_tree_from_list(sub_paths_list);
                  if sub_tree.is_empty() { continue; }
@@ -749,6 +650,7 @@ async fn check_conflict(conn: &Connection, key: &str, val: &str, current_rec_id:
 }
 
 async fn enforce_uniqueness(conn: &Connection, col_id: i64, record_id: Option<i64>, data: &Value, schema: &CollectionSchema) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 1. Check Standard Fields
     for (name, def) in &schema.fields {
         if def.unique.unwrap_or(false) {
             if let Some(val) = data.get(name) {
@@ -759,20 +661,52 @@ async fn enforce_uniqueness(conn: &Connection, col_id: i64, record_id: Option<i6
             }
         }
     }
+
+    // 2. Check Relations (One-to-One)
+    for (name, def) in &schema.relations {
+        if def.relation_type == crate::schema::RelationType::One {
+            if let Some(val) = data.get(name) {
+                if val.is_null() { continue; }
+                let val_str = serialize_unique_val(val);
+                let index_key = format!("{}-{}", col_id, def.uid);
+                check_conflict(conn, &index_key, &val_str, record_id, &format!("Relation '{}'", name)).await?;
+            }
+        }
+    }
+
+    // 3. Check Composite Keys
     for field_group in &schema.composite_unique {
         let mut composite_uids = Vec::new();
         let mut composite_values = Vec::new();
         let mut missing_data = false;
+
         for field_name in field_group {
-            if let Some(def) = schema.fields.get(field_name) {
-                composite_uids.push(def.uid.clone());
+            // FIX: Check BOTH fields AND relations
+            let uid_opt = if let Some(def) = schema.fields.get(field_name) {
+                Some(def.uid.clone())
+            } else if let Some(rel) = schema.relations.get(field_name) {
+                Some(rel.uid.clone())
+            } else {
+                None
+            };
+
+            if let Some(uid) = uid_opt {
+                composite_uids.push(uid);
                 if let Some(val) = data.get(field_name) {
                     if val.is_null() { missing_data = true; break; }
                     composite_values.push(serialize_unique_val(val));
-                } else { missing_data = true; break; }
+                } else { 
+                    missing_data = true; 
+                    break; 
+                }
+            } else {
+                missing_data = true;
+                break;
             }
         }
+        
         if missing_data { continue; }
+        
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         for (i, uid) in composite_uids.iter().enumerate() { map.insert(uid.clone(), composite_values[i].clone()); }
         let sorted_uids: Vec<&String> = map.keys().collect();
@@ -784,34 +718,92 @@ async fn enforce_uniqueness(conn: &Connection, col_id: i64, record_id: Option<i6
     Ok(())
 }
 
-async fn commit_uniqueness(batcher: &batching::WriteManager, col_id: i64, record_id: i64, data: &Value, schema: &CollectionSchema) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    batcher.execute("DELETE FROM _unique_values WHERE record_id = ?1".into(), vec![record_id.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+async fn commit_uniqueness(
+    batcher: &batching::WriteManager, 
+    col_id: i64, 
+    record_id: i64, 
+    data: &Value, 
+    schema: &CollectionSchema
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    
+    // 1. Cleanup old unique values for this record
+    batcher.execute(
+        "DELETE FROM _unique_values WHERE record_id = ?1".into(), 
+        vec![record_id.into()]
+    ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+
+    // 2. Handle Single Field Unique Constraints
     for (name, def) in &schema.fields {
         if def.unique.unwrap_or(false) {
             if let Some(val) = data.get(name) {
                 if !val.is_null() {
                     let index_key = format!("{}-{}", col_id, def.uid);
                     let val_str = serialize_unique_val(val);
-                    batcher.execute("INSERT INTO _unique_values (index_key, value, record_id) VALUES (?1, ?2, ?3)".into(), vec![index_key.into(), val_str.into(), record_id.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+                    batcher.execute(
+                        "INSERT INTO _unique_values (index_key, value, record_id) VALUES (?1, ?2, ?3)".into(), 
+                        vec![index_key.into(), val_str.into(), record_id.into()]
+                    ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
                 }
             }
         }
     }
+
+    // 3. Handle Single Relation Unique Constraints (One-to-One)
+    for (name, def) in &schema.relations {
+        if def.relation_type == crate::schema::RelationType::One {
+            if let Some(val) = data.get(name) {
+                if !val.is_null() {
+                    let index_key = format!("{}-{}", col_id, def.uid);
+                    let val_str = serialize_unique_val(val);
+                    batcher.execute(
+                        "INSERT INTO _unique_values (index_key, value, record_id) VALUES (?1, ?2, ?3)".into(), 
+                        vec![index_key.into(), val_str.into(), record_id.into()]
+                    ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+                }
+            }
+        }
+    }
+
+    // 4. Handle Composite Unique Constraints
     for field_group in &schema.composite_unique {
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         let mut missing = false;
+
         for field_name in field_group {
-            if let Some(def) = schema.fields.get(field_name) {
+            // FIX: Check BOTH fields AND relations
+            let uid_opt = if let Some(def) = schema.fields.get(field_name) {
+                Some(def.uid.clone())
+            } else if let Some(rel) = schema.relations.get(field_name) {
+                Some(rel.uid.clone())
+            } else {
+                None
+            };
+
+            if let Some(uid) = uid_opt {
                 if let Some(val) = data.get(field_name) {
                     if val.is_null() { missing = true; break; }
-                    map.insert(def.uid.clone(), serialize_unique_val(val));
-                } else { missing = true; break; }
+                    map.insert(uid, serialize_unique_val(val));
+                } else { 
+                    missing = true; 
+                    break; 
+                }
+            } else {
+                missing = true;
+                break;
             }
         }
+        
         if !missing {
-            let index_key = format!("{}-{}", col_id, map.keys().cloned().collect::<Vec<_>>().join("-"));
-            let value_str = map.values().cloned().collect::<Vec<_>>().join(COMPOSITE_SEPARATOR);
-            batcher.execute("INSERT INTO _unique_values (index_key, value, record_id) VALUES (?1, ?2, ?3)".into(), vec![index_key.into(), value_str.into(), record_id.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            let sorted_uids: Vec<&String> = map.keys().collect();
+            let sorted_vals: Vec<&String> = map.values().collect();
+            
+            let index_key = format!("{}-{}", col_id, sorted_uids.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join("-"));
+            let value_str = sorted_vals.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(COMPOSITE_SEPARATOR);
+            
+            batcher.execute(
+                "INSERT INTO _unique_values (index_key, value, record_id) VALUES (?1, ?2, ?3)".into(), 
+                vec![index_key.into(), value_str.into(), record_id.into()]
+            ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         }
     }
     Ok(())
@@ -868,27 +860,20 @@ impl Db for ApexKit {
         let col = self.get_collection(collection_id).await?.ok_or("Collection not found")?;
         let schema = col.schema.unwrap_or_default();
         
-        // 1. Serialization (Do once)
         let json_str = serde_json::to_string(data)?;
 
-        // 2. Logic Checks (Must block)
         enforce_uniqueness(&conn, collection_id, None, data, &schema).await?;
 
-        // 3. Batcher INSERT (Fast)
+        // [UPDATED] Uses defaults for created/updated
         let record_id = self.data_batcher.insert(
             "INSERT INTO records (collection_id, data) VALUES (?1, jsonb(?2))".into(),
-            vec![collection_id.into(), json_str.into()] // Pass pre-serialized string
+            vec![collection_id.into(), json_str.into()]
         ).await?;
         
-        // 4. Post-Process (Parallelize)
-        // We can run uniqueness commitment and relation syncing concurrently
         let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, data, &schema);
         let relation_future = self.sync_relations(&conn, collection_id, record_id, data);
 
-        // Wait for both, but let them run in parallel
         tokio::try_join!(unique_future, relation_future)?;
-
-        // NOTE: Search Indexing is now handled by the API Layer via JobQueue (Async)
         
         Ok(record_id)
     }
@@ -899,7 +884,6 @@ impl Db for ApexKit {
         let schema = col.schema.unwrap_or_default();
         let existing = self.get_record(collection_id, record_id, None).await?.ok_or("Rec not found")?;
         
-        // 1. Data Merging
         let mut merged_data = existing.data.clone();
         if let Some(obj) = merged_data.as_object_mut() {
             if let Some(new_obj) = data.as_object() {
@@ -907,68 +891,56 @@ impl Db for ApexKit {
             }
         }
         
-        // 2. Serialization
         let json_str = serde_json::to_string(&merged_data)?;
 
-        // 3. Constraints
         enforce_uniqueness(&conn, collection_id, Some(record_id), &merged_data, &schema).await?;
 
-        // 4. Update (Fast)
+        // [UPDATED] Set updated = CURRENT_TIMESTAMP
         self.data_batcher.execute(
-            "UPDATE records SET data = jsonb(?1) WHERE collection_id = ?2 AND id = ?3".into(), 
+            "UPDATE records SET data = jsonb(?1), updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND id = ?3".into(), 
             vec![json_str.into(), collection_id.into(), record_id.into()]
         ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         
-        // 5. Post-Process (Parallelize)
         let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, &merged_data, &schema);
         let relation_future = self.sync_relations(&conn, collection_id, record_id, &merged_data);
         
         tokio::try_join!(unique_future, relation_future)?;
         
-        // NOTE: Search Indexing is now handled by the API Layer via JobQueue (Async)
-        
-        Ok(Record { id: record_id, data: merged_data, expand: serde_json::json!({}).into() })
+        Ok(Record { 
+            id: record_id, 
+            data: merged_data, 
+            expand: serde_json::json!({}).into(),
+            created: existing.created,
+            updated: chrono::Utc::now().to_rfc3339() // Optimistic update
+        })
     }
 
     async fn delete_record(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let map_err = |e: String| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
         };
-
-        // 1. Parallelize Deletions
-        // Instead of waiting for one SQL execute to finish before sending the next,
-        // we fire all of them at the batcher simultaneously. 
-        // The batcher queue will handle serialization, but we don't pay the round-trip latency cost 5 times.
         
         let f1 = self.data_batcher.execute(
             "DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(), 
             vec![collection_id.into(), record_id.into()]
         );
-        
         let f2 = self.data_batcher.execute(
             "DELETE FROM _unique_values WHERE record_id = ?1".into(), 
             vec![record_id.into()]
         );
-        
         let f3 = self.data_batcher.execute(
             "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(), 
             vec![collection_id.into(), record_id.into()]
         );
-        
         let f4 = self.data_batcher.execute(
             "DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id=?2".into(), 
             vec![collection_id.into(), record_id.into()]
         );
-        
-        // Vectors are in a different DB file (different batcher), so it runs perfectly in parallel
         let f5 = self.vector_batcher.execute(
             "DELETE FROM vectors WHERE collection_id = ?1 AND record_id = ?2".into(),
             vec![collection_id.into(), record_id.into()]
         );
 
-        // 2. Await all
-        // We define Search deletion as non-critical here (handled by API job), 
-        // but if we did it here, we'd add it to the join.
         let _ = tokio::try_join!(f1, f2, f3, f4).map_err(map_err)?;
         let _ = f5.await.map_err(map_err)?;
 
@@ -977,7 +949,6 @@ impl Db for ApexKit {
 
     // --- Implement New Trait Methods ---
     async fn index_record_search(&self, collection_id: i64, record_id: i64, data: &Value, schema: &CollectionSchema) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
-        // This is now called by the Background Worker
         self.search.index_record(collection_id, record_id, data, schema).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn StdError + Send + Sync>)
     }
 
@@ -988,12 +959,10 @@ impl Db for ApexKit {
     async fn list_records(&self, collection_id: i64, options: QueryOptions) -> std::result::Result<ListResult, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_data()?;
         
-        // 1. Prepare Schema Maps for Expansion Logic
         let mut schema_map = HashMap::new();
         let mut id_map = HashMap::new();
         let mut current_col_name = String::new();
 
-        // Only fetch schemas if expansion is requested
         if let Some(ref ex) = options.expand {
             if !ex.trim().is_empty() {
                 let all_cols = self.list_collections().await?;
@@ -1009,35 +978,25 @@ impl Db for ApexKit {
             }
         }
         
-        // Fallback: If name not found (no expand or collection fetch skipped), fetch just this one
         if current_col_name.is_empty() {
              if let Some(c) = self.get_collection(collection_id).await? {
                  current_col_name = c.name;
              } else {
-                 // Collection doesn't exist
                  return Ok(ListResult { items: vec![], total: 0 });
              }
         }
 
-        // 2. Use SqlBuilder to construct the query
-        // This builder uses `build_expand_json_object` internally to create the 3rd column
         let builder = query::SqlBuilder::new(collection_id, &current_col_name, options.clone(), &schema_map, &id_map);
         
-        // 3. Count Query
         let mut count_rows = conn.query(&builder.count_sql, builder.params.clone()).await?;
-        let total = if let Some(row) = count_rows.next().await? {
-            row.get::<i64>(0)?
-        } else { 0 };
+        let total = if let Some(row) = count_rows.next().await? { row.get::<i64>(0)? } else { 0 };
 
-        // 4. Main Data Query
         let mut rows = conn.query(&builder.base_sql, builder.params).await?;
         let mut records = Vec::new();
         while let Some(row) = rows.next().await? { 
-            // row_to_record expects: [0]=id, [1]=data, [2]=expand
             records.push(row_to_record(&row)?); 
         }
         
-        // 5. Hydrate Owner Fields (Application Layer Join)
         self.populate_owners_in_memory(&mut records, collection_id, options.expand.as_ref()).await?;
 
         Ok(ListResult { items: records, total })
@@ -1047,17 +1006,13 @@ impl Db for ApexKit {
         let conn = self.get_data()?;
         
         let mut record_opt = if expand.is_none() || expand.as_ref().unwrap().trim().is_empty() {
-            // Optimization: Simple Select if no expand
-            // We pass NULL as the 3rd column (expand) to satisfy row_to_record
             let mut rows = conn.query(
-                "SELECT id, json(data), NULL FROM records WHERE collection_id = ?1 AND id = ?2", 
+                "SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2", 
                 params![collection_id, record_id]
             ).await?;
             match rows.next().await? { Some(row) => Some(row_to_record(&row)?), None => None }
         } else {
             let expand_str = expand.clone().unwrap();
-            
-            // 1. Prepare Maps
             let all_cols = self.list_collections().await?;
             let mut schema_map = HashMap::new(); 
             let mut id_map = HashMap::new(); 
@@ -1073,23 +1028,13 @@ impl Db for ApexKit {
                 id_map.insert(c.id.to_string(), c.id);
             }
 
-            // 2. Build Expansion SQL Segment
-            // We use the helper directly since we aren't using SqlBuilder (which adds WHERE/LIMIT stuff we don't need for single ID)
             let paths = crate::query::smart_split(&expand_str);
             let expand_json_sql = crate::query::build_expand_json_object(
-                paths, 
-                "records", 
-                0, 
-                &current_col_name, 
-                collection_id, 
-                &schema_map, 
-                &id_map
+                paths, "records", 0, &current_col_name, collection_id, &schema_map, &id_map
             );
 
-            // 3. Construct Full Query
-            // Columns: id, data, expand
             let sql = format!(
-                "SELECT id, json(data), {} FROM records WHERE collection_id = ?1 AND id = ?2", 
+                "SELECT id, json(data), {}, created, updated FROM records WHERE collection_id = ?1 AND id = ?2", 
                 expand_json_sql
             );
             
@@ -1097,11 +1042,9 @@ impl Db for ApexKit {
             match rows.next().await? { Some(row) => Some(row_to_record(&row)?), None => None }
         };
 
-        // 4. Hydrate Owner Fields (Application Layer Join)
         if let Some(rec) = &mut record_opt {
              let mut single_vec = vec![rec.clone()];
              self.populate_owners_in_memory(&mut single_vec, collection_id, expand.as_ref()).await?;
-             // Update the record with hydrated data
              *rec = single_vec.pop().unwrap();
         }
 
@@ -1113,7 +1056,7 @@ impl Db for ApexKit {
         let ids = self.search.search(collection_id, query, 50)?;
         if ids.is_empty() { return Ok(vec![]); }
         let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id, json(data) FROM records WHERE id IN ({})", id_list);
+        let sql = format!("SELECT id, json(data), NULL, created, updated FROM records WHERE id IN ({})", id_list);
         let conn = self.get_data()?;
         let mut rows = conn.query(&sql, ()).await?;
         let mut records = Vec::new();
@@ -1203,18 +1146,14 @@ impl Db for ApexKit {
         
         if !schema.fields.values().any(|f| f.indexed) { return Ok(()); }
         
-        // 1. Reset Index
         self.search.delete_index(id).map_err(|e| format!("Search Delete Error: {}", e))?; 
         self.search.load_index(id, &schema).map_err(|e| format!("Search Load Error: {}", e))?;
         
         let conn = self.get_data().map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
-        
-        // 2. Stream records
-        let mut rows = conn.query("SELECT id, json(data) FROM records WHERE collection_id = ?1", params![id])
+        let mut rows = conn.query("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1", params![id])
             .await
             .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
             
-        // 3. Batching Strategy
         let mut buffer: Vec<(i64, serde_json::Value)> = Vec::with_capacity(1000);
         let batch_size = 1000;
 
@@ -1223,13 +1162,11 @@ impl Db for ApexKit {
             buffer.push((record.id, record.data));
 
             if buffer.len() >= batch_size {
-                // Flush buffer to Tantivy
                 self.search.index_batch(id, &buffer, &schema).map_err(|e| format!("Indexing Error: {}", e))?;
                 buffer.clear();
             }
         }
 
-        // 4. Flush remaining items
         if !buffer.is_empty() {
             self.search.index_batch(id, &buffer, &schema).map_err(|e| format!("Indexing Error: {}", e))?;
         }
@@ -1248,33 +1185,58 @@ impl Db for ApexKit {
     }
 
     // --- Core DB (Users, Auth, Settings) ---
-    async fn create_user(&self, e: &str, p: &str, r: &str) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> {
+    async fn create_user(&self, e: &str, p: &str, r: &str, metadata: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
-        conn.execute("INSERT INTO users (email, password_hash, role) VALUES (?1, ?2, ?3)", params![e, p, r]).await?;
-        Ok(User { id: conn.last_insert_rowid(), email: e.into(), password_hash: p.into(), role: r.into() })
+        let meta = metadata.unwrap_or(json!({}));
+        let meta_str = serde_json::to_string(&meta)?;
+        conn.execute("INSERT INTO users (email, password_hash, role, metadata) VALUES (?1, ?2, ?3, ?4)", params![e, p, r, meta_str]).await?;
+        Ok(User { 
+            id: conn.last_insert_rowid(), 
+            email: e.into(), 
+            password_hash: p.into(), 
+            role: r.into(), 
+            metadata: Some(meta) 
+        })
     }
+
     async fn get_user_by_email(&self, email: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
-        let mut r = conn.query("SELECT id, email, password_hash, role FROM users WHERE email = ?1", params![email]).await?;
-        if let Some(row) = r.next().await? { Ok(Some(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)? })) } else { Ok(None) }
+        let mut r = conn.query("SELECT id, email, password_hash, role, metadata FROM users WHERE email = ?1", params![email]).await?;
+        if let Some(row) = r.next().await? { 
+            let meta_str: String = row.get(4).unwrap_or("{}".to_string());
+            Ok(Some(User { 
+                id: row.get(0)?, 
+                email: row.get(1)?, 
+                password_hash: row.get(2)?, 
+                role: row.get(3)?,
+                metadata: serde_json::from_str(&meta_str).ok()
+            })) 
+        } else { Ok(None) }
     }
+
     async fn list_users(&self, query: Option<String>, limit: i64, offset: i64) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
         let sql = if let Some(q) = query {
-            // Simple LIKE search on email
-            format!("SELECT id, email, password_hash, role FROM users WHERE email LIKE '%{}%' ORDER BY id DESC LIMIT {} OFFSET {}", q, limit, offset)
+            format!("SELECT id, email, password_hash, role, metadata FROM users WHERE email LIKE '%{}%' ORDER BY id DESC LIMIT {} OFFSET {}", q, limit, offset)
         } else {
-            format!("SELECT id, email, password_hash, role FROM users ORDER BY id DESC LIMIT {} OFFSET {}", limit, offset)
+            format!("SELECT id, email, password_hash, role, metadata FROM users ORDER BY id DESC LIMIT {} OFFSET {}", limit, offset)
         };
         
         let mut rows = conn.query(&sql, ()).await?;
         let mut users = Vec::new();
         while let Some(row) = rows.next().await? { 
-            users.push(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)? }); 
+            let meta_str: String = row.get(4).unwrap_or("{}".to_string());
+            users.push(User { 
+                id: row.get(0)?, 
+                email: row.get(1)?, 
+                password_hash: row.get(2)?, 
+                role: row.get(3)?,
+                metadata: serde_json::from_str(&meta_str).ok()
+            }); 
         }
         Ok(users)
     }
-    // IMPLEMENTATION: count_users
+
     async fn count_users(&self, query: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
         let sql = if let Some(q) = query {
@@ -1285,25 +1247,42 @@ impl Db for ApexKit {
         let mut row = conn.query(&sql, ()).await?;
         if let Some(r) = row.next().await? { Ok(r.get(0)?) } else { Ok(0) }
     }
-    // IMPLEMENTATION: get_users_by_ids
+
     async fn get_users_by_ids(&self, ids: &[i64]) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
         if ids.is_empty() { return Ok(vec![]); }
         let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id, email, password_hash, role FROM users WHERE id IN ({})", id_list);
+        let sql = format!("SELECT id, email, password_hash, role, metadata FROM users WHERE id IN ({})", id_list);
         
         let conn = self.get_core()?;
         let mut rows = conn.query(&sql, ()).await?;
         let mut users = Vec::new();
         while let Some(row) = rows.next().await? { 
-            users.push(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)? }); 
+            let meta_str: String = row.get(4).unwrap_or("{}".to_string());
+            users.push(User { 
+                id: row.get(0)?, 
+                email: row.get(1)?, 
+                password_hash: row.get(2)?, 
+                role: row.get(3)?,
+                metadata: serde_json::from_str(&meta_str).ok()
+            }); 
         }
         Ok(users)
     }
+
     async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core()?.execute("DELETE FROM users WHERE id = ?1", params![id]).await?; Ok(()) }
     async fn get_user_by_oauth(&self, p: &str, pid: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
-        let mut r = conn.query("SELECT u.id, u.email, u.password_hash, u.role FROM users u JOIN auth_identities ai ON u.id = ai.user_id WHERE ai.provider = ?1 AND ai.provider_id = ?2", params![p, pid]).await?;
-        if let Some(row) = r.next().await? { Ok(Some(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)? })) } else { Ok(None) }
+        let mut r = conn.query("SELECT u.id, u.email, u.password_hash, u.role, u.metadata FROM users u JOIN auth_identities ai ON u.id = ai.user_id WHERE ai.provider = ?1 AND ai.provider_id = ?2", params![p, pid]).await?;
+        if let Some(row) = r.next().await? { 
+            let meta_str: String = row.get(4).unwrap_or("{}".to_string());
+            Ok(Some(User { 
+                id: row.get(0)?, 
+                email: row.get(1)?, 
+                password_hash: row.get(2)?, 
+                role: row.get(3)?,
+                metadata: serde_json::from_str(&meta_str).ok()
+            })) 
+        } else { Ok(None) }
     }
     async fn link_oauth(&self, uid: i64, p: &str, pid: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core()?.execute("INSERT INTO auth_identities (user_id, provider, provider_id) VALUES (?1, ?2, ?3)", params![uid, p, pid]).await?; Ok(()) }
     async fn create_auth_token(&self, uid: i64, t: &str, tk: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core()?.execute("INSERT INTO auth_tokens (token, user_id, type, expires_at) VALUES (?1, ?2, ?3, datetime('now', '+1 hour'))", params![tk, uid, t]).await?; Ok(()) }
@@ -1313,25 +1292,25 @@ impl Db for ApexKit {
         if let Some(row) = r.next().await? { let uid: i64 = row.get(0)?; conn.execute("DELETE FROM auth_tokens WHERE token = ?1", params![tk]).await?; Ok(Some(uid)) } else { Ok(None) }
     }
     async fn set_user_verified(&self, uid: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core()?.execute("UPDATE users SET is_verified = 1 WHERE id = ?1", params![uid]).await?; Ok(()) }
-    async fn set_system_config(&self, k: &str, v: &security::EncryptedValue) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_config(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
-        let j = serde_json::to_string(v)?;
-        conn.execute("INSERT INTO _system_config (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![k, j]).await?; Ok(())
+        let mut rows = conn.query("SELECT value FROM _system_config_settings WHERE key = ?1", params![key]).await?;
+        if let Some(row) = rows.next().await? { 
+            let v_str: String = row.get(0)?; 
+            Ok(Some(serde_json::from_str(&v_str)?)) 
+        } else { 
+            Ok(None) 
+        }
     }
-    async fn get_system_config(&self, k: &str) -> std::result::Result<Option<security::EncryptedValue>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn set_config(&self, key: &str, value: &serde_json::Value, encrypted: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
-        let mut r = conn.query("SELECT value FROM _system_config WHERE key = ?1", params![k]).await?;
-        if let Some(row) = r.next().await? { let j: String = row.get(0)?; Ok(Some(serde_json::from_str(&j)?)) } else { Ok(None) }
-    }
-    async fn get_setting(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
-        let mut rows = conn.query("SELECT value FROM _settings WHERE key = ?1", params![key]).await?;
-        if let Some(row) = rows.next().await? { let v: String = row.get(0)?; Ok(Some(serde_json::from_str(&v)?)) } else { Ok(None) }
-    }
-    async fn save_setting(&self, key: &str, value: serde_json::Value, encrypted: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
-        let v_str = serde_json::to_string(&value)?;
-        conn.execute("INSERT INTO _settings (key, value, encrypted) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=excluded.encrypted, updated_at=CURRENT_TIMESTAMP", params![key, v_str, encrypted]).await?; Ok(())
+        let v_str = serde_json::to_string(value)?;
+        conn.execute(
+            "INSERT INTO _system_config_settings (key, value, encrypted, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP) 
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=excluded.encrypted, updated_at=CURRENT_TIMESTAMP", 
+            params![key, v_str, encrypted]
+        ).await?; 
+        Ok(())
     }
 
     // --- Files ---
@@ -1381,7 +1360,6 @@ impl Db for ApexKit {
         Ok(logs)
     }
     async fn log_system_event(&self, level: &str, target: &str, message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Use log_batcher to avoid locking issues
         self.log_batcher.execute(
             "INSERT INTO _system_logs (level, target, message) VALUES (?1, ?2, ?3)".into(),
             vec![level.into(), target.into(), message.into()]
@@ -1444,7 +1422,6 @@ impl Db for ApexKit {
                 name: row.get(1)?, 
                 messages: serde_json::from_str(&m_str)?, 
                 current_manifest: match man_str { Some(s) => serde_json::from_str(&s).ok(), None => None },
-                // NEW FIELDS
                 pending_manifest: match pend_str { Some(s) => serde_json::from_str(&s).ok(), None => None },
                 diff_summary: row.get(5).unwrap_or(None),
                 last_error: row.get(6).unwrap_or(None),
@@ -1453,7 +1430,6 @@ impl Db for ApexKit {
         } else { Ok(None) }
     }
 
-    // 4. UPDATE UPDATE SESSION
     async fn update_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
         self.get_sys()?.execute(
             "UPDATE _ai_sessions SET messages = ?1, current_manifest = ?2, pending_manifest = ?3, diff_summary = ?4, last_error = ?5 WHERE id = ?6", 
@@ -1469,7 +1445,6 @@ impl Db for ApexKit {
         Ok(()) 
     }
 
-    // 5. UPDATE LIST SESSIONS
     async fn list_ai_sessions(&self) -> std::result::Result<Vec<AiSession>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
         let mut r = conn.query("SELECT id, name, messages, current_manifest, pending_manifest, diff_summary, last_error, created_at FROM _ai_sessions ORDER BY created_at DESC", ()).await?;
@@ -1484,7 +1459,6 @@ impl Db for ApexKit {
                  name: row.get(1)?, 
                  messages: serde_json::from_str(&m_str).unwrap_or_default(), 
                  current_manifest: match man_str { Some(str) => serde_json::from_str(&str).ok(), None => None }, 
-                 // NEW FIELDS
                  pending_manifest: match pend_str { Some(str) => serde_json::from_str(&str).ok(), None => None },
                  diff_summary: row.get(5).unwrap_or(None),
                  last_error: row.get(6).unwrap_or(None),
@@ -1503,7 +1477,6 @@ impl Db for ApexKit {
     }
     async fn list_scripts(&self) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        // Added target_collection to SELECT
         let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts", ()).await?;
         let mut v = Vec::new();
         while let Some(row) = r.next().await? { 
@@ -1513,16 +1486,14 @@ impl Db for ApexKit {
                 trigger_type: row.get(2)?, 
                 code: row.get(3)?, 
                 active: row.get(4)?,
-                target_collection: row.get(5)? // Added field mapping
+                target_collection: row.get(5)? 
             }); 
         }
         Ok(v)
     }
 
-    // 3. Update create_script
     async fn create_script(&self, req: script_models::CreateScriptReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        // Added target_collection to INSERT and UPDATE
         let mut rows = conn.query(
             "INSERT INTO _scripts (name, trigger_type, code, target_collection) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, target_collection=excluded.target_collection, created_at=CURRENT_TIMESTAMP RETURNING id", 
             params![req.name, req.trigger_type, req.code, req.target_collection]
@@ -1531,11 +1502,9 @@ impl Db for ApexKit {
     }
 
     async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("DELETE FROM _scripts WHERE id = ?1", params![id]).await?; Ok(()) }
-
-    // 4. Update get_script_by_name
+    
     async fn get_script_by_name(&self, name: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        // Added target_collection to SELECT
         let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts WHERE name = ?1", params![name]).await?;
         if let Some(row) = r.next().await? { 
             Ok(Some(script_models::Script { 
@@ -1544,15 +1513,13 @@ impl Db for ApexKit {
                 trigger_type: row.get(2)?, 
                 code: row.get(3)?, 
                 active: row.get(4)?,
-                target_collection: row.get(5)? // Added field mapping
+                target_collection: row.get(5)? 
             })) 
         } else { Ok(None) }
     }
 
-    // 5. Update get_scripts_by_trigger
     async fn get_scripts_by_trigger(&self, t: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys()?;
-        // Added target_collection to SELECT
         let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts WHERE trigger_type = ?1 AND active = 1", params![t]).await?;
         let mut v = Vec::new();
         while let Some(row) = r.next().await? { 
@@ -1562,7 +1529,7 @@ impl Db for ApexKit {
                 trigger_type: row.get(2)?, 
                 code: row.get(3)?, 
                 active: row.get(4)?,
-                target_collection: row.get(5)? // Added field mapping
+                target_collection: row.get(5)? 
             }); 
         }
         Ok(v)
@@ -1605,7 +1572,7 @@ impl Db for ApexKit {
     async fn get_records_by_ids(&self, collection_id: i64, ids: &[i64]) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
         if ids.is_empty() { return Ok(vec![]); }
         let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id, json(data) FROM records WHERE collection_id = ? AND id IN ({})", id_list);
+        let sql = format!("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ? AND id IN ({})", id_list);
         let conn = self.get_data()?;
         let mut rows = conn.query(&sql, params![collection_id]).await?;
         let mut records = Vec::new();
@@ -1778,8 +1745,8 @@ impl Db for ApexKit {
     }
 }
 
-// DUMMY Provider for Core initialization (since Core can't depend on ApexVector)
-#[allow(dead_code)] // Allow dead code on this struct since it's a fallback
+// DUMMY Provider for Core initialization
+#[allow(dead_code)]
 struct NoOpVectorProvider;
 #[async_trait]
 impl VectorProvider for NoOpVectorProvider {
@@ -1808,7 +1775,6 @@ pub async fn a_new_database_connection(vector_provider: Arc<dyn VectorProvider>)
     setup_sys(&sys).await?;
     setup_vectors(&vec).await?;
 
-    // Pass the provider to ApexKit::new
     Ok(ApexKit::new(
         Arc::new(core), 
         Arc::new(data), 
@@ -1835,18 +1801,30 @@ async fn apply_pragmas(db: &Database) -> Result<()> {
 
 async fn setup_core(db: &Database) -> Result<()> {
     let conn = db.connect()?;
-    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL, is_verified BOOLEAN DEFAULT 0)", ()).await?;
+    
+    // [UPDATED] Added metadata column
+    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL, is_verified BOOLEAN DEFAULT 0, metadata JSON DEFAULT '{}')", ()).await?;
+    
+    // Migration for existing tables
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN metadata JSON DEFAULT '{}'", ()).await;
+
     conn.execute("CREATE TABLE IF NOT EXISTS auth_identities (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, provider TEXT NOT NULL, provider_id TEXT NOT NULL)", ()).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS auth_tokens (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, type TEXT NOT NULL, expires_at DATETIME NOT NULL)", ()).await?;
-    conn.execute("CREATE TABLE IF NOT EXISTS _system_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)", ()).await?;
-    conn.execute("CREATE TABLE IF NOT EXISTS _settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, encrypted BOOLEAN DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
+    conn.execute("CREATE TABLE IF NOT EXISTS _system_config_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, encrypted BOOLEAN DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     Ok(())
 }
 
 async fn setup_data(db: &Database) -> Result<()> {
     let conn = db.connect()?;
     conn.execute("CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, schema JSON)", ()).await?;
-    conn.execute("CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id INTEGER NOT NULL, data JSONB NOT NULL)", ()).await?;
+    
+    // [UPDATED] Added created/updated columns
+    conn.execute("CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id INTEGER NOT NULL, data JSONB NOT NULL, created DATETIME DEFAULT CURRENT_TIMESTAMP, updated DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
+    
+    // Migrations for existing tables
+    let _ = conn.execute("ALTER TABLE records ADD COLUMN created DATETIME DEFAULT CURRENT_TIMESTAMP", ()).await;
+    let _ = conn.execute("ALTER TABLE records ADD COLUMN updated DATETIME DEFAULT CURRENT_TIMESTAMP", ()).await;
+
     conn.execute("CREATE TABLE IF NOT EXISTS _storage_files (id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT NOT NULL, original_name TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL, user_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS _relations (id INTEGER PRIMARY KEY AUTOINCREMENT, origin_col_id INTEGER NOT NULL, origin_rec_id INTEGER NOT NULL, target_col_id INTEGER NOT NULL, target_rec_id INTEGER NOT NULL, rel_name TEXT NOT NULL, properties JSON)", ()).await?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_origin ON _relations(origin_col_id, origin_rec_id, rel_name)", ()).await?;
@@ -1859,9 +1837,7 @@ async fn setup_data(db: &Database) -> Result<()> {
 
 async fn setup_logs(db: &Database) -> Result<()> {
     let conn = db.connect()?;
-    // Audit Logs (Business Logic)
     conn.execute("CREATE TABLE IF NOT EXISTS _audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, message TEXT NOT NULL, source TEXT NOT NULL, meta JSON, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
-    // System Logs (Technical/Debug Logs from Tracing)
     conn.execute("CREATE TABLE IF NOT EXISTS _system_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         level TEXT NOT NULL, 
@@ -1882,13 +1858,8 @@ async fn setup_sys(db: &Database) -> Result<()> {
     Ok(())
 }
 
-// --- TABLE SETUP ---
 async fn setup_vectors(db: &Database) -> Result<()> {
     let conn = db.connect()?;
-    
-    // 1. Create Table with updated UNIQUE constraint
-    // Note: If table exists with old constraint, this SQL won't run. 
-    // In production, you'd need a migration script to recreate the table.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS vectors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1898,16 +1869,11 @@ async fn setup_vectors(db: &Database) -> Result<()> {
             vector BLOB NOT NULL,
             model TEXT NOT NULL DEFAULT 'unknown',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            -- UPDATED CONSTRAINT: Now includes model
             UNIQUE(collection_id, record_id, field_name, model) 
         )", 
         ()
     ).await?;
-    
-    // Migration helper: Try to create a unique index if the table was created without the named constraint previously
-    // This allows multiple models for same record
     let _ = conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_vec_unique_model ON vectors(collection_id, record_id, field_name, model)", ()).await;
-
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vec_record ON vectors(record_id)", ()).await?;
     Ok(())
 }
@@ -1937,7 +1903,7 @@ impl Db for Mutex<Connection> {
         Ok(()) 
     }
     async fn reindex_collection(&self, _id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { Ok(()) }
-    async fn create_user(&self, _e: &str, _p: &str, _r: &str) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
+    async fn create_user(&self, _e: &str, _p: &str, _r: &str, _m: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
     async fn get_user_by_email(&self, _e: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     async fn list_users(&self, _q: Option<String>, _l: i64, _o: i64) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
     async fn count_users(&self, _q: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(0) }
@@ -1953,10 +1919,8 @@ impl Db for Mutex<Connection> {
     async fn create_auth_token(&self, _u: i64, _t: &str, _tk: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn consume_auth_token(&self, _t: &str, _tt: &str) -> std::result::Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     async fn set_user_verified(&self, _u: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn set_system_config(&self, _k: &str, _v: &security::EncryptedValue) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn get_system_config(&self, _k: &str) -> std::result::Result<Option<security::EncryptedValue>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn get_setting(&self, _k: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn save_setting(&self, _k: &str, _v: serde_json::Value, _e: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    async fn get_config(&self, _k: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    async fn set_config(&self, _k: &str, _v: &serde_json::Value, _e: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn log_audit_event(&self, _l: &str, _m: &str, _s: &str, _meta: Option<serde_json::Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn list_audit_logs(&self) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
     async fn log_system_event(&self, _level: &str, _target: &str, _message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }

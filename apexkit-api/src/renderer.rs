@@ -130,6 +130,12 @@ async fn render_view_core(
         "is_htmx": is_htmx,
     });
 
+    // --- Derive Base URL from Headers ---
+    let base_url = headers.get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| format!("http://{}", h)); // Assume http behind proxy or handle https via config if needed
+    // ----------------------------------------
+
     if !body.is_empty() {
         if let Ok(j) = serde_json::from_str::<Value>(&body) { merge_json(&mut context_data, json!({"body": j})); } 
         else if let Ok(f) = serde_qs::from_str::<HashMap<String, String>>(&body) { merge_json(&mut context_data, json!({"body": f})); }
@@ -139,7 +145,7 @@ async fn render_view_core(
     if let Some(script_id) = target_template.script_id {
         let scripts = db.list_scripts().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         if let Some(script) = scripts.into_iter().find(|s| s.id == script_id) {
-            let script_res = state.script_engine.run_script(&script.code, context_data.clone(), db.clone(), state.embedder.clone(), state.vector_provider.clone(),  state.vault.clone())
+            let script_res = state.script_engine.run_script(&script.code, context_data.clone(), db.clone(), state.embedder.clone(), state.vector_provider.clone(),  state.vault.clone(), base_url, Some(state.tx.clone()))
                 .await.map_err(|e| AppError::UnknownError(format!("Script Error: {}", e)))?;
             merge_json(&mut context_data, script_res);
         }

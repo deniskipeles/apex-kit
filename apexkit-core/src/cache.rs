@@ -1,4 +1,4 @@
-use crate::{Db, Collection, Record, schema::CollectionSchema, query::QueryOptions, auth::User, security, models, ai_models};
+use crate::{Db, Collection, Record, schema::CollectionSchema, query::QueryOptions, auth::User, models, ai_models};
 use async_trait::async_trait;
 use moka::future::Cache;
 use serde_json::Value;
@@ -209,8 +209,9 @@ impl Db for CachedDb {
         email: &str,
         password_hash: &str,
         role: &str,
+        metadata: Option<serde_json::Value>,
     ) -> Result<User, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.create_user(email, password_hash, role).await
+        self.inner.create_user(email, password_hash, role, metadata).await
     }
 
     async fn get_user_by_email(
@@ -311,21 +312,13 @@ impl Db for CachedDb {
     }
 
     // --- Config & Settings ---
-
-    async fn set_system_config(&self, key: &str, value: &security::EncryptedValue) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.set_system_config(key, value).await
-    }
-    
-    async fn get_system_config(&self, key: &str) -> std::result::Result<Option<security::EncryptedValue>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.get_system_config(key).await
+    async fn get_config(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        // We could cache config here if needed, but it's often better to fetch fresh for settings
+        self.inner.get_config(key).await
     }
 
-    async fn get_setting(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.get_setting(key).await
-    }
-
-    async fn save_setting(&self, key: &str, value: serde_json::Value, encrypt: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.save_setting(key, value, encrypt).await
+    async fn set_config(&self, key: &str, value: &serde_json::Value, encrypted: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.set_config(key, value, encrypted).await
     }
 
     // --- Audit Logs ---

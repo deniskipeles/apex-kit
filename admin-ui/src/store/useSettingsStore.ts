@@ -17,13 +17,13 @@ export const useSettingsStore = create<SettingsState>()(
   persist(
     (set) => ({
       settings: {
-        appName: 'Tinybase Admin',
+        appName: 'ApexKit Admin',
         appUrl: 'http://localhost:8090',
         theme: 'system'
       },
       updateSettings: (newSettings) => 
         set((state) => ({ settings: { ...state.settings, ...newSettings } })),
     }),
-    { name: 'tinybase-settings' }
+    { name: 'apexkit-settings' }
   )
 );
