@@ -261,6 +261,31 @@ export class ApexKit {
              */
             deleteCollection: (id) => this._request(`/collections/${id}`, { method: 'DELETE' }),
 
+            /**
+             * List system configurations.
+             * @returns {Promise<Array<object>>}
+             */
+            listConfigs: () => this._request('/admin/config'),
+
+            /**
+             * Set or update a system configuration.
+             * @param {string} key 
+             * @param {string} value 
+             * @param {boolean} encrypt 
+             * @returns {Promise<void>}
+             */
+            setConfig: (key, value, encrypt) => this._request('/admin/config', { 
+                method: 'POST', 
+                body: { key, value, encrypt } 
+            }),
+
+            /**
+             * Delete a system configuration.
+             * @param {string} key 
+             * @returns {Promise<void>}
+             */
+            deleteConfig: (key) => this._request(`/admin/config/${encodeURIComponent(key)}`, { method: 'DELETE' }),
+
             // --- Users ---
             /**
              * List all registered users (Admin only). with pagination, sorting, and filtering.
@@ -447,11 +472,13 @@ export class ApexKit {
              * @param {string} name - Project name.
              * @param {string} [initialPrompt] - First instruction.
              * @param {string} [model] - LLM Model ID.
+             * @param {string} [cloneStrategy] - clone strategy from request
+             * @param {number} [cloneRecordLimit] - Number of records add from root app
              * @returns {Promise<object>} New session object.
              */
-            createSession: (name, initialPrompt, model) => this._request('/admin/ai/sessions', { 
+            createSession: (name, initialPrompt, model, cloneStrategy, cloneRecordLimit) => this._request('/admin/ai/sessions', { 
                 method: 'POST', 
-                body: { name, initial_prompt: initialPrompt, model } 
+                body: { name, initial_prompt: initialPrompt, model, clone_strategy: cloneStrategy, clone_record_limit: cloneRecordLimit } 
             }),
 
             /**

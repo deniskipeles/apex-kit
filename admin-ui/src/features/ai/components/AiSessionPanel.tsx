@@ -101,7 +101,7 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
     };
 
     const startUrl = session?.current_manifest?.templates[0]?.slug
-        ? `${APP_CONFIG.apiBaseUrl}/render/${session.current_manifest.templates[0].slug}`
+        ? `${APP_CONFIG.apiBaseUrl}/sandbox/${session.id}/render/${session.current_manifest.templates[0].slug}`
         : null;
 
     if (!session) return null;

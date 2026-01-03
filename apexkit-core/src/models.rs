@@ -35,7 +35,13 @@ pub struct Record {
     pub id: Option<i64>, 
     #[schema(value_type = Object)]
     pub data: Value,
+    // Skip deserializing timestamps (Client doesn't send them)
+    // Use default value ("") when reading from JSON payload
+    #[serde(skip_deserializing)]
+    #[serde(default)] 
     pub created: String,
+    #[serde(skip_deserializing)]
+    #[serde(default)]
     pub updated: String,
 }
 
@@ -123,4 +129,12 @@ pub struct ManifestTemplate {
     pub slug: String,       // e.g. "dashboard/tasks"
     pub content: String,    // HTML + Tera
     pub loader_script: Option<String>, // Name of script to run before rendering
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct ConfigItem {
+    pub key: String,
+    pub value: Option<String>, // Masked if encrypted, otherwise the raw string
+    pub encrypted: bool,
+    pub updated_at: String,
 }

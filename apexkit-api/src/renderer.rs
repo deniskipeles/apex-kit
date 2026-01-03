@@ -240,11 +240,24 @@ pub async fn render_view(
 pub async fn render_sandbox_view(
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
-    Path((session_id, slug)): Path<(String, String)>,
+    Path((session_id, slug)): Path<(String, String)>, // Accepts 2 params
     Query(params): Query<HashMap<String, String>>, 
     headers: HeaderMap,
     body: String, 
 ) -> Result<Response, AppError> {
     let label = format!("Sandbox {}", session_id);
+    render_view_core(db, state, slug, params, headers, body, &label).await
+}
+
+// [NEW] Handler for Tenant Routes
+pub async fn render_tenant_view(
+    DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    Path((tenant_id, slug)): Path<(String, String)>, // Accepts 2 params
+    Query(params): Query<HashMap<String, String>>, 
+    headers: HeaderMap,
+    body: String, 
+) -> Result<Response, AppError> {
+    let label = format!("Tenant {}", tenant_id);
     render_view_core(db, state, slug, params, headers, body, &label).await
 }

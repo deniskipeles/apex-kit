@@ -96,6 +96,7 @@ export const RecordsListPage = () => {
   const [isFilterOpen, setIsFilterOpen] = useState(false);
   const [isApiDocsOpen, setIsApiDocsOpen] = useState(false);
   const [isImportOpen, setIsImportOpen] = useState(false);
+  const [isImporting, setIsImporting] = useState(false); // [NEW] Loading state for import
 
   // Pagination
   const { page, setPage, perPage } = usePagination(1, 20);
@@ -240,11 +241,15 @@ export const RecordsListPage = () => {
       const fileInput = form.elements.namedItem('file') as HTMLInputElement;
       if (!fileInput.files?.length) return;
       
+      setIsImporting(true); // Start loading
       try {
           const res = await apiClient.importData(collection.name, fileInput.files[0]);
           if (res.ok) {
               const json = await res.json();
               toast(`Imported ${json.records_imported} records`, 'success');
+              if (json.schema_updated) {
+                 toast('Schema updated based on imported data', 'info');
+              }
               setIsImportOpen(false);
               loadData();
           } else {
@@ -252,6 +257,8 @@ export const RecordsListPage = () => {
           }
       } catch (err) {
           toast('Network error during import', 'error');
+      } finally {
+          setIsImporting(false); // Stop loading
       }
   };
 
@@ -489,16 +496,18 @@ export const RecordsListPage = () => {
       </PreviewPanel>
 
       {/* IMPORT MODAL */}
-      <Dialog isOpen={isImportOpen} onClose={() => setIsImportOpen(false)} title="Import Data" size="sm">
+      <Dialog isOpen={isImportOpen} onClose={() => !isImporting && setIsImportOpen(false)} title="Import Data" size="sm">
         <form onSubmit={handleImport} className="space-y-4">
              <div className="text-sm text-muted-foreground">Upload a <b>JSON</b> or <b>CSV</b> file. Schema will be inferred if the collection is empty.</div>
              <div className="space-y-2">
                  <Label>File</Label>
-                 <Input type="file" name="file" accept=".json,.csv" required className="cursor-pointer" />
+                 <Input type="file" name="file" accept=".json,.csv" required className="cursor-pointer" disabled={isImporting} />
              </div>
              <div className="flex justify-end gap-2 pt-2">
-                 <Button type="button" variant="ghost" onClick={() => setIsImportOpen(false)}>Cancel</Button>
-                 <Button type="submit"><Upload className="mr-2 h-4 w-4" /> Start Import</Button>
+                 <Button type="button" variant="ghost" onClick={() => setIsImportOpen(false)} disabled={isImporting}>Cancel</Button>
+                 <Button type="submit" isLoading={isImporting} disabled={isImporting}>
+                    <Upload className="mr-2 h-4 w-4" /> Start Import
+                 </Button>
              </div>
         </form>
       </Dialog>

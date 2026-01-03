@@ -40,9 +40,23 @@ export const architectService = {
     },
 
     // Start a new project
-    createSession: async (name: string, initialPrompt?: string, model?: string): Promise<AiSession> => {
-        const res = await apiClient.ai.createSession(name, initialPrompt, model);
-        if (!res.id) throw new Error(res.message);
+    // [UPDATED] Added cloneStrategy and cloneRecordLimit
+    createSession: async (
+        name: string, 
+        initialPrompt?: string, 
+        model?: string,
+        cloneStrategy?: string,
+        cloneRecordLimit?: number
+    ): Promise<AiSession> => {
+        const res = await apiClient.ai.createSession(
+            name, 
+            initialPrompt, 
+            model,
+            // Map to snake_case for the backend
+            cloneStrategy,
+            cloneRecordLimit
+        );
+        if (!(res as any)?.id) throw new Error((res as any)?.message);
         return res as AiSession;
     },
 

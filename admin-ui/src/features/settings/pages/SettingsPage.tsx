@@ -1,25 +1,27 @@
 import React, { useEffect, useState } from 'react';
 import { 
-    Save, Loader2, Settings as SettingsIcon, Shield, Database, 
-    BrainCircuit, HardDrive, Key, BellRing, Monitor
+    Loader2, Settings as SettingsIcon, Shield, Database, 
+    BrainCircuit, HardDrive, Key,
+    Mail
 } from 'lucide-react';
-import { Button, Card, CardHeader, CardTitle, CardContent } from '../../../components/ui/Elements';
+import { Button } from '../../../components/ui/Elements';
 import { GeneralSettings } from '../components/GeneralSettings';
 import { SecuritySettings } from '../components/SecuritySettings';
+import { SmtpSettings } from '../components/SmtpSettings';
 import { StorageSettings } from '../components/StorageSettings';
 import { BackupSettings } from '../components/BackupSettings';
 import { TokenSettings } from '../components/TokenSettings';
 import { AiSettings } from '../components/AiSettings';
+import { ConfigSettings } from '../components/ConfigSettings';
 import { settingsService } from '../services/settingsService';
 import { AppSettings } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
 
-type Tab = 'general' | 'security' | 'storage' | 'backups' | 'tokens' | 'ai';
+type Tab = 'general' | 'security' | 'smtp' | 'storage' | 'backups' | 'tokens' | 'ai' | 'config';
 
 export const SettingsPage = () => {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>('general');
   const { toast } = useToast();
 
@@ -38,29 +40,37 @@ export const SettingsPage = () => {
       }
   };
 
-  const handleSave = async () => {
-      if (!settings) return;
-      setIsSaving(true);
-      try {
-          await settingsService.update(settings);
-          toast('Settings saved successfully', 'success');
-      } catch (e) {
-          toast('Failed to save settings', 'error');
-      } finally {
-          setIsSaving(false);
-      }
-  };
-
+  // Helper to update local state (passed to components to update UI immediately)
   const updateLocalSettings = (updates: Partial<AppSettings>) => {
       setSettings(prev => prev ? ({ ...prev, ...updates }) : null);
+  };
+
+  // Handler for saving specific sections
+  const handleSaveSection = async (sectionData: Partial<AppSettings>) => {
+      if (!settings) return;
+      try {
+          // Merge current settings with the section data to ensure consistency, 
+          // but strictly speaking, we could just send sectionData if the API supports it fully.
+          // Sending specific sectionData is safer to avoid overwriting other sections if stale.
+          await settingsService.update(sectionData);
+          toast('Section saved successfully', 'success');
+          
+          // Optionally reload to ensure sync
+          // loadSettings(); 
+      } catch (e) {
+          toast('Failed to save settings', 'error');
+          throw e; // Rethrow so child component can handle loading state
+      }
   };
 
   const tabs: { id: Tab; label: string; icon: any; desc: string }[] = [
       { id: 'general', label: 'General', icon: SettingsIcon, desc: 'App identity and branding' },
       { id: 'security', label: 'Security', icon: Shield, desc: 'Access control and CORS' },
+      { id: 'smtp', label: 'Email (SMTP)', icon: Mail, desc: 'Email delivery settings' },
       { id: 'storage', label: 'Storage', icon: HardDrive, desc: 'File uploads and S3' },
       { id: 'ai', label: 'AI Engine', icon: BrainCircuit, desc: 'LLM providers and keys' },
       { id: 'backups', label: 'System', icon: Database, desc: 'Backups and cron jobs' },
+      { id: 'config', label: 'Config Registry', icon: SettingsIcon, desc: 'Raw system configurations' },
       { id: 'tokens', label: 'API Keys', icon: Key, desc: 'Manage access tokens' },
   ];
 
@@ -83,9 +93,7 @@ export const SettingsPage = () => {
                 </h1>
                 <p className="text-muted-foreground mt-1">Manage your application configuration and preferences.</p>
             </div>
-            <Button onClick={handleSave} isLoading={isSaving} className="shadow-lg hover:shadow-primary/20 transition-all">
-                <Save className="mr-2 h-4 w-4" /> Save Changes
-            </Button>
+            {/* Global Save Button Removed */}
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
@@ -126,12 +134,14 @@ export const SettingsPage = () => {
                 </div>
 
                 <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
-                    {activeTab === 'general' && <GeneralSettings settings={settings} onChange={updateLocalSettings} />}
-                    {activeTab === 'security' && <SecuritySettings settings={settings} onChange={updateLocalSettings} />}
-                    {activeTab === 'storage' && <StorageSettings settings={settings} onChange={updateLocalSettings} />}
-                    {activeTab === 'backups' && <BackupSettings settings={settings} onChange={updateLocalSettings} />}
+                    {activeTab === 'general' && <GeneralSettings settings={settings} onChange={updateLocalSettings} onSave={handleSaveSection} />}
+                    {activeTab === 'security' && <SecuritySettings settings={settings} onChange={updateLocalSettings} onSave={handleSaveSection} />}
+                    {activeTab === 'smtp' && <SmtpSettings settings={settings} onChange={updateLocalSettings} onSave={handleSaveSection} />}
+                    {activeTab === 'storage' && <StorageSettings settings={settings} onChange={updateLocalSettings} onSave={handleSaveSection} />}
+                    {activeTab === 'backups' && <BackupSettings settings={settings} onChange={updateLocalSettings} onSave={handleSaveSection} />}
+                    {activeTab === 'config' && <ConfigSettings />}
                     {activeTab === 'tokens' && <TokenSettings settings={settings} onChange={updateLocalSettings} />}
-                    {activeTab === 'ai' && <AiSettings settings={settings} onChange={updateLocalSettings} />}
+                    {activeTab === 'ai' && <AiSettings settings={settings} onChange={updateLocalSettings} onSave={handleSaveSection} />}
                 </div>
             </div>
 

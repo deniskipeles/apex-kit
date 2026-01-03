@@ -83,6 +83,8 @@ pub trait Db: Send + Sync {
 
     // --- Records ---
     async fn create_record(&self, collection_id: i64, data: &Value) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
+    // Allows forcing an ID (for Sandbox cloning/Importing)
+    async fn import_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn list_records(&self, collection_id: i64, options: QueryOptions) -> std::result::Result<ListResult, Box<dyn std::error::Error + Send + Sync>>;
     async fn get_record(&self, collection_id: i64, record_id: i64, expand: Option<String>) -> std::result::Result<Option<Record>, Box<dyn std::error::Error + Send + Sync>>;
     async fn update_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<Record, Box<dyn std::error::Error + Send + Sync>>;
@@ -99,8 +101,10 @@ pub trait Db: Send + Sync {
     async fn delete_record_search(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
 
     // --- Users (Auth) ---
-    // [UPDATED] Added metadata argument
+    // Added metadata argument
     async fn create_user(&self, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>>;
+    // Allows forcing an ID (for Sandbox cloning)
+    async fn import_user(&self, id: i64, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_user_by_email(&self, email: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>>;
     async fn list_users(&self, query: Option<String>, limit: i64, offset: i64) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>>;
     async fn count_users(&self, query: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
@@ -125,6 +129,10 @@ pub trait Db: Send + Sync {
     // --- Unified Configuration (System Secrets & App Settings) ---
     async fn get_config(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>;
     async fn set_config(&self, key: &str, value: &serde_json::Value, encrypted: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    // List all configs
+    async fn list_configs(&self) -> std::result::Result<Vec<models::ConfigItem>, Box<dyn std::error::Error + Send + Sync>>;
+    // Delete config
+    async fn delete_config(&self, key: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     
     // --- Audit Logs ---
     async fn log_audit_event(&self, level: &str, message: &str, source: &str, meta: Option<serde_json::Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -260,7 +268,7 @@ impl ApexKit {
             data_batcher,
             log_batcher,
             vector_batcher,
-            search: Arc::new(SearchManager::new("./tantivy_indexes")),
+            search: Arc::new(SearchManager::new("./indexes")),
             embedder: Arc::new(embeddings::EmbedderService::new()), // Init service
         }
     }
@@ -878,6 +886,31 @@ impl Db for ApexKit {
         Ok(record_id)
     }
 
+    // Import (Forced ID)
+    async fn import_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_data()?; 
+        let col = self.get_collection(collection_id).await?.ok_or("Collection not found")?;
+        let schema = col.schema.unwrap_or_default();
+        let json_str = serde_json::to_string(data)?;
+
+        // 1. Enforce Uniqueness logic (skip if you trust the source, but safer to keep)
+        enforce_uniqueness(&conn, collection_id, Some(record_id), data, &schema).await?;
+
+        // 2. Insert with Specific ID
+        // Note: We use 'execute' here because we don't need the DB to generate an ID
+        self.data_batcher.execute(
+            "INSERT INTO records (id, collection_id, data) VALUES (?1, ?2, jsonb(?3))".into(),
+            vec![record_id.into(), collection_id.into(), json_str.into()] 
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        // 3. Sync relations/uniqueness
+        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, data, &schema);
+        let relation_future = self.sync_relations(&conn, collection_id, record_id, data);
+        tokio::try_join!(unique_future, relation_future)?;
+
+        Ok(())
+    }
+
     async fn update_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<Record, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_data()?;
         let col = self.get_collection(collection_id).await?.ok_or("Col not found")?;
@@ -1199,6 +1232,20 @@ impl Db for ApexKit {
         })
     }
 
+    // Import User (Forced ID)
+    async fn import_user(&self, id: i64, e: &str, p: &str, r: &str, metadata: Option<Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core()?;
+        let meta = metadata.unwrap_or(json!({}));
+        let meta_str = serde_json::to_string(&meta)?;
+        
+        // Explicitly set ID
+        conn.execute(
+            "INSERT INTO users (id, email, password_hash, role, metadata) VALUES (?1, ?2, ?3, ?4, ?5)", 
+            params![id, e, p, r, meta_str]
+        ).await?;
+        Ok(())
+    }
+
     async fn get_user_by_email(&self, email: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
         let mut r = conn.query("SELECT id, email, password_hash, role, metadata FROM users WHERE email = ?1", params![email]).await?;
@@ -1310,6 +1357,42 @@ impl Db for ApexKit {
              ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=excluded.encrypted, updated_at=CURRENT_TIMESTAMP", 
             params![key, v_str, encrypted]
         ).await?; 
+        Ok(())
+    }
+    async fn list_configs(&self) -> std::result::Result<Vec<models::ConfigItem>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core()?;
+        let mut rows = conn.query("SELECT key, value, encrypted, updated_at FROM _system_config_settings ORDER BY key ASC", ()).await?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let key: String = row.get(0)?;
+            let val_str: String = row.get(1)?;
+            let encrypted: bool = row.get(2)?;
+            let updated_at: String = row.get(3)?;
+            
+            // If encrypted, we return None for value (masked) or a placeholder
+            // If not encrypted, we return the raw value
+            let value = if encrypted {
+                Some("******".to_string())
+            } else {
+                // Try to format JSON nicely if possible, else return raw
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&val_str) {
+                    if v.is_string() {
+                        Some(v.as_str().unwrap().to_string())
+                    } else {
+                        Some(val_str)
+                    }
+                } else {
+                    Some(val_str)
+                }
+            };
+
+            items.push(models::ConfigItem { key, value, encrypted, updated_at });
+        }
+        Ok(items)
+    }
+    async fn delete_config(&self, key: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core()?;
+        conn.execute("DELETE FROM _system_config_settings WHERE key = ?1", params![key]).await?;
         Ok(())
     }
 
@@ -1919,8 +2002,12 @@ impl Db for Mutex<Connection> {
     async fn create_auth_token(&self, _u: i64, _t: &str, _tk: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn consume_auth_token(&self, _t: &str, _tt: &str) -> std::result::Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     async fn set_user_verified(&self, _u: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    async fn import_record(&self, _c: i64, _r: i64, _d: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    async fn import_user(&self, _id: i64, _e: &str, _p: &str, _r: &str, _m: Option<Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn get_config(&self, _k: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     async fn set_config(&self, _k: &str, _v: &serde_json::Value, _e: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    async fn list_configs(&self) -> std::result::Result<Vec<models::ConfigItem>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn delete_config(&self, _key: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn log_audit_event(&self, _l: &str, _m: &str, _s: &str, _meta: Option<serde_json::Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn list_audit_logs(&self) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
     async fn log_system_event(&self, _level: &str, _target: &str, _message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }

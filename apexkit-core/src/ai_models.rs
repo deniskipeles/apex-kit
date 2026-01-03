@@ -63,6 +63,9 @@ pub struct CreateSessionReq {
     pub initial_prompt: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    // Cloning options
+    pub clone_strategy: Option<String>, // "none", "schema", "partial", "full"
+    pub clone_record_limit: Option<usize>,
 }
 
 #[derive(Deserialize, ToSchema)]

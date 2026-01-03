@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State, Query, Request, FromRef, ConnectInfo},
-    http::{StatusCode, HeaderMap, request::Parts}, 
+    http::{StatusCode, HeaderMap, HeaderValue, request::Parts}, 
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -40,7 +40,6 @@ use apexkit_core::scripting::ScriptEngine;
 use crate::sandbox_manager::SandboxManager;
 use crate::graphql::RelationLoader;
 use std::collections::HashMap;
-// use axum_extra::extract::Host;
 use crate::tenant_manager::TenantManager;
 use apexkit_core::realtime::EventScope;
 use axum::response::sse::{Event, Sse};
@@ -378,7 +377,13 @@ async fn sandbox_lifecycle_middleware(
             let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
             req.extensions_mut().insert(storage);
             req.extensions_mut().insert(EventScope::Sandbox(session_id.to_string()));
-            Ok(next.run(req).await)
+            
+            // [UPDATED] Inject Header
+            let mut response = next.run(req).await;
+            if let Ok(val) = HeaderValue::from_str(&format!("sandbox:{}", session_id)) {
+                response.headers_mut().insert("X-Apex-Scope", val);
+            }
+            Ok(response)
         }
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
@@ -393,8 +398,7 @@ async fn tenant_resolver_middleware(
 ) -> std::result::Result<Response, StatusCode> {
     let mut tenant_id = String::new();
     
-    // Parse host from base_url (format: "scheme://host:port")
-    // Split scheme:// first, then take the host part
+    // Parse host from base_url
     let host_str = base_url.split("://").nth(1).unwrap_or("").split(':').next().unwrap_or("");
     let host_parts: Vec<&str> = host_str.split('.').collect();
 
@@ -407,7 +411,10 @@ async fn tenant_resolver_middleware(
 
     if tenant_id.is_empty() {
         req.extensions_mut().insert(EventScope::Root);
-        return Ok(next.run(req).await);
+        // [UPDATED] Inject Header for Root
+        let mut response = next.run(req).await;
+        response.headers_mut().insert("X-Apex-Scope", HeaderValue::from_static("root"));
+        return Ok(response);
     }
 
     match state.tenant_manager.get_tenant(tenant_id.clone()).await {
@@ -416,12 +423,22 @@ async fn tenant_resolver_middleware(
             let storage_path = format!("tenants/{}/uploads", tenant_id);
             let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
             req.extensions_mut().insert(storage);
-            req.extensions_mut().insert(EventScope::Tenant(tenant_id));
-            Ok(next.run(req).await)
+            req.extensions_mut().insert(EventScope::Tenant(tenant_id.clone()));
+            
+            // [UPDATED] Inject Header for Tenant
+            let mut response = next.run(req).await;
+            if let Ok(val) = HeaderValue::from_str(&format!("tenant:{}", tenant_id)) {
+                response.headers_mut().insert("X-Apex-Scope", val);
+            }
+            Ok(response)
         }
         Err(_) => {
             req.extensions_mut().insert(EventScope::Root);
-            Ok(next.run(req).await)
+            
+            // [UPDATED] Fallback to Root Header
+            let mut response = next.run(req).await;
+            response.headers_mut().insert("X-Apex-Scope", HeaderValue::from_static("root"));
+            Ok(response)
         }
     }
 }
@@ -1498,8 +1515,9 @@ fn make_api_router() -> Router<AppState> {
         .route("/storage/files/{id}", axum::routing::delete(storage::delete_file))
         .route("/admin/storage/test", post(storage::test_s3_connection))
         .route("/admin/storage/migrate", post(storage::migrate_storage))
-        .route("/admin/config", post(config_routes::set_config))
         .route("/admin/settings", get(settings::get_settings).patch(settings::update_settings))
+        .route("/admin/config", post(config_routes::set_config).get(config_routes::list_configs))
+        .route("/admin/config/{key}", axum::routing::delete(config_routes::delete_config))
         .route("/admin/system/reload", post(reload_system))
         .route("/admin/users", get(list_users_handler))
         .route("/admin/users/{id}", axum::routing::delete(delete_user_handler))
@@ -1533,7 +1551,8 @@ pub fn app_router(state: AppState) -> Router {
 
     let sandbox_router = Router::new()
         .nest("/api/v1", core_api.clone())
-        .merge(renderer_routes.clone())
+        // Explicit route for sandbox renderer (2 params)
+        .route("/render/{*slug}", get(renderer::render_sandbox_view).post(renderer::render_sandbox_view))
         .route("/graphql", post(sandbox_graphql_handler).get(sandbox_graphql_playground))
         .route("/scalar", get(sandbox_scalar_html))
         .route("/scalar/openapi.json", get(sandbox_openapi_json))
@@ -1543,7 +1562,8 @@ pub fn app_router(state: AppState) -> Router {
 
     let tenant_path_router = Router::new()
         .nest("/api/v1", core_api.clone())
-        .merge(renderer_routes.clone())
+        // Explicit route for tenant renderer (2 params)
+        .route("/render/{*slug}", get(renderer::render_tenant_view).post(renderer::render_tenant_view))
         .route("/graphql", post(tenant_graphql_handler).get(tenant_graphql_playground)) 
         .route("/scalar", get(tenant_scalar_html))
         .route("/scalar/openapi.json", get(tenant_openapi_json))

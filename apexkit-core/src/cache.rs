@@ -103,6 +103,13 @@ impl Db for CachedDb {
         self.inner.create_record(collection_id, data).await
     }
 
+    async fn import_record(&self, collection_id: i64, record_id: i64, data: &Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let res = self.inner.import_record(collection_id, record_id, data).await;
+        // Even though it's an import, if we somehow imported into a live DB, we should invalidate cache
+        self.record_cache.invalidate(&(collection_id, record_id)).await;
+        res
+    }
+
     async fn get_record(
         &self,
         collection_id: i64,
@@ -214,6 +221,10 @@ impl Db for CachedDb {
         self.inner.create_user(email, password_hash, role, metadata).await
     }
 
+    async fn import_user(&self, id: i64, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.import_user(id, email, password_hash, role, metadata).await
+    }
+
     async fn get_user_by_email(
         &self,
         email: &str,
@@ -319,6 +330,14 @@ impl Db for CachedDb {
 
     async fn set_config(&self, key: &str, value: &serde_json::Value, encrypted: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.set_config(key, value, encrypted).await
+    }
+
+    async fn list_configs(&self) -> std::result::Result<Vec<models::ConfigItem>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_configs().await
+    }
+
+    async fn delete_config(&self, key: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_config(key).await
     }
 
     // --- Audit Logs ---

@@ -179,7 +179,7 @@ export const SandboxAiToolbar = ({ sessionId }: SandboxAiToolbarProps) => {
                 const latestTemplates = await refreshResources();
                 if (!previewUrl && latestTemplates.length > 0) {
                     const home = latestTemplates.find(t => t.slug.includes('index') || t.slug.includes('home')) || latestTemplates[0];
-                    setPreviewUrl(`/render/${home.slug}`);
+                    setPreviewUrl(`/sandbox/${session.id}/render/${home.slug}`);
                 }
             }
         }
@@ -345,7 +345,7 @@ export const SandboxAiToolbar = ({ sessionId }: SandboxAiToolbarProps) => {
                                 templates.map(t => (
                                     <button 
                                         key={t.id}
-                                        onClick={() => setPreviewUrl(`/render/${t.slug}`)}
+                                        onClick={() => setPreviewUrl(`/sandbox/${session.id}/render/${t.slug}`)}
                                         className={`px-3 py-1 text-xs rounded-full whitespace-nowrap transition-colors flex items-center gap-1.5 ${previewUrl?.endsWith(t.slug) ? 'bg-primary text-primary-foreground shadow-sm' : 'bg-background hover:bg-secondary border border-border text-muted-foreground'}`}
                                     >
                                         <LayoutTemplate className="h-3 w-3 opacity-70" />

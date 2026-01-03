@@ -14,6 +14,7 @@ use apexkit_core::{
 use crate::{AppState, AppError};
 use tracing::{info, error};
 use std::sync::Arc;
+use crate::sandbox_manager::CloneStrategy;
 
 // --- CONSTANTS & PROMPTS ---
 
@@ -186,8 +187,16 @@ pub async fn start_session(
     let id = uuid::Uuid::new_v4().to_string();
     info!("AI Architect: Initializing Sandbox Session '{}'", id);
 
-    // 1. Create Physical Sandbox DB -> USE STATE MANAGER
-    let _ = state.sandbox_manager.create_sandbox(&id).await
+    // [NEW] Parse clone strategy from request
+    let strategy = match req.clone_strategy.as_deref() {
+        Some("schema") => CloneStrategy::SchemaOnly,
+        Some("partial") => CloneStrategy::Partial(req.clone_record_limit.unwrap_or(100)),
+        Some("full") => CloneStrategy::Full,
+        _ => CloneStrategy::None,
+    };
+    
+    // [UPDATED] Call sandbox manager with strategy and source DB (root DB)
+    let _ = state.sandbox_manager.create_sandbox(&id, strategy, state.db.clone()).await
         .map_err(|e| AppError::UnknownError(e))?;
 
     // 2. Create Session Record in MAIN DB

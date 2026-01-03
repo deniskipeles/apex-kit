@@ -56,7 +56,12 @@ impl SearchManager {
         // Always add a system field for record ID
         schema_builder.add_i64_field("record_id", STORED | INDEXED | FAST);
 
-        for (name, def) in &schema.fields {
+        // [FIX] Sort fields alphabetically to ensure Deterministic Field IDs
+        // This prevents "Schema Mismatch" errors on app restart due to HashMap randomization
+        let mut sorted_fields: Vec<_> = schema.fields.iter().collect();
+        sorted_fields.sort_by_key(|(name, _)| *name);
+
+        for (name, def) in sorted_fields {
             if def.indexed {
                 match def.r#type {
                     FieldType::String | FieldType::Text => {
@@ -66,17 +71,13 @@ impl SearchManager {
                         schema_builder.add_f64_field(name, STORED | INDEXED | FAST);
                     },
                     FieldType::Boolean => {
-                        // Store boolean as u64 (0 or 1)
                         schema_builder.add_u64_field(name, STORED | INDEXED | FAST);
                     },
-                    // --- OPTIMIZATION: FLATTEN GEOPOINT ---
                     FieldType::GeoPoint => {
-                        // We add two fields: {name}_lat and {name}_lng
-                        // FAST is required for Range Queries (Bounding Box)
                         schema_builder.add_f64_field(&format!("{}_lat", name), STORED | INDEXED | FAST);
                         schema_builder.add_f64_field(&format!("{}_lng", name), STORED | INDEXED | FAST);
                     },
-                    _ => {} // Json not searchable yet
+                    _ => {} 
                 }
             }
         }
@@ -97,7 +98,6 @@ impl SearchManager {
                     let _ = fs::remove_dir_all(&index_path);
                     let _ = fs::create_dir_all(&index_path);
                     
-                    // Re-open directory on fresh folder
                     let new_dir = MmapDirectory::open(&index_path).map_err(|e| e.to_string())?;
                     
                     Index::create(new_dir, tantivy_schema, tantivy::IndexSettings::default())

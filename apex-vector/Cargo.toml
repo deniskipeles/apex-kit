@@ -25,6 +25,9 @@ tracing = "0.1"
 # Explicitly pin rand to match candle-core
 rand = "0.8.5"
 
+# [NEW] For smart HTML -> Text conversion (preserves Code blocks)
+html2text = "0.6"
+
 # FIX: Force half to 2.3.1 to prevent it from pulling rand 0.9
 # We enable the "rand" feature so it implements traits for rand 0.8
 half = { version = "=2.3.1", features = ["rand_distr", "std"] }

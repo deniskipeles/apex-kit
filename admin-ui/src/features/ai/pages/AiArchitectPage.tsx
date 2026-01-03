@@ -13,6 +13,8 @@ export const AiArchitectPage = () => {
     const [isCreating, setIsCreating] = useState(false);
     const [selectedModel, setSelectedModel] = useState(DEFAULT_AI_MODEL);
     const [newProjectName, setNewProjectName] = useState('');
+    const [cloneStrategy, setCloneStrategy] = useState('none');
+    const [cloneRecordLimit, setCloneRecordLimit] = useState(100);
     const { toast } = useToast();
 
     const loadSessions = async () => {
@@ -34,11 +36,17 @@ export const AiArchitectPage = () => {
         if (!newProjectName.trim()) return;
         setIsCreating(true);
         try {
-            const newSession = await architectService.createSession(newProjectName, undefined, selectedModel);
+            const newSession = await architectService.createSession(
+                newProjectName,
+                undefined,
+                selectedModel,
+                cloneStrategy, // Pass strategy
+                cloneStrategy === 'partial' ? cloneRecordLimit : undefined // Pass limit if partial
+            );
             setSessions([newSession, ...sessions]);
             setActiveSession(newSession);
             setNewProjectName('');
-            toast('Project initialized successfully', 'success');
+            toast('Project initialized successfully. Data cloning in background.', 'success');
         } catch (e: any) {
             toast(e.message || 'Failed to create session', 'error');
         } finally {
@@ -55,7 +63,7 @@ export const AiArchitectPage = () => {
                         <Sparkles className="h-8 w-8 text-primary" /> AI Architect
                     </h1>
                     <p className="text-muted-foreground text-sm md:text-base max-w-2xl">
-                        Build, iterate, and deploy full-stack applications using natural language. 
+                        Build, iterate, and deploy full-stack applications using natural language.
                         Describe your app, and the AI will generate the schema, API, and UI.
                     </p>
                 </div>
@@ -67,7 +75,7 @@ export const AiArchitectPage = () => {
                     <div className="h-12 w-12 rounded-full bg-gradient-to-br from-primary to-purple-600 flex items-center justify-center shrink-0 shadow-lg group-hover:scale-105 transition-transform">
                         <Plus className="h-6 w-6 text-white" />
                     </div>
-                    
+
                     <div className="flex-1 flex flex-col md:flex-row gap-3 w-full">
                         <div className="flex-1">
                             <Input
@@ -87,14 +95,43 @@ export const AiArchitectPage = () => {
                                 {AI_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
                             </Select>
                         </div>
-                        <Button 
-                            onClick={handleCreate} 
-                            isLoading={isCreating} 
+                        <Button
+                            onClick={handleCreate}
+                            isLoading={isCreating}
                             disabled={!newProjectName}
                             className="h-11 px-8 font-semibold shadow-lg hover:shadow-primary/25 transition-all"
                         >
                             Start Project
                         </Button>
+                    </div>
+                </div>
+                
+                {/* [NEW] ADVANCED OPTIONS */}
+                <div className="w-full border-t border-border/50 pt-4 mt-2 flex flex-col md:flex-row items-center gap-3">
+                    <div className="w-full md:w-1/3">
+                        <label className="text-xs font-semibold text-muted-foreground mb-1 block">AI Model</label>
+                        <Select value={selectedModel} onChange={(e: any) => setSelectedModel(e.target.value)} className="h-9 bg-background/80 border-border/50">
+                            {AI_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                        </Select>
+                    </div>
+                    <div className="w-full md:w-1/3">
+                        <label className="text-xs font-semibold text-muted-foreground mb-1 block">Initial State</label>
+                        <Select value={cloneStrategy} onChange={(e: any) => setCloneStrategy(e.target.value)} className="h-9 bg-background/80 border-border/50">
+                            <option value="none">Empty Sandbox</option>
+                            <option value="schema">Clone Schema Only</option>
+                            <option value="partial">Clone Schema + N Records</option>
+                            <option value="full">Full Clone</option>
+                        </Select>
+                    </div>
+                    <div className={`w-full md:w-1/3 transition-opacity duration-300 ${cloneStrategy === 'partial' ? 'opacity-100' : 'opacity-30 pointer-events-none'}`}>
+                        <label className="text-xs font-semibold text-muted-foreground mb-1 block">Record Limit</label>
+                        <Input
+                            type="number"
+                            value={cloneRecordLimit}
+                            onChange={(e: any) => setCloneRecordLimit(Number(e.target.value))}
+                            className="h-9 bg-background/80 border-border/50"
+                            disabled={cloneStrategy !== 'partial'}
+                        />
                     </div>
                 </div>
             </div>
@@ -118,8 +155,8 @@ export const AiArchitectPage = () => {
             ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
                     {sessions.map(session => (
-                        <div 
-                            key={session.id} 
+                        <div
+                            key={session.id}
                             onClick={() => setActiveSession(session)}
                             className="group relative bg-card border border-border rounded-xl p-5 cursor-pointer hover:border-primary/50 hover:shadow-lg hover:-translate-y-1 transition-all duration-200 flex flex-col h-full"
                         >
@@ -163,9 +200,9 @@ export const AiArchitectPage = () => {
 
                                 {/* Action Footer */}
                                 <div className="pt-4 mt-2 border-t border-border flex justify-end">
-                                    <Button 
-                                        variant="outline" 
-                                        size="sm" 
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
                                         className="w-full bg-background/50 hover:bg-primary hover:text-primary-foreground transition-colors text-xs h-9"
                                         onClick={(e) => {
                                             e.stopPropagation();

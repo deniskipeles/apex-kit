@@ -278,6 +278,19 @@ export const apiClient = {
     }
   },
 
+  configs: {
+    list: async (): Promise<any[]> => {
+      // The backend returns snake_case for updated_at usually, verify mapping
+      return await pb.admins.listConfigs();
+    },
+    set: async (key: string, value: string, encrypt: boolean = false) => {
+      return await pb.admins.setConfig(key, value, encrypt);
+    },
+    delete: async (key: string) => {
+      return await pb.admins.deleteConfig(key);
+    }
+  },
+
   collections: {
     list: async (): Promise<Collection[]> => {
       const cols = await pb.admins.listCollections();
@@ -331,8 +344,8 @@ export const apiClient = {
         id: item.id.toString(),
         collectionId,
         collectionName: 'unknown',
-        created: new Date().toISOString(),
-        updated: new Date().toISOString(),
+        created: new Date(item.created).toISOString(),
+        updated: new Date(item.updated).toISOString(),
         ...item.data,
         expand: item.expand || {} // Ensure expand object exists
       }));
@@ -368,8 +381,8 @@ export const apiClient = {
         id: res.id.toString(),
         collectionId,
         collectionName: '',
-        created: new Date().toISOString(),
-        updated: new Date().toISOString(),
+        created: new Date(res.created).toISOString(),
+        updated: new Date(res.updated).toISOString(),
         ...res.data
       };
     },
@@ -379,8 +392,8 @@ export const apiClient = {
         id: res.id.toString(),
         collectionId,
         collectionName: '',
-        created: new Date().toISOString(),
-        updated: new Date().toISOString(),
+        created: new Date(res.created).toISOString(),
+        updated: new Date(res.updated).toISOString(),
         ...res.data
       };
     },
@@ -390,8 +403,8 @@ export const apiClient = {
         id: res.id.toString(),
         collectionId,
         collectionName: '',
-        created: new Date().toISOString(),
-        updated: new Date().toISOString(),
+        created: new Date(res.created).toISOString(),
+        updated: new Date(res.updated).toISOString(),
         ...res.data,
         expand: res.expand || {} // Ensure expand object exists
       };
@@ -526,8 +539,8 @@ export const apiClient = {
       const res = await pb.ai.listSessions();
       return res;
     },
-    createSession: async (name: string, initialPrompt?: string, model?: string): Promise<object> => {
-      const res = await pb.ai.createSession(name, initialPrompt, model);
+    createSession: async (name: string, initialPrompt?: string, model?: string, cloneStrategy?: string, cloneRecordLimit?: number): Promise<object> => {
+      const res = await pb.ai.createSession(name, initialPrompt, model, cloneStrategy, cloneRecordLimit);
       return res;
     },
     chat: async (id: string, prompt: string, model: string): Promise<object> => {

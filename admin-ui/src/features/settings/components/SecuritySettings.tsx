@@ -1,38 +1,30 @@
-
 import React, { useState } from 'react';
-import { Mail, Shield, Send, Globe, Lock } from 'lucide-react';
-import { Card, CardHeader, CardTitle, CardContent, Input, Label, Switch, Button, Textarea } from '../../../components/ui/Elements'; // Assuming Textarea is exported
+import { Shield, Globe, Lock, Save } from 'lucide-react';
+import { Card, CardHeader, CardTitle, CardContent, Label, Switch, Button, Textarea } from '../../../components/ui/Elements';
 import { AppSettings } from '../../../types';
-import { settingsService } from '../services/settingsService';
-import { useToast } from '../../../components/feedback/Toast';
-import { PasswordInput } from '../../../components/form/PasswordInput';
 
 interface SecuritySettingsProps {
   settings: AppSettings;
   onChange: (settings: Partial<AppSettings>) => void;
+  onSave: (data: Partial<AppSettings>) => Promise<void>;
 }
 
-export const SecuritySettings = ({ settings, onChange }: SecuritySettingsProps) => {
-  const [isTestingEmail, setIsTestingEmail] = useState(false);
-  const { toast } = useToast();
-
-  const updateSmtp = (key: string, value: any) => {
-      onChange({ smtp: { ...settings.smtp, [key]: value } });
-  };
+export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySettingsProps) => {
+  const [isSaving, setIsSaving] = useState(false);
 
   const updateSecurity = (key: string, value: any) => {
       onChange({ security: { ...settings.security, [key]: value } });
   };
 
-  const handleTestEmail = async () => {
-      setIsTestingEmail(true);
+  const handleSaveClick = async () => {
+      setIsSaving(true);
       try {
-          await settingsService.testEmail('test@example.com');
-          toast('Test email sent successfully', 'success');
-      } catch (e) {
-          toast('Failed to send test email', 'error');
+          await onSave({
+              allowPublicRegistration: settings.allowPublicRegistration,
+              security: settings.security
+          });
       } finally {
-          setIsTestingEmail(false);
+          setIsSaving(false);
       }
   };
 
@@ -84,7 +76,7 @@ export const SecuritySettings = ({ settings, onChange }: SecuritySettingsProps) 
                             placeholder="https://myapp.com, http://localhost:3000"
                             className="font-mono text-xs min-h-[80px]"
                         />
-                        <p className="text-[10px] text-muted-foreground">Comma separated list of full URLs (including protocol).</p>
+                        <p className="text-[10px] text-muted-foreground">Comma separated list of full URLs.</p>
                     </div>
                 </div>
                 {settings.security.corsAllowAll && (
@@ -95,50 +87,12 @@ export const SecuritySettings = ({ settings, onChange }: SecuritySettingsProps) 
             </CardContent>
         </Card>
 
-        {/* SMTP Card (Existing) */}
-        <Card>
-            <CardHeader>
-                <div className="flex items-center justify-between">
-                    <CardTitle className="flex items-center gap-2"><Mail className="h-4 w-4" /> SMTP Configuration</CardTitle>
-                    <Switch 
-                        checked={settings.smtp.enabled}
-                        onCheckedChange={(c: boolean) => updateSmtp('enabled', c)}
-                    />
-                </div>
-            </CardHeader>
-            <CardContent className={`space-y-6 transition-opacity ${settings.smtp.enabled ? 'opacity-100' : 'opacity-50 pointer-events-none'}`}>
-               {/* ... existing SMTP inputs ... */}
-               <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-                    <div className="space-y-2 md:col-span-2">
-                        <Label>SMTP Host</Label>
-                        <Input value={settings.smtp.host} onChange={(e: any) => updateSmtp('host', e.target.value)} placeholder="smtp.example.com" />
-                    </div>
-                    <div className="space-y-2">
-                        <Label>Port</Label>
-                        <Input type="number" value={settings.smtp.port} onChange={(e: any) => updateSmtp('port', Number(e.target.value))} placeholder="587" />
-                    </div>
-                </div>
-                <div className="space-y-2">
-                    <Label>From Email Address</Label>
-                    <Input value={settings.smtp.fromEmail} onChange={(e: any) => updateSmtp('fromEmail', e.target.value)} placeholder="noreply@yourdomain.com" />
-                </div>
-                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                     <div className="space-y-2">
-                        <Label>Username</Label>
-                        <Input value={settings.smtp.username} onChange={(e: any) => updateSmtp('username', e.target.value)} />
-                    </div>
-                    <div className="space-y-2">
-                        <Label>Password</Label>
-                        <PasswordInput value={settings.smtp.password || ''} onChange={(e: any) => updateSmtp('password', e.target.value)} placeholder="Leave empty to keep unchanged" />
-                    </div>
-                </div>
-                <div className="pt-4 border-t border-border flex justify-end">
-                     <Button variant="secondary" size="sm" className="w-full sm:w-auto" onClick={handleTestEmail} isLoading={isTestingEmail} disabled={!settings.smtp.enabled}>
-                         <Send className="mr-2 h-3 w-3" /> Send Test Email
-                     </Button>
-                </div>
-            </CardContent>
-        </Card>
+        {/* Global Save for this Tab */}
+        <div className="flex justify-end">
+            <Button onClick={handleSaveClick} isLoading={isSaving} className="w-full sm:w-auto">
+                <Save className="mr-2 h-4 w-4" /> Save Security Settings
+            </Button>
+        </div>
     </div>
   );
 };

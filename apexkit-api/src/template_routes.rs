@@ -5,7 +5,7 @@ use axum::{
 use serde::{Deserialize};
 use serde_json::{json, Value};
 use apexkit_core::{auth::Claims, models::{Template, CreateTemplateReq}};
-use crate::{AppState, AppError};
+use crate::{AppState, AppError, DatabaseConnection}; // [FIX] Added DatabaseConnection
 
 // DTO for Updates
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -23,10 +23,14 @@ pub struct UpdateTemplateReq {
 )]
 pub async fn list_templates(
     Extension(claims): Extension<Claims>,
-    State(state): State<AppState>
+    DatabaseConnection(db): DatabaseConnection, // [FIX] Use contextual DB
+    State(_state): State<AppState>
 ) -> Result<Json<Vec<Template>>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    let templates = state.db.list_templates().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [FIX] Use db (Sandbox/Tenant) instead of state.db (Root)
+    let templates = db.list_templates().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
     Ok(Json(templates))
 }
 
@@ -38,17 +42,20 @@ pub async fn list_templates(
 )]
 pub async fn create_template(
     Extension(claims): Extension<Claims>,
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection, // [FIX] Use contextual DB
+    State(state): State<AppState>, // Keep state for css_cache
     Json(payload): Json<CreateTemplateReq>
 ) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
     
-    // Check if slug exists? DB constraint handles uniqueness usually, but we catch error
-    let id = state.db.create_template(payload).await
+    // [FIX] Use db
+    let id = db.create_template(payload).await
         .map_err(|e| AppError::UnknownError(format!("Failed to create template: {}", e)))?;
+    
+    // Clear global CSS cache (this is fine to be global as styles might be shared or recompiled)
     {
         let mut cache = state.css_cache.write().await;
-        *cache = String::new(); // Clear css cache
+        *cache = String::new(); 
     }
         
     Ok(Json(json!({ "id": id })))
@@ -62,17 +69,20 @@ pub async fn create_template(
 )]
 pub async fn update_template(
     Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection, // [FIX] Use contextual DB
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateTemplateReq>
 ) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
     
-    state.db.update_template(id, payload.content, payload.script_id).await
+    // [FIX] Use db
+    db.update_template(id, payload.content, payload.script_id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
     {
         let mut cache = state.css_cache.write().await;
-        *cache = String::new(); // Clear css cache
+        *cache = String::new(); 
     }
         
     Ok(Json(json!({ "success": true })))
@@ -85,10 +95,19 @@ pub async fn update_template(
 )]
 pub async fn delete_template(
     Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection, // [FIX] Use contextual DB
     State(state): State<AppState>,
     Path(id): Path<i64>
 ) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    state.db.delete_template(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [FIX] Use db
+    db.delete_template(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    {
+        let mut cache = state.css_cache.write().await;
+        *cache = String::new();
+    }
+
     Ok(Json(json!({ "success": true })))
 }

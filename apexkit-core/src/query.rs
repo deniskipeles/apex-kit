@@ -1,9 +1,10 @@
-use serde::{Deserialize, Serialize}; // Added Serialize
+// =========================== apexkit-core/src/query.rs ===========================
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use crate::schema::{CollectionSchema, FieldType, RelationType};
 use crate::filter::FilterNode;
 
-#[derive(Debug, Deserialize, Serialize, Clone)] // Added Serialize
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct QueryOptions {
     pub page: Option<u64>,
     pub per_page: Option<u64>,
@@ -83,6 +84,8 @@ impl SqlBuilder {
         // Column 1: ID
         // Column 2: Data (as JSON string)
         // Column 3: Expand (as JSON string or NULL)
+        // Column 4: Created
+        // Column 5: Updated
         
         let expand_col_sql = if let Some(expand_str) = &options.expand {
             if !expand_str.trim().is_empty() {
@@ -103,16 +106,22 @@ impl SqlBuilder {
             "NULL".to_string()
         };
 
-        // Note: json(records.data) ensures we get text instead of blob from JSONB columns
-        let mut sql = format!("SELECT records.id, json(records.data), {} FROM records {}", expand_col_sql, where_clause);
+        // [UPDATED] Added records.created, records.updated to SELECT
+        let mut sql = format!(
+            "SELECT records.id, json(records.data), {}, records.created, records.updated FROM records {}", 
+            expand_col_sql, 
+            where_clause
+        );
 
         if let Some(sort) = options.sort {
             let desc = sort.starts_with('-');
             let field = if desc { &sort[1..] } else { &sort };
             
-            if field == "id" || field == "created" {
+            // [UPDATED] Handle system fields explicitly in sort
+            if field == "id" || field == "created" || field == "updated" {
                 sql.push_str(&format!(" ORDER BY records.{} {}", field, if desc { "DESC" } else { "ASC" }));
             } else {
+                // Otherwise sort by JSON data field
                 sql.push_str(&format!(" ORDER BY records.data ->> '{}' {}", field, if desc { "DESC" } else { "ASC" }));
             }
         } else {
@@ -288,9 +297,12 @@ pub fn build_expand_json_object(
         );
 
         // Build Full Target Record JSON Structure
+        // [UPDATED] Include created/updated in nested JSON via subquery if needed, 
+        // but typically 'data' JSON blob doesn't contain them. 
+        // We inject them into the JSON object construction here.
         let target_record_json = format!(
-            "json_object('id', {}.id, 'data', json({}.data), 'expand', {})",
-            target_alias, target_alias, nested_expand_sql
+            "json_object('id', {}.id, 'data', json({}.data), 'created', {}.created, 'updated', {}.updated, 'expand', {})",
+            target_alias, target_alias, target_alias, target_alias, nested_expand_sql
         );
 
         // Construct Subquery based on cardinality and direction
