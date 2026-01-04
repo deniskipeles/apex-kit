@@ -14,6 +14,9 @@ use regex::Regex;
 use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 use crate::{trigger_void_hook, extract_log_meta};
+use crate::BaseUrl;
+use apexkit_core::realtime::EventScope;
+
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct ExecutePromptReq {
@@ -102,12 +105,15 @@ pub async fn run_action(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>, // [NEW]
     headers: axum::http::HeaderMap,             // [NEW]
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     Path(slug): Path<String>,
     Json(payload): Json<ExecutePromptReq>,
 ) -> Result<Json<Value>, AppError> {
     let claims = auth.map(|Extension(c)| c);
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     // [TRIGGER] Before AI Run
-    trigger_void_hook(&state, "before_ai_run", json!({ "slug": slug, "vars": payload.variables }), claims.as_ref()).await?;
+    trigger_void_hook(&state, "before_ai_run", json!({ "slug": slug, "vars": payload.variables }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
     
     // 1. Get Action Config (From Tenant/Sandbox DB)
     let action = db.get_ai_action(&slug).await
@@ -238,7 +244,7 @@ pub async fn run_action(
     let _ = db.log_audit_event("info", "AI Action Run", "ai", Some(meta)).await;
 
     // [TRIGGER] After AI Run
-    let _ = trigger_void_hook(&state, "after_ai_run", json!({ "slug": slug, "result": result, "metadata": metadata }), claims.as_ref()).await;
+    let _ = trigger_void_hook(&state, "after_ai_run", json!({ "slug": slug, "result": result, "metadata": metadata }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
 
     Ok(Json(json!({ 
         "result": result,

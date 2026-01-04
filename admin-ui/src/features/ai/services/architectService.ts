@@ -1,4 +1,3 @@
-import { APEX_TOKEN } from '@/src/constants';
 import { apiClient } from '../../../lib/apiClient';
 
 export interface ChatMessage {
@@ -34,13 +33,11 @@ export interface Plugin {
 export const architectService = {
     // List all past sessions
     listSessions: async (): Promise<AiSession[]> => {
-        const token = localStorage.getItem(APEX_TOKEN);
         const res = await apiClient.ai.listSessions();
         return res as AiSession[];
     },
 
     // Start a new project
-    // [UPDATED] Added cloneStrategy and cloneRecordLimit
     createSession: async (
         name: string, 
         initialPrompt?: string, 
@@ -52,66 +49,41 @@ export const architectService = {
             name, 
             initialPrompt, 
             model,
-            // Map to snake_case for the backend
             cloneStrategy,
             cloneRecordLimit
         );
-        if (!(res as any)?.id) throw new Error((res as any)?.message);
+        // SDK returns the object directly, or throws. 
+        // If your SDK returns {id: ...}, this check is valid.
+        if (!(res as any)?.id) throw new Error((res as any)?.message || "Failed to create session");
         return res as AiSession;
     },
 
     // Continue conversation
     chat: async (id: string, prompt: string, model: string): Promise<AiSession> => {
-        const token = localStorage.getItem(APEX_TOKEN);
-        const res = await fetch(`${apiClient.apiUrl}/api/v1/admin/ai/sessions/${id}/chat`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ prompt, model })
-        });
-        if (!res.ok) throw new Error((await res.json()).message);
-        return await res.json();
+        const res = await apiClient.ai.chat(id, prompt, model);
+        return res as AiSession;
     },
 
-    // code assistant edit AI
+    // Code assistant edit AI
     codeEdit: async (prompt: string, currentCode: string, contextType: string, model: string): Promise<any> => {
-        const token = localStorage.getItem(APEX_TOKEN);
-        const res = await fetch(`${apiClient.apiUrl}/api/v1/admin/ai/edit-code`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${token}`
-            },
-            body: JSON.stringify({
-                prompt,
-                current_code: currentCode,
-                context_type: contextType,
-                model: model // Pass selected model
-            })
-        });
-        if (!res.ok) throw new Error((await res.json()).message);
-        return await res.json();
+        const res = await apiClient.ai.codeEdit(prompt, currentCode, contextType, model);
+        return res;
     },
 
     // Publish as Plugin
     publish: async (id: string): Promise<any> => {
-        const token = localStorage.getItem(APEX_TOKEN);
-        const res = await fetch(`${apiClient.apiUrl}/api/v1/admin/ai/sessions/${id}/publish`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` }
-        });
-        if (!res.ok) throw new Error((await res.json()).message);
-        return await res.json();
+        const res = await apiClient.ai.publishSession(id);
+        return res;
     },
+
     // List published plugins
     listPlugins: async (): Promise<Plugin[]> => {
-        const token = localStorage.getItem(APEX_TOKEN);
-        const res = await fetch(`${apiClient.apiUrl}/api/v1/admin/ai/plugins`, {
-            headers: { 'Authorization': `Bearer ${token}` }
-        });
-        if (!res.ok) throw new Error("Failed to load plugins");
-        return await res.json();
+        const res = await apiClient.ai.listPlugins();
+        return res as Plugin[];
     },
+
     // Apply Changes
-    applySessionChanges: async (id: string): Promise<any> => await apiClient.ai.applySessionChanges(id),
-    // Publish
+    applySessionChanges: async (id: string): Promise<any> => {
+        return await apiClient.ai.applySessionChanges(id);
+    }
 };

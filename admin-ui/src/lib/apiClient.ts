@@ -1,5 +1,5 @@
 import { APEX_TOKEN } from '../constants';
-import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction } from '../types';
+import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions } from '../types';
 import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
 
 // const env = (import.meta as any).env;
@@ -535,37 +535,38 @@ export const apiClient = {
     run: async (slug: string, variables: Record<string, string>) => {
       return await pb.ai.run(slug, variables);
     },
-    listSessions: async (): Promise<Array<object>> => {
-      const res = await pb.ai.listSessions();
-      return res;
+    // --- Architect ---
+    listSessions: async () => await pb.ai.listSessions(),
+    
+    createSession: async (name: string, initialPrompt?: string, model?: string, cloneStrategy?: string, cloneRecordLimit?: number) => {
+        return await pb.ai.createSession(name, initialPrompt, model, cloneStrategy, cloneRecordLimit);
     },
-    createSession: async (name: string, initialPrompt?: string, model?: string, cloneStrategy?: string, cloneRecordLimit?: number): Promise<object> => {
-      const res = await pb.ai.createSession(name, initialPrompt, model, cloneStrategy, cloneRecordLimit);
-      return res;
+
+    chat: async (id: string, prompt: string, model: string) => {
+        return await pb.ai.chat(id, prompt, model);
     },
-    chat: async (id: string, prompt: string, model: string): Promise<object> => {
-      const res = await pb.ai.chat(id, prompt, model);
-      return res;
+
+    applySessionChanges: async (id: string) => {
+        return await pb.ai.applySessionChanges(id);
     },
-    applySessionChanges: async (id: string): Promise<any> => {
-      const res = await pb.ai.applySessionChanges(id);
-      return res;
+
+    publishSession: async (id: string) => {
+        return await pb.ai.publishSession(id);
     },
-    publishSession: async (id: string): Promise<any> => {
-      const res = await pb.ai.publishSession(id);
-      return res;
+
+    listPlugins: async () => {
+        return await pb.ai.listPlugins();
     },
-    listPlugins: async (): Promise<Plugin[]> => {
-      const res = await pb.ai.listPlugins();
-      return res;
+
+    codeEdit: async (prompt: string, currentCode: string, contextType: string, model: string) => {
+        return await pb.ai.editCode(prompt, currentCode, contextType, model);
     }
   },
 
   logs: {
     list: async (): Promise<SystemLog[]> => {
       try {
-        // Fetch from real endpoint
-        const res = await pb.logs.list(); // You need to add listLogs to SDK admin object
+        const res = await pb.logs.list();
         return res.map((l: any) => ({
           id: l.id.toString(),
           level: l.level,
@@ -577,5 +578,17 @@ export const apiClient = {
         return [];
       }
     }
-  }
+  },
+
+  // Add this new method
+  getVersions: async (): Promise<AppVersions> => {
+    try {
+        const res = await fetch('/version');
+        if (!res.ok) throw new Error('Failed to fetch versions');
+        return await res.json();
+    } catch (e) {
+        console.error(e);
+        return { root: '0.0.0', api: '0.0.0', core: '0.0.0', vector: '0.0.0' };
+    }
+  },
 };

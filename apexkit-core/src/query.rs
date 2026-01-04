@@ -1,4 +1,3 @@
-// =========================== apexkit-core/src/query.rs ===========================
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use crate::schema::{CollectionSchema, FieldType, RelationType};

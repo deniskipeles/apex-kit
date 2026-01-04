@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use regex::Regex;
 use serde::Deserialize;
 use tracing::{warn, info};
+use apexkit_core::realtime::EventScope;
 
 // --- DATALOADERS ---
 
@@ -398,6 +399,7 @@ pub async fn build_schema(
                         let script_record = state.db.get_script_by_name(&s_name).await
                             .map_err(|e| async_graphql::Error::new(e.to_string()))?
                             .ok_or_else(|| async_graphql::Error::new("Linked script not found"))?;
+                        let event_scope = ctx.data::<EventScope>().unwrap_or(&EventScope::Root).clone();
 
                         let result = state.script_engine.run_script(
                             &script_record.code,
@@ -407,7 +409,8 @@ pub async fn build_schema(
                             state.vector_provider.clone(),
                             state.vault.clone(),
                             None,
-                            Some(state.tx.clone())
+                            Some(state.tx.clone()),
+                            event_scope
                         ).await.map_err(|e| async_graphql::Error::new(e))?;
 
                         // FIX: Use `FieldValue::value` + `json_to_gql` for scalars

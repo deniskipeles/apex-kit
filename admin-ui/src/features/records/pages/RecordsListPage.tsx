@@ -13,7 +13,7 @@ import { RecordFilters } from '../components/RecordFilters';
 import { ApiDocsModal } from '../components/ApiDocsModal';
 import { collectionsService } from '../../collections/services/collectionsService';
 import { recordsService } from '../services/recordsService';
-import { AppRecord, Collection } from '../../../types';
+import { AppRecord, AppVersions, Collection } from '../../../types';
 import { Overlay } from '../../../components/overlay/Overlay';
 import { usePagination } from '../../../hooks/usePagination';
 import { InstantSearchInput } from '../../../components/search/InstantSearchInput';
@@ -22,6 +22,7 @@ import { useToast } from '@/src/components/feedback/Toast';
 import { Dialog } from '../../../components/ui/Dialog'; 
 import { Input, Label } from '../../../components/form/FormPrimitives';
 import { APEX_NUMBER_OF_RECORD_FIELDS, APEX_TRUNCATION_SIZE } from '@/src/constants';
+import { VersionsModal } from '@/src/components/feedback/VersionsModal';
 
 // --- HELPER: Mobile Collection Selector ---
 const MobileCollectionSelect = ({ collections, active, onSelect }: { collections: Collection[], active: string, onSelect: (name: string) => void }) => {
@@ -102,7 +103,16 @@ export const RecordsListPage = () => {
   const { page, setPage, perPage } = usePagination(1, 20);
   const [totalItems, setTotalItems] = useState(0);
 
+  // Version State
+  const [versions, setVersions] = useState<AppVersions | null>(null);
+  const [isVersionsOpen, setIsVersionsOpen] = useState(false);
+
   const { toast } = useToast();
+
+  // Fetch Versions on mount
+  useEffect(() => {
+      apiClient.getVersions().then(setVersions);
+  }, []);
 
   // 1. Initial Load: Fetch Collections
   useEffect(() => {
@@ -421,15 +431,32 @@ export const RecordsListPage = () => {
           </div>
           
           <div className="flex-shrink-0 pt-4 px-4 sm:px-0 flex justify-between items-center border-t border-border mt-2 bg-background sm:bg-transparent">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-xs text-muted-foreground hover:text-primary gap-2"
-              onClick={() => setIsApiDocsOpen(true)}
-            >
-              <Code className="h-4 w-4" />
-              <span className="hidden sm:inline">API Docs</span>
-            </Button>
+            {/* Left Side Footer */}
+            <div className="flex items-center gap-3">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs text-muted-foreground hover:text-primary gap-2"
+                  onClick={() => setIsApiDocsOpen(true)}
+                >
+                  <Code className="h-4 w-4" />
+                  <span className="hidden sm:inline">API Docs</span>
+                </Button>
+
+                {/* [NEW] Version Indicator */}
+                {versions && (
+                    <>
+                        <div className="h-4 w-px bg-border"></div>
+                        <button 
+                            onClick={() => setIsVersionsOpen(true)}
+                            className="text-[10px] font-mono text-muted-foreground/60 hover:text-primary transition-colors cursor-pointer"
+                            title="Click to view all module versions"
+                        >
+                            v{versions.root}
+                        </button>
+                    </>
+                )}
+            </div>
             
             {/* Pagination works for both list and search */}
             <Pagination
@@ -442,6 +469,12 @@ export const RecordsListPage = () => {
       </div>
 
       {/* --- MODALS & PANELS --- */}
+      {/* [NEW] Versions Modal */}
+      <VersionsModal 
+        isOpen={isVersionsOpen}
+        onClose={() => setIsVersionsOpen(false)}
+        versions={versions}
+      />
 
       {(viewMode === 'create' || viewMode === 'edit') && collection && 
           <RecordForm 

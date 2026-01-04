@@ -2,6 +2,7 @@ use axum::{
     extract::{Path, State, Query},
     response::{Html, IntoResponse, Response},
     http::{HeaderMap}, 
+    Extension, 
 };
 use serde_json::{json, Value};
 use tera::{Tera, Context, Function}; 
@@ -10,6 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use apexkit_core::Db;
 use tracing::{warn, info};
+use crate::BaseUrl;
+use apexkit_core::realtime::EventScope;
+
 
 // --- HELPERS ---
 fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
@@ -112,6 +116,8 @@ async fn render_view_core(
     headers: HeaderMap,
     body: String,
     source_label: &str,
+    _base_url: Option<String>,
+    scope: EventScope 
 ) -> Result<Response, AppError> {
     info!("[Renderer] Serving '{}' from source: {}", slug, source_label);
 
@@ -145,7 +151,7 @@ async fn render_view_core(
     if let Some(script_id) = target_template.script_id {
         let scripts = db.list_scripts().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         if let Some(script) = scripts.into_iter().find(|s| s.id == script_id) {
-            let script_res = state.script_engine.run_script(&script.code, context_data.clone(), db.clone(), state.embedder.clone(), state.vector_provider.clone(),  state.vault.clone(), base_url, Some(state.tx.clone()))
+            let script_res = state.script_engine.run_script(&script.code, context_data.clone(), db.clone(), state.embedder.clone(), state.vector_provider.clone(),  state.vault.clone(), base_url, Some(state.tx.clone()), scope)
                 .await.map_err(|e| AppError::UnknownError(format!("Script Error: {}", e)))?;
             merge_json(&mut context_data, script_res);
         }
@@ -229,35 +235,44 @@ async fn render_view_core(
 pub async fn render_view(
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     Path(slug): Path<String>,
     Query(params): Query<HashMap<String, String>>, 
     headers: HeaderMap,
     body: String, 
 ) -> Result<Response, AppError> {
-    render_view_core(db, state, slug, params, headers, body, "Production").await
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    render_view_core(db, state, slug, params, headers, body, "Root App", Some(base_url), event_scope).await
 }
 
 pub async fn render_sandbox_view(
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     Path((session_id, slug)): Path<(String, String)>, // Accepts 2 params
     Query(params): Query<HashMap<String, String>>, 
     headers: HeaderMap,
     body: String, 
 ) -> Result<Response, AppError> {
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     let label = format!("Sandbox {}", session_id);
-    render_view_core(db, state, slug, params, headers, body, &label).await
+    render_view_core(db, state, slug, params, headers, body, &label, Some(base_url), event_scope).await
 }
 
 // [NEW] Handler for Tenant Routes
 pub async fn render_tenant_view(
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     Path((tenant_id, slug)): Path<(String, String)>, // Accepts 2 params
     Query(params): Query<HashMap<String, String>>, 
     headers: HeaderMap,
     body: String, 
 ) -> Result<Response, AppError> {
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     let label = format!("Tenant {}", tenant_id);
-    render_view_core(db, state, slug, params, headers, body, &label).await
+    render_view_core(db, state, slug, params, headers, body, &label, Some(base_url), event_scope).await
 }

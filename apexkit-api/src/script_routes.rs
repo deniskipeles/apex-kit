@@ -8,7 +8,7 @@ use apexkit_core::{auth::Claims, script_models::{Script, CreateScriptReq}, Db};
 use crate::{AppState, AppError, DatabaseConnection};
 use std::sync::Arc;
 use tracing::info;
-// use axum_extra::extract::Host;
+use apexkit_core::realtime::EventScope;
 use crate::BaseUrl;
 
 // --- PATH DTOS ---
@@ -70,7 +70,8 @@ async fn run_script_core(
     script_name: String,
     payload: Value,
     source: &str,
-    base_url: Option<String>
+    base_url: Option<String>,
+    scope: EventScope 
 ) -> Result<Json<Value>, AppError> {
     info!("[ScriptRunner] Running '{}' in {}", script_name, source);
     
@@ -90,7 +91,8 @@ async fn run_script_core(
         state.vector_provider.clone(),
         state.vault.clone(),
         base_url,
-        Some(state.tx.clone()) 
+        Some(state.tx.clone()),
+        scope
     ).await.map_err(|e| AppError::UnknownError(format!("Script Execution Error: {}", e)))?;
 
     Ok(Json(result))
@@ -103,10 +105,12 @@ pub async fn run_script(
     BaseUrl(base_url): BaseUrl,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>,
     Path(path): Path<ScriptNamePath>, // FIX: Use struct
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    run_script_core(db, state, path.script_name, payload, "API", Some(base_url)).await
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    run_script_core(db, state, path.script_name, payload, "API", Some(base_url), event_scope).await
 }
 
 // Sandbox Handler
@@ -116,8 +120,10 @@ pub async fn run_sandbox_script(
     BaseUrl(base_url): BaseUrl,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>,
     Path(path): Path<ScriptNamePath>, // FIX: Use struct (auto-ignores session_id)
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    run_script_core(db, state, path.script_name, payload, "Sandbox", Some(base_url)).await
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    run_script_core(db, state, path.script_name, payload, "Sandbox", Some(base_url), event_scope).await
 }

@@ -114,18 +114,6 @@ pub struct RecordResponse {
 #[derive(Deserialize, ToSchema, IntoParams)] pub struct SearchQuery { pub q: String, pub limit: Option<usize> }
 #[derive(Serialize, ToSchema, Deserialize)] pub struct RecordListResponse { items: Vec<RecordResponse>, total: i64 }
 
-// --- Path Structs for Nested Routes ---
-#[derive(Deserialize)]
-pub struct IdPath {
-    pub id: i64,
-}
-
-#[derive(Deserialize)]
-pub struct RecordPath {
-    pub id: i64, // Maps to collection {id}
-    pub record_id: i64, // Maps to {record_id}
-}
-
 #[derive(Debug)]
 pub enum AppError {
     LibsqlError(libsql::Error),
@@ -227,7 +215,9 @@ pub async fn trigger_void_hook(
     state: &AppState,
     trigger: &str,
     data: Value,
-    auth: Option<&Claims>
+    auth: Option<&Claims>,
+    scope: Option<&EventScope>,
+    base_url: Option<String>
 ) -> Result<(), AppError> {
     let scripts = state.db.get_scripts_by_trigger(trigger).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
@@ -242,7 +232,7 @@ pub async fn trigger_void_hook(
     });
 
     for script in scripts {
-        state.script_engine.run_hook(&script.code, ctx.clone(), state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), None, Some(state.tx.clone()))
+        state.script_engine.run_hook(&script.code, ctx.clone(), state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), base_url.clone(), Some(state.tx.clone()), scope.cloned())
             .await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))?;
     }
     Ok(())
@@ -253,7 +243,9 @@ pub async fn trigger_filter_hook(
     state: &AppState,
     trigger: &str,
     data: Value,
-    auth: Option<&Claims>
+    auth: Option<&Claims>,
+    scope: Option<&EventScope>,
+    base_url: Option<String>
 ) -> Result<Value, AppError> {
     let scripts = state.db.get_scripts_by_trigger(trigger).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
@@ -269,7 +261,7 @@ pub async fn trigger_filter_hook(
             "auth": auth.map(|c| json!({ "id": c.uid, "email": c.sub, "role": c.role }))
         });
 
-        if let Some(res) = state.script_engine.run_hook(&script.code, ctx, state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), None, Some(state.tx.clone()))
+        if let Some(res) = state.script_engine.run_hook(&script.code, ctx, state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), base_url.clone(), Some(state.tx.clone()), scope.cloned())
             .await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))? 
         {
             current_data = res;
@@ -286,7 +278,8 @@ async fn trigger_hooks(
     record_id: Option<i64>,
     data: &serde_json::Value,
     auth: Option<&Claims>,
-    base_url: Option<String>
+    base_url: Option<String>,
+    scope: Option<&EventScope>
 ) -> Result<Option<serde_json::Value>, AppError> {
     
     let scripts = state.db.get_scripts_by_trigger(trigger).await
@@ -308,7 +301,7 @@ async fn trigger_hooks(
         });
 
         match state.script_engine.run_hook(
-            &script.code, event_context, state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), base_url.clone(), Some(state.tx.clone())
+            &script.code, event_context, state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), base_url.clone(), Some(state.tx.clone()), scope.cloned()
         ).await {
             Ok(Some(new_data)) => { current_data = new_data; modified = true; },
             Ok(None) => {},
@@ -480,19 +473,23 @@ pub async fn list_collections(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap
 ) -> Result<Json<Vec<CollectionResponse>>, AppError> {
     let claims = auth.map(|Extension(c)| c);
+
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     
     // [TRIGGER] Before List
-    trigger_void_hook(&state, "before_list_collections", json!({}), claims.as_ref()).await?;
+    trigger_void_hook(&state, "before_list_collections", json!({}), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     let cols = db.list_collections().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     let resp = cols.into_iter().map(|c| CollectionResponse { id: c.id, name: c.name, schema: c.schema }).collect::<Vec<_>>();
 
     // [TRIGGER] After List
-    let filtered_json = trigger_filter_hook(&state, "after_list_collections", json!(resp), claims.as_ref()).await?;
+    let filtered_json = trigger_filter_hook(&state, "after_list_collections", json!(resp), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
     let final_resp: Vec<CollectionResponse> = serde_json::from_value(filtered_json).map_err(|_| AppError::UnknownError("Script returned invalid collection format".into()))?;
 
     // [LOG]
@@ -507,24 +504,28 @@ pub async fn get_collection(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<IdPath>
 ) -> Result<Json<CollectionResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
-
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+    
     // [TRIGGER] Before Get
-    trigger_void_hook(&state, "before_get_collection", json!({ "id": path.id }), claims.as_ref()).await?;
+    trigger_void_hook(&state, "before_get_collection", json!({ "id": path.id }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
-    let c = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Not found".into()))?;
+    // [FIX] Use Resolver
+    let c = resolve_collection_by_id_or_name(&db, &path.id).await?;
     let resp = CollectionResponse{id: c.id, name: c.name, schema: c.schema};
 
     // [TRIGGER] After Get
-    let filtered_json = trigger_filter_hook(&state, "after_get_collection", json!(resp), claims.as_ref()).await?;
+    let filtered_json = trigger_filter_hook(&state, "after_get_collection", json!(resp), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
     let final_resp: CollectionResponse = serde_json::from_value(filtered_json).unwrap_or(resp);
 
     // [LOG]
-    let meta = extract_log_meta(&headers, Some(addr), json!({ "collection_id": path.id, "name": final_resp.name }));
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "collection_id": final_resp.id, "name": final_resp.name }));
     let _ = db.log_audit_event("info", "Collection Accessed", "api", Some(meta)).await;
 
     Ok(Json(final_resp))
@@ -540,15 +541,19 @@ pub async fn create_collection(
     auth: Option<Extension<Claims>>, 
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>, 
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<CreateCollectionReq>
 ) -> Result<(StatusCode, Json<CollectionResponse>), AppError> {
     let claims = auth.map(|Extension(c)| c);
     if !matches!(claims, Some(ref c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     
     // [TRIGGER]
-    trigger_void_hook(&state, "before_collection_create", json!({ "name": payload.name, "schema": payload.schema }), claims.as_ref()).await?;
+    trigger_void_hook(&state, "before_collection_create", json!({ "name": payload.name, "schema": payload.schema }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     let id = db.create_collection(&payload.name, &payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
@@ -557,7 +562,7 @@ pub async fn create_collection(
     let _ = db.log_audit_event("info", "Collection Created", "api", Some(meta)).await;
 
     // [TRIGGER]
-    let _ = trigger_void_hook(&state, "after_collection_create", json!({ "id": id, "name": payload.name }), claims.as_ref()).await;
+    let _ = trigger_void_hook(&state, "after_collection_create", json!({ "id": id, "name": payload.name }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
 
     Ok((StatusCode::CREATED, Json(CollectionResponse{id, name: payload.name, schema: payload.schema})))
 }
@@ -567,6 +572,8 @@ pub async fn update_collection(
     auth: Option<Extension<Claims>>, 
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>, 
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<IdPath>, 
@@ -575,17 +582,21 @@ pub async fn update_collection(
     let claims = auth.map(|Extension(c)| c);
     if !matches!(claims, Some(ref c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
 
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+    
     // [TRIGGER]
-    trigger_void_hook(&state, "before_collection_update", json!({ "id": path.id, "updates": payload }), claims.as_ref()).await?;
+    trigger_void_hook(&state, "before_collection_update", json!({ "id": path.id, "updates": payload }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
-    let c = db.update_collection(path.id, payload.name, payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    // [FIX] Resolve ID
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    let c = db.update_collection(col.id, payload.name, payload.schema).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // [LOG]
-    let meta = extract_log_meta(&headers, Some(addr), json!({ "id": path.id, "name": c.name }));
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "id": c.id, "name": c.name }));
     let _ = db.log_audit_event("info", "Collection Updated", "api", Some(meta)).await;
 
     // [TRIGGER]
-    let _ = trigger_void_hook(&state, "after_collection_update", json!({ "id": c.id }), claims.as_ref()).await;
+    let _ = trigger_void_hook(&state, "after_collection_update", json!({ "id": c.id }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
 
     Ok(Json(CollectionResponse{id: c.id, name: c.name, schema: c.schema}))
 }
@@ -595,6 +606,8 @@ pub async fn delete_collection(
     auth: Option<Extension<Claims>>, 
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>, 
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<IdPath>
@@ -602,13 +615,17 @@ pub async fn delete_collection(
     let claims = auth.map(|Extension(c)| c);
     if !matches!(claims, Some(ref c) if c.role == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
     
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+    
     // [TRIGGER]
-    trigger_void_hook(&state, "before_collection_delete", json!({ "id": path.id }), claims.as_ref()).await?;
+    trigger_void_hook(&state, "before_collection_delete", json!({ "id": path.id }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
-    db.delete_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    // [FIX] Resolve ID
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    db.delete_collection(col.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     // [LOG]
-    let meta = extract_log_meta(&headers, Some(addr), json!({ "id": path.id }));
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "id": col.id }));
     let _ = db.log_audit_event("warning", "Collection Deleted", "api", Some(meta)).await;
 
     Ok(StatusCode::NO_CONTENT)
@@ -617,6 +634,37 @@ pub async fn delete_collection(
 // =========================================================
 // 2. RECORDS HANDLERS
 // =========================================================
+
+// --- Path Structs for Nested Routes ---
+#[derive(Deserialize)]
+pub struct IdPath {
+    pub id: String, // Can be "1" (ID) or "posts" (Name)
+}
+
+#[derive(Deserialize)]
+pub struct RecordPath {
+    pub id: String, // Collection ID or Name
+    pub record_id: i64, // Maps to {record_id}
+}
+
+// Helper to resolve Collection from String (ID or Name)
+pub async fn resolve_collection_by_id_or_name(
+    db: &Arc<dyn Db>, 
+    identifier: &str
+) -> Result<apexkit_core::Collection, AppError> {
+    // 1. Try to parse as numeric ID first
+    if let Ok(id_num) = identifier.parse::<i64>() {
+        if let Ok(Some(col)) = db.get_collection(id_num).await {
+            return Ok(col);
+        }
+    }
+
+    // 2. Fallback: Look up by Name via list (Cached in CachedDb)
+    let cols = db.list_collections().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    cols.into_iter()
+        .find(|c| c.name == identifier)
+        .ok_or_else(|| AppError::NotFound(format!("Collection '{}' not found", identifier)))
+}
 
 #[utoipa::path(
     get,
@@ -627,28 +675,34 @@ pub async fn list_records(
     auth: Option<Extension<Claims>>, 
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<IdPath>, 
     Query(q): Query<QueryOptions>
 ) -> Result<Json<RecordListResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    
+    // [UPDATED] Resolve Collection by ID or Name
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     
     let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
     if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Read denied".into())); }
 
     // [TRIGGER] Before List (Tunable Query)
     let query_json = json!(q);
-    let modified_query_json = trigger_filter_hook(&state, "before_list_records", query_json, claims.as_ref()).await?;
+    let modified_query_json = trigger_filter_hook(&state, "before_list_records", query_json, claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
     let modified_q: QueryOptions = serde_json::from_value(modified_query_json).unwrap_or(q);
 
-    let res = db.list_records(path.id, modified_q.clone()).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let res = db.list_records(col.id, modified_q.clone()).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     let mut response_data = RecordListResponse{ items: res.items.into_iter().map(|r| RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}).collect(), total: res.total };
 
     // [TRIGGER] After List (Output Filter)
-    let filtered_json = trigger_filter_hook(&state, "after_list_records", json!(response_data), claims.as_ref()).await?;
+    let filtered_json = trigger_filter_hook(&state, "after_list_records", json!(response_data), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
     response_data = serde_json::from_value(filtered_json).unwrap_or(response_data);
 
     // [LOG]
@@ -663,18 +717,24 @@ pub async fn get_record(
     auth: Option<Extension<Claims>>, 
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<RecordPath>, 
     Query(q): Query<QueryOptions>
 ) -> Result<Json<RecordResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
     
-    // [TRIGGER] Before Get
-    trigger_void_hook(&state, "before_get_record", json!({ "collection": col.name, "id": path.record_id }), claims.as_ref()).await?;
+    // [UPDATED] Resolve Collection by ID or Name
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
 
-    let r = db.get_record(path.id, path.record_id, q.expand).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    // [TRIGGER] Before Get
+    trigger_void_hook(&state, "before_get_record", json!({ "collection": col.name, "id": path.record_id }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
+
+    let r = db.get_record(col.id, path.record_id, q.expand).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
     
     let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
     if !policies::check_access(policy, claims.as_ref(), Some(&r.data)) { return Err(AppError::Forbidden("Read denied".into())); }
@@ -682,7 +742,7 @@ pub async fn get_record(
     let response = RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated};
 
     // [TRIGGER] After Get
-    let filtered_json = trigger_filter_hook(&state, "after_get_record", json!(response), claims.as_ref()).await?;
+    let filtered_json = trigger_filter_hook(&state, "after_get_record", json!(response), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
     let final_resp = serde_json::from_value(filtered_json).unwrap_or(response);
 
     // [LOG]
@@ -710,7 +770,9 @@ pub async fn create_record(
     Json(p): Json<apexkit_core::models::Record>
 ) -> Result<Json<RecordResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    
+    // [UPDATED] Resolve Collection by ID or Name
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
     
     let policy = col.schema.as_ref().map(|s| s.policies.create.as_str()).unwrap_or("auth");
     if !policies::check_access(policy, claims.as_ref(), None) { 
@@ -720,22 +782,22 @@ pub async fn create_record(
         return Err(AppError::Forbidden("Create denied".into())); 
     }
     
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     // [TRIGGER] Record-level Hook (legacy) AND System Hook (new)
-    let data_to_save = match trigger_hooks(&state, "before_create", &col, None, &p.data, claims.as_ref(), Some(base_url.clone())).await? { Some(d) => d, None => p.data };
+    let data_to_save = match trigger_hooks(&state, "before_create", &col, None, &p.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { Some(d) => d, None => p.data };
 
     if let Some(schema) = &col.schema { validate_record(schema, &data_to_save).map_err(AppError::Validation)?; }
 
-    let rid = db.create_record(path.id, &data_to_save).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let rid = db.create_record(col.id, &data_to_save).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     // [LOG] Success
     let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "record_id": rid, "user_id": claims.as_ref().map(|c| c.uid) }));
     let _ = db.log_audit_event("info", "Record Created", "api", Some(meta)).await;
 
     // ... (broadcast, hooks, jobs) ...
-    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    let _ = state.tx.send(DbEvent::Insert { collection_id: path.id, record_id: rid, data: data_to_save.clone(), scope: event_scope.clone() });
+    let _ = state.tx.send(DbEvent::Insert { collection_id: col.id, record_id: rid, data: data_to_save.clone(), scope: event_scope.clone() });
     
-    let _ = trigger_hooks(&state, "after_create", &col, Some(rid), &data_to_save, claims.as_ref(), Some(base_url)).await;
+    let _ = trigger_hooks(&state, "after_create", &col, Some(rid), &data_to_save, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
 
     // Jobs (Vector/Index)
     if let Some(schema) = col.schema {
@@ -744,13 +806,13 @@ pub async fn create_record(
         for (field_name, def) in &schema.fields {
             if def.vectorize {
                 if let Some(text_val) = data_to_save.get(field_name).and_then(|v| v.as_str()) {
-                    let job = Job::GenerateEmbedding { collection_id: path.id, record_id: rid, tenant_id: current_tenant.clone(), field_name: field_name.clone(), text_content: text_val.to_string(), model: model_name.clone() };
+                    let job = Job::GenerateEmbedding { collection_id: col.id, record_id: rid, tenant_id: current_tenant.clone(), field_name: field_name.clone(), text_content: text_val.to_string(), model: model_name.clone() };
                     state.queue.enqueue(job).await;
                 }
             }
         }
         if schema.fields.values().any(|f| f.indexed) {
-            let job = Job::IndexRecord { collection_id: path.id, record_id: rid, data: data_to_save.clone(), schema: schema.clone(), tenant_id: current_tenant.clone() };
+            let job = Job::IndexRecord { collection_id: col.id, record_id: rid, data: data_to_save.clone(), schema: schema.clone(), tenant_id: current_tenant.clone() };
             state.queue.enqueue(job).await;
         }
     }
@@ -771,23 +833,27 @@ pub async fn update_record(
     Json(p): Json<apexkit_core::models::Record>
 ) -> Result<Json<RecordResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
-    let existing = db.get_record(path.id, path.record_id, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    
+    // [UPDATED] Resolve Collection
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    
+    let existing = db.get_record(col.id, path.record_id, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
     
     let policy = col.schema.as_ref().map(|s| s.policies.update.as_str()).unwrap_or("admin");
     if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) { return Err(AppError::Forbidden("Update denied".into())); }
     
-    let data_updates = match trigger_hooks(&state, "before_update", &col, Some(path.record_id), &p.data, claims.as_ref(), Some(base_url.clone())).await? { Some(d) => d, None => p.data };
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+
+    let data_updates = match trigger_hooks(&state, "before_update", &col, Some(path.record_id), &p.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { Some(d) => d, None => p.data };
     
-    let r = db.update_record(path.id, path.record_id, &data_updates).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let r = db.update_record(col.id, path.record_id, &data_updates).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "record_id": path.record_id, "user_id": claims.as_ref().map(|c| c.uid) }));
     let _ = db.log_audit_event("info", "Record Updated", "api", Some(meta)).await;
 
-    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    let _ = state.tx.send(DbEvent::Update { collection_id: path.id, record_id: path.record_id, data: r.data.clone(), scope: event_scope.clone() });
-    let _ = trigger_hooks(&state, "after_update", &col, Some(path.record_id), &r.data, claims.as_ref(), Some(base_url)).await;
+    let _ = state.tx.send(DbEvent::Update { collection_id: col.id, record_id: path.record_id, data: r.data.clone(), scope: event_scope.clone() });
+    let _ = trigger_hooks(&state, "after_update", &col, Some(path.record_id), &r.data, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
     
     Ok(Json(RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}))
 }
@@ -804,23 +870,27 @@ pub async fn delete_record(
     Path(path): Path<RecordPath>
 ) -> Result<StatusCode, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
-    let existing = db.get_record(path.id, path.record_id, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
+    
+    // [UPDATED] Resolve Collection
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    
+    let existing = db.get_record(col.id, path.record_id, None).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
     
     let policy = col.schema.as_ref().map(|s| s.policies.delete.as_str()).unwrap_or("admin");
     if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) { return Err(AppError::Forbidden("Delete denied".into())); }
     
-    let _ = trigger_hooks(&state, "before_delete", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url.clone())).await?;
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     
-    db.delete_record(path.id, path.record_id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let _ = trigger_hooks(&state, "before_delete", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await?;
+    
+    db.delete_record(col.id, path.record_id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "record_id": path.record_id, "user_id": claims.as_ref().map(|c| c.uid) }));
     let _ = db.log_audit_event("warning", "Record Deleted", "api", Some(meta)).await;
 
-    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    let _ = state.tx.send(DbEvent::Delete { collection_id: path.id, record_id: path.record_id, scope: event_scope.clone() });
-    let _ = trigger_hooks(&state, "after_delete", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url)).await;
+    let _ = state.tx.send(DbEvent::Delete { collection_id: col.id, record_id: path.record_id, scope: event_scope.clone() });
+    let _ = trigger_hooks(&state, "after_delete", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -828,10 +898,13 @@ pub async fn delete_record(
 #[utoipa::path(get, path = "/api/v1/collections/{id}/search", params(SearchQuery), responses((status = 200, body = Vec<RecordResponse>)))]
 pub async fn search_records(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>, Query(q): Query<SearchQuery>) -> Result<Json<Vec<RecordResponse>>, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    let col = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Collection not found".into()))?;
+    
+    // [UPDATED] Resolve Collection
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    
     let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
     if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Search denied".into())); }
-    let res = db.search_records(path.id, &q.q).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let res = db.search_records(col.id, &q.q).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(res.into_iter().map(|r| RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}).collect()))
 }
 
@@ -848,10 +921,13 @@ pub async fn instant_search_handler(
     Query(params): Query<SearchQuery>
 ) -> Result<Json<Vec<apexkit_core::models::InstantResult>>, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    let collection = db.get_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound(format!("Collection {} not found", path.id)))?;
+    
+    // [UPDATED] Resolve Collection
+    let collection = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    
     let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
     if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Search denied by policy".into())); }
-    let results = db.instant_search(path.id, &params.q, params.limit.unwrap_or(10)).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let results = db.instant_search(collection.id, &params.q, params.limit.unwrap_or(10)).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(results))
 }
 
@@ -863,25 +939,31 @@ pub async fn instant_search_handler(
 pub async fn create_relation(
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>, 
+    BaseUrl(base_url): BaseUrl, 
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<RecordPath>, 
-    auth: Option<Extension<Claims>>, // FIX: Auth before Json
-    Json(p): Json<RelationRequest>   // FIX: Json Last
+    auth: Option<Extension<Claims>>, 
+    Json(p): Json<RelationRequest>   
 ) -> Result<StatusCode, AppError> {
     let claims = auth.map(|Extension(c)| c);
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     
     // [TRIGGER]
-    trigger_void_hook(&state, "before_relation_create", json!({ "origin": path.id, "target_col": p.target_collection_id, "relation": p.relation_name }), claims.as_ref()).await?;
+    trigger_void_hook(&state, "before_relation_create", json!({ "origin": path.id, "target_col": p.target_collection_id, "relation": p.relation_name }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
-    db.create_relation(path.id, path.record_id, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    // [FIX] Resolve Collection ID
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    
+    db.create_relation(col.id, path.record_id, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "relation": p.relation_name, "origin_id": path.record_id, "target_id": p.target_record_id }));
     let _ = db.log_audit_event("info", "Relation Created", "api", Some(meta)).await;
 
     // [TRIGGER]
-    let _ = trigger_void_hook(&state, "after_relation_create", json!({ "relation": p.relation_name }), claims.as_ref()).await;
+    let _ = trigger_void_hook(&state, "after_relation_create", json!({ "relation": p.relation_name }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
 
     Ok(StatusCode::CREATED)
 }
@@ -890,23 +972,30 @@ pub async fn create_relation(
 pub async fn delete_relation(
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>, 
+    BaseUrl(base_url): BaseUrl, 
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<RecordPath>, 
-    auth: Option<Extension<Claims>>, // FIX: Auth before Json
-    Json(p): Json<RelationRequest>   // FIX: Json Last
+    auth: Option<Extension<Claims>>, 
+    Json(p): Json<RelationRequest>   
 ) -> Result<StatusCode, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    
-    trigger_void_hook(&state, "before_relation_delete", json!({ "relation": p.relation_name }), claims.as_ref()).await?;
 
-    db.delete_relation(path.id, path.record_id, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    
+    trigger_void_hook(&state, "before_relation_delete", json!({ "relation": p.relation_name }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
+
+    // [FIX] Resolve Collection ID
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+
+    db.delete_relation(col.id, path.record_id, p.target_collection_id, p.target_record_id, &p.relation_name).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "relation": p.relation_name }));
     let _ = db.log_audit_event("info", "Relation Deleted", "api", Some(meta)).await;
 
-    let _ = trigger_void_hook(&state, "after_relation_delete", json!({ "relation": p.relation_name }), claims.as_ref()).await;
+    let _ = trigger_void_hook(&state, "after_relation_delete", json!({ "relation": p.relation_name }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -964,14 +1053,17 @@ pub async fn register(
     BaseUrl(_base_url): BaseUrl, 
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>, 
+    BaseUrl(base_url): BaseUrl, 
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(p): Json<AuthRequest>
 ) -> Result<Json<AuthResponse>, AppError> {
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     
     // [TRIGGER] before_user_create
     let input_data = json!({ "email": p.email, "role": "user" });
-    trigger_void_hook(&state, "before_user_create", input_data.clone(), None).await?;
+    trigger_void_hook(&state, "before_user_create", input_data.clone(), None, Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     let hash = auth::hash_password(&p.password).map_err(|_| AppError::UnknownError("Hash fail".into()))?;
     let u = db.create_user(&p.email, &hash, "user", None).await.map_err(|_| AppError::UnknownError("User exists".into()))?;
@@ -982,7 +1074,7 @@ pub async fn register(
 
     // [TRIGGER] after_user_create
     let user_json = json!({ "id": u.id, "email": u.email, "role": u.role });
-    let _ = trigger_void_hook(&state, "after_user_create", user_json, None).await;
+    let _ = trigger_void_hook(&state, "after_user_create", user_json, None, Some(&event_scope.clone()), Some(base_url.clone())).await;
 
     let token = auth::create_jwt(u.id, &u.email, &u.role).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
     
@@ -1001,16 +1093,20 @@ pub async fn list_users_handler(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(params): Query<UserListQuery>,
 ) -> Result<Json<UserListResponse>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     
     // [TRIGGER] Before List
     let query_json = json!({ "search": params.search, "page": params.page });
-    let mod_q = trigger_filter_hook(&state, "before_list_users", query_json, Some(&claims)).await?;
+    let mod_q = trigger_filter_hook(&state, "before_list_users", query_json, Some(&claims), Some(&event_scope.clone()), Some(base_url.clone())).await?;
     
     let search = mod_q.get("search").and_then(|s| s.as_str()).map(String::from);
     let page = mod_q.get("page").and_then(|v| v.as_i64()).unwrap_or(1).max(1);
@@ -1026,7 +1122,7 @@ pub async fn list_users_handler(
     };
 
     // [TRIGGER] After List
-    let final_json = trigger_filter_hook(&state, "after_list_users", json!(response), Some(&claims)).await?;
+    let final_json = trigger_filter_hook(&state, "after_list_users", json!(response), Some(&claims), Some(&event_scope.clone()), Some(base_url.clone())).await?;
     let final_resp: UserListResponse = serde_json::from_value(final_json).unwrap_or(response);
 
     // [LOG]
@@ -1038,9 +1134,10 @@ pub async fn list_users_handler(
 
 #[utoipa::path(delete, path = "/api/v1/admin/users/{id}")]
 pub async fn delete_user_handler(
-    BaseUrl(_base_url): BaseUrl, // Fixed unused param
+    BaseUrl(base_url): BaseUrl,
     auth: Option<Extension<Claims>>, 
     State(state): State<AppState>, 
+    scope: Option<Extension<EventScope>>,
     DatabaseConnection(db): DatabaseConnection, 
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
@@ -1048,19 +1145,24 @@ pub async fn delete_user_handler(
 ) -> Result<StatusCode, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     
     // [TRIGGER] Before Delete
     let user_json = json!({ "id": path.id });
-    trigger_void_hook(&state, "before_user_delete", user_json.clone(), Some(&claims)).await?;
+    trigger_void_hook(&state, "before_user_delete", user_json.clone(), Some(&claims), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
-    db.delete_user(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    // [FIX] Parse String ID to i64
+    let user_id = path.id.parse::<i64>().map_err(|_| AppError::JsonError("Invalid User ID format".into()))?;
+
+    db.delete_user(user_id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     // [LOG]
-    let meta = extract_log_meta(&headers, Some(addr), json!({ "target_user_id": path.id }));
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "target_user_id": user_id }));
     let _ = db.log_audit_event("warning", "User Deleted", "admin", Some(meta)).await;
 
     // [TRIGGER] After Delete
-    let _ = trigger_void_hook(&state, "after_user_delete", user_json, Some(&claims)).await;
+    let _ = trigger_void_hook(&state, "after_user_delete", user_json, Some(&claims), Some(&event_scope.clone()), Some(base_url.clone())).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1090,6 +1192,7 @@ pub struct UserListResponse {
 pub async fn list_tenants_handler(
     auth: Option<Extension<Claims>>,
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap
 ) -> Result<Json<Vec<String>>, AppError> {
@@ -1097,7 +1200,7 @@ pub async fn list_tenants_handler(
     if claims.role != "admin" { return Err(AppError::Forbidden("Only admins".into())); }
 
     // [TRIGGER]
-    trigger_void_hook(&state, "before_list_tenants", json!({}), Some(&claims)).await?;
+    trigger_void_hook(&state, "before_list_tenants", json!({}), Some(&claims), None, Some(base_url.clone())).await?;
 
     let tenants = state.tenant_manager.list_tenants().await.map_err(|e| AppError::UnknownError(e))?;
 
@@ -1123,6 +1226,7 @@ pub async fn list_tenants_handler(
 pub async fn create_tenant_handler(
     auth: Option<Extension<Claims>>,
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<CreateTenantReq>,
@@ -1131,7 +1235,7 @@ pub async fn create_tenant_handler(
     if claims.role != "admin" { return Err(AppError::Forbidden("Only admins can create tenants".into())); }
 
     // [TRIGGER] Before
-    trigger_void_hook(&state, "before_tenant_create", json!({ "tenant_id": payload.tenant_id }), Some(&claims)).await?;
+    trigger_void_hook(&state, "before_tenant_create", json!({ "tenant_id": payload.tenant_id }), Some(&claims), None, Some(base_url.clone())).await?;
 
     state.tenant_manager.create_tenant(payload.tenant_id.clone()).await.map_err(|e| AppError::UnknownError(e))?;
     
@@ -1140,7 +1244,7 @@ pub async fn create_tenant_handler(
     let _ = state.db.log_audit_event("info", "Tenant Created", "admin", Some(meta)).await;
 
     // [TRIGGER] After
-    let _ = trigger_void_hook(&state, "after_tenant_create", json!({ "tenant_id": payload.tenant_id }), Some(&claims)).await;
+    let _ = trigger_void_hook(&state, "after_tenant_create", json!({ "tenant_id": payload.tenant_id }), Some(&claims), None, Some(base_url.clone())).await;
 
     Ok((StatusCode::CREATED, Json(TenantResponse {
         tenant_id: payload.tenant_id,
@@ -1226,7 +1330,11 @@ pub async fn get_dashboard_stats_handler(
 #[utoipa::path(post, path = "/api/v1/admin/collections/{id}/reindex", responses((status = 200, description = "Reindexing started")))]
 pub async fn reindex_collection_handler(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>) -> Result<Json<serde_json::Value>, AppError> {
     if !matches!(auth.map(|e| e.0.role), Some(r) if r == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
-    db.reindex_collection(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [FIX] Resolve ID
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    
+    db.reindex_collection(col.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -1458,22 +1566,25 @@ async fn graphql_handler(State(state): State<AppState>, req: GraphQLRequest) -> 
     schema.execute(req.into_inner()).await.into()
 }
 
-async fn sandbox_graphql_handler(DatabaseConnection(db): DatabaseConnection, State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
+async fn sandbox_graphql_handler(DatabaseConnection(db): DatabaseConnection, State(state): State<AppState>, scope: Option<Extension<EventScope>>, req: GraphQLRequest) -> GraphQLResponse {
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     let relation_loader = Arc::new(DataLoader::new(RelationLoader::new(db.clone()), tokio::spawn));
     let mut sandbox_state = state.clone();
     sandbox_state.db = db;
     match crate::graphql::build_schema(sandbox_state, relation_loader).await {
-        Ok(schema) => schema.execute(req.into_inner()).await.into(),
+        Ok(schema) => schema.execute(req.into_inner().data(event_scope)).await.into(),
         Err(e) => async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(e.to_string(), None)]).into()
     }
 }
 
-async fn tenant_graphql_handler(DatabaseConnection(db): DatabaseConnection, State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
+async fn tenant_graphql_handler(DatabaseConnection(db): DatabaseConnection, State(state): State<AppState>, scope: Option<Extension<EventScope>>, req: GraphQLRequest) -> GraphQLResponse {
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     let relation_loader = Arc::new(DataLoader::new(RelationLoader::new(db.clone()), tokio::spawn));
     let mut tenant_state = state.clone();
     tenant_state.db = db;
     match crate::graphql::build_schema(tenant_state, relation_loader).await {
-        Ok(schema) => schema.execute(req.into_inner()).await.into(),
+        // Ok(schema) => schema.execute(req.into_inner()).await.into(),
+        Ok(schema) => schema.execute(req.into_inner().data(event_scope)).await.into(),
         Err(e) => async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(e.to_string(), None)]).into()
     }
 }

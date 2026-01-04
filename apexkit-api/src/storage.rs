@@ -23,6 +23,8 @@ use apexkit_core::{
     Db
 };
 use crate::{AppState, AppError, assets::Assets, settings::StorageConfigDto, DatabaseConnection, StorageConnection};
+use apexkit_core::realtime::EventScope;
+use crate::BaseUrl;
 
 use async_trait::async_trait;
 
@@ -438,6 +440,8 @@ pub async fn upload_file(
     DatabaseConnection(db): DatabaseConnection,   
     StorageConnection(storage): StorageConnection, 
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>, // Capture IP
     headers: axum::http::HeaderMap, // Capture Headers
     mut multipart: Multipart,
@@ -445,8 +449,10 @@ pub async fn upload_file(
     let claims = auth.map(|Extension(c)| c);
     let user_id = claims.as_ref().map(|c| c.uid);
 
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+
     // [TRIGGER] Before Upload
-    trigger_void_hook(&state, "before_file_upload", serde_json::json!({}), claims.as_ref()).await?;
+    trigger_void_hook(&state, "before_file_upload", serde_json::json!({}), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     while let Some(field) = multipart.next_field().await.map_err(|_| AppError::InputValidation(validator::ValidationErrors::new()))? {
         let original_name = field.file_name().unwrap_or("unknown.bin").to_string();
@@ -469,7 +475,7 @@ pub async fn upload_file(
         let url = format!("{}{}", storage.get_public_url_base(), filename);
 
         // [TRIGGER] After Upload
-        let _ = trigger_void_hook(&state, "after_file_upload", serde_json::json!({ "id": id, "filename": filename }), claims.as_ref()).await;
+        let _ = trigger_void_hook(&state, "after_file_upload", serde_json::json!({ "id": id, "filename": filename }), claims.as_ref(),  Some(&event_scope.clone()), Some(base_url.clone())).await;
 
         return Ok(Json(FileResponse { id, url, filename }));
     }
@@ -541,14 +547,16 @@ pub async fn delete_file(
     DatabaseConnection(db): DatabaseConnection,
     StorageConnection(storage): StorageConnection,
     State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Path(path): Path<FileIdPath>,
 ) -> Result<StatusCode, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     // [TRIGGER] Before Delete
-    trigger_void_hook(&state, "before_file_delete", serde_json::json!({ "id": path.id }), claims.as_ref()).await?;
+    trigger_void_hook(&state, "before_file_delete", serde_json::json!({ "id": path.id }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     let file = db.get_file_metadata(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("File".into()))?;
     storage.delete(&file.filename).await.map_err(|e| AppError::UnknownError(e.to_string()))?;

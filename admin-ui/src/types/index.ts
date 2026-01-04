@@ -6,6 +6,12 @@ export * from './settings';
 export * from './api';
 export * from './files';
 
+export interface AppVersions {
+    root: string;
+    api: string;
+    core: string;
+    vector: string;
+}
 
 // Script Types
 export interface Script {

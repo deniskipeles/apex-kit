@@ -1,4 +1,3 @@
-// =========================== apexkit-core/src/scripting.rs ===========================
 use std::sync::Arc;
 use serde_json::Value as JsonValue;
 use crate::{Db, query::QueryOptions, embeddings::{EmbedderService, EmbedderProvider}, VectorProvider, security::Vault};
@@ -67,7 +66,8 @@ thread_local! {
         Arc<Vault>, 
         tokio::runtime::Handle,
         Option<String>,
-        Option<broadcast::Sender<DbEvent>> // [NEW] Added Sender
+        Option<broadcast::Sender<DbEvent>>, // Sender
+        EventScope // Current Execution Scope 
     )>> = RefCell::new(None);
 }
 
@@ -88,10 +88,11 @@ impl ScriptEngine {
         vector_provider: Arc<dyn VectorProvider>,
         vault: Arc<Vault>,
         base_url: Option<String>,
-        tx: Option<broadcast::Sender<DbEvent>> // [NEW]
+        tx: Option<broadcast::Sender<DbEvent>>,
+        scope: EventScope
     ) -> Result<JsonValue, String> {
         
-        self.execute_js_task(code, db, embedder, vector_provider, vault, base_url, tx, move |ctx| {
+        self.execute_js_task(code, db, embedder, vector_provider, vault, base_url, tx, scope, move |ctx| {
             let js_body = JsValue::from_json(&input_data, ctx).map_err(|e| e.to_string())?;
             
             // Construct Request Object
@@ -150,8 +151,11 @@ impl ScriptEngine {
         vector_provider: Arc<dyn VectorProvider>,
         vault: Arc<Vault>,
         base_url: Option<String>,
-        tx: Option<broadcast::Sender<DbEvent>> // [NEW]
+        tx: Option<broadcast::Sender<DbEvent>>,
+        scope: Option<EventScope> // Optional because background jobs might not have one?
     ) -> Result<Option<JsonValue>, String> {
+
+        let actual_scope = scope.unwrap_or(EventScope::Root); // Default to Root if missing
 
         let wrapped_code = format!(
             r#"
@@ -167,7 +171,7 @@ impl ScriptEngine {
             code
         );
 
-        self.execute_js_task(&wrapped_code, db, embedder, vector_provider, vault, base_url, tx, move |ctx| {
+        self.execute_js_task(&wrapped_code, db, embedder, vector_provider, vault, base_url, tx, actual_scope, move |ctx| {
             let js_event = JsValue::from_json(&event_data, ctx).map_err(|e| e.to_string())?;
             
             ctx.register_global_property(JsString::from("__hook_context__"), js_event.clone(), Attribute::all()).unwrap();
@@ -207,7 +211,8 @@ impl ScriptEngine {
         vector_provider: Arc<dyn VectorProvider>,
         vault: Arc<Vault>, 
         base_url: Option<String>,
-        tx: Option<broadcast::Sender<DbEvent>>, // [NEW]
+        tx: Option<broadcast::Sender<DbEvent>>,
+        scope: EventScope,
         task_logic: F
     ) -> Result<R, String>
     where
@@ -229,7 +234,7 @@ impl ScriptEngine {
         let result = tokio::task::spawn_blocking(move || -> Result<R, String> {
             let mut context = Context::default();
 
-            Self::setup_boa_environment(&mut context, &handle, db, embedder, vector_provider, vault, base_url, tx)?;
+            Self::setup_boa_environment(&mut context, &handle, db, embedder, vector_provider, vault, base_url, tx, scope)?;
 
             if let Err(e) = context.eval(Source::from_bytes(processed_code.as_bytes())) {
                  return Err(format!("Script Syntax Error: {}", e));
@@ -253,7 +258,8 @@ impl ScriptEngine {
         vector_provider: Arc<dyn VectorProvider>,
         vault: Arc<Vault>,
         base_url: Option<String>,
-        tx: Option<broadcast::Sender<DbEvent>>, // [NEW]
+        tx: Option<broadcast::Sender<DbEvent>>, 
+        scope: EventScope
     ) -> Result<(), String> {
         
         ctx.eval(Source::from_bytes(JS_PRELUDE.as_bytes()))
@@ -267,7 +273,8 @@ impl ScriptEngine {
                 vault.clone(), 
                 handle.clone(),
                 base_url.clone(),
-                tx // Store tx
+                tx, // Store tx
+                scope // Store scope
             )); 
         });
 
@@ -296,7 +303,7 @@ impl ScriptEngine {
             }
 
             let (val, error) = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, vault, handle, _, _)) = &*c.borrow() {
+                if let Some((db, _, _, vault, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         match db.get_config(&key).await {
                             Ok(Some(json_val)) => {
@@ -415,7 +422,7 @@ impl ScriptEngine {
             let col = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
             let id = args.get_or_undefined(1).to_number(ctx).unwrap_or(0.0) as i64;
             let result = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
+                if let Some((db, _, _, _, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -446,7 +453,7 @@ impl ScriptEngine {
                 } else { None }
             } else { None };
             let result_vec = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
+                if let Some((db, _, _, _, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -476,7 +483,7 @@ impl ScriptEngine {
             let col = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
             let data = args.get_or_undefined(1).to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
             let new_id = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
+                if let Some((db, _, _, _, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -501,7 +508,7 @@ impl ScriptEngine {
             let id = args.get_or_undefined(1).to_number(ctx).unwrap_or(0.0) as i64;
             let data = args.get_or_undefined(2).to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
             let updated_record = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
+                if let Some((db, _, _, _, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -527,7 +534,7 @@ impl ScriptEngine {
             let col = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
             let id = args.get_or_undefined(1).to_number(ctx).unwrap_or(0.0) as i64;
             let success = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, _, handle, _, _)) = &*c.borrow() {
+                if let Some((db, _, _, _, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         if let Ok(cols) = db.list_collections().await {
                             if let Some(c) = cols.iter().find(|x| x.name == col) {
@@ -558,7 +565,7 @@ impl ScriptEngine {
             let provider_str = args.get_or_undefined(1).as_string().map(|s| s.to_std_string_escaped()).unwrap_or("local".to_string());
 
             let (embedding, error) = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, embedder, vector_provider, _, handle, _, _)) = &*c.borrow() {
+                if let Some((db, embedder, vector_provider, _, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         let provider_lower = provider_str.to_lowercase();
                         if provider_lower == "local" {
@@ -611,7 +618,7 @@ impl ScriptEngine {
             let body = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
 
             let result = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((db, _, _, vault, handle, _, _)) = &*c.borrow() {
+                if let Some((db, _, _, vault, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         jobs::send_email(db.clone(), vault.clone(), &to, &subject, &body).await
                     })
@@ -629,28 +636,40 @@ impl ScriptEngine {
             .build();
         ctx.register_global_property(JsString::from("$mail"), mail_obj, Attribute::all()).unwrap();
 
-        // 7. [NEW] $realtime
+        // 7. $realtime
         let rt_send = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let channel = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped(); // e.g. "chat_room"
-            let event_name = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped(); // e.g. "message"
+            let user_channel = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped(); // "chat"
+            let event_name = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
             let payload = args.get_or_undefined(2).to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
 
             let result = ACTIVE_DB_CONTEXT.with(|c| {
-                if let Some((_, _, _, _, _, _, Some(tx))) = &*c.borrow() {
+                // Destructure scope (item 7)
+                if let Some((_, _, _, _, _, _, Some(tx), current_scope)) = &*c.borrow() {
+                    
+                    // [AUTO-INJECT SCOPE]
+                    // Transform "chat" -> "tenant_123::chat" automatically
+                    let scoped_channel_name = match current_scope {
+                        EventScope::Root => user_channel.clone(), // Root doesn't namespace? Or maybe "root::chat"?
+                        EventScope::Tenant(id) => format!("tenant_{}::{}", id, user_channel),
+                        EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, user_channel),
+                        _ => user_channel.clone()
+                    };
+
                     // Create Custom Event
                     let event = DbEvent::Custom {
                         event: event_name,
                         data: payload,
-                        scope: EventScope::Channel(channel)
+                        // Use the NAMESPACED channel
+                        scope: EventScope::Channel(scoped_channel_name)
                     };
-                    // Send it
+
                     if let Err(e) = tx.send(event) {
                         Err(format!("Broadcast failed: {}", e))
                     } else {
                         Ok(())
                     }
                 } else {
-                    Err("Realtime context not available (tx missing)".to_string())
+                    Err("Realtime context not available".to_string())
                 }
             });
 

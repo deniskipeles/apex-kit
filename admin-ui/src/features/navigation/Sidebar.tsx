@@ -2,7 +2,7 @@ import React from 'react';
 import { 
     LayoutDashboard, Database, Table, Settings, LogOut, Folder, 
     Activity, Sparkles, Users, FileCode, BrainCircuit, LayoutTemplate, 
-    Server, ArrowLeft 
+    Server, ArrowLeft, BoxIcon
 } from 'lucide-react';
 import { Button } from '../../components/form/FormPrimitives';
 import { useAuth } from '../../hooks/useAuth';
@@ -55,8 +55,8 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
       // Insert Tenants after Dashboard
       links.splice(1, 0, { icon: Server, label: 'Tenants', page: 'tenants' });
       // Append System features
-      links.splice(7, 0, { icon: BrainCircuit, label: 'AI Actions', page: 'ai-actions' });
-      links.splice(6, 0, { icon: Sparkles, label: 'AI Architect', page: 'ai-architect' });
+      links.splice(7, 0, { icon: Sparkles, label: 'AI Actions', page: 'ai-actions' });
+      links.splice(6, 0, { icon: BoxIcon, label: 'Sandboxes', page: 'ai-architect' });
   }
 
   // Helper: Construct target view string based on context

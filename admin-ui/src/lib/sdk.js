@@ -506,7 +506,25 @@ export class ApexKit {
              * @param {string} sessionId
              * @returns {Promise<object>} Plugin definition.
              */
-            publishSession: (sessionId) => this._request(`/admin/ai/sessions/${sessionId}/publish`, { method: 'POST' })
+            publishSession: (sessionId) => this._request(`/admin/ai/sessions/${sessionId}/publish`, { method: 'POST' }),
+
+            /**
+             * 
+             */
+            listPlugins: () => this._request('/ai/plugins'), // Check router path, usually /api/v1/ai/plugins
+
+            /**
+             * 
+             */
+            editCode: (prompt, currentCode, contextType, model) => this._request('/admin/ai/edit-code', {
+                method: 'POST',
+                body: { 
+                    prompt, 
+                    current_code: currentCode, 
+                    context_type: contextType, 
+                    model 
+                }
+            })
         };
     }
 
