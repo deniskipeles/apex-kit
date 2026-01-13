@@ -17,7 +17,10 @@ export default defineConfig(({ mode }) => {
         port: 5000,
         host: '0.0.0.0',
         // Ensure this matches the actual URL you access in the browser
-        allowedHosts: ["5173-01jp06r43r3zeenk9nb1sbyeyg.cloudspaces.litng.ai"], 
+        allowedHosts: [
+          "5173-01jp06r43r3zeenk9nb1sbyeyg.cloudspaces.litng.ai",
+          "5173-01ke6hmdydtz0mhahe6ktw06fm.cloudspaces.litng.ai"
+        ], 
         proxy: {
           '/api': {
             // FIX: Use 'env' variable, provide a fallback if missing

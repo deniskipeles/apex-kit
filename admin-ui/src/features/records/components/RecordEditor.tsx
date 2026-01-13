@@ -14,6 +14,7 @@ import { FIELD_TYPES_CONFIG } from '../../../config/field-types.config';
 import { validateRecord, ValidationError } from '../../../lib/schemaValidators';
 import { filesService } from '../../files/services/filesService';
 import { useToast } from '../../../components/feedback/Toast';
+import { markdownHelper, turndownHelper } from '@/src/components/texteditor/components/GeminiEditor';
 
 interface RecordEditorProps {
   collection: Collection;
@@ -31,6 +32,15 @@ export const RecordEditor = ({ collection, record, onSave, onCancel, depth = 0 }
 
   useEffect(() => {
     if (record) {
+      collection.schema.forEach(f => {
+        if (f.type === 'text') {
+          try {
+            record[f.name] =markdownHelper(record[f.name]);
+          } catch (error) {
+            console.log(error)
+          }
+        }
+      });
       setFormData({ ...record });
     } else {
       const defaults: any = {};
@@ -74,7 +84,30 @@ export const RecordEditor = ({ collection, record, onSave, onCancel, depth = 0 }
   };
 
   const handleSave = async () => {
-      const validationErrors = validateRecord(formData, collection.schema);
+      // [FIX] Pre-process data: Parse JSON strings back to objects for submission
+      const processedData = { ...formData };
+      
+      collection.schema.forEach(field => {
+          if (field.type === 'json' && typeof processedData[field.name] === 'string') {
+              try {
+                  processedData[field.name] = JSON.parse(processedData[field.name]);
+              } catch (e) {
+                  // If parse fails, leave as string (validation will likely catch it)
+                  console.warn(`Failed to parse JSON for field ${field.name}`, e);
+              }
+          }
+          if (field.type === 'text' && typeof processedData[field.name] === 'string' && processedData[field.name].length > 0) {
+              try {
+                  processedData[field.name] = turndownHelper(processedData[field.name]);
+              } catch (e) {
+                  // If turndown fails, leave as string (validation will likely catch it)
+                  console.warn(`Failed to turndown for field ${field.name}`, e);
+              }
+          }
+      });
+
+      // Validate against the PROCESSED data
+      const validationErrors = validateRecord(processedData, collection.schema);
       if (validationErrors.length > 0) {
           setErrors(validationErrors);
           return;
@@ -82,7 +115,8 @@ export const RecordEditor = ({ collection, record, onSave, onCancel, depth = 0 }
 
       setIsSaving(true);
       try {
-          await onSave(formData);
+          // Send the PROCESSED data (with actual arrays/objects)
+          await onSave(processedData);
       } finally {
           setIsSaving(false);
       }

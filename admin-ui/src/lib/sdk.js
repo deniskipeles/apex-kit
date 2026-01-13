@@ -209,12 +209,56 @@ export class ApexKit {
             },
 
             /**
+             * Retrieve the currently authenticated user's profile.
+             * Requires a valid JWT token to be set.
+             * 
+             * @returns {Promise<{id: number, email: string, role: string, metadata: object}>} User object
+             * @throws {Error} 401 Unauthorized if not logged in.
+             */
+            getMe: () => this._request('/auth/me'),
+
+            /**
              * Logout (clears local state only).
              */
             logout: () => {
                 this.token = null;
                 this.currentUser = null;
-            }
+            },
+
+            /**
+             * Initiate GitHub OAuth Login.
+             * 
+             * @param {string} [redirectTo] - The URL to redirect back to after GitHub auth.
+             * @returns {Promise<void>} - Redirects the browser window immediately.
+             */
+            loginWithGithub: async (redirectTo) => {
+                // We use _request to respect the current instance's baseUrl (Tenant/Sandbox)
+                // Note: The backend endpoint returns a 302 Redirect.
+                // Fetch cannot handle 302 redirects opaquely to get the target URL string easily.
+                // However, since we know the structure, we can construct the URL client-side
+                // using the instance's baseUrl property.
+                
+                let path = '/auth/github';
+                
+                // Ensure proper path construction if using Tenant/Sandbox prefix
+                // The _request logic does this internally, but we need the raw URL string for window.location.
+                // We replicate the path logic from _request here:
+                if (!path.startsWith('/api/v1')) {
+                     // Check if baseUrl already includes /api/v1 or if we need to append it?
+                     // Based on your SDK constructor, baseUrl is just the host.
+                     // Based on _request logic: path = `/api/v1${path}`
+                     path = `/api/v1${path}`;
+                }
+
+                const url = new URL(`${this.baseUrl}${path}`);
+                
+                if (redirectTo) {
+                    url.searchParams.append('redirect_to', redirectTo);
+                }
+
+                // Redirect the user
+                window.location.href = url.toString();
+            },
         };
     }
 
@@ -252,7 +296,15 @@ export class ApexKit {
              * @param {object} payload 
              * @returns {Promise<object>}
              */
-            updateCollection: (id, payload) => this._request(`/collections/${id}`, { method: 'PATCH', body: payload }),
+            updateCollection: (id, payload) => this._request(`/collections/${id}`, { method: 'PUT', body: payload }),
+            
+            /**
+             * Patch a collection's name or schema.
+             * @param {number|string} id 
+             * @param {object} payload 
+             * @returns {Promise<object>}
+             */
+            patchCollection: (id, payload) => this._request(`/collections/${id}`, { method: 'PATCH', body: payload }),
 
             /**
              * Delete a collection.
@@ -319,7 +371,14 @@ export class ApexKit {
              * @param {object} settings - The settings object to merge.
              * @returns {Promise<object>}
              */
-            updateSettings: (settings) => this._request('/admin/settings', { method: 'PATCH', body: settings }),
+            updateSettings: (settings) => this._request('/admin/settings', { method: 'PUT', body: settings }),
+            
+            /**
+             * Patch system settings.
+             * @param {object} settings - The settings object to merge.
+             * @returns {Promise<object>}
+             */
+            patchSettings: (settings) => this._request('/admin/settings', { method: 'PATCH', body: settings }),
 
             /**
              * Test S3 Storage Configuration.
@@ -589,7 +648,15 @@ export class ApexKit {
              * @param {object} data 
              * @returns {Promise<void>}
              */
-            update: (id, data) => this._request(`/admin/templates/${id}`, { method: 'PATCH', body: data }),
+            update: (id, data) => this._request(`/admin/templates/${id}`, { method: 'PUT', body: data }),
+            
+            /**
+             * Patch a template.
+             * @param {number|string} id 
+             * @param {object} data 
+             * @returns {Promise<void>}
+             */
+            patch: (id, data) => this._request(`/admin/templates/${id}`, { method: 'PATCH', body: data }),
 
             /**
              * Delete a template.
@@ -624,17 +691,24 @@ export class ApexKit {
 
             /**
              * Perform a full-text search (SQL-based).
+             * @param {object} query 
+             * @returns {Promise<Array<object>>}
+             */
+            searchRecordsWithSQL: (query) => this._request(`/collections/${collectionId}/query`, { method: 'POST', body: { query } }),
+
+            /**
+             * Perform an ultra-fast Optimized Search Engine via Tantivy Index (No SQL).
              * @param {string} query 
              * @returns {Promise<Array<object>>}
              */
-            recordsSearch: (query) => this._request(`/collections/${collectionId}/search`, { method: 'GET', params: { q: query } }),
-
+            searchRecordsWithOSE: (query) => this._request(`/collections/${collectionId}/search`, { method: 'GET', params: { q: query } }),
+            
             /**
              * Perform an ultra-fast Instant Search via Tantivy Index (No SQL).
              * @param {string} query 
              * @returns {Promise<Array<{id: number, score: number, snippet: object}>>}
              */
-            instantSearch: (query) => this._request(`/collections/${collectionId}/instant-search`, { method: 'GET', params: { q: query } }),
+            searchRecordsInstantlyWithOSE: (query) => this._request(`/collections/${collectionId}/instant-search`, { method: 'GET', params: { q: query } }),
 
             /**
              * Create a new record.
@@ -657,7 +731,15 @@ export class ApexKit {
              * @param {object} data 
              * @returns {Promise<object>}
              */
-            update: (recordId, data) => this._request(`/collections/${collectionId}/records/${recordId}`, { method: 'PATCH', body: { data } }),
+            update: (recordId, data) => this._request(`/collections/${collectionId}/records/${recordId}`, { method: 'PUT', body: { data } }),
+            
+            /**
+             * Patch a record.
+             * @param {number|string} recordId 
+             * @param {object} data 
+             * @returns {Promise<object>}
+             */
+            patch: (recordId, data) => this._request(`/collections/${collectionId}/records/${recordId}`, { method: 'PATCH', body: { data } }),
 
             /**
              * Delete a record.
@@ -963,6 +1045,18 @@ export class ApexKitRealtimeWSClient {
             console.log("[ApexKit] Disconnected. Retrying...");
             setTimeout(() => this.connect(), this.reconnectInterval);
         };
+    }
+
+    /**
+     * Close the connection.
+     */
+    disconnect() {
+        if (this.socket) {
+            this.socket.close();
+            this.socket = null;
+            this.isConnected = false;
+            console.log("[ApexKit] WebSocket Disconnected manually");
+        }
     }
 
     /**

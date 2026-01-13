@@ -638,7 +638,7 @@ impl ScriptEngine {
 
         // 7. $realtime
         let rt_send = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let user_channel = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped(); // "chat"
+            let channel = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped(); // "chat"
             let event_name = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
             let payload = args.get_or_undefined(2).to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
 
@@ -649,10 +649,10 @@ impl ScriptEngine {
                     // [AUTO-INJECT SCOPE]
                     // Transform "chat" -> "tenant_123::chat" automatically
                     let scoped_channel_name = match current_scope {
-                        EventScope::Root => user_channel.clone(), // Root doesn't namespace? Or maybe "root::chat"?
-                        EventScope::Tenant(id) => format!("tenant_{}::{}", id, user_channel),
-                        EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, user_channel),
-                        _ => user_channel.clone()
+                        EventScope::Root => format!("root::{}", channel.clone()), // Root doesn't namespace? Or maybe "root::chat"?
+                        EventScope::Tenant(id) => format!("tenant_{}::{}", id, channel),
+                        EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, channel),
+                        _ => channel.clone()
                     };
 
                     // Create Custom Event
@@ -684,6 +684,46 @@ impl ScriptEngine {
             .build();
         
         ctx.register_global_property(JsString::from("$realtime"), rt_obj, Attribute::all()).unwrap();
+
+        // =========================================================
+        // MANUAL CONSOLE POLYFILL
+        // =========================================================
+        
+        // Define a generic logger function that handles multiple arguments
+        let console_log = NativeFunction::from_copy_closure(move |_this, args, ctx| {
+            let mut output = String::new();
+            
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 { output.push(' '); }
+                
+                // Convert JS Value to String safely
+                let str_val = arg.to_string(ctx)
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_else(|_| "???".to_string());
+                
+                output.push_str(&str_val);
+            }
+
+            // Print to Rust Stdout (or use tracing::info!)
+            println!("[SCRIPT CONSOLE] {}", output);
+            
+            Ok(JsValue::undefined())
+        });
+
+        // Create the 'console' object
+        let console_obj = ObjectInitializer::new(ctx)
+            .function(console_log.clone(), JsString::from("log"), 0)
+            .function(console_log.clone(), JsString::from("info"), 0)
+            .function(console_log.clone(), JsString::from("warn"), 0)
+            .function(console_log.clone(), JsString::from("error"), 0)
+            .build();
+
+        // Register it globally
+        ctx.register_global_property(
+            JsString::from("console"), 
+            console_obj, 
+            Attribute::all()
+        ).map_err(|e| format!("Failed to register console: {}", e))?;
 
         Ok(())
     }

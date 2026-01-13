@@ -359,17 +359,27 @@ export const apiClient = {
       if (!query) return [];
       try {
         // Call the SDK
-        return await pb.collection(collectionId).instantSearch(query);
+        return await pb.collection(collectionId).searchRecordsInstantlyWithOSE(query);
       } catch (e) {
         console.error("Instant search failed", e);
         return [];
       }
     },
-    recordsSearch: async (collectionId: string | number, query: string): Promise<InstantResult[]> => {
+    recordsSearchOSE: async (collectionId: string | number, query: string): Promise<InstantResult[]> => {
       if (!query) return [];
       try {
         // Call the SDK
-        return await pb.collection(collectionId).recordsSearch(query);
+        return await pb.collection(collectionId).searchRecordsWithOSE(query);
+      } catch (e) {
+        console.error("Records search failed", e);
+        return [];
+      }
+    },
+    recordsSearchSQL: async (collectionId: string | number, query: any): Promise<InstantResult[]> => {
+      if (!query) return [];
+      try {
+        // Call the SDK
+        return await pb.collection(collectionId).searchRecordsWithSQL(query);
       } catch (e) {
         console.error("Records search failed", e);
         return [];
@@ -409,8 +419,8 @@ export const apiClient = {
         expand: res.expand || {} // Ensure expand object exists
       };
     },
-    delete: async (id: string): Promise<void> => {
-      console.warn("Use recordsService.delete(collectionId, recordId) instead");
+    delete: async (collectionId: string, recordId: string): Promise<void> => {
+      return await pb.collection(collectionId).delete(recordId);
     },
 
     searchTextVector: async (collectionId: string, query: string, limit = 10) => {

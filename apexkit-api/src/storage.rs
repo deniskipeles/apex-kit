@@ -459,7 +459,15 @@ pub async fn upload_file(
         let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
         let data = field.bytes().await.map_err(|_| AppError::UnknownError("Failed bytes".into()))?;
         let size = data.len() as i64;
-        let filename = format!("{}.{}", uuid::Uuid::new_v4(), "bin");
+        
+        // 1. Extract extension from original name
+        // Use fully qualified 'std::path::Path' to avoid conflict with Axum's Path
+        let extension = std::path::Path::new(&original_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("bin");
+        // 2. Create filename with correct extension
+        let filename = format!("{}.{}", uuid::Uuid::new_v4(), extension);
 
         storage.save(&filename, &data, &content_type).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 

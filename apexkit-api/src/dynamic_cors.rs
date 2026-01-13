@@ -14,15 +14,20 @@ pub async fn cors_middleware(
     let origin_header = req.headers().get(header::ORIGIN).cloned();
     let method = req.method().clone();
     
-    // Capture requested headers to reflect them back (Simplifies header whitelisting)
+    // [UPDATED] Capture Host AND Forwarded Host (for Cloud Environments)
+    let host_header = req.headers().get(header::HOST)
+        .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        
+    let forwarded_host = req.headers().get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+
+    // Capture requested headers
     let request_headers = req.headers()
         .get("access-control-request-headers")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // Load Settings
     let security_setting = state.db.get_config("security").await.unwrap_or(None);
-    
     let config: SecurityConfigDto = if let Some(val) = security_setting {
         serde_json::from_value(val).unwrap_or_default()
     } else {
@@ -31,22 +36,28 @@ pub async fn cors_middleware(
 
     let mut allow_origin_val: Option<HeaderValue> = None;
     let mut allow_credentials = false;
+    let mut blocked = false; // Track if we should strictly block execution
 
     if let Some(origin) = origin_header {
         if let Ok(origin_str) = origin.to_str() {
             if config.cors_allow_all {
-                // Public API mode
                 allow_origin_val = Some(HeaderValue::from_static("*"));
             } else {
-                // Restricted mode: Check allowed list
                 let allowed_list: Vec<&str> = config.cors_origins.split(',').map(|s| s.trim()).collect();
                 
-                if allowed_list.contains(&origin_str) {
-                    allow_origin_val = Some(origin); // Echo exact origin
-                    allow_credentials = true; // Allow creds for specific matches
+                // [UPDATED] Robust Same-Origin Check
+                // Strips http:// or https:// to compare just the domain/port
+                let clean_origin = origin_str.replace("https://", "").replace("http://", "");
+                
+                let matches_host = host_header.as_ref().map(|h| clean_origin.contains(h)).unwrap_or(false);
+                let matches_forwarded = forwarded_host.as_ref().map(|h| clean_origin.contains(h)).unwrap_or(false);
+
+                if allowed_list.contains(&origin_str) || matches_host || matches_forwarded {
+                    allow_origin_val = Some(origin); 
+                    allow_credentials = true; 
                 } else {
-                    // DEBUG LOG: Helps identify why it blocked
-                    tracing::warn!("CORS Blocked: Origin '{}' not in allowed list: {:?}", origin_str, allowed_list);
+                    tracing::warn!("CORS Blocked: Origin '{}' not allowed. Hosts checked: {:?}/{:?}", origin_str, host_header, forwarded_host);
+                    blocked = true; // Mark as blocked
                 }
             }
         }
@@ -59,11 +70,9 @@ pub async fn cors_middleware(
 
         if let Some(val) = allow_origin_val {
             headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, val);
-            // Explicitly allow PATCH and other methods
             headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"));
             
-            // Allow standard headers + whatever the client requested
-            let default_headers = "Authorization, Content-Type, Accept, Origin, X-Requested-With";
+            let default_headers = "Authorization, Content-Type, Accept, Origin, X-Requested-With, HX-Request, HX-Current-URL, HX-Target, HX-Trigger";
             let final_headers = if !request_headers.is_empty() {
                 format!("{}, {}", default_headers, request_headers)
             } else {
@@ -73,7 +82,6 @@ pub async fn cors_middleware(
             if let Ok(h_val) = HeaderValue::from_str(&final_headers) {
                 headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, h_val);
             }
-
             headers.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
             
             if allow_credentials {
@@ -81,6 +89,13 @@ pub async fn cors_middleware(
             }
         }
         return response;
+    }
+
+    // --- [CRITICAL FIX] STRICT BLOCKING ---
+    // If we determined this is a blocked Origin, STOP execution here. 
+    // Do not call next.run(req), or the DB operation will happen anyway.
+    if blocked {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     // --- ACTUAL REQUEST HANDLER ---
@@ -91,10 +106,8 @@ pub async fn cors_middleware(
         if allow_credentials {
             response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
         }
-        // Important for caching proxies to know response varies by Origin
         response.headers_mut().insert(header::VARY, HeaderValue::from_static("Origin"));
     }
 
     response
 }
-

@@ -895,6 +895,110 @@ pub async fn delete_record(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- DTO ---
+#[derive(Deserialize, ToSchema)]
+pub struct AdvancedQueryRequest {
+    /// MongoDB-style filter object (e.g. {"status": "active", "age": {"$gt": 18}})
+    #[schema(value_type = Object)]
+    pub filter: serde_json::Value,
+    
+    /// Sort string (e.g. "-created")
+    pub sort: Option<String>,
+    
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+    
+    /// Comma-separated relations to expand
+    pub expand: Option<String>,
+}
+
+// --- HANDLER ---
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/collections/{id}/query",
+    request_body = AdvancedQueryRequest,
+    responses((status = 200, body = RecordListResponse))
+)]
+pub async fn query_records_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
+    Path(path): Path<IdPath>, 
+    Json(payload): Json<AdvancedQueryRequest>
+) -> Result<Json<RecordListResponse>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    
+    // 1. Resolve Collection
+    let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+
+    // 2. Check Permissions
+    let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !policies::check_access(policy, claims.as_ref(), None) { 
+        return Err(AppError::Forbidden("Read denied".into())); 
+    }
+
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+
+    // 3. Map Request to QueryOptions
+    // Note: We stringify the filter because QueryOptions expects a JSON string
+    // logic inside apexkit-core will parse this string into a FilterNode and generate SQL.
+    let mut options = QueryOptions {
+        filter: Some(payload.filter.to_string()), 
+        sort: payload.sort,
+        limit: payload.limit,
+        offset: payload.offset,
+        expand: payload.expand,
+        per_page: None, // We use explicit limit/offset for POST queries
+        page: None,
+    };
+
+    // 4. [TRIGGER] Before List (Allow scripts to modify the query options)
+    let query_json = json!(options);
+    let modified_query_json = trigger_filter_hook(
+        &state, 
+        "before_list_records", 
+        query_json, 
+        claims.as_ref(), 
+        Some(&event_scope.clone()), 
+        Some(base_url.clone())
+    ).await?;
+    
+    options = serde_json::from_value(modified_query_json).unwrap_or(options);
+
+    // 5. Execute DB Query
+    // This calls db.list_records -> SqlBuilder -> FilterNode::parse -> FilterNode::to_sql
+    let res = db.list_records(col.id, options.clone()).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    let mut response_data = RecordListResponse { 
+        items: res.items.into_iter().map(|r| RecordResponse {
+            id: r.id, 
+            data: r.data, 
+            expand: r.expand, 
+            created: r.created, 
+            updated: r.updated
+        }).collect(), 
+        total: res.total 
+    };
+
+    // 6. [TRIGGER] After List (Allow scripts to filter results)
+    let filtered_json = trigger_filter_hook(
+        &state, 
+        "after_list_records", 
+        json!(response_data), 
+        claims.as_ref(), 
+        Some(&event_scope.clone()), 
+        Some(base_url.clone())
+    ).await?;
+    
+    response_data = serde_json::from_value(filtered_json).unwrap_or(response_data);
+
+    Ok(Json(response_data))
+}
+
 #[utoipa::path(get, path = "/api/v1/collections/{id}/search", params(SearchQuery), responses((status = 200, body = Vec<RecordResponse>)))]
 pub async fn search_records(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, Path(path): Path<IdPath>, Query(q): Query<SearchQuery>) -> Result<Json<Vec<RecordResponse>>, AppError> {
     let claims = auth.map(|Extension(c)| c);
@@ -1607,14 +1711,17 @@ fn make_api_router() -> Router<AppState> {
     Router::new()
         .route("/auth/login", post(login))
         .route("/auth/register", post(register))
+        .route("/auth/me", get(auth_advanced::get_me)) 
         .route("/auth/github", get(auth_advanced::github_login))
         .route("/auth/github/callback", get(auth_advanced::github_callback))
         .route("/auth/verify", get(auth_advanced::verify_email))
         .route("/auth/verify/resend", post(auth_advanced::resend_verification))
         .route("/collections", post(create_collection).get(list_collections))
-        .route("/collections/{id}", get(get_collection).patch(update_collection).delete(delete_collection))
+        .route("/collections/{id}", get(get_collection).patch(update_collection).put(update_collection).delete(delete_collection))
         .route("/collections/{id}/records", post(create_record).get(list_records))
-        .route("/collections/{id}/records/{record_id}", get(get_record).patch(update_record).delete(delete_record))
+        // Advanced Query Endpoint
+        .route("/collections/{id}/query", post(query_records_handler))
+        .route("/collections/{id}/records/{record_id}", get(get_record).patch(update_record).put(update_record).delete(delete_record))
         .route("/collections/{id}/search", get(search_records))
         .route("/collections/{id}/instant-search", get(instant_search_handler))
         .route("/collections/{id}/search-vector", post(vector_routes::search_vector))
@@ -1626,7 +1733,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/storage/files/{id}", axum::routing::delete(storage::delete_file))
         .route("/admin/storage/test", post(storage::test_s3_connection))
         .route("/admin/storage/migrate", post(storage::migrate_storage))
-        .route("/admin/settings", get(settings::get_settings).patch(settings::update_settings))
+        .route("/admin/settings", get(settings::get_settings).patch(settings::update_settings).put(settings::update_settings))
         .route("/admin/config", post(config_routes::set_config).get(config_routes::list_configs))
         .route("/admin/config/{key}", axum::routing::delete(config_routes::delete_config))
         .route("/admin/system/reload", post(reload_system))
@@ -1651,7 +1758,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/admin/scripts/{id}", axum::routing::delete(script_routes::delete_script))
         .route("/run/{script_name}", post(script_routes::run_script))
         .route("/admin/templates", get(template_routes::list_templates).post(template_routes::create_template))
-        .route("/admin/templates/{id}", axum::routing::patch(template_routes::update_template).delete(template_routes::delete_template))
+        .route("/admin/templates/{id}", axum::routing::patch(template_routes::update_template).put(template_routes::update_template).delete(template_routes::delete_template))
         .route("/sse", get(sse_handler))
 }
 

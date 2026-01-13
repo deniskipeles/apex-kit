@@ -1,19 +1,28 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
-    response::Redirect,
+    http::{StatusCode},
+    response::{Redirect, Response, IntoResponse},
     Json,
 };
-use serde::Deserialize;
-// use std::env;
+use serde::{Deserialize};
 use apexkit_core::{auth, jobs::Job};
 use crate::{AppState, AppError, AuthResponse, UserDto};
 use apexkit_core::security::EncryptedValue;
+use serde_json::json;
+use apexkit_core::auth::Claims;
+use crate::DatabaseConnection;
+use axum::Extension;
 
 // --- GitHub Models ---
 #[derive(Deserialize)]
 pub struct OauthCallback {
     code: String,
+    state: Option<String>, // Can be used for CSRF or Redirect URL
+}
+
+#[derive(Deserialize)]
+pub struct LoginQuery {
+    redirect_to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -26,6 +35,10 @@ struct GithubUser {
     id: i64,
     email: Option<String>,
     login: String,
+    // [NEW] Metadata fields
+    avatar_url: Option<String>,
+    name: Option<String>,
+    html_url: Option<String>,
 }
 
 // Helper to fetch and decrypt
@@ -35,7 +48,6 @@ async fn get_secret(state: &AppState, key: &str) -> Result<String, AppError> {
         
     let json_val = json_opt.ok_or_else(|| AppError::UnknownError(format!("Configuration '{}' missing", key)))?;
     
-    // Deserialize JSON to EncryptedValue
     let enc: EncryptedValue = serde_json::from_value(json_val)
         .map_err(|_| AppError::UnknownError("Invalid secret format".into()))?;
     
@@ -44,13 +56,19 @@ async fn get_secret(state: &AppState, key: &str) -> Result<String, AppError> {
 
 // --- GitHub Handlers ---
 
-pub async fn github_login(State(state): State<AppState>) -> Result<Redirect, AppError> {
-    // DYNAMIC FETCH
+pub async fn github_login(
+    State(state): State<AppState>,
+    Query(query): Query<LoginQuery>,
+) -> Result<Redirect, AppError> {
     let client_id = get_secret(&state, "github_client_id").await?;
     
+    // Pass the redirect URL in the 'state' parameter (simple approach)
+    // For production, this should be signed/encrypted to prevent open redirect vulnerabilities
+    let state_param = query.redirect_to.unwrap_or_default();
+    
     let url = format!(
-        "https://github.com/login/oauth/authorize?client_id={}&scope=user:email",
-        client_id
+        "https://github.com/login/oauth/authorize?client_id={}&scope=user:email&state={}",
+        client_id, state_param
     );
     Ok(Redirect::to(&url))
 }
@@ -58,12 +76,11 @@ pub async fn github_login(State(state): State<AppState>) -> Result<Redirect, App
 pub async fn github_callback(
     State(state): State<AppState>,
     Query(params): Query<OauthCallback>,
-) -> Result<Json<AuthResponse>, AppError> {
-    // DYNAMIC FETCH
+) -> Result<Response, AppError> {
     let client_id = get_secret(&state, "github_client_id").await?;
     let client_secret = get_secret(&state, "github_client_secret").await?;
     
-    // 1. Exchange Code for Token
+    // 1. Exchange Code
     let client = reqwest::Client::new();
     let token_res = client.post("https://github.com/login/oauth/access_token")
         .header("Accept", "application/json")
@@ -96,14 +113,25 @@ pub async fn github_callback(
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     let user = match existing {
-        Some(u) => u,
+        Some(u) => {
+            // [OPTIONAL] Update metadata on login if changed?
+            u
+        },
         None => {
-            // Create new user
+            // [NEW] Construct Metadata
+            let metadata = json!({
+                "avatar": gh_user.avatar_url,
+                "name": gh_user.name.unwrap_or(gh_user.login.clone()),
+                "github_url": gh_user.html_url,
+                "source": "github"
+            });
+
             let email = gh_user.email.unwrap_or_else(|| format!("{}@github.oauth", gh_user.login));
-            let pwd = uuid::Uuid::new_v4().to_string(); // Random pwd
+            let pwd = uuid::Uuid::new_v4().to_string(); 
             let hash = auth::hash_password(&pwd).unwrap();
             
-            let u = state.db.create_user(&email, &hash, "user", None).await
+            // Pass metadata to create_user
+            let u = state.db.create_user(&email, &hash, "user", Some(metadata)).await
                 .map_err(|_| AppError::UnknownError("Email already taken".into()))?;
             
             state.db.link_oauth(u.id, "github", &provider_id).await
@@ -116,10 +144,20 @@ pub async fn github_callback(
     let token = auth::create_jwt(user.id, &user.email, &user.role)
         .map_err(|_| AppError::UnknownError("Token failed".into()))?;
 
+    // 5. Handle Response Type (JSON vs Redirect)
+    // If 'state' param was passed (containing redirect URL), use it
+    if let Some(target) = params.state.filter(|s| !s.is_empty()) {
+        // Append token to redirect URL (e.g. ?token=...)
+        let separator = if target.contains('?') { '&' } else { '?' };
+        let redirect_url = format!("{}{}{}={}", target, separator, "token", token);
+        return Ok(Redirect::to(&redirect_url).into_response());
+    }
+
+    // Default: Return JSON
     Ok(Json(AuthResponse {
         token,
         user: UserDto { id: user.id, email: user.email, role: user.role, metadata: user.metadata },
-    }))
+    }).into_response())
 }
 
 // --- Verification Handlers ---
@@ -159,4 +197,36 @@ pub async fn resend_verification(
     }
     // Always return OK to prevent enumeration
     Ok(StatusCode::OK)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/me",
+    responses((status = 200, body = UserDto))
+)]
+pub async fn get_me(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Json<UserDto>, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    
+    // We can fetch fresh data from DB, or just return claims if that's enough.
+    // Fetching is safer to ensure user wasn't deleted/banned.
+    // Note: get_user_by_email might need to be exposed or we use list with filter. 
+    // Ideally, we should have get_user(id) in the Db trait.
+    
+    // Since 'get_user' by ID isn't explicitly in the Db trait visible here (only list/get_by_email),
+    // let's use list with ID filter logic or add get_user(id). 
+    // Assuming we can use get_users_by_ids([id]) which IS in the trait.
+    
+    let users = db.get_users_by_ids(&[claims.uid]).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    let user = users.first().ok_or(AppError::NotFound("User not found".into()))?;
+
+    Ok(Json(UserDto {
+        id: user.id,
+        email: user.email.clone(),
+        role: user.role.clone(),
+        metadata: user.metadata.clone()
+    }))
 }

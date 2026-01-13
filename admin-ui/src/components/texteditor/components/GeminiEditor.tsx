@@ -778,3 +778,5 @@ const GeminiEditor: React.FC<GeminiEditorProps> = ({ value, onChange }) => {
 };
 
 export default GeminiEditor;
+export const turndownHelper = (content:string) => turndownService.turndown(content)
+export const markdownHelper = (content:string) => marked.parse(content)

@@ -1,4 +1,3 @@
-// =========================== apexkit-api/src/websocket.rs ===========================
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
