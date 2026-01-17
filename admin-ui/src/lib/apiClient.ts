@@ -61,7 +61,9 @@ const transformCollection = (col: any): Collection => {
               type: uiType,
               required: def.required,
               unique: def.unique,
-              indexed: def.indexed,
+              ose_indexed: def.ose_indexed,
+              sql_indexed: def.sql_indexed,
+              auto: def.auto,
               default: def.default,
               uid: def.uid,
               position: def.position,
@@ -150,8 +152,10 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
               type: field.type,
               required: field.required,
               unique: field.unique,
-              indexed: field.indexed,
+              ose_indexed: field.ose_indexed,
+              sql_indexed: field.sql_indexed,
               default: field.default,
+              auto: field.auto,
               uid: field.uid,
               position: field.position,
               vectorize: field.vectorize,
@@ -325,7 +329,21 @@ export const apiClient = {
       return pb.admins.deleteCollection(id);
     },
     revectorize: (id: string) => pb.admins.revectorizeCollection(id),
-    reIndex: (id: string) => pb.admins.reIndex(id)
+    reIndex: (id: string) => pb.admins.reIndex(id),
+
+    exportSchema: async () => {
+        const blob = await pb.admins.exportSchema();
+        const downloadUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = downloadUrl;
+        a.download = "apex_schema.json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    },
+    importSchema: async (file: File, strategy: 'skip' | 'overwrite' | 'error' = 'skip') => {
+        return await pb.admins.importSchema(file, strategy);
+    },
   },
 
   records: {
@@ -369,9 +387,18 @@ export const apiClient = {
       if (!query) return [];
       try {
         // Call the SDK
-        return await pb.collection(collectionId).searchRecordsWithOSE(query);
+        const result = await pb.collection(collectionId).searchRecordsWithOSE(query);
+        return result.map((item: any) => ({
+          id: item.id.toString(),
+          collectionId,
+          collectionName: 'unknown',
+          created: new Date(item.created).toISOString(),
+          updated: new Date(item.updated).toISOString(),
+          ...item.data,
+          expand: item.expand || {} // Ensure expand object exists
+        }));
       } catch (e) {
-        console.error("Records search failed", e);
+        console.error("OSE Records search failed", e);
         return [];
       }
     },
@@ -379,9 +406,18 @@ export const apiClient = {
       if (!query) return [];
       try {
         // Call the SDK
-        return await pb.collection(collectionId).searchRecordsWithSQL(query);
+        const result =  await pb.collection(collectionId).searchRecordsWithSQL(query);
+        return result.map((item: any) => ({
+          id: item.id.toString(),
+          collectionId,
+          collectionName: 'unknown',
+          created: new Date(item.created).toISOString(),
+          updated: new Date(item.updated).toISOString(),
+          ...item.data,
+          expand: item.expand || {} // Ensure expand object exists
+        }));
       } catch (e) {
-        console.error("Records search failed", e);
+        console.error("SQL Records search failed", e);
         return [];
       }
     },
@@ -429,7 +465,12 @@ export const apiClient = {
     
     searchVector: async (collectionId: string, field: string, vector: number[], limit = 10) => {
         return await pb.collection(collectionId).searchVector(field, vector, limit);
-    }
+    },
+    
+    getVector: async (collectionId: string, recordId: number | string) => {
+        return await pb.collection(collectionId).getVector(recordId);
+    },
+
   },
 
   testS3Connection: async (config: any) => {

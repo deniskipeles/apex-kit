@@ -138,3 +138,22 @@ pub struct ConfigItem {
     pub encrypted: bool,
     pub updated_at: String,
 }
+
+// Struct for returning raw vectors
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct VectorRecord {
+    pub field_name: String,
+    pub vector: Vec<f32>,
+    pub model: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct ApiKey {
+    pub id: i64,
+    pub name: String,
+    pub prefix: String, // First 8 chars for display
+    #[serde(skip_serializing)]
+    pub hash: String,   // Hashed full key
+    pub role: String,   // Usually 'admin' or 'user'
+    pub created_at: String,
+}

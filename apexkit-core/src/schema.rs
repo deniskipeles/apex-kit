@@ -9,6 +9,8 @@ pub fn generate_hex_id() -> String {
     format!("{:x}", rng.r#gen::<u32>())
 }
 
+fn default_true() -> bool { true }
+
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema, Default)]
 pub struct CollectionSchema {
     pub fields: HashMap<String, FieldDefinition>,
@@ -72,18 +74,31 @@ impl Default for CollectionPolicies {
 pub struct FieldDefinition {
     pub r#type: FieldType,
     pub required: bool,
+    
     #[schema(value_type = Option<Object>)]
     pub default: Option<serde_json::Value>,
+    
+    // Tantivy Search Index (Full Text)
     #[serde(default)]
-    pub indexed: bool,
-    // Toggle to auto-generate embeddings for this field ---
+    pub ose_indexed: bool,
+
+    // [NEW] SQL B-Tree Index (Filtering/Sorting)
+    #[serde(default)]
+    pub sql_indexed: bool,
+    
+    // AI Embeddings
     #[serde(default)]
     pub vectorize: bool, 
 
+    // [NEW] Auto-inject owner ID (Defaults to true for Owner fields)
+    #[serde(default = "default_true")]
+    pub auto: bool,
+
     #[serde(default)]
-    pub position: i32, // For Admin UI Column Ordering
+    pub position: i32, 
+    
     #[serde(default = "generate_hex_id")]
-    pub uid: String,   // Stable Hex ID for constructing Index Keys
+    pub uid: String,   
 
     // --- Dynamic Validation ---
     pub unique: Option<bool>,
@@ -95,14 +110,14 @@ pub struct FieldDefinition {
     // String / Text / Blob
     pub min_length: Option<usize>,
     pub max_length: Option<usize>,
-    pub pattern: Option<String>, // Regex
+    pub pattern: Option<String>, 
     
     // Select
     pub options: Option<Vec<String>>,
     
     // File / Blob
     pub mime_types: Option<Vec<String>>,
-    pub max_size: Option<usize>, // bytes
+    pub max_size: Option<usize>, 
     
     // Vector
     pub dimension: Option<usize>,

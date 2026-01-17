@@ -62,7 +62,7 @@ impl SearchManager {
         sorted_fields.sort_by_key(|(name, _)| *name);
 
         for (name, def) in sorted_fields {
-            if def.indexed {
+            if def.ose_indexed {
                 match def.r#type {
                     FieldType::String | FieldType::Text => {
                         schema_builder.add_text_field(name, TEXT | STORED);
@@ -168,7 +168,7 @@ impl SearchManager {
 
         // Add User Fields
         for (name, def) in &schema.fields {
-            if def.indexed {
+            if def.ose_indexed {
                 if let Ok(field) = index_schema.get_field(name) {
                     if let Some(val) = data.get(name) {
                         match def.r#type {
@@ -232,7 +232,7 @@ impl SearchManager {
             doc.add_i64(id_field, *record_id);
 
             for (name, def) in &schema.fields {
-                if def.indexed {
+                if def.ose_indexed {
                     if let Ok(field) = index_schema.get_field(name) {
                         if let Some(val) = data.get(name) {
                             // ... (Copy your field mapping logic from index_record here) ...
@@ -285,34 +285,13 @@ impl SearchManager {
     }
 
     /// Returns a list of Record IDs matching the query (For Full Search)
+    /// Reuses the logic from instant_search to ensure consistency.
     pub fn search(&self, collection_id: i64, query_str: &str, limit: usize) -> Result<Vec<i64>, String> {
-        let lock = self.indexes.lock().unwrap();
-        let index = lock.get(&collection_id).ok_or("Index not loaded")?;
-
-        let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into().map_err(|e| e.to_string())?;
-        let searcher = reader.searcher();
-        let schema = index.schema();
-
-        let default_fields: Vec<Field> = schema.fields()
-            .filter(|(_, entry)| matches!(entry.field_type(), TantivyFieldType::Str(_)))
-            .map(|(f, _)| f)
-            .collect();
+        // Reuse instant_search logic to get ranked results
+        let results = self.instant_search(collection_id, query_str, limit)?;
         
-        if default_fields.is_empty() { return Ok(vec![]); }
-
-        let query_parser = QueryParser::for_index(index, default_fields);
-        let query = query_parser.parse_query(query_str).map_err(|e| e.to_string())?;
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit)).map_err(|e| e.to_string())?;
-
-        let id_field = schema.get_field("record_id").unwrap();
-        let mut results = Vec::new();
-        for (_, doc_address) in top_docs {
-            let retrieved_doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| e.to_string())?;
-            if let Some(val) = retrieved_doc.get_first(id_field) {
-                if let Some(id) = val.as_i64() { results.push(id); }
-            }
-        }
-        Ok(results)
+        // Extract just the IDs, preserving the relevance order
+        Ok(results.into_iter().map(|r| r.id).collect())
     }
 
     /// Returns lightweight results directly from Index (For Instant Search)

@@ -76,7 +76,7 @@ pub struct SandboxManager {
 
 impl SandboxManager {
     pub fn new(shared_embedder: Option<Arc<CandleEmbedder>>) -> Self {
-        let _ = fs::create_dir_all("sandboxes");
+        let _ = fs::create_dir_all("storage/sandboxes");
         
         // STRICT CACHE POLICY:
         // Evict sandbox from memory 3 minutes after the last access.
@@ -99,7 +99,7 @@ impl SandboxManager {
     /// Immediately loads it into the cache.
     // [UPDATED] create_sandbox now takes a strategy and a source DB
     pub async fn create_sandbox(&self, session_id: &str, strategy: CloneStrategy, source_db: Arc<dyn Db>) -> Result<Arc<dyn Db>, String> {
-        let sandbox_dir = format!("sandboxes/session_{}", session_id);
+        let sandbox_dir = format!("storage/sandboxes/session_{}", session_id);
         
         if Path::new(&sandbox_dir).exists() {
             let _ = fs::remove_dir_all(&sandbox_dir);
@@ -128,7 +128,7 @@ impl SandboxManager {
     
     // [NEW] Helper to initialize an empty sandbox filesystem and DB connection
     async fn init_empty_sandbox_db(&self, session_id: &str) -> Result<Arc<dyn Db>, String> {
-        let base_path = format!("sandboxes/session_{}", session_id);
+        let base_path = format!("storage/sandboxes/session_{}", session_id);
         fs::create_dir_all(&format!("{}/indexes", base_path)).ok();
         fs::create_dir_all(&format!("{}/uploads", base_path)).ok();
         
@@ -355,7 +355,7 @@ impl SandboxManager {
     /// Internal logic to initialize DB connections and Vector Index
     // Internal logic to initialize DB connections and Vector Index
     async fn load_context_from_disk(&self, session_id: &str) -> Result<SandboxContext, String> {
-        let sandbox_dir = format!("sandboxes/session_{}", session_id);
+        let sandbox_dir = format!("storage/sandboxes/session_{}", session_id);
         if !Path::new(&sandbox_dir).exists() {
             return Err("Sandbox expired or not found".into());
         }
@@ -434,7 +434,7 @@ impl SandboxManager {
         tokio::spawn(async move {
             cache.invalidate(&session_key).await;
             
-            let sandbox_dir = format!("sandboxes/session_{}", session_key);
+            let sandbox_dir = format!("storage/sandboxes/session_{}", session_key);
             if Path::new(&sandbox_dir).exists() {
                 if let Err(e) = fs::remove_dir_all(&sandbox_dir) {
                     warn!("Failed to delete sandbox dir {}: {}", session_key, e);

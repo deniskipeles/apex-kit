@@ -3,6 +3,7 @@ use crate::AppState;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use apexkit_core::models::CronJob;
 // use crate::settings::AppSettingsDto;
+use crate::settings::BackupConfigDto;
 
 pub struct SchedulerService {
     scheduler: JobScheduler,
@@ -97,6 +98,32 @@ impl SchedulerService {
                         },
                         Err(e) => tracing::error!("Invalid schedule for {}: {}", job.name, e),
                     }
+                }
+            }
+        }
+
+        // 3. System Backup Job
+        let backup_setting = state.db.get_config("backups").await.unwrap_or(None);
+        if let Some(val) = backup_setting {
+            let config: BackupConfigDto = serde_json::from_value(val).unwrap_or_default();
+            
+            if config.enabled {
+                let state_clone = state.clone();
+                let config_clone = config.clone();
+                
+                let job = Job::new_async(config.schedule.as_str(), move |_uuid, _l| {
+                    let s = state_clone.clone();
+                    let c = config_clone.clone();
+                    Box::pin(async move {
+                        if let Err(e) = crate::backup::perform_backup(s.db.clone(), s.vault.clone(), c).await {
+                            tracing::error!("Backup Job Failed: {}", e);
+                        }
+                    })
+                });
+
+                if let Ok(j) = job {
+                    self.scheduler.add(j).await.ok();
+                    tracing::info!("Backup job scheduled: {}", config.schedule);
                 }
             }
         }

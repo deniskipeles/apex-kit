@@ -5,6 +5,7 @@ use std::io::Write;
 use serde_json::{json};
 use apexkit_core::security::EncryptedValue;
 use apexkit_core::realtime::EventScope;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "ApexKit CLI Manager", long_about = None)]
@@ -200,12 +201,8 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
             let result = state.script_engine.run_script(
                 &script.code, 
                 payload, 
-                state.db.clone(), 
-                state.embedder.clone(), 
-                state.vector_provider.clone(),
-                state.vault.clone(),
+                Arc::new(state.clone()), // Pass AppState
                 None,
-                Some(state.tx.clone()),
                 EventScope::Root
             ).await.map_err(|e| format!("Script Error: {}", e))?;
 

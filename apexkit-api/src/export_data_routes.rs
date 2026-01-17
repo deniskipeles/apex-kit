@@ -13,6 +13,8 @@ use crate::{AppState, AppError};
 use utoipa::{IntoParams, ToSchema}; 
 use csv::WriterBuilder;
 
+use crate::DatabaseConnection;
+
 // --- DTOs ---
 
 #[derive(Deserialize, IntoParams, ToSchema)] 
@@ -158,5 +160,37 @@ pub async fn export_data_handler(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
         .body(body_bytes.into())
+        .map_err(|e| AppError::UnknownError(format!("Response build failed: {}", e)))
+}
+
+// Handler: Export All Collections (Schema Only)
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/export-schema",
+    responses((status = 200, description = "Downloadable JSON"))
+)]
+pub async fn export_schema_handler(
+    Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Response, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let collections = db.list_collections().await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    // Wrap in a structure compatible with ImportRequest
+    let export_obj = serde_json::json!({
+        "collections": collections,
+        "strategy": "skip", // Default for documentation
+        "exported_at": chrono::Utc::now().to_rfc3339()
+    });
+
+    let json_bytes = serde_json::to_vec_pretty(&export_obj)
+        .map_err(|e| AppError::UnknownError(format!("Serialization Error: {}", e)))?;
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_DISPOSITION, "attachment; filename=\"apex_schema.json\"")
+        .body(json_bytes.into())
         .map_err(|e| AppError::UnknownError(format!("Response build failed: {}", e)))
 }

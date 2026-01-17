@@ -446,15 +446,38 @@ export class ApexKit {
              * @returns {Promise<Blob>} The binary blob of the file.
              */
             exportData: async (collectionId, format = 'json') => {
-                // Direct fetch is used here to handle Blob response type specifically
-                const url = `${this.baseUrl}/api/v1/admin/export-data/${collectionId}?format=${format}`;
-                const headers = {};
-                if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
-                
-                const response = await fetch(url, { method: 'GET', headers });
+                const response = await this._request(`/admin/export-data/${collectionId}?format=${format}`, { method: 'GET' });
                 
                 if (!response.ok) {
                     throw new Error(`Export failed: ${response.statusText}`);
+                }
+                return response.blob();
+            },
+
+            /**
+             * Import a schema JSON file to create or update collections.
+             * @param {File} file - The .json file containing the schema definition.
+             * @param {'skip' | 'overwrite' | 'error'} [strategy='skip'] - Conflict strategy.
+             * @returns {Promise<{created: number, updated: number, skipped: number, errors: string[]}>}
+             */
+            importSchema: (file, strategy = 'skip') => {
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('strategy', strategy);
+                // _request handles FormData automatically
+                return this._request('/admin/import-schema', { method: 'POST', body: formData });
+            },
+
+            /**
+             * Export the entire database schema as a Blob.
+             * @returns {Promise<Blob>} The JSON file blob.
+             */
+            exportSchema: async () => {
+                const response = await this._request('/admin/export-schema', { method: 'GET' });
+                
+                if (!response.ok) {
+                    const errText = await response.text();
+                    throw new Error(`Export failed: ${response.status} ${errText}`);
                 }
                 return response.blob();
             },
@@ -781,6 +804,7 @@ export class ApexKit {
                     }
                 });
             },
+            
             /**
              * Perform a semantic vector search using a raw float array.
              * @param {string} field - The field name storing vectors (e.g. "description_vec").
@@ -804,6 +828,15 @@ export class ApexKit {
                 method: 'POST',
                 body: { query_text: queryText, limit }
             }),
+
+            /**
+             * Retrieve the raw vector embedding(s) for a specific record.
+             * Useful for finding "related" items without regenerating the vector from text.
+             * 
+             * @param {number|string} recordId - The ID of the record.
+             * @returns {Promise<Array<{field_name: string, vector: number[], model: string}>>} List of vectors stored for this record.
+             */
+            getVector: (recordId) => this._request(`/collections/${collectionId}/get-vector/${recordId}`, { method: 'GET' }),
         };
     }
 

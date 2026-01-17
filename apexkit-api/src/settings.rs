@@ -73,6 +73,14 @@ pub struct AiConfigDto {
     pub api_key: Option<String>, // Masked on GET
 }
 
+#[derive(Serialize, Deserialize, ToSchema, Clone, Default)]
+pub struct BackupConfigDto {
+    pub enabled: bool,
+    pub schedule: String, // e.g. "0 0 * * *"
+    pub retention: u32,   // Days
+    pub destination: String, // "local" | "s3"
+}
+
 // --- Handlers ---
 
 #[utoipa::path(

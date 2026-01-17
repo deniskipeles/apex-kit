@@ -59,6 +59,11 @@ impl WriteManager {
                 return;
             }
         };
+
+        // Apply connection-specific pragmas (Critical for concurrency)
+        if let Err(e) = conn.execute("PRAGMA busy_timeout = 5000;", ()).await {
+            eprintln!("CRITICAL: Batcher failed to set busy_timeout: {}", e);
+        }
         
         // Dynamic capacity
         let mut buffer = Vec::with_capacity(max_batch_size);

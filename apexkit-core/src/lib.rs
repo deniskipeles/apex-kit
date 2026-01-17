@@ -8,13 +8,15 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::ai_models::{AiSession, Plugin};
-use crate::models::{DashboardData, DashboardStats, ChartPoint};
+use crate::models::{DashboardData, DashboardStats, ChartPoint, ApiKey};
 use chrono::Utc;
 use std::collections::{HashMap, BTreeMap};
 use std::error::Error as StdError;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering}; 
 use crate::schema::FieldType;
+use crate::embeddings::EmbedderService;
+use crate::security::Vault;
 
 const COMPOSITE_SEPARATOR: &str = "__::__";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -39,6 +41,7 @@ pub mod scripting;
 pub mod filter;
 pub mod batching;
 pub mod embeddings;
+pub mod utils;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)] 
 pub struct Collection {
@@ -72,6 +75,32 @@ pub trait VectorProvider: Send + Sync {
     async fn index(&self, col_id: i64, rec_id: i64, field: &str, vec: &[f32]) -> std::result::Result<(), String>;
 }
 
+/// Interface to expose Application State to the Script Engine
+/// without creating circular dependencies.
+pub trait ScriptContext: Send + Sync {
+    fn get_db(&self) -> Arc<dyn Db>;
+    fn get_vault(&self) -> Arc<Vault>;
+    fn get_embedder(&self) -> Arc<EmbedderService>;
+    fn get_vector_provider(&self) -> Arc<dyn VectorProvider>;
+    fn get_realtime_tx(&self) -> tokio::sync::broadcast::Sender<crate::realtime::DbEvent>;
+    
+    // Optional: Only available if Managers are initialized
+    // Returns Option because Core doesn't know about Manager structs
+    // Note: We need a trait for managers if we want to return them here, 
+    // or expose specific methods directly on ScriptContext.
+    // Let's expose specific methods to keep Core clean.
+    
+    // Resolve specific DB context
+    fn resolve_tenant_db(&self, tenant_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>>;
+    fn resolve_sandbox_db(&self, session_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>>;
+
+    // Expose Admin Manager access if needed (e.g. for $root.createTenant)
+    // We can't return the Struct, but we can return a trait object or handle logic here.
+    // For simplicity, let's assume `create_tenant` is handled via `resolve_tenant_db` or a specific method.
+    // Better Approach: Expose specific admin functions on ScriptContext directly
+    fn admin_create_tenant(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+}
+
 #[async_trait]
 pub trait Db: Send + Sync {
     // --- Collections ---
@@ -103,6 +132,10 @@ pub trait Db: Send + Sync {
     // --- Users (Auth) ---
     // Added metadata argument
     async fn create_user(&self, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>>;
+    
+    // Tenants
+    async fn register_tenant(&self, id: &str, owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    
     // Allows forcing an ID (for Sandbox cloning)
     async fn import_user(&self, id: i64, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_user_by_email(&self, email: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>>;
@@ -138,6 +171,12 @@ pub trait Db: Send + Sync {
     async fn log_audit_event(&self, level: &str, message: &str, source: &str, meta: Option<serde_json::Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn list_audit_logs(&self) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>;
     async fn log_system_event(&self, level: &str, target: &str, message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    // --- API keys ---
+    async fn create_api_key(&self, name: &str, role: &str) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn delete_api_key(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn verify_api_key(&self, key: &str) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>>;
 
     // --- AI Actions ---
     async fn list_ai_actions(&self) -> std::result::Result<Vec<ai_models::AiAction>, Box<dyn std::error::Error + Send + Sync>>;
@@ -184,6 +223,7 @@ pub trait Db: Send + Sync {
     async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>>;
     async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>, model: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
     async fn has_vector(&self, collection_id: i64, record_id: i64, field_name: &str, model: &str) -> std::result::Result<bool, Box<dyn StdError + Send + Sync>>;
+    async fn get_record_vectors(&self, collection_id: i64, record_id: i64) -> std::result::Result<Vec<models::VectorRecord>, Box<dyn StdError + Send + Sync>>;
 }
 
 fn row_to_collection(row: &Row) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
@@ -268,7 +308,7 @@ impl ApexKit {
             data_batcher,
             log_batcher,
             vector_batcher,
-            search: Arc::new(SearchManager::new("./indexes")),
+            search: Arc::new(SearchManager::new("./storage/system/indexes")),
             embedder: Arc::new(embeddings::EmbedderService::new()), // Init service
         }
     }
@@ -331,7 +371,7 @@ impl ApexKit {
     async fn ensure_search_index(&self, collection_id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(col) = self.get_collection(collection_id).await? {
             if let Some(schema) = &col.schema {
-                if schema.fields.values().any(|f| f.indexed) {
+                if schema.fields.values().any(|f| f.ose_indexed) {
                     self.search.load_index(collection_id, schema)?;
                 }
             }
@@ -817,15 +857,171 @@ async fn commit_uniqueness(
     Ok(())
 }
 
+// Generates an index name: idx_col_{collection_id}_{field_uid}
+fn sql_index_name(col_id: i64, field_uid: &str) -> String {
+    format!("idx_col_{}_{}", col_id, field_uid)
+}
+
+async fn reconcile_sql_indexes(
+    batcher: &batching::WriteManager,
+    col_id: i64,
+    new_schema: &CollectionSchema,
+    old_schema: Option<&CollectionSchema>
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    
+    // 1. Identify Indexes to Create
+    for (name, def) in &new_schema.fields {
+        if def.sql_indexed {
+            let idx_name = sql_index_name(col_id, &def.uid);
+            
+            // Check if already existed (if old schema exists)
+            let exists = old_schema.map(|s| {
+                s.fields.get(name).map(|f| f.sql_indexed).unwrap_or(false)
+            }).unwrap_or(false);
+
+            if !exists {
+                // CREATE INDEX IF NOT EXISTS idx_name ON records (json_extract(data, '$.field')) WHERE collection_id = X
+                let sql = format!(
+                    "CREATE INDEX IF NOT EXISTS {} ON records (json_extract(data, '$.{}')) WHERE collection_id = {}", 
+                    idx_name, name, col_id
+                );
+                batcher.execute(sql, vec![]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+        }
+    }
+
+    // 2. Identify Indexes to Drop (If field removed or sql_indexed set to false)
+    if let Some(old) = old_schema {
+        for (name, def) in &old.fields {
+            let should_drop = if let Some(new_def) = new_schema.fields.get(name) {
+                def.sql_indexed && !new_def.sql_indexed // Existed, but now turned off
+            } else {
+                def.sql_indexed // Field removed entirely
+            };
+
+            if should_drop {
+                let idx_name = sql_index_name(col_id, &def.uid);
+                let sql = format!("DROP INDEX IF EXISTS {}", idx_name);
+                batcher.execute(sql, vec![]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl Db for ApexKit {
+    // --- API keys / Super tokens ---
+    async fn create_api_key(&self, name: &str, role: &str) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core()?;
+        
+        let raw_key = format!("ak_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
+        let prefix = raw_key[0..8].to_string();
+        let hash = crate::auth::hash_password(&raw_key)?;
+
+        conn.execute(
+            "INSERT INTO _api_keys (name, prefix, hash, role) VALUES (?1, ?2, ?3, ?4)", 
+            params![name, prefix.clone(), hash, role] // [FIX] Clone here
+        ).await?;
+        
+        let id = conn.last_insert_rowid();
+        
+        let key_obj = ApiKey {
+            id,
+            name: name.to_string(),
+            prefix, // Use original here
+            hash: String::new(), 
+            role: role.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        Ok((raw_key, key_obj))
+    }
+
+    async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core()?;
+        let mut rows = conn.query("SELECT id, name, prefix, hash, role, created_at FROM _api_keys ORDER BY created_at DESC", ()).await?;
+        let mut keys = Vec::new();
+        while let Some(row) = rows.next().await? {
+            keys.push(ApiKey {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                prefix: row.get(2)?,
+                hash: String::new(), // Don't return hash
+                role: row.get(4)?,
+                created_at: row.get(5)?,
+            });
+        }
+        Ok(keys)
+    }
+
+    async fn delete_api_key(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.get_core()?.execute("DELETE FROM _api_keys WHERE id = ?1", params![id]).await?;
+        Ok(())
+    }
+
+    async fn verify_api_key(&self, key: &str) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core()?;
+        let prefix = if key.len() > 8 { &key[0..8] } else { key };
+        
+        let mut rows = conn.query("SELECT id, name, prefix, hash, role, created_at FROM _api_keys WHERE prefix = ?1", params![prefix]).await?;
+        
+        while let Some(row) = rows.next().await? {
+            let hash: String = row.get(3)?;
+            if crate::auth::verify_password(key, &hash) {
+                return Ok(Some(ApiKey {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    prefix: row.get(2)?,
+                    hash: String::new(),
+                    role: row.get(4)?,
+                    created_at: row.get(5)?,
+                }));
+            }
+        }
+        Ok(None)
+    }
+    
     // --- Data DB (Collections/Records) ---
 
     async fn create_collection(&self, name: &str, schema: &Option<CollectionSchema>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let schema_str = serde_json::to_string(&schema)?;
         let id = self.data_batcher.insert("INSERT INTO collections (name, schema) VALUES (?1, ?2)".into(), vec![name.into(), schema_str.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
-        if let Some(s) = schema { if s.fields.values().any(|f| f.indexed) { self.search.load_index(id, s)?; } }
+        
+        if let Some(s) = schema {
+            // 1. OSE Index (Tantivy)
+            if s.fields.values().any(|f| f.ose_indexed) { 
+                self.search.load_index(id, s)?; 
+            }
+            // 2. SQL Index (B-Tree)
+            reconcile_sql_indexes(&self.data_batcher, id, s, None).await?;
+        }
         Ok(id)
+    }
+
+    async fn update_collection(&self, id: i64, name: Option<String>, schema: Option<CollectionSchema>) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
+        // Fetch existing for diffing
+        let existing = self.get_collection(id).await?.ok_or("Not found")?;
+        let old_schema = existing.schema;
+
+        if let Some(n) = name { self.data_batcher.execute("UPDATE collections SET name = ?1 WHERE id = ?2".into(), vec![n.into(), id.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?; }
+        
+        if let Some(s) = &schema { 
+            let s_str = serde_json::to_string(&s)?; 
+            self.data_batcher.execute("UPDATE collections SET schema = ?1 WHERE id = ?2".into(), vec![s_str.into(), id.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?; 
+            
+            // Reconcile SQL Indexes
+            reconcile_sql_indexes(&self.data_batcher, id, s, old_schema.as_ref()).await?;
+            
+            // Reload OSE (Tantivy) if needed
+            // Ideally we'd only do this if ose_indexed changed, but simple reload is safe
+            if s.fields.values().any(|f| f.ose_indexed) {
+                self.search.load_index(id, s)?;
+            }
+        }
+        
+        self.get_collection(id).await?.ok_or("Not found".into())
     }
 
     async fn get_collection(&self, id: i64) -> std::result::Result<Option<Collection>, Box<dyn std::error::Error + Send + Sync>> {
@@ -840,12 +1036,6 @@ impl Db for ApexKit {
         let mut cols = Vec::new();
         while let Some(row) = rows.next().await? { cols.push(row_to_collection(&row)?); }
         Ok(cols)
-    }
-
-    async fn update_collection(&self, id: i64, name: Option<String>, schema: Option<CollectionSchema>) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(n) = name { self.data_batcher.execute("UPDATE collections SET name = ?1 WHERE id = ?2".into(), vec![n.into(), id.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?; }
-        if let Some(s) = schema { let s_str = serde_json::to_string(&s)?; self.data_batcher.execute("UPDATE collections SET schema = ?1 WHERE id = ?2".into(), vec![s_str.into(), id.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?; }
-        self.get_collection(id).await?.ok_or("Not found".into())
     }
 
     async fn delete_collection(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1086,14 +1276,31 @@ impl Db for ApexKit {
 
     async fn search_records(&self, collection_id: i64, query: &str) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
         self.ensure_search_index(collection_id).await?;
+        
+        // 1. Get IDs sorted by relevance score from Tantivy
         let ids = self.search.search(collection_id, query, 50)?;
         if ids.is_empty() { return Ok(vec![]); }
+        
+        // 2. Fetch raw records from DB (Returned in arbitrary order)
         let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
         let sql = format!("SELECT id, json(data), NULL, created, updated FROM records WHERE id IN ({})", id_list);
         let conn = self.get_data()?;
         let mut rows = conn.query(&sql, ()).await?;
+        
         let mut records = Vec::new();
-        while let Some(row) = rows.next().await? { records.push(row_to_record(&row)?); }
+        while let Some(row) = rows.next().await? { 
+            records.push(row_to_record(&row)?); 
+        }
+
+        // 3. Re-sort records to match the relevance order of 'ids'
+        let id_pos: std::collections::HashMap<i64, usize> = ids.iter().enumerate().map(|(pos, id)| (*id, pos)).collect();
+        
+        records.sort_by(|a, b| {
+            let pos_a = id_pos.get(&a.id).unwrap_or(&usize::MAX);
+            let pos_b = id_pos.get(&b.id).unwrap_or(&usize::MAX);
+            pos_a.cmp(pos_b)
+        });
+
         Ok(records)
     }
 
@@ -1135,7 +1342,7 @@ impl Db for ApexKit {
 
                     // 2. Get Index Count
                     if let Some(schema) = &col.schema {
-                        if !schema.fields.values().any(|f| f.indexed) { return Some(()); }
+                        if !schema.fields.values().any(|f| f.ose_indexed) { return Some(()); }
                         let _ = db.search.load_index(col.id, schema);
                     }
                     
@@ -1177,7 +1384,7 @@ impl Db for ApexKit {
         let col = self.get_collection(id).await?.ok_or_else(|| format!("Collection {} not found", id))?; 
         let schema = col.schema.unwrap_or_default();
         
-        if !schema.fields.values().any(|f| f.indexed) { return Ok(()); }
+        if !schema.fields.values().any(|f| f.ose_indexed) { return Ok(()); }
         
         self.search.delete_index(id).map_err(|e| format!("Search Delete Error: {}", e))?; 
         self.search.load_index(id, &schema).map_err(|e| format!("Search Load Error: {}", e))?;
@@ -1210,7 +1417,7 @@ impl Db for ApexKit {
     async fn instant_search(&self, collection_id: i64, query: &str, limit: usize) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(col) = self.get_collection(collection_id).await? {
             if let Some(schema) = &col.schema {
-                if schema.fields.values().any(|f| f.indexed) { self.search.load_index(collection_id, schema)?; } else { return Ok(vec![]); }
+                if schema.fields.values().any(|f| f.ose_indexed) { self.search.load_index(collection_id, schema)?; } else { return Ok(vec![]); }
             }
         }
         let results = self.search.instant_search(collection_id, query, limit.try_into().unwrap())?;
@@ -1663,6 +1870,16 @@ impl Db for ApexKit {
         Ok(records)
     }
 
+    // --- Tenants ---
+    async fn register_tenant(&self, id: &str, owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Implementation logic (e.g. insert into _tenants table in root core.db)
+        // Since register_tenant was discussed earlier as part of the core logic update but missed in the trait,
+        // we add a basic implementation here targeting the core DB.
+        let conn = self.get_core()?;
+        conn.execute("INSERT INTO _tenants (id, owner_id) VALUES (?1, ?2)", params![id, owner_id]).await?;
+        Ok(())
+    }
+
     // --- Dashboard ---
     async fn get_dashboard_stats(&self) -> std::result::Result<DashboardData, Box<dyn std::error::Error + Send + Sync>> {
         let data_conn = self.get_data()?;
@@ -1788,6 +2005,42 @@ impl Db for ApexKit {
         Ok(rows.next().await?.is_some())
     }
 
+    async fn get_record_vectors(&self, collection_id: i64, record_id: i64) -> std::result::Result<Vec<models::VectorRecord>, Box<dyn StdError + Send + Sync>> {
+        let conn = self.get_vector()?;
+        let mut rows = conn.query(
+            "SELECT field_name, vector, model FROM vectors WHERE collection_id = ?1 AND record_id = ?2",
+            params![collection_id, record_id]
+        ).await?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let field_name: String = row.get(0)?;
+            
+            // [FIX] Safely extract value to avoid 'invalid value type' panic in libsql
+            let val = row.get_value(1).map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
+            
+            let vector_blob: Vec<u8> = match val {
+                libsql::Value::Blob(b) => b,
+                libsql::Value::Text(s) => s.into_bytes(), // Fallback if stored as text
+                _ => vec![], // Empty if Null or other type
+            };
+
+            let model: String = row.get(2)?;
+
+            // Parse the stored JSON vector
+            // Only try to parse if we have data
+            if !vector_blob.is_empty() {
+                let vector: Vec<f32> = serde_json::from_slice(&vector_blob).unwrap_or_default();
+                results.push(models::VectorRecord {
+                    field_name,
+                    vector,
+                    model
+                });
+            }
+        }
+        Ok(results)
+    }
+
     // VECTORS: Implement get_vectors_for_collection
     // Filter by model so we don't load incompatible vectors into HNSW
     async fn get_vectors_for_collection(&self, collection_id: i64, model: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> {
@@ -1839,33 +2092,59 @@ impl VectorProvider for NoOpVectorProvider {
 }
 
 // --- Constructor ---
-pub async fn a_new_database_connection(vector_provider: Arc<dyn VectorProvider>) -> Result<ApexKit> {
-    let core = Builder::new_local("core.db").build().await?;
-    let data = Builder::new_local("data.db").build().await?;
-    let log = Builder::new_local("logs.db").build().await?;
-    let sys = Builder::new_local("system.db").build().await?;
-    let vec = Builder::new_local("vectors.db").build().await?;
+pub async fn a_new_database_connection(
+    vector_provider: Arc<dyn VectorProvider>
+) -> std::result::Result<ApexKit, Box<dyn std::error::Error + Send + Sync>> {
+    
+    // Ensure the new centralized directory structure exists
+    let base_dirs = vec![
+        "storage/system",
+        "storage/system/uploads",
+        "storage/system/indexes",
+        "storage/tenants",
+        "storage/sandboxes",
+        "storage/tmp"
+    ];
 
-    apply_pragmas(&core).await?;
-    apply_pragmas(&data).await?;
-    apply_pragmas(&log).await?;
-    apply_pragmas(&sys).await?;
-    apply_pragmas(&vec).await?;
+    for dir in base_dirs {
+        // [FIX] Convert IO error to Box<dyn Error>
+        std::fs::create_dir_all(dir).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    }
 
-    setup_core(&core).await?;
-    setup_data(&data).await?;
-    setup_logs(&log).await?;
-    setup_sys(&sys).await?;
-    setup_vectors(&vec).await?;
+    // Connect to DBs (Errors here are libsql::Error, need boxing)
+    let core = Builder::new_local("storage/system/core.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let data = Builder::new_local("storage/system/data.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let log = Builder::new_local("storage/system/logs.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let sys = Builder::new_local("storage/system/system.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let vec = Builder::new_local("storage/system/vectors.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-    Ok(ApexKit::new(
+    // Helper to map errors for async blocks below
+    let map_err = |e: libsql::Error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) };
+
+    apply_pragmas(&core).await.map_err(map_err)?;
+    apply_pragmas(&data).await.map_err(map_err)?;
+    apply_pragmas(&log).await.map_err(map_err)?;
+    apply_pragmas(&sys).await.map_err(map_err)?;
+    apply_pragmas(&vec).await.map_err(map_err)?;
+
+    setup_core(&core).await.map_err(map_err)?;
+    setup_data(&data).await.map_err(map_err)?;
+    setup_logs(&log).await.map_err(map_err)?;
+    setup_sys(&sys).await.map_err(map_err)?;
+    setup_vectors(&vec).await.map_err(map_err)?;
+
+    let mut instance = ApexKit::new(
         Arc::new(core), 
         Arc::new(data), 
         Arc::new(log), 
         Arc::new(sys), 
         Arc::new(vec), 
         vector_provider
-    ))
+    );
+    
+    instance.set_search_manager(Arc::new(SearchManager::new("storage/system/indexes")));
+
+    Ok(instance)
 }
 
 // --- OPTIMIZATION: PRAGMAS ---
@@ -1894,6 +2173,14 @@ async fn setup_core(db: &Database) -> Result<()> {
     conn.execute("CREATE TABLE IF NOT EXISTS auth_identities (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, provider TEXT NOT NULL, provider_id TEXT NOT NULL)", ()).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS auth_tokens (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, type TEXT NOT NULL, expires_at DATETIME NOT NULL)", ()).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS _system_config_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, encrypted BOOLEAN DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
+    conn.execute("CREATE TABLE IF NOT EXISTS _api_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        name TEXT NOT NULL, 
+        prefix TEXT NOT NULL, 
+        hash TEXT NOT NULL, 
+        role TEXT NOT NULL DEFAULT 'admin',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )", ()).await?;
     Ok(())
 }
 
@@ -2042,10 +2329,18 @@ impl Db for Mutex<Connection> {
     async fn has_vector(&self, _c: i64, _r: i64, _f: &str, _m: &str) -> std::result::Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         Ok(false) 
     }
+    async fn get_record_vectors(&self, _c: i64, _r: i64) -> std::result::Result<Vec<models::VectorRecord>, Box<dyn StdError + Send + Sync>> { Ok(vec![]) }
     async fn save_vector(&self, _c: i64, _r: i64, _f: &str, _v: Vec<f32>, _m: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { 
         Ok(()) 
     }
     async fn get_vectors_for_collection(&self, _c: i64, _m: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> { 
         Ok(vec![]) 
     }
+    async fn register_tenant(&self, _id: &str, _owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+    async fn create_api_key(&self, _n: &str, _r: &str) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
+    async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    async fn delete_api_key(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    async fn verify_api_key(&self, _k: &str) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
 }

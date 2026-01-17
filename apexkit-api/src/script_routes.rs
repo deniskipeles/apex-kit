@@ -86,12 +86,8 @@ async fn run_script_core(
     let result = state.script_engine.run_script(
         &script.code, 
         payload, 
-        db, 
-        state.embedder.clone(), 
-        state.vector_provider.clone(),
-        state.vault.clone(),
+        Arc::new(state.clone()), // Pass AppState
         base_url,
-        Some(state.tx.clone()),
         scope
     ).await.map_err(|e| AppError::UnknownError(format!("Script Execution Error: {}", e)))?;
 

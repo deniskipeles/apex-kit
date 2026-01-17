@@ -1,7 +1,8 @@
+// =========================== /teamspace/studios/this_studio/apex/apex-kit/admin-ui/src/features/collections/components/SchemaEditor.tsx ===========================
 import React, { useState, useEffect, Suspense } from 'react';
 import { 
   Plus, Trash2, Settings, GripVertical, Check, X,
-  Search, ShieldCheck, ChevronDown, Loader2, History, Fingerprint
+  Search, ShieldCheck, ChevronDown, Loader2, History, Fingerprint, Database, Zap
 } from 'lucide-react';
 import { Button, Input, Switch, Label, Badge, Textarea } from '../../../components/ui/Elements';
 import { Dialog } from '../../../components/ui/Dialog';
@@ -26,6 +27,7 @@ const generateHexId = () => Math.floor(Math.random() * 0xFFFFFFFF).toString(16);
 // --- Components ---
 
 const ValidationPreview = ({ field }: { field: SchemaField }) => {
+    // ... existing ValidationPreview code ...
     const [testValue, setTestValue] = useState('');
     const [status, setStatus] = useState<'idle' | 'valid' | 'invalid'>('idle');
     const [error, setError] = useState('');
@@ -120,7 +122,6 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [selectOptions, setSelectOptions] = useState(field.options?.join('\n') || '');
   
-  // Relation Picker State
   const [isColPickerOpen, setIsColPickerOpen] = useState(false);
   const [isCollectionCreatorOpen, setIsCollectionCreatorOpen] = useState(false);
 
@@ -141,14 +142,12 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
         updated.options = selectOptions.split('\n').map(s => s.trim()).filter(s => s);
     }
     
-    // Clean up empty strings for numbers
+    // Clean up
     if (updated.min === ('' as any)) updated.min = null;
     if (updated.max === ('' as any)) updated.max = null;
     if (updated.minLength === ('' as any)) updated.minLength = null;
     if (updated.maxLength === ('' as any)) updated.maxLength = null;
     if (updated.dimension === ('' as any)) updated.dimension = null;
-    
-    // If not vectorize, clear dimension
     if (!updated.vectorize) updated.dimension = null;
 
     onSave(updated);
@@ -182,7 +181,6 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                             className="font-mono"
                             autoFocus
                         />
-                        {/* Renaming Tracker UI */}
                         {!isNew && data.originalName && data.name !== data.originalName && (
                             <div className="flex items-center gap-1.5 text-[10px] text-amber-500 bg-amber-500/10 px-2 py-1 rounded">
                                 <History className="h-3 w-3" />
@@ -202,7 +200,8 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                                     onClick={() => setData({ 
                                         ...data, 
                                         type: key as any, 
-                                        indexed: ['string', 'text'].includes(key) ? true : data.indexed, // Default Index for text/string
+                                        // Default "Search Index (OSE)" for searchable types
+                                        ose_indexed: ['string', 'text', 'email'].includes(key) ? true : data.ose_indexed,
                                         vectorize: ['string', 'text'].includes(key) ? data.vectorize : false,
                                         dimension: ['string', 'text'].includes(key) && data.vectorize ? data.dimension : null
                                     })} 
@@ -219,7 +218,6 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                     </div>
                 </div>
                 
-                {/* Validation Preview */}
                 {['string', 'text', 'email', 'url', 'number'].includes(data.type) && (
                     <ValidationPreview field={data} />
                 )}
@@ -246,36 +244,66 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                             <Label className="text-xs cursor-pointer" onClick={() => setData({...data, unique: !data.unique})}>Unique</Label>
                             <Switch checked={data.unique} onCheckedChange={(c) => setData({ ...data, unique: c })} />
                         </div>
+
+                        {/* SQL Index */}
+                        <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5">
+                            <div className="space-y-0.5">
+                                <Label className="text-xs cursor-pointer flex items-center gap-1" onClick={() => setData({...data, sql_indexed: !data.sql_indexed})}>
+                                    <Database className="h-3 w-3 text-muted-foreground" /> SQL Index
+                                </Label>
+                                <p className="text-[9px] text-muted-foreground">Faster filter/sort</p>
+                            </div>
+                            <Switch checked={data.sql_indexed || false} onCheckedChange={(c) => setData({ ...data, sql_indexed: c })} />
+                        </div>
+
+                        {/* Search Index (OSE / Tantivy) */}
                         {['string', 'text', 'email', 'url', 'number', 'bool', 'select'].includes(data.type) && (
                             <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5">
                                 <div className="space-y-0.5">
-                                    <Label className="text-xs cursor-pointer" onClick={() => setData({...data, indexed: !data.indexed})}>Indexed</Label>
+                                    <Label className="text-xs cursor-pointer flex items-center gap-1" onClick={() => setData({...data, ose_indexed: !data.ose_indexed})}>
+                                        <Search className="h-3 w-3 text-muted-foreground" /> OSE Index
+                                    </Label>
+                                    <p className="text-[9px] text-muted-foreground">Full-text / Fuzzy</p>
                                 </div>
-                                <Switch checked={data.indexed} onCheckedChange={(c) => setData({ ...data, indexed: c })} />
+                                <Switch checked={data.ose_indexed || false} onCheckedChange={(c) => setData({ ...data, ose_indexed: c })} />
                             </div>
                         )}
-                        {/* --- ADD NEW VECTORIZE TOGGLE HERE --- */}
+
+                        {/* Vectorize */}
                         {['string', 'text'].includes(data.type) && (
-                            <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5">
+                            <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5 col-span-2">
                                 <div className="space-y-0.5">
-                                    <Label className="text-xs cursor-pointer" onClick={() => setData({...data, vectorize: !data.vectorize})}>Vectorize</Label>
-                                    <p className="text-[10px] text-muted-foreground">AI Embeddings</p>
+                                    <Label className="text-xs cursor-pointer flex items-center gap-1" onClick={() => setData({...data, vectorize: !data.vectorize})}>
+                                        <Zap className="h-3 w-3 text-purple-400" /> Vectorize (AI)
+                                    </Label>
+                                    <p className="text-[10px] text-muted-foreground">Auto-generate embeddings for semantic search</p>
                                 </div>
                                 <Switch 
                                     checked={data.vectorize || false} 
                                     onCheckedChange={(c) => setData({ 
                                         ...data, 
                                         vectorize: c,
-                                        // Auto-index when vectorize is enabled
-                                        indexed: c ? true : data.indexed, 
+                                        ose_indexed: c ? true : data.ose_indexed, // Often useful to have keyword search too
                                     })} 
                                 />
                             </div>
                         )}
-                        {/* ------------------------------------- */}
+                        
+                        {/* Auto Inject */}
+                        {['owner', 'date'].includes(data.type) && (
+                            <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5 col-span-2">
+                                <div className="space-y-0.5">
+                                    <Label className="text-xs cursor-pointer" onClick={() => setData({...data, auto: !data.auto})}>Auto Inject</Label>
+                                    <p className="text-[10px] text-muted-foreground">
+                                        {data.type === 'owner' ? 'Set current User ID on create' : 'Set current Timestamp on create'}
+                                    </p>
+                                </div>
+                                <Switch checked={data.auto !== false} onCheckedChange={(c) => setData({ ...data, auto: c })} />
+                            </div>
+                        )}
                     </div>
                     
-                    {/* System Properties (Index & Position) */}
+                    {/* System Properties */}
                     <div className="space-y-2 bg-secondary/10 p-3 rounded-md border border-border/50">
                          <div className="flex items-center justify-between">
                              <Label className="text-xs flex items-center gap-1 text-muted-foreground">
@@ -284,12 +312,6 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                              <code className="text-[10px] font-mono bg-background px-1.5 py-0.5 rounded text-foreground">
                                  {data.uid || 'Pending...'}
                              </code>
-                         </div>
-                         <div className="flex items-center justify-between">
-                             <Label className="text-xs flex items-center gap-1 text-muted-foreground">
-                                Order Position
-                             </Label>
-                             <span className="text-[10px] font-mono">{data.position ?? 'Auto'}</span>
                          </div>
                     </div>
                     
@@ -308,7 +330,6 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
 
                     {/* --- TYPE SPECIFIC CONFIGS --- */}
                     <div className="space-y-4 animate-in fade-in duration-300">
-                        
                         {/* SELECT */}
                         {data.type === 'select' && (
                             <div className="space-y-2">
@@ -325,38 +346,18 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                         {/* NUMBER */}
                         {data.type === 'number' && (
                             <div className="grid grid-cols-2 gap-3">
-                                <div className="space-y-1">
-                                    <Label className="text-xs">Min Value</Label>
-                                    <Input type="number" value={data.min ?? ''} onChange={(e: any) => setData({...data, min: e.target.value ? Number(e.target.value) : null})} className="h-8" />
-                                </div>
-                                 <div className="space-y-1">
-                                    <Label className="text-xs">Max Value</Label>
-                                    <Input type="number" value={data.max ?? ''} onChange={(e: any) => setData({...data, max: e.target.value ? Number(e.target.value) : null})} className="h-8" />
-                                </div>
+                                <div className="space-y-1"><Label className="text-xs">Min Value</Label><Input type="number" value={data.min ?? ''} onChange={(e: any) => setData({...data, min: e.target.value ? Number(e.target.value) : null})} className="h-8" /></div>
+                                 <div className="space-y-1"><Label className="text-xs">Max Value</Label><Input type="number" value={data.max ?? ''} onChange={(e: any) => setData({...data, max: e.target.value ? Number(e.target.value) : null})} className="h-8" /></div>
                             </div>
                         )}
 
-                        {/* STRINGS (Text, String, Email, Url, Blob) */}
+                        {/* STRINGS */}
                         {['string', 'text', 'email', 'url', 'blob'].includes(data.type) && (
                              <div className="space-y-3">
-                                <div className="space-y-1">
-                                    <Label className="text-xs">Regex Pattern</Label>
-                                    <Input 
-                                        value={data.pattern || ''} 
-                                        onChange={(e: any) => setData({...data, pattern: e.target.value})} 
-                                        className="h-8 font-mono text-xs" 
-                                        placeholder="e.g. ^[A-Z]+$"
-                                    />
-                                </div>
+                                <div className="space-y-1"><Label className="text-xs">Regex Pattern</Label><Input value={data.pattern || ''} onChange={(e: any) => setData({...data, pattern: e.target.value})} className="h-8 font-mono text-xs" placeholder="e.g. ^[A-Z]+$" /></div>
                                 <div className="grid grid-cols-2 gap-3">
-                                    <div className="space-y-1">
-                                        <Label className="text-xs">Min Length</Label>
-                                        <Input type="number" value={data.minLength ?? ''} onChange={(e: any) => setData({...data, minLength: e.target.value ? Number(e.target.value) : null})} className="h-8" />
-                                    </div>
-                                    <div className="space-y-1">
-                                        <Label className="text-xs">Max Length</Label>
-                                        <Input type="number" value={data.maxLength ?? ''} onChange={(e: any) => setData({...data, maxLength: e.target.value ? Number(e.target.value) : null})} className="h-8" />
-                                    </div>
+                                    <div className="space-y-1"><Label className="text-xs">Min Length</Label><Input type="number" value={data.minLength ?? ''} onChange={(e: any) => setData({...data, minLength: e.target.value ? Number(e.target.value) : null})} className="h-8" /></div>
+                                    <div className="space-y-1"><Label className="text-xs">Max Length</Label><Input type="number" value={data.maxLength ?? ''} onChange={(e: any) => setData({...data, maxLength: e.target.value ? Number(e.target.value) : null})} className="h-8" /></div>
                                 </div>
                              </div>
                         )}
@@ -364,28 +365,16 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                          {/* FILE / BLOB */}
                          {['file', 'blob'].includes(data.type) && (
                              <div className="space-y-3">
-                                <div className="space-y-1">
-                                    <Label className="text-xs">Max Size (bytes)</Label>
-                                    <Input type="number" value={data.maxSize ?? ''} onChange={(e: any) => setData({...data, maxSize: e.target.value ? Number(e.target.value) : null})} className="h-8" placeholder="5242880 (5MB)" />
-                                </div>
-                                <div className="space-y-1">
-                                    <Label className="text-xs">Allowed MIME Types</Label>
-                                    <Input value={data.mimeTypes?.join(', ') || ''} onChange={(e: any) => setData({...data, mimeTypes: e.target.value.split(',').map((t:string) => t.trim())})} className="h-8" placeholder="image/png, application/pdf" />
-                                </div>
+                                <div className="space-y-1"><Label className="text-xs">Max Size (bytes)</Label><Input type="number" value={data.maxSize ?? ''} onChange={(e: any) => setData({...data, maxSize: e.target.value ? Number(e.target.value) : null})} className="h-8" placeholder="5242880 (5MB)" /></div>
+                                <div className="space-y-1"><Label className="text-xs">Allowed MIME Types</Label><Input value={data.mimeTypes?.join(', ') || ''} onChange={(e: any) => setData({...data, mimeTypes: e.target.value.split(',').map((t:string) => t.trim())})} className="h-8" placeholder="image/png, application/pdf" /></div>
                              </div>
                         )}
 
-                        {/* VECTOR DIMENSION (for vectorized string/text fields) */}
+                        {/* VECTOR DIMENSION */}
                         {['string', 'text'].includes(data.type) && (data.vectorize) && (
                             <div className="space-y-2 animate-in fade-in duration-300">
                                 <Label className="text-xs">Vector Dimensions</Label>
-                                <Input 
-                                    type="number" 
-                                    value={data.dimension ?? ''} 
-                                    onChange={(e: any) => setData({...data, dimension: e.target.value ? Number(e.target.value) : null})} 
-                                    className="h-8" 
-                                    placeholder="e.g. 1536 (OpenAI), 768"
-                                />
+                                <Input type="number" value={data.dimension ?? ''} onChange={(e: any) => setData({...data, dimension: e.target.value ? Number(e.target.value) : null})} className="h-8" placeholder="e.g. 1536 (OpenAI), 768" />
                                 <p className="text-[10px] text-muted-foreground">Required for similarity search.</p>
                             </div>
                         )}
@@ -395,57 +384,27 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                              <div className="space-y-2">
                                 <Label required>{data.type === 'owner' ? 'User Collection' : 'Related Collection'}</Label>
                                 <div className="relative">
-                                    <Button
-                                        type="button"
-                                        variant="outline"
-                                        className="w-full justify-between text-left font-normal px-3 h-9"
-                                        onClick={() => setIsColPickerOpen(true)}
-                                    >
+                                    <Button type="button" variant="outline" className="w-full justify-between text-left font-normal px-3 h-9" onClick={() => setIsColPickerOpen(true)}>
                                         {data.relationTo ? (
-                                            <span className="flex items-center gap-2">
-                                                <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
-                                                <span className="font-semibold text-foreground">{collections.find(c => c.id === data.relationTo || c.name === data.relationTo)?.name || data.relationTo}</span>
-                                            </span>
-                                        ) : (
-                                            <span className="text-muted-foreground">Select Collection...</span>
-                                        )}
+                                            <span className="flex items-center gap-2"><div className="h-2 w-2 rounded-full bg-emerald-500"></div><span className="font-semibold text-foreground">{collections.find(c => c.id === data.relationTo || c.name === data.relationTo)?.name || data.relationTo}</span></span>
+                                        ) : (<span className="text-muted-foreground">Select Collection...</span>)}
                                         <ChevronDown className="h-4 w-4 opacity-50" />
                                     </Button>
                                     
-                                    {/* Mock Dialog for Collection Picker (Simplified for brevity) */}
                                     {isColPickerOpen && (
                                         <div className="absolute top-full left-0 right-0 z-50 mt-1 max-h-48 overflow-y-auto rounded-md border bg-popover p-1 shadow-md">
                                             {collections.map(c => (
-                                                <button key={c.id} 
-                                                    className="w-full rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent flex items-center justify-between"
-                                                    onClick={() => { setData({...data, relationTo: c.id}); setIsColPickerOpen(false); }}
-                                                >
-                                                    <span>{c.name}</span>
-                                                    <Badge variant="secondary" className="text-[10px]">{c.type}</Badge>
+                                                <button key={c.id} className="w-full rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent flex items-center justify-between" onClick={() => { setData({...data, relationTo: c.id}); setIsColPickerOpen(false); }}>
+                                                    <span>{c.name}</span><Badge variant="secondary" className="text-[10px]">{c.type}</Badge>
                                                 </button>
                                             ))}
-                                            <button className="w-full rounded-sm px-2 py-1.5 text-left text-sm text-primary hover:bg-accent font-medium flex items-center gap-1 border-t mt-1 pt-2"
-                                                onClick={() => { setIsColPickerOpen(false); setIsCollectionCreatorOpen(true); }}>
-                                                <Plus className="h-3 w-3" /> Create New
-                                            </button>
+                                            <button className="w-full rounded-sm px-2 py-1.5 text-left text-sm text-primary hover:bg-accent font-medium flex items-center gap-1 border-t mt-1 pt-2" onClick={() => { setIsColPickerOpen(false); setIsCollectionCreatorOpen(true); }}><Plus className="h-3 w-3" /> Create New</button>
                                         </div>
                                     )}
 
-                                     {/* Create New Collection Dialog */}
-                                    <Dialog 
-                                        isOpen={isCollectionCreatorOpen} 
-                                        onClose={() => setIsCollectionCreatorOpen(false)} 
-                                        size="xl" 
-                                        title="New Collection" 
-                                        zIndex={zIndex + 20}
-                                    >
+                                    <Dialog isOpen={isCollectionCreatorOpen} onClose={() => setIsCollectionCreatorOpen(false)} size="xl" title="New Collection" zIndex={zIndex + 20}>
                                         <Suspense fallback={<div className="flex justify-center p-8"><Loader2 className="animate-spin" /></div>}>
-                                            <CollectionForm 
-                                                onSave={handleCreateCollection}
-                                                onCancel={() => setIsCollectionCreatorOpen(false)}
-                                                isEmbedded
-                                                zIndex={zIndex + 20}
-                                            />
+                                            <CollectionForm onSave={handleCreateCollection} onCancel={() => setIsCollectionCreatorOpen(false)} isEmbedded zIndex={zIndex + 20} />
                                         </Suspense>
                                     </Dialog>
                                 </div>
@@ -476,24 +435,12 @@ export const SchemaEditor = ({ value, onChange, zIndex = 60 }: SchemaEditorProps
   const handleSaveField = (field: SchemaField) => {
       const newFields = [...value];
       if (isCreating) {
-          // New fields get their "originalName" set to their initial name
-          // Also generate a UID if not present
-          newFields.push({ 
-              ...field, 
-              originalName: field.name,
-              uid: field.uid || generateHexId()
-          });
+          newFields.push({ ...field, originalName: field.name, uid: field.uid || generateHexId() });
       } else if (editingIdx !== null) {
           const prev = newFields[editingIdx];
-          newFields[editingIdx] = { 
-              ...field, 
-              originalName: prev.originalName || prev.name 
-          };
+          newFields[editingIdx] = { ...field, originalName: prev.originalName || prev.name };
       }
-      
-      // Re-calculate positions for ALL fields
       const reorderedFields = newFields.map((f, idx) => ({ ...f, position: idx }));
-
       onChange(reorderedFields);
       setEditingIdx(null);
       setIsCreating(false);
@@ -503,26 +450,18 @@ export const SchemaEditor = ({ value, onChange, zIndex = 60 }: SchemaEditorProps
       e.stopPropagation();
       const newFields = [...value];
       newFields.splice(index, 1);
-      // Re-calculate positions after deletion
       const reorderedFields = newFields.map((f, idx) => ({ ...f, position: idx }));
       onChange(reorderedFields);
   };
   
-  const handleDragStart = (e: React.DragEvent, index: number) => {
-    setDraggedIndex(index);
-    e.dataTransfer.effectAllowed = "move";
-  };
-
+  const handleDragStart = (e: React.DragEvent, index: number) => { setDraggedIndex(index); e.dataTransfer.effectAllowed = "move"; };
   const handleDrop = (e: React.DragEvent, dropIndex: number) => {
     e.preventDefault();
     if (draggedIndex === null) return;
     const newFields = [...value];
     const [movedItem] = newFields.splice(draggedIndex, 1);
     newFields.splice(dropIndex, 0, movedItem);
-    
-    // Re-calculate positions after reordering
     const reorderedFields = newFields.map((f, idx) => ({ ...f, position: idx }));
-    
     onChange(reorderedFields);
     setDraggedIndex(null);
     setDragOverIndex(null);
@@ -543,31 +482,21 @@ export const SchemaEditor = ({ value, onChange, zIndex = 60 }: SchemaEditorProps
                         onDragStart={(e) => handleDragStart(e, index)}
                         onDragOver={(e) => { e.preventDefault(); setDragOverIndex(index); }}
                         onDrop={(e) => handleDrop(e, index)}
-                        className={`
-                            group relative flex items-center gap-3 p-2.5 rounded-lg border transition-all bg-card
-                            ${draggedIndex === index ? 'opacity-50 border-dashed' : 'hover:border-primary/50 hover:shadow-sm'}
-                            ${dragOverIndex === index ? 'border-primary border-t-2' : 'border-border'}
-                        `}
+                        className={`group relative flex items-center gap-3 p-2.5 rounded-lg border transition-all bg-card ${draggedIndex === index ? 'opacity-50 border-dashed' : 'hover:border-primary/50 hover:shadow-sm'} ${dragOverIndex === index ? 'border-primary border-t-2' : 'border-border'}`}
                     >
-                        <div className="cursor-grab active:cursor-grabbing p-1.5 text-muted-foreground/30 hover:text-foreground rounded hover:bg-secondary">
-                            <GripVertical className="h-4 w-4" />
-                        </div>
-
-                        <div className={`flex items-center justify-center h-8 w-8 rounded-md bg-secondary/50 ${typeColor}`}>
-                            <TypeIcon className="h-4 w-4" />
-                        </div>
+                        <div className="cursor-grab active:cursor-grabbing p-1.5 text-muted-foreground/30 hover:text-foreground rounded hover:bg-secondary"><GripVertical className="h-4 w-4" /></div>
+                        <div className={`flex items-center justify-center h-8 w-8 rounded-md bg-secondary/50 ${typeColor}`}><TypeIcon className="h-4 w-4" /></div>
 
                         <div className="flex items-center gap-3 min-w-0 flex-1">
                             <span className="font-semibold text-sm truncate">{field.name}</span>
                             <div className="flex gap-1">
                                 {field.required && <Badge variant="destructive" className="text-[10px] h-5 px-1.5 rounded-sm font-mono">REQ</Badge>}
                                 {field.unique && <Badge variant="secondary" className="text-[10px] h-5 px-1.5 rounded-sm font-mono">UNQ</Badge>}
+                                {field.sql_indexed && <Badge variant="secondary" className="text-[10px] h-5 px-1.5 rounded-sm font-mono flex items-center gap-0.5"><Database className="h-2 w-2" /> SQL</Badge>}
+                                {field.ose_indexed && <Badge variant="secondary" className="text-[10px] h-5 px-1.5 rounded-sm font-mono flex items-center gap-0.5"><Search className="h-2 w-2" /> OSE</Badge>}
                                 {field.vectorize && <Badge variant="secondary" className="text-[10px] h-5 px-1.5 rounded-sm font-mono bg-indigo-500/10 text-indigo-400">VEC</Badge>}
-                                {field.originalName && field.name !== field.originalName && (
-                                    <Badge variant="warning" className="text-[10px] h-5 px-1.5 rounded-sm font-mono flex items-center gap-1" title={`Renamed from ${field.originalName}`}>
-                                        <History className="h-3 w-3" /> RENAMED
-                                    </Badge>
-                                )}
+                                {field.auto && <Badge variant="secondary" className="text-[10px] h-5 px-1.5 rounded-sm font-mono bg-emerald-500/10 text-emerald-400">AUTO</Badge>}
+                                {field.originalName && field.name !== field.originalName && (<Badge variant="warning" className="text-[10px] h-5 px-1.5 rounded-sm font-mono flex items-center gap-1" title={`Renamed from ${field.originalName}`}><History className="h-3 w-3" /> RENAMED</Badge>)}
                             </div>
                         </div>
 
@@ -577,54 +506,19 @@ export const SchemaEditor = ({ value, onChange, zIndex = 60 }: SchemaEditorProps
                                 {(field.type === 'relation' || field.type === 'owner') && <span className="normal-case opacity-70">→ {field.relationTo}</span>}
                                 {(field.type === 'string' || field.type === 'text') && field.vectorize && <span className="normal-case opacity-70">[{field.dimension || '?'}]</span>}
                              </div>
-                             {(field.pattern || field.min !== undefined || field.maxLength !== undefined) && (
-                                <div title="Validation active">
-                                    <ShieldCheck className="h-3.5 w-3.5 text-emerald-500/70" />
-                                </div>
-                             )}
-                             {/* Display short UID for debugging */}
-                             {field.uid && (
-                                 <span className="text-[9px] font-mono text-muted-foreground/40 select-all">
-                                     #{field.uid.substring(0,4)}
-                                 </span>
-                             )}
+                             {field.uid && <span className="text-[9px] font-mono text-muted-foreground/40 select-all">#{field.uid.substring(0,4)}</span>}
                         </div>
 
                         <div className="flex items-center gap-1 border-l pl-2 ml-2 border-border/50">
-                            <Button 
-                                size="icon" 
-                                variant="ghost" 
-                                className="h-8 w-8 text-muted-foreground hover:text-primary"
-                                onClick={() => setEditingIdx(index)}
-                                title="Edit Field"
-                            >
-                                <Settings className="h-4 w-4" />
-                            </Button>
-                            <Button 
-                                size="icon" 
-                                variant="ghost" 
-                                className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                                onClick={(e) => removeField(index, e)}
-                                title="Delete Field"
-                            >
-                                <Trash2 className="h-4 w-4" />
-                            </Button>
+                            <Button size="icon" variant="ghost" className="h-8 w-8 text-muted-foreground hover:text-primary" onClick={() => setEditingIdx(index)} title="Edit Field"><Settings className="h-4 w-4" /></Button>
+                            <Button size="icon" variant="ghost" className="h-8 w-8 text-muted-foreground hover:text-destructive" onClick={(e) => removeField(index, e)} title="Delete Field"><Trash2 className="h-4 w-4" /></Button>
                         </div>
                     </div>
                 );
             })}
 
-            <Button 
-                variant="outline" 
-                className="w-full border-dashed py-8 text-muted-foreground hover:text-primary hover:border-primary hover:bg-primary/5 group transition-all"
-                onClick={() => setIsCreating(true)}
-            >
-                <div className="flex flex-col items-center gap-1">
-                    <div className="rounded-full bg-secondary p-2 group-hover:bg-primary/10 group-hover:text-primary transition-colors">
-                        <Plus className="h-4 w-4" />
-                    </div>
-                    <span className="text-xs font-medium">Add New Field</span>
-                </div>
+            <Button variant="outline" className="w-full border-dashed py-8 text-muted-foreground hover:text-primary hover:border-primary hover:bg-primary/5 group transition-all" onClick={() => setIsCreating(true)}>
+                <div className="flex flex-col items-center gap-1"><div className="rounded-full bg-secondary p-2 group-hover:bg-primary/10 group-hover:text-primary transition-colors"><Plus className="h-4 w-4" /></div><span className="text-xs font-medium">Add New Field</span></div>
             </Button>
        </div>
 
@@ -632,14 +526,7 @@ export const SchemaEditor = ({ value, onChange, zIndex = 60 }: SchemaEditorProps
             <FieldEditorDialog 
                 isOpen={true}
                 isNew={isCreating}
-                field={isCreating ? { 
-                    name: '', 
-                    type: 'string', 
-                    required: false,
-                    indexed: true, // <--- DEFAULT INDEXED FOR NEW FIELD
-                    uid: generateHexId(), // Pre-fill UID for new fields
-                    position: value.length 
-                } : value[editingIdx!]}
+                field={isCreating ? { name: '', type: 'string', required: false, ose_indexed: false, sql_indexed: false, auto: false, uid: generateHexId(), position: value.length } : value[editingIdx!]}
                 onSave={handleSaveField}
                 onCancel={() => { setIsCreating(false); setEditingIdx(null); }}
                 zIndex={zIndex + 10}
@@ -648,3 +535,4 @@ export const SchemaEditor = ({ value, onChange, zIndex = 60 }: SchemaEditorProps
     </div>
   );
 };
+// =========================== /teamspace/studios/this_studio/apex/apex-kit/admin-ui/src/features/collections/components/SchemaEditor.tsx ends here ===========================

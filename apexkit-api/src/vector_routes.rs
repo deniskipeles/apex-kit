@@ -3,7 +3,7 @@ use axum::{
     Extension,
 };
 use serde::{ Deserialize };
-use apexkit_core::{auth::Claims, jobs::Job}; 
+use apexkit_core::{auth::Claims, jobs::Job, models::VectorRecord}; 
 use crate::{AppState, AppError, RecordResponse, DatabaseConnection, IdPath, resolve_collection_by_id_or_name};
 use std::collections::HashMap;
 use apexkit_core::realtime::EventScope;
@@ -29,6 +29,61 @@ pub struct TextVectorSearchReq {
 pub struct RevectorizeOptions {
     #[serde(default)]
     pub force: bool,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct RecordVectorPath {
+    pub id: String,        // Collection ID/Name
+    pub record_id: i64,    // Record ID
+}
+
+//  Handler: Get Vector
+#[utoipa::path(
+    get,
+    path = "/api/v1/collections/{id}/get-vector/{record_id}",
+    responses((status = 200, body = Vec<VectorRecord>))
+)]
+pub async fn get_record_vector(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection, 
+    Path(path): Path<RecordVectorPath>,
+) -> Result<Json<Vec<VectorRecord>>, AppError> {
+    // 1. Auth Check
+    let claims = auth.map(|Extension(c)| c);
+    
+    // 2. Resolve Collection
+    let collection = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    
+    // 3. Check Policy (Read access is required to see vectors)
+    let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    
+    // We need to fetch the record data first to verify 'owner' policy if needed
+    // However, for efficiency, if policy is public/admin/auth we can skip fetching data.
+    // If it's complex (owner-based), we fetch.
+    let access_granted = if policy == "public" {
+        true
+    } else if policy == "admin" {
+        claims.as_ref().map(|c| c.role == "admin").unwrap_or(false)
+    } else if policy == "auth" {
+        claims.is_some()
+    } else {
+        // Complex policy: fetch record to verify
+        let rec = db.get_record(collection.id, path.record_id, None).await
+            .map_err(|e| AppError::UnknownError(e.to_string()))?
+            .ok_or(AppError::NotFound("Record not found".into()))?;
+            
+        apexkit_core::policies::check_access(policy, claims.as_ref(), Some(&rec.data))
+    };
+
+    if !access_granted {
+        return Err(AppError::Forbidden("Read denied".into()));
+    }
+
+    // 4. Fetch Vectors
+    let vectors = db.get_record_vectors(collection.id, path.record_id).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(Json(vectors))
 }
 
 #[utoipa::path(

@@ -54,7 +54,7 @@ pub struct TenantManager {
 
 impl TenantManager {
     pub fn new(shared_embedder: Option<Arc<CandleEmbedder>>, capacity: u64) -> Self {
-        let _ = std::fs::create_dir_all("tenants");
+        let _ = std::fs::create_dir_all("storage/tenants");
         Self {
             cache: Cache::builder()
                 .max_capacity(capacity)
@@ -83,7 +83,7 @@ impl TenantManager {
         }
 
         // 2. Check Disk Existence (Security Check)
-        let base_path = format!("tenants/{}", tenant_id);
+        let base_path = format!("storage/tenants/{}", tenant_id);
         if !Path::new(&base_path).exists() {
             return Err(format!("Tenant '{}' does not exist", tenant_id));
         }
@@ -96,7 +96,7 @@ impl TenantManager {
 
     /// EXPLICITLY CREATES a new tenant.
     pub async fn create_tenant(&self, tenant_id: String) -> Result<Arc<dyn Db>, String> {
-        let base_path = format!("tenants/{}", tenant_id);
+        let base_path = format!("storage/tenants/{}", tenant_id);
         
         if Path::new(&base_path).exists() {
             return Err(format!("Tenant '{}' already exists", tenant_id));
@@ -120,7 +120,7 @@ impl TenantManager {
 
     // Internal helper to hydrate the DB connection logic
     async fn load_tenant(&self, tenant_id: &str) -> Result<TenantContext, String> {
-        let base_path = format!("tenants/{}", tenant_id);
+        let base_path = format!("storage/tenants/{}", tenant_id);
 
         // 1. Prepare Tenant Specific Vector Provider (Isolated HNSW Index)
         let vector_index = Arc::new(VectorIndex::new());
@@ -179,7 +179,7 @@ impl TenantManager {
 
     pub async fn list_tenants(&self) -> Result<Vec<String>, String> {
         let mut tenants = Vec::new();
-        let path = Path::new("tenants");
+        let path = Path::new("storage/tenants");
         
         if path.exists() {
             let entries = std::fs::read_dir(path).map_err(|e| e.to_string())?;

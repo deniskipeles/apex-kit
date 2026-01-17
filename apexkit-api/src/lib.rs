@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::fmt; 
 use std::net::SocketAddr;
 use apexkit_core::{
-    schema::CollectionSchema,
+    schema::{CollectionSchema, FieldType},
     validation::{validate_record, ValidationError},
     auth::{self, Claims},
     query::QueryOptions,
@@ -66,12 +66,14 @@ pub mod renderer;
 pub mod template_routes;
 pub mod ai_architect;
 pub mod css_compiler;
-pub mod sandbox_manager; 
 pub mod vector_routes;
 pub mod import_data_routes;
 pub mod export_data_routes;
 pub mod cli;
+pub mod sandbox_manager; 
 pub mod tenant_manager;
+pub mod backup;
+pub mod backup_routes;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -232,8 +234,13 @@ pub async fn trigger_void_hook(
     });
 
     for script in scripts {
-        state.script_engine.run_hook(&script.code, ctx.clone(), state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), base_url.clone(), Some(state.tx.clone()), scope.cloned())
-            .await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))?;
+        state.script_engine.run_hook(
+            &script.code, 
+            ctx.clone(), 
+            Arc::new(state.clone()), // Pass AppState
+            base_url.clone(),  
+            scope.cloned()
+        ).await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))?;
     }
     Ok(())
 }
@@ -261,8 +268,13 @@ pub async fn trigger_filter_hook(
             "auth": auth.map(|c| json!({ "id": c.uid, "email": c.sub, "role": c.role }))
         });
 
-        if let Some(res) = state.script_engine.run_hook(&script.code, ctx, state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), base_url.clone(), Some(state.tx.clone()), scope.cloned())
-            .await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))? 
+        if let Some(res) = state.script_engine.run_hook(
+            &script.code, 
+            ctx, 
+            Arc::new(state.clone()), // Pass AppState
+            base_url.clone(), 
+            scope.cloned()
+        ).await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))? 
         {
             current_data = res;
         }
@@ -301,7 +313,11 @@ async fn trigger_hooks(
         });
 
         match state.script_engine.run_hook(
-            &script.code, event_context, state.db.clone(), state.embedder.clone(), state.vector_provider.clone(), state.vault.clone(), base_url.clone(), Some(state.tx.clone()), scope.cloned()
+            &script.code, 
+            event_context, 
+            Arc::new(state.clone()), // Pass AppState
+            base_url.clone(), 
+            scope.cloned()
         ).await {
             Ok(Some(new_data)) => { current_data = new_data; modified = true; },
             Ok(None) => {},
@@ -316,12 +332,35 @@ async fn trigger_hooks(
 
 // --- MIDDLEWARE ---
 
-async fn auth_middleware(State(_state): State<AppState>, mut req: Request, next: Next) -> Result<Response, StatusCode> {
+async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: Next) -> Result<Response, StatusCode> {
+    // 1. Check Bearer Token (JWT)
     if let Some(auth_header) = req.headers().typed_get::<Authorization<Bearer>>() {
         if let Ok(claims) = auth::decode_jwt(auth_header.token()) {
             req.extensions_mut().insert(claims);
+            return Ok(next.run(req).await);
+        }
+        // If JWT fails but starts with 'ak_', check API Key logic below? 
+        // Usually Bearer is JWT. Let's support `Authorization: ApiKey <key>` or `x-api-key`.
+    }
+
+    // 2. Check API Key Header (x-api-key)
+    if let Some(key_header) = req.headers().get("x-api-key") {
+        if let Ok(key) = key_header.to_str() {
+             // We need to look up the key in the DB.
+             // Since middleware is sync/async boundary, we use the DB in state.
+             if let Ok(Some(api_key)) = state.db.verify_api_key(key).await {
+                 // Create a Synthetic Claims object
+                 let claims = Claims {
+                     sub: format!("apikey:{}", api_key.id),
+                     uid: 0, // System/API User ID (0 reserved?)
+                     role: api_key.role,
+                     exp: 9999999999, // Never expires
+                 };
+                 req.extensions_mut().insert(claims);
+             }
         }
     }
+
     Ok(next.run(req).await)
 }
 
@@ -354,6 +393,54 @@ impl JobContext for GlobalJobContext {
     }
 }
 
+// Implement the trait for AppState
+impl apexkit_core::ScriptContext for AppState {
+    fn get_db(&self) -> Arc<dyn Db> {
+        self.db.clone()
+    }
+
+    fn get_vault(&self) -> Arc<Vault> {
+        self.vault.clone()
+    }
+
+    fn get_embedder(&self) -> Arc<apexkit_core::embeddings::EmbedderService> {
+        self.embedder.clone()
+    }
+
+    fn get_vector_provider(&self) -> Arc<dyn VectorProvider> {
+        self.vector_provider.clone()
+    }
+
+    fn get_realtime_tx(&self) -> tokio::sync::broadcast::Sender<apexkit_core::realtime::DbEvent> {
+        self.tx.clone()
+    }
+
+    // Dynamic Resolution for Tenant Switching
+    fn resolve_tenant_db(&self, tenant_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>> {
+        let tm = self.tenant_manager.clone();
+        let tid = tenant_id.to_string();
+        Box::pin(async move {
+            tm.get_tenant(tid).await.ok()
+        })
+    }
+
+    // Dynamic Resolution for Sandbox Switching
+    fn resolve_sandbox_db(&self, session_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>> {
+        let sm = self.sandbox_manager.clone();
+        let sid = session_id.to_string();
+        Box::pin(async move {
+            sm.get_sandbox(&sid).await.ok()
+        })
+    }
+
+    fn admin_create_tenant(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        let tm = self.tenant_manager.clone();
+        Box::pin(async move {
+            tm.create_tenant(id).await.map(|_| ())
+        })
+    }
+}
+
 // --- TENANT/SANDBOX MIDDLEWARES ---
 
 async fn sandbox_lifecycle_middleware(
@@ -366,7 +453,7 @@ async fn sandbox_lifecycle_middleware(
     match state.sandbox_manager.get_sandbox(session_id).await {
         Ok(sandbox_db) => {
             req.extensions_mut().insert(sandbox_db);
-            let storage_path = format!("sandboxes/session_{}/uploads", session_id);
+            let storage_path = format!("storage/sandboxes/session_{}/uploads", session_id);
             let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
             req.extensions_mut().insert(storage);
             req.extensions_mut().insert(EventScope::Sandbox(session_id.to_string()));
@@ -413,7 +500,7 @@ async fn tenant_resolver_middleware(
     match state.tenant_manager.get_tenant(tenant_id.clone()).await {
         Ok(tenant_db) => {
             req.extensions_mut().insert(tenant_db.clone());
-            let storage_path = format!("tenants/{}/uploads", tenant_id);
+            let storage_path = format!("storage/tenants/{}/uploads", tenant_id);
             let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
             req.extensions_mut().insert(storage);
             req.extensions_mut().insert(EventScope::Tenant(tenant_id.clone()));
@@ -752,6 +839,55 @@ pub async fn get_record(
     Ok(Json(final_resp))
 }
 
+// Helper to inject auto fileds
+fn inject_auto_fields(data: &mut serde_json::Value, schema: &CollectionSchema, user_id: Option<i64>) {
+    if let Some(obj) = data.as_object_mut() {
+        for (name, def) in &schema.fields {
+            // Check if field is effectively "missing" (not present, null, or empty string)
+            // Empty string check fixes frontend forms sending "" for empty dates
+            let is_missing = match obj.get(name) {
+                None => true,
+                Some(val) => val.is_null() || (val.as_str().map(|s| s.is_empty()).unwrap_or(false)),
+            };
+
+            if is_missing {
+                // Clean up empty strings to ensure clean state for injection or validation
+                if obj.contains_key(name) {
+                    obj.remove(name);
+                }
+
+                match def.r#type {
+                    // 1. Owner: Inject User ID
+                    FieldType::Owner => {
+                        if def.auto {
+                            if let Some(uid) = user_id {
+                                obj.insert(name.clone(), serde_json::json!(uid.to_string()));
+                            }
+                        } else if let Some(default_val) = &def.default {
+                             obj.insert(name.clone(), default_val.clone());
+                        }
+                    },
+                    // 2. Date: Inject Current Timestamp
+                    FieldType::Date => {
+                        if def.auto {
+                            // Inject current UTC time in ISO 8601 format
+                            obj.insert(name.clone(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+                        } else if let Some(default_val) = &def.default {
+                             obj.insert(name.clone(), default_val.clone());
+                        }
+                    },
+                    // 3. Others: Inject configured default
+                    _ => {
+                        if let Some(default_val) = &def.default {
+                            obj.insert(name.clone(), default_val.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/collections/{id}/records",
@@ -784,9 +920,16 @@ pub async fn create_record(
     
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     // [TRIGGER] Record-level Hook (legacy) AND System Hook (new)
-    let data_to_save = match trigger_hooks(&state, "before_create", &col, None, &p.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { Some(d) => d, None => p.data };
+    let mut data_to_save = match trigger_hooks(&state, "before_create", &col, None, &p.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { Some(d) => d, None => p.data };
 
-    if let Some(schema) = &col.schema { validate_record(schema, &data_to_save).map_err(AppError::Validation)?; }
+    // [NEW] Auto-Inject Owner ID
+    if let Some(schema) = &col.schema {
+        let uid = claims.as_ref().map(|c| c.uid);
+        inject_auto_fields(&mut data_to_save, schema, uid);
+        
+        // THEN Validate
+        validate_record(schema, &data_to_save).map_err(AppError::Validation)?; 
+    }
 
     let rid = db.create_record(col.id, &data_to_save).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
@@ -811,7 +954,7 @@ pub async fn create_record(
                 }
             }
         }
-        if schema.fields.values().any(|f| f.indexed) {
+        if schema.fields.values().any(|f| f.ose_indexed) {
             let job = Job::IndexRecord { collection_id: col.id, record_id: rid, data: data_to_save.clone(), schema: schema.clone(), tenant_id: current_tenant.clone() };
             state.queue.enqueue(job).await;
         }
@@ -1726,6 +1869,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/collections/{id}/instant-search", get(instant_search_handler))
         .route("/collections/{id}/search-vector", post(vector_routes::search_vector))
         .route("/collections/{id}/search-text-vector", post(vector_routes::query_vector_search))
+        .route("/collections/{id}/get-vector/{record_id}", get(vector_routes::get_record_vector)) 
         .route("/collections/{id}/records/{record_id}/relations", post(create_relation).delete(delete_relation))
         .route("/storage/upload", post(storage::upload_file))
         .route("/storage/file/{filename}", get(storage::serve_file))
@@ -1743,6 +1887,8 @@ fn make_api_router() -> Router<AppState> {
         .route("/admin/dashboard", get(get_dashboard_stats_handler))
         .route("/admin/import-data", post(import_data_routes::import_data_handler))
         .route("/admin/export-data/{id}", get(export_data_routes::export_data_handler))
+        .route("/admin/import-schema", post(import_data_routes::import_schema_handler))
+        .route("/admin/export-schema", get(export_data_routes::export_schema_handler))
         .route("/admin/collections/{id}/reindex", post(reindex_collection_handler))
         .route("/admin/collections/{id}/revectorize", post(vector_routes::revectorize_collection_handler))
         .route("/admin/ai/actions", get(ai_routes::list_actions).post(ai_routes::create_action))
@@ -1808,6 +1954,7 @@ pub fn app_router(state: AppState) -> Router {
                 .post(create_tenant_handler)
                 .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         )
+        .route("/api/v1/admin/restore", post(backup_routes::restore_handler))
         .route("/styles.css", get(serve_styles)) 
         .route("/metrics", get(metrics_handler))
         .route("/_dashboard", get(assets::dashboard_handler))
@@ -1840,10 +1987,13 @@ pub fn app_router(state: AppState) -> Router {
         ai_architect::start_session, ai_architect::continue_chat, ai_architect::publish_plugin, ai_architect::list_sessions,
         import_data_routes::import_data_handler,
         export_data_routes::export_data_handler,
+        import_data_routes::import_schema_handler,
+        export_data_routes::export_schema_handler,
         reindex_collection_handler,
         vector_routes::revectorize_collection_handler,
         vector_routes::search_vector,
         vector_routes::query_vector_search,
+        vector_routes::get_record_vector,
         serve_styles,
         create_tenant_handler,
         sse_handler
@@ -1878,8 +2028,11 @@ pub fn app_router(state: AppState) -> Router {
         apexkit_core::models::ChartPoint,
         import_data_routes::ImportRequestDto,
         import_data_routes::ImportResponseDto,
+        import_data_routes::ImportSchemaRequest,
+        import_data_routes::ImportSchemaResponse,
         export_data_routes::ExportQuery,
         vector_routes::VectorSearchReq, 
+        vector_routes::RecordVectorPath, 
         vector_routes::TextVectorSearchReq,
         TenantResponse, CreateTenantReq,
     )),

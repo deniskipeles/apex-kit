@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::ai_models::{AiSession, Plugin};
 use crate::ListResult;
 use std::error::Error as StdError;
+use crate::ApiKey;
 
 #[derive(Clone)]
 pub struct CachedDb {
@@ -190,6 +191,27 @@ impl Db for CachedDb {
         self.inner.reindex_collection(id).await
     }
 
+    // --- API keys ---
+    async fn create_api_key(&self, name: &str, role: &str) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.create_api_key(name, role).await
+    }
+    
+    async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_api_keys().await
+    }
+    
+    async fn delete_api_key(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_api_key(id).await
+    }
+    
+    async fn verify_api_key(&self, key: &str) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.verify_api_key(key).await
+    }
+
+    // --- Tenants ---
+    async fn register_tenant(&self, id: &str, owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.register_tenant(id, owner_id).await
+    }
 
     // --- Vectorization ---
 
@@ -199,6 +221,10 @@ impl Db for CachedDb {
     
     async fn has_vector(&self, collection_id: i64, record_id: i64, field_name: &str, model: &str) -> std::result::Result<bool, Box<dyn StdError + Send + Sync>> {
         self.inner.has_vector(collection_id, record_id, field_name, model).await
+    }
+
+    async fn get_record_vectors(&self, collection_id: i64, record_id: i64) -> std::result::Result<Vec<models::VectorRecord>, Box<dyn StdError + Send + Sync>> {
+        self.inner.get_record_vectors(collection_id, record_id).await
     }
     
     async fn get_vectors_for_collection(&self, collection_id: i64, model: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> {

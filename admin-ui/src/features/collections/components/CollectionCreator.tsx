@@ -76,7 +76,7 @@ const CompositeIndexModal = ({
 export const CollectionForm = ({ onSave, onCancel, isEmbedded = false, zIndex = 0, initialValues }: CollectionFormProps) => {
   const [name, setName] = useState(initialValues?.name || '');
   const [schema, setSchema] = useState<SchemaField[]>(initialValues?.schema || [
-    { name: 'title', type: 'string', required: true, indexed: true, uid: Math.floor(Math.random() * 0xFFFFFFFF).toString(16), position: 0 },
+    { name: 'title', type: 'string', required: true, sql_indexed: true, uid: Math.floor(Math.random() * 0xFFFFFFFF).toString(16), position: 0 },
   ]);
   
   // State for Composite Indexes (Array of Arrays of strings)

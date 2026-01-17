@@ -101,7 +101,9 @@ fn infer_schema(data: &[Value]) -> CollectionSchema {
         fields.insert(name.clone(), FieldDefinition {
             r#type: r#type_clone.clone(),
             required: false, // Imported data might be sparse
-            indexed: matches!(r#type_clone, FieldType::String | FieldType::Text), 
+            ose_indexed: matches!(r#type_clone, FieldType::String | FieldType::Text), 
+            sql_indexed: false,
+            auto: false,
             vectorize: false,
             default: None,
             unique: None,
@@ -305,4 +307,82 @@ pub async fn import_data_handler(
         collection_created,
         schema_updated,
     }))
+}
+
+use apexkit_core::models::Collection;
+// [NEW] DTO for Schema Import
+#[derive(Deserialize, ToSchema)]
+pub struct ImportSchemaRequest {
+    pub collections: Vec<Collection>, // Array of full collection objects
+    #[serde(default)]
+    pub strategy: String, // "skip", "overwrite", "error"
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ImportSchemaResponse {
+    pub created: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+//  Handler: Import Collections (Schema Only)
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/import-schema",
+    request_body(content = ImportSchemaRequest, content_type = "multipart/form-data"),
+    responses((status = 200, body = ImportSchemaResponse))
+)]
+pub async fn import_schema_handler(
+    Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection, 
+    mut multipart: Multipart,
+) -> Result<Json<ImportSchemaResponse>, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let mut file_data = Vec::new();
+    let mut strategy = "skip".to_string();
+
+    while let Some(field) = multipart.next_field().await.map_err(|_| AppError::UnknownError("Multipart error".into()))? {
+        let name = field.name().unwrap_or_default().to_string();
+        
+        if name == "file" {
+            file_data = field.bytes().await.map_err(|_| AppError::UnknownError("Failed to read file".into()))?.to_vec();
+        } else if name == "strategy" {
+            if let Ok(s) = field.text().await { strategy = s; }
+        }
+    }
+
+    if file_data.is_empty() { return Err(AppError::UnknownError("No file uploaded".into())); }
+
+    // Parse JSON from file bytes
+    let payload: ImportSchemaRequest = serde_json::from_slice(&file_data)
+        .map_err(|e| AppError::UnknownError(format!("Invalid JSON Schema File: {}", e)))?;
+
+    // ... (rest of logic remains same: list existing, iterate payload.collections, apply strategy) ...
+    let existing_cols = db.list_collections().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let mut stats = ImportSchemaResponse { created: 0, updated: 0, skipped: 0, errors: vec![] };
+
+    for col in payload.collections {
+        let exists = existing_cols.iter().find(|c| c.name == col.name);
+        // [FIX] Use the strategy parsed from multipart form, fallback to payload if needed (though payload structure is file content)
+        let effective_strategy = if !strategy.is_empty() { strategy.as_str() } else { payload.strategy.as_str() };
+        
+        match (exists, effective_strategy) {
+             (Some(existing), "overwrite") => {
+                if let Err(e) = db.update_collection(existing.id, None, col.schema).await {
+                    stats.errors.push(format!("Failed to update {}: {}", col.name, e));
+                } else { stats.updated += 1; }
+            },
+            (Some(_), "error") => return Err(AppError::UnknownError(format!("Collection {} exists", col.name))),
+            (Some(_), _) => { stats.skipped += 1; },
+            (None, _) => {
+                if let Err(e) = db.create_collection(&col.name, &col.schema).await {
+                    stats.errors.push(format!("Failed to create {}: {}", col.name, e));
+                } else { stats.created += 1; }
+            }
+        }
+    }
+
+    Ok(Json(stats))
 }

@@ -7,7 +7,9 @@ export interface SchemaField {
   type: FieldType;
   required: boolean;
   unique?: boolean;
-  indexed?: boolean;
+  ose_indexed?: boolean;
+  sql_indexed?: boolean;
+  auto?: boolean;
   system?: boolean;
   default?: any;
   uid: string;

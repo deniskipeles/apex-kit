@@ -404,12 +404,8 @@ pub async fn build_schema(
                         let result = state.script_engine.run_script(
                             &script_record.code,
                             serde_json::Value::Object(script_input), 
-                            state.db.clone(),
-                            state.embedder.clone(),
-                            state.vector_provider.clone(),
-                            state.vault.clone(),
+                            Arc::new(state.clone()), // Pass AppState as ScriptContext
                             None,
-                            Some(state.tx.clone()),
                             event_scope
                         ).await.map_err(|e| async_graphql::Error::new(e))?;
 
