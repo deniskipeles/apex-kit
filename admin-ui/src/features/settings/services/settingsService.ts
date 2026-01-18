@@ -8,8 +8,8 @@ const mapToFrontend = (apiData: any): AppSettings => {
         appUrl: apiData.app_url || 'http://localhost:3000',
         allowPublicRegistration: apiData.allow_public_registration || false,
         theme: apiData.theme || 'system',
-        appLogo: apiData.app_logo || '',     
-        logoWidth: apiData.logo_width || '', 
+        appLogo: apiData.app_logo || '',
+        logoWidth: apiData.logo_width || '',
         logoHeight: apiData.logo_height || '',
         smtp: {
             enabled: apiData.smtp?.enabled || false,
@@ -54,10 +54,10 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
     if (settings.appUrl) payload.app_url = settings.appUrl;
     if (settings.allowPublicRegistration !== undefined) payload.allow_public_registration = settings.allowPublicRegistration;
     if (settings.theme) payload.theme = settings.theme;
-     // Map Logo Fields back to API
-     if (settings.appLogo !== undefined) payload.app_logo = settings.appLogo;
-     if (settings.logoWidth !== undefined) payload.logo_width = settings.logoWidth;
-     if (settings.logoHeight !== undefined) payload.logo_height = settings.logoHeight;
+    // Map Logo Fields back to API
+    if (settings.appLogo !== undefined) payload.app_logo = settings.appLogo;
+    if (settings.logoWidth !== undefined) payload.logo_width = settings.logoWidth;
+    if (settings.logoHeight !== undefined) payload.logo_height = settings.logoHeight;
 
     if (settings.smtp) {
         payload.smtp = {
@@ -94,7 +94,7 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
         payload.cron_jobs = settings.cronJobs;
     }
 
-    if (settings.ai){
+    if (settings.ai) {
         payload.ai = {
             enabled: settings.ai.enabled,
             api_key: settings.ai.apiKey,
@@ -106,24 +106,37 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
 };
 
 export const settingsService = {
-  get: async (): Promise<AppSettings> => {
-    try {
-        const res = await pb.admins.getSettings();
+    get: async (): Promise<AppSettings> => {
+        try {
+            const res = await pb.admins.getSettings();
+            return mapToFrontend(res);
+        } catch (e) {
+            console.error("Failed to load settings", e);
+            // Return default on failure to not crash UI
+            return mapToFrontend({});
+        }
+    },
+
+    update: async (settings: Partial<AppSettings>): Promise<AppSettings> => {
+        const payload = mapToApi(settings);
+        const res = await pb.admins.updateSettings(payload);
         return mapToFrontend(res);
-    } catch (e) {
-        console.error("Failed to load settings", e);
-        // Return default on failure to not crash UI
-        return mapToFrontend({}); 
-    }
-  },
+    },
 
-  update: async (settings: Partial<AppSettings>): Promise<AppSettings> => {
-    const payload = mapToApi(settings);
-    const res = await pb.admins.updateSettings(payload);
-    return mapToFrontend(res);
-  },
-
-  // Keep mocks for untethered features
-  testEmail: async (email: string) => true,
-  generateToken: async (name: string) => ({ token: { id: '1', name, key: 'xxx', created: '' }, rawKey: 'xxx' })
+    // Keep mocks for untethered features
+    testEmail: async (email: string) => true,
+    generateToken: async (name: string, role: string = 'admin') => {
+        // Use the new apiClient method
+        const res = await apiClient.keys.create(name, role);
+        // Map to frontend structure
+        return {
+            token: {
+                id: res.info.id,
+                name: res.info.name,
+                key: res.key.substring(0, 8) + '...', // Masked prefix
+                created: res.info.created
+            },
+            rawKey: res.key
+        };
+    },
 };

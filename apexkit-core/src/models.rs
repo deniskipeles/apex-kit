@@ -155,5 +155,7 @@ pub struct ApiKey {
     #[serde(skip_serializing)]
     pub hash: String,   // Hashed full key
     pub role: String,   // Usually 'admin' or 'user'
+    pub scope: String, 
+    pub bypass_cors: bool,
     pub created_at: String,
 }

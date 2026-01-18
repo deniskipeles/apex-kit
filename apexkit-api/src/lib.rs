@@ -74,6 +74,7 @@ pub mod sandbox_manager;
 pub mod tenant_manager;
 pub mod backup;
 pub mod backup_routes;
+pub mod key_routes;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -92,6 +93,7 @@ pub struct AppState {
     pub thumb_cache: Cache<String, Arc<Vec<u8>>>, 
     pub embedder: Arc<apexkit_core::embeddings::EmbedderService>,
     pub vector_provider: Arc<dyn VectorProvider>,
+    pub port: u16,
 }
 
 // --- DTOs ---
@@ -476,36 +478,82 @@ async fn tenant_resolver_middleware(
     mut req: Request,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
-    let mut tenant_id = String::new();
     
-    // Parse host from base_url
-    let host_str = base_url.split("://").nth(1).unwrap_or("").split(':').next().unwrap_or("");
-    let host_parts: Vec<&str> = host_str.split('.').collect();
-
-    if host_parts.len() >= 2 && host_parts[0] != "localhost" && host_parts[0] != "www" && host_parts[0] != "api" {
-        tenant_id = host_parts[0].to_string();
+    // 1. Check for API Key override (Smart Key)
+    let mut key_scope_override: Option<String> = None;
+    
+    if let Some(key_header) = req.headers().get("x-api-key") {
+         if let Ok(key) = key_header.to_str() {
+             // Verify key (cached lookup would be better, here we hit DB via state)
+             // Note: verification uses the Root DB inherently as api keys are global
+             if let Ok(Some(api_key)) = state.db.verify_api_key(key).await {
+                 key_scope_override = Some(api_key.scope.clone());
+                 
+                 // Inject key info into extensions for auth_middleware or cors_middleware to use
+                 // We wrap it in Arc to be cloneable if needed, or just the struct
+                 req.extensions_mut().insert(api_key);
+             }
+         }
     }
-    if let Some(Path(params)) = path_params {
-        if let Some(id) = params.get("tenant_id") { tenant_id = id.clone(); }
+
+    let mut tenant_id = String::new();
+
+    // 2. Logic: If Key Scope is specific (e.g. "tenant:xyz"), force that tenant context.
+    if let Some(scope) = key_scope_override {
+        if scope.starts_with("tenant:") {
+            let target = scope.strip_prefix("tenant:").unwrap();
+            // If wildcard, we don't force, we allow normal routing.
+            // If specific ID, we force it.
+            if target != "*" {
+                tenant_id = target.to_string();
+            }
+        }
     }
 
+    // 3. Fallback: If no key override, use URL routing (Subdomain or Path)
     if tenant_id.is_empty() {
+        // Parse host from base_url
+        let host_str = base_url.split("://").nth(1).unwrap_or("").split(':').next().unwrap_or("");
+        let host_parts: Vec<&str> = host_str.split('.').collect();
+
+        // Subdomain check
+        if host_parts.len() >= 2 && host_parts[0] != "localhost" && host_parts[0] != "www" && host_parts[0] != "api" {
+            tenant_id = host_parts[0].to_string();
+        }
+        
+        // Path check override
+        if let Some(Path(params)) = path_params {
+            if let Some(id) = params.get("tenant_id") { 
+                tenant_id = id.clone(); 
+            }
+        }
+    }
+
+    // 4. Resolve Context
+    if tenant_id.is_empty() {
+        // Root Context
         req.extensions_mut().insert(EventScope::Root);
-        // [UPDATED] Inject Header for Root
         let mut response = next.run(req).await;
         response.headers_mut().insert("X-Apex-Scope", HeaderValue::from_static("root"));
         return Ok(response);
     }
 
+    // Tenant Context
     match state.tenant_manager.get_tenant(tenant_id.clone()).await {
         Ok(tenant_db) => {
             req.extensions_mut().insert(tenant_db.clone());
-            let storage_path = format!("storage/tenants/{}/uploads", tenant_id);
-            let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
+            
+            // Inject Tenant-Specific Storage
+            let storage_path = format!("tenants/{}/uploads", tenant_id);
+            // Public URL base needs to point to the tenant endpoint
+            // e.g. /tenant/{id}/api/v1/storage/file/
+            let public_url = format!("/tenant/{}/api/v1/storage/file/", tenant_id);
+            
+            let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, &public_url).await);
             req.extensions_mut().insert(storage);
+            
             req.extensions_mut().insert(EventScope::Tenant(tenant_id.clone()));
             
-            // [UPDATED] Inject Header for Tenant
             let mut response = next.run(req).await;
             if let Ok(val) = HeaderValue::from_str(&format!("tenant:{}", tenant_id)) {
                 response.headers_mut().insert("X-Apex-Scope", val);
@@ -1878,9 +1926,16 @@ fn make_api_router() -> Router<AppState> {
         .route("/admin/storage/test", post(storage::test_s3_connection))
         .route("/admin/storage/migrate", post(storage::migrate_storage))
         .route("/admin/settings", get(settings::get_settings).patch(settings::update_settings).put(settings::update_settings))
+        .route("/admin/smtp/test", post(auth_advanced::test_email_handler))
         .route("/admin/config", post(config_routes::set_config).get(config_routes::list_configs))
         .route("/admin/config/{key}", axum::routing::delete(config_routes::delete_config))
+        .route("/admin/keys", get(key_routes::list_keys).post(key_routes::create_key))
+        .route("/admin/keys/{id}", axum::routing::delete(key_routes::delete_key))
         .route("/admin/system/reload", post(reload_system))
+        .route("/admin/backup", post(backup_routes::trigger_backup_handler))
+        .route("/admin/backups", get(backup_routes::list_backups_handler))
+        .route("/admin/backups/{filename}", get(backup_routes::download_backup_handler))
+        .route("/admin/restore-file", post(backup_routes::restore_from_file_handler))
         .route("/admin/users", get(list_users_handler))
         .route("/admin/users/{id}", axum::routing::delete(delete_user_handler))
         .route("/admin/logs", get(list_audit_logs))

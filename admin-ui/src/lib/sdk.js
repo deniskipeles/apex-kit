@@ -400,12 +400,90 @@ export class ApexKit {
                 body: { source, destination }
             }),
 
+            // --- Backups ---
+            /**
+             * Trigger a manual system backup.
+             * @returns {Promise<{message: string}>}
+             */
+            createBackup: () => this._request('/admin/backup', { method: 'POST' }),
+            
+            /**
+             * List available backups on the server (Local/S3).
+             * @returns {Promise<Array<{name: string, size: number, created: string}>>}
+             */
+            listBackups: () => this._request('/admin/backups', { method: 'GET' }),
+
+            /**
+             * Download a backup file.
+             * @param {string} filename - The name of the backup file.
+             * @returns {Promise<Blob>} The backup file blob.
+             */
+            downloadBackup: async (filename) => {
+                // Using raw fetch for Blob response
+                const url = `${this.baseUrl}/api/v1/admin/backups/${filename}`;
+                const headers = {};
+                if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+                const res = await fetch(url, { headers });
+                if (!res.ok) throw new Error("Download failed");
+                return res.blob();
+            },
+
+            /**
+             * Restore system from an existing backup file on the server.
+             * @param {string} filename - The name of the backup file to restore.
+             * @returns {Promise<{message: string}>}
+             */
+            restoreFromFile: (filename) => this._request('/admin/restore-file', { method: 'POST', body: { filename } }),
+
+            /**
+             * Restore system from an uploaded backup file.
+             * @param {File} file - The .tar.gz backup file.
+             * @returns {Promise<{message: string}>}
+             */
+            restoreBackup: (file) => {
+                const formData = new FormData();
+                formData.append('file', file);
+                return this._request('/admin/restore', { method: 'POST', body: formData });
+            },
+
+            // --- API Keys ---
+            /**
+             * List all active API keys.
+             * @returns {Promise<Array<{id: number, name: string, prefix: string, role: string, created_at: string}>>}
+             */
+            listApiKeys: () => this._request('/admin/keys', { method: 'GET' }),
+
+            /**
+             * Create a new API key.
+             * Returns the full key ONLY ONCE.
+             * @param {string} name - Human readable name for the key.
+             * @param {string} [role='admin'] - Role associated with the key.
+             * @param {string} [scope='root'] - Scope associated with the key.
+             * @param {boolean} [bypass_cors=true] - This key should by pass CORS or not.
+             * @returns {Promise<{key: string, info: object}>}
+             */
+            createApiKey: (name, role = 'admin', scope = 'root', bypass_cors = true) => this._request('/admin/keys', { method: 'POST', body: { name, role, scope, bypass_cors } }),
+
+            /**
+             * Revoke (delete) an API key.
+             * @param {number|string} id - The ID of the key to delete.
+             * @returns {Promise<void>}
+             */
+            deleteApiKey: (id) => this._request(`/admin/keys/${id}`, { method: 'DELETE' }),
+
             /**
              * Force a system reload.
              * Syncs GraphQL schema, Cron jobs, and caches.
              * @returns {Promise<object>} Status message.
              */
             reloadSystem: () => this._request('/admin/system/reload', { method: 'POST', body: JSON.stringify({}) }),
+
+            /**
+             * Send a test email to verify SMTP settings.
+             * @param {string} email - Recipient email address.
+             * @returns {Promise<{success: boolean}>}
+             */
+            testEmail: (email) => this._request('/admin/smtp/test', { method: 'POST', body: { email } }),
 
             /**
              * Re-build the Tantivy search index for a specific collection.

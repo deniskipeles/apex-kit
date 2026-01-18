@@ -22,6 +22,9 @@ export interface SmtpConfig {
   username?: string;
   password?: string; // usually not returned by API, only set
   fromEmail: string;
+  template_welcome: string;
+  template_reset: string;
+  template_verify: string;
 }
 
 export interface S3Config {
@@ -60,6 +63,17 @@ export interface ApiToken {
   key: string; // Partial key for display
   created: string;
 }
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  prefix: string;
+  role: string;
+  scope: string;
+  bypass_cors: string;
+  created: string;
+}
+
 
 export interface AIProvider{
   enabled: Boolean;

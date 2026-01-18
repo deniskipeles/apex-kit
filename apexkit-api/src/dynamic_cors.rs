@@ -52,7 +52,23 @@ pub async fn cors_middleware(
                 let matches_host = host_header.as_ref().map(|h| clean_origin.contains(h)).unwrap_or(false);
                 let matches_forwarded = forwarded_host.as_ref().map(|h| clean_origin.contains(h)).unwrap_or(false);
 
-                if allowed_list.contains(&origin_str) || matches_host || matches_forwarded {
+                // [NEW] Smart Key Check for CORS Bypass
+                // We check headers for x-api-key. If valid AND bypass_cors=true, we skip origin checks.
+                let mut bypass_cors = false;
+                
+                if let Some(key_header) = req.headers().get("x-api-key") {
+                    if let Ok(key) = key_header.to_str() {
+                        // Verification is async. 
+                        // Note: In middleware, we clone db ref.
+                        if let Ok(Some(api_key)) = state.db.verify_api_key(key).await {
+                            if api_key.bypass_cors {
+                                bypass_cors = true;
+                            }
+                        }
+                    }
+                }
+
+                if allowed_list.contains(&origin_str) || matches_host || matches_forwarded || bypass_cors {
                     allow_origin_val = Some(origin); 
                     allow_credentials = true; 
                 } else {

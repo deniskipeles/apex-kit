@@ -33,7 +33,7 @@ aws-sdk-s3 = "1.1"
 aws-credential-types = "1.1" 
 
 # Email
-lettre = { version = "0.11", features = ["tokio1", "smtp-transport", "builder", "tokio1-native-tls"] }
+lettre = { version = "0.11", features = ["tokio1", "smtp-transport", "builder", "tokio1-native-tls", "sendmail-transport"] }
 
 # Auth & Crypto
 bcrypt = "0.15"

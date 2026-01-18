@@ -286,6 +286,7 @@ async fn main() {
         thumb_cache,
         embedder,
         vector_provider: vector_provider.clone(),
+        port: cli.port,
     };
 
     // 11. Build Real Schema

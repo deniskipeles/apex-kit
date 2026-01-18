@@ -35,6 +35,10 @@ pub struct SmtpConfigDto {
     pub username: Option<String>,
     pub password: Option<String>, // Masked on GET
     pub from_email: String,
+    // Templates
+    pub template_welcome: Option<String>,   // "Welcome to {{app_name}}!"
+    pub template_reset: Option<String>,     // "Click here to reset: {{link}}"
+    pub template_verify: Option<String>,    // "Verify email: {{link}}"
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Default)]
@@ -124,7 +128,18 @@ pub async fn get_settings(
 
     // SMTP (Mask Password)
     if let Some(smtp_val) = smtp {
-        let mut s: SmtpConfigDto = serde_json::from_value(smtp_val).unwrap_or_else(|_| SmtpConfigDto { enabled: false, host: "".into(), port: 587, username: None, password: None, from_email: "".into() });
+        let mut s: SmtpConfigDto = serde_json::from_value(smtp_val).unwrap_or_else(|_| SmtpConfigDto { 
+            enabled: false, 
+            host: "".into(), 
+            port: 587, 
+            username: None, 
+            password: None, 
+            from_email: "".into(),
+            template_welcome: None,
+            template_reset: None,
+            template_verify: None
+        });
+        
         if s.password.is_some() && !s.password.as_ref().unwrap().is_empty() {
             s.password = Some("******".to_string());
         }

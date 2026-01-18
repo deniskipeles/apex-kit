@@ -1,11 +1,11 @@
 // apexkit-api/src/backup.rs
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::fs;
 use std::sync::Arc;
 use apexkit_core::{Db, storage::StorageBackend, security::Vault, security::EncryptedValue};
 use crate::settings::{StorageConfigDto, BackupConfigDto};
 use chrono::Utc;
-use tracing::{info, error};
+use tracing::info;
 
 // Since we removed 'zip' crate to save size, we use system 'tar'
 // If 'zip' is absolutely required, we'd need to re-add it or use system 'zip' command.
@@ -153,7 +153,7 @@ pub async fn restore_backup(
     file_path: &str, // Path to the uploaded .tar.gz
     is_s3: bool,
     db: Arc<dyn Db>,
-    vault: Arc<Vault>
+    _vault: Arc<Vault>
 ) -> Result<(), String> {
     info!("Starting restoration from {}", file_path);
 
@@ -162,7 +162,7 @@ pub async fn restore_backup(
     // 1. Fetch File (if S3)
     let local_archive_path = if is_s3 {
          // Load S3 settings, download file to tmp
-         let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
+         let _storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
          // ... (S3 download logic similar to backup but reverse) ...
          // For brevity, assuming file_path is already local for now (Upload handler handles S3 download if needed)
          file_path.to_string() 

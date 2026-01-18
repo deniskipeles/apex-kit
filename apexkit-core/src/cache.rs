@@ -192,8 +192,8 @@ impl Db for CachedDb {
     }
 
     // --- API keys ---
-    async fn create_api_key(&self, name: &str, role: &str) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.create_api_key(name, role).await
+    async fn create_api_key(&self, name: &str, role: &str, scope: &str, bypass_cors: bool) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.create_api_key(name, role, scope, bypass_cors).await
     }
     
     async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {

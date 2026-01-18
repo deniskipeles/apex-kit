@@ -12,6 +12,8 @@ use serde_json::json;
 use apexkit_core::auth::Claims;
 use crate::DatabaseConnection;
 use axum::Extension;
+use apexkit_core::jobs;
+use utoipa::ToSchema;
 
 // --- GitHub Models ---
 #[derive(Deserialize)]
@@ -229,4 +231,31 @@ pub async fn get_me(
         role: user.role.clone(),
         metadata: user.metadata.clone()
     }))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct TestEmailReq {
+    pub email: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/smtp/test",
+    request_body = TestEmailReq,
+    responses((status = 200, description = "Email Sent"))
+)]
+pub async fn test_email_handler(
+    Extension(claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Json(payload): Json<TestEmailReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let subject = "Test Email from ApexKit";
+    let body = "If you are reading this, your SMTP or Sendmail configuration is working correctly.";
+
+    jobs::send_email(state.db.clone(), state.vault.clone(), &payload.email, subject, body).await
+        .map_err(|e| AppError::UnknownError(format!("Failed to send: {}", e)))?;
+
+    Ok(Json(json!({ "success": true, "message": "Email sent." })))
 }

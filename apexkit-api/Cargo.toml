@@ -68,6 +68,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 
 # Scheduler
 tokio-cron-scheduler = "0.9"
+cron = "0.12"
 
 # Templates
 tera = "1.19" 

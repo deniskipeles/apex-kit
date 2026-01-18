@@ -1,5 +1,5 @@
 import { APEX_TOKEN } from '../constants';
-import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions } from '../types';
+import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions, ApiKey } from '../types';
 import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
 
 // const env = (import.meta as any).env;
@@ -13,7 +13,7 @@ const basePb = new PowerBase(apiUrl);
 // Load persisted token
 const storedToken = localStorage.getItem(APEX_TOKEN);
 if (storedToken) {
-    basePb.setToken(storedToken);
+  basePb.setToken(storedToken);
 }
 
 // --- DYNAMIC CLIENT PROXY ---
@@ -21,24 +21,24 @@ if (storedToken) {
 // if the URL path is /_dashboard/tenant/:id/...
 export const pb = new Proxy(basePb, {
   get(target, prop, receiver) {
-      if (typeof window !== 'undefined') {
-          const path = window.location.pathname;
+    if (typeof window !== 'undefined') {
+      const path = window.location.pathname;
 
-          // 1. Check for TENANT URL
-          const tenantMatch = path.match(/^\/_dashboard\/tenant\/([^/]+)/);
-          if (tenantMatch && tenantMatch[1]) {
-              const tenantInstance = target.tenant(tenantMatch[1]);
-              return Reflect.get(tenantInstance, prop, receiver);
-          }
-
-          // 2. Check for SANDBOX URL (NEW)
-          const sandboxMatch = path.match(/^\/_dashboard\/sandbox\/([^/]+)/);
-          if (sandboxMatch && sandboxMatch[1]) {
-              const sandboxInstance = target.sandbox(sandboxMatch[1]);
-              return Reflect.get(sandboxInstance, prop, receiver);
-          }
+      // 1. Check for TENANT URL
+      const tenantMatch = path.match(/^\/_dashboard\/tenant\/([^/]+)/);
+      if (tenantMatch && tenantMatch[1]) {
+        const tenantInstance = target.tenant(tenantMatch[1]);
+        return Reflect.get(tenantInstance, prop, receiver);
       }
-      return Reflect.get(target, prop, receiver);
+
+      // 2. Check for SANDBOX URL (NEW)
+      const sandboxMatch = path.match(/^\/_dashboard\/sandbox\/([^/]+)/);
+      if (sandboxMatch && sandboxMatch[1]) {
+        const sandboxInstance = target.sandbox(sandboxMatch[1]);
+        return Reflect.get(sandboxInstance, prop, receiver);
+      }
+    }
+    return Reflect.get(target, prop, receiver);
   }
 });
 
@@ -52,53 +52,53 @@ const transformCollection = (col: any): Collection => {
 
   // 1. Map Standard Fields
   if (col.schema && col.schema.fields) {
-      schemaArray = Object.entries(col.schema.fields).map(([name, def]: [string, any]) => {
-          let uiType = def.type;
-          if (uiType === 'boolean') uiType = 'bool'; 
-          
-          return {
-              name,
-              type: uiType,
-              required: def.required,
-              unique: def.unique,
-              ose_indexed: def.ose_indexed,
-              sql_indexed: def.sql_indexed,
-              auto: def.auto,
-              default: def.default,
-              uid: def.uid,
-              position: def.position,
-              vectorize: def.vectorize,
-              
-              min: def.min,
-              max: def.max,
-              minLength: def.min_length,
-              maxLength: def.max_length,
-              pattern: def.pattern,
-              options: def.options,
-              mimeTypes: def.mime_types,
-              maxSize: def.max_size,
-              dimension: def.dimension,
-              relationTo: def.relation_to, 
-              
-              originalName: name 
-          };
-      });
+    schemaArray = Object.entries(col.schema.fields).map(([name, def]: [string, any]) => {
+      let uiType = def.type;
+      if (uiType === 'boolean') uiType = 'bool';
+
+      return {
+        name,
+        type: uiType,
+        required: def.required,
+        unique: def.unique,
+        ose_indexed: def.ose_indexed,
+        sql_indexed: def.sql_indexed,
+        auto: def.auto,
+        default: def.default,
+        uid: def.uid,
+        position: def.position,
+        vectorize: def.vectorize,
+
+        min: def.min,
+        max: def.max,
+        minLength: def.min_length,
+        maxLength: def.max_length,
+        pattern: def.pattern,
+        options: def.options,
+        mimeTypes: def.mime_types,
+        maxSize: def.max_size,
+        dimension: def.dimension,
+        relationTo: def.relation_to,
+
+        originalName: name
+      };
+    });
   }
 
   // 2. Map Relations (Separate map in backend -> Field in frontend)
   if (col.schema && col.schema.relations) {
-      Object.entries(col.schema.relations).forEach(([name, def]: [string, any]) => {
-          schemaArray.push({
-              name,
-              type: 'relation',
-              relationTo: def.target_collection,
-              required: def.required || false,
-              unique: def.relation_type === 'one' ? true : false,
-              originalName: name,
-              position: def.position || 999, 
-              uid: def.uid || "gen_rel"
-          });
+    Object.entries(col.schema.relations).forEach(([name, def]: [string, any]) => {
+      schemaArray.push({
+        name,
+        type: 'relation',
+        relationTo: def.target_collection,
+        required: def.required || false,
+        unique: def.relation_type === 'one' ? true : false,
+        originalName: name,
+        position: def.position || 999,
+        uid: def.uid || "gen_rel"
       });
+    });
   }
 
   // Sort schema array by position to ensure UI renders correctly
@@ -109,84 +109,84 @@ const transformCollection = (col: any): Collection => {
   const compositeUnique = col.schema?.composite_unique || [];
 
   return {
-      id: col.id.toString(),
-      name: col.name,
-      type: col.type || 'base', 
-      schema: schemaArray,
-      rules: rules,
-      fieldHistory: fieldHistory,
-      compositeUnique: compositeUnique,
-      created: new Date().toISOString(),
-      updated: new Date().toISOString()
+    id: col.id.toString(),
+    name: col.name,
+    type: col.type || 'base',
+    schema: schemaArray,
+    rules: rules,
+    fieldHistory: fieldHistory,
+    compositeUnique: compositeUnique,
+    created: new Date().toISOString(),
+    updated: new Date().toISOString()
   };
 };
 
 // --- HELPER: Transform Frontend Schema -> Backend Format ---
 const transformToBackendSchema = (data: Partial<Collection>) => {
-  const schema: any = { 
-      fields: {}, 
-      relations: {}, 
-      policies: data.rules || {},
-      field_history: data.fieldHistory || {},
-      composite_unique: data.compositeUnique || []
+  const schema: any = {
+    fields: {},
+    relations: {},
+    policies: data.rules || {},
+    field_history: data.fieldHistory || {},
+    composite_unique: data.compositeUnique || []
   };
-  
+
   if (data.schema) {
-      data.schema.forEach(field => {
-          const { name } = field;
+    data.schema.forEach(field => {
+      const { name } = field;
 
-          // CASE 1: RELATION (Explicit Type)
-          if (field.type === 'relation') {
-              schema.relations[name] = {
-                  target_collection: field.relationTo,
-                  relation_type: field.unique ? 'one' : 'many',
-                  position: field.position,
-                  required: field.required,
-                  uid: field.uid
-              };
-              return; 
-          }
+      // CASE 1: RELATION (Explicit Type)
+      if (field.type === 'relation') {
+        schema.relations[name] = {
+          target_collection: field.relationTo,
+          relation_type: field.unique ? 'one' : 'many',
+          position: field.position,
+          required: field.required,
+          uid: field.uid
+        };
+        return;
+      }
 
-          // Prepare Backend Field Definition
-          const backendField: any = {
-              type: field.type,
-              required: field.required,
-              unique: field.unique,
-              ose_indexed: field.ose_indexed,
-              sql_indexed: field.sql_indexed,
-              default: field.default,
-              auto: field.auto,
-              uid: field.uid,
-              position: field.position,
-              vectorize: field.vectorize,
-              
-              min: field.min,
-              max: field.max,
-              min_length: field.minLength,
-              max_length: field.maxLength,
-              pattern: field.pattern,
-              options: field.options,
-              mime_types: field.mimeTypes,
-              max_size: field.maxSize,
-              dimension: field.dimension,
-              relation_to: field.relationTo 
-          };
+      // Prepare Backend Field Definition
+      const backendField: any = {
+        type: field.type,
+        required: field.required,
+        unique: field.unique,
+        ose_indexed: field.ose_indexed,
+        sql_indexed: field.sql_indexed,
+        default: field.default,
+        auto: field.auto,
+        uid: field.uid,
+        position: field.position,
+        vectorize: field.vectorize,
 
-          if (backendField.type === 'bool') {
-              backendField.type = 'boolean';
-          }
-          
-          Object.keys(backendField).forEach(key => backendField[key] === undefined && delete backendField[key]);
+        min: field.min,
+        max: field.max,
+        min_length: field.minLength,
+        max_length: field.maxLength,
+        pattern: field.pattern,
+        options: field.options,
+        mime_types: field.mimeTypes,
+        max_size: field.maxSize,
+        dimension: field.dimension,
+        relation_to: field.relationTo
+      };
 
-          schema.fields[name] = backendField;
-      });
+      if (backendField.type === 'bool') {
+        backendField.type = 'boolean';
+      }
+
+      Object.keys(backendField).forEach(key => backendField[key] === undefined && delete backendField[key]);
+
+      schema.fields[name] = backendField;
+    });
   }
   return schema;
 };
 
 export const apiClient = {
   apiUrl: apiUrl,
-  logoUrl: apiUrl+"/logo?thumb=100x100",
+  logoUrl: apiUrl + "/logo?thumb=100x100",
   stripHtmlTags: basePb.utils.stripHtmlTags,
   getAdminDashboardStats: pb.admins.getDashboardStats,
   searchVector: (collectionId: string | number, field: string, vector: Array<number>, limit?: number) => pb.collection(collectionId).searchVector(field, vector, limit),
@@ -208,11 +208,77 @@ export const apiClient = {
     return res;
   },
 
+  // --- System / Backups ---
+  system: {
+    reload: async () => {
+      return await pb.admins.reloadSystem();
+    },
+    testEmail: async (email: string) => {
+      return await pb.admins.testEmail(email);
+    },
+    createBackup: async () => {
+      return await pb.admins.createBackup();
+    },
+    listBackups: async () => {
+      return await pb.admins.listBackups();
+    },
+    downloadBackup: async (filename: string) => {
+      const blob = await pb.admins.downloadBackup(filename);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    },
+    restoreFromFile: async (filename: string) => {
+      return await pb.admins.restoreFromFile(filename);
+    },
+    restoreBackup: async (file: File) => {
+      return await pb.admins.restoreBackup(file);
+    }
+  },
+
+  // --- API Keys ---
+  keys: {
+    list: async (): Promise<ApiKey[]> => {
+      const res = await pb.admins.listApiKeys();
+      return res.map((k: any) => ({
+        id: k.id.toString(),
+        name: k.name,
+        prefix: k.prefix,
+        role: k.role,
+        scope: k.scope,
+        bypass_cors: k.bypass_cors,
+        created: k.created_at
+      }));
+    },
+    create: async (name: string, role = 'admin', scope = 'root', bypass_cors = true): Promise<{ key: string, info: ApiKey }> => {
+      const res = await pb.admins.createApiKey(name, role, scope, bypass_cors);
+      return {
+        key: res.key,
+        info: {
+          id: res.info.id.toString(),
+          name: res.info.name,
+          prefix: res.info.prefix,
+          role: res.info.role,
+          scope: res.info.scope,
+          bypass_cors: res.info.bypass_cors,
+          created: res.info.created_at
+        }
+      };
+    },
+    delete: async (id: string) => {
+      return await pb.admins.deleteApiKey(id);
+    }
+  },
+
   // Explicit Admin methods for Root
   root: {
-      createTenant: (id: string) => basePb.admins.createTenant(id), // Always use basePb for creating tenants
-      // deleteTenant: (id: string) => basePb.admins.deleteTenant(id),
-      listTenants: () => basePb.admins.listTenants(),
+    createTenant: (id: string) => basePb.admins.createTenant(id), // Always use basePb for creating tenants
+    // deleteTenant: (id: string) => basePb.admins.deleteTenant(id),
+    listTenants: () => basePb.admins.listTenants(),
   },
 
   auth: {
@@ -237,7 +303,7 @@ export const apiClient = {
     list: async (page = 1, perPage = 20, search = ''): Promise<{ items: AuthUser[], total: number }> => {
       try {
         // Call the new Admin API
-        const res = await pb.admins.listUsers({page, per_page:perPage, sort:"", filter:search});
+        const res = await pb.admins.listUsers({ page, per_page: perPage, sort: "", filter: search });
 
         // Map backend response to AuthUser type
         const items = res.items.map((u: any) => ({
@@ -332,17 +398,17 @@ export const apiClient = {
     reIndex: (id: string) => pb.admins.reIndex(id),
 
     exportSchema: async () => {
-        const blob = await pb.admins.exportSchema();
-        const downloadUrl = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        a.download = "apex_schema.json";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
+      const blob = await pb.admins.exportSchema();
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = downloadUrl;
+      a.download = "apex_schema.json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
     },
     importSchema: async (file: File, strategy: 'skip' | 'overwrite' | 'error' = 'skip') => {
-        return await pb.admins.importSchema(file, strategy);
+      return await pb.admins.importSchema(file, strategy);
     },
   },
 
@@ -406,7 +472,7 @@ export const apiClient = {
       if (!query) return [];
       try {
         // Call the SDK
-        const result =  await pb.collection(collectionId).searchRecordsWithSQL(query);
+        const result = await pb.collection(collectionId).searchRecordsWithSQL(query);
         return result.map((item: any) => ({
           id: item.id.toString(),
           collectionId,
@@ -460,15 +526,15 @@ export const apiClient = {
     },
 
     searchTextVector: async (collectionId: string, query: string, limit = 10) => {
-        return await pb.collection(collectionId).searchTextVector(query, limit);
+      return await pb.collection(collectionId).searchTextVector(query, limit);
     },
-    
+
     searchVector: async (collectionId: string, field: string, vector: number[], limit = 10) => {
-        return await pb.collection(collectionId).searchVector(field, vector, limit);
+      return await pb.collection(collectionId).searchVector(field, vector, limit);
     },
-    
+
     getVector: async (collectionId: string, recordId: number | string) => {
-        return await pb.collection(collectionId).getVector(recordId);
+      return await pb.collection(collectionId).getVector(recordId);
     },
 
   },
@@ -476,17 +542,17 @@ export const apiClient = {
   testS3Connection: async (config: any) => {
     // Map camelCase (frontend) to snake_case (backend)
     const payload = {
-        bucket: config.bucket,
-        region: config.region,
-        endpoint: config.endpoint,
-        access_key: config.accessKey,
-        secret_key: config.secretKey
+      bucket: config.bucket,
+      region: config.region,
+      endpoint: config.endpoint,
+      access_key: config.accessKey,
+      secret_key: config.secretKey
     };
     return await pb.admins.testS3StorageConnection(payload);
   },
 
   migrateStorage: async (source: string, destination: string) => {
-      return await pb.admins.migrateStorage(source, destination);
+    return await pb.admins.migrateStorage(source, destination);
   },
 
   files: {
@@ -530,7 +596,7 @@ export const apiClient = {
       await pb.files.delete(id);
     },
     getFileUrl: (filename: string) => pb.files.getFileUrl(filename)
-  
+
   },
 
   scripts: {
@@ -588,29 +654,29 @@ export const apiClient = {
     },
     // --- Architect ---
     listSessions: async () => await pb.ai.listSessions(),
-    
+
     createSession: async (name: string, initialPrompt?: string, model?: string, cloneStrategy?: string, cloneRecordLimit?: number) => {
-        return await pb.ai.createSession(name, initialPrompt, model, cloneStrategy, cloneRecordLimit);
+      return await pb.ai.createSession(name, initialPrompt, model, cloneStrategy, cloneRecordLimit);
     },
 
     chat: async (id: string, prompt: string, model: string) => {
-        return await pb.ai.chat(id, prompt, model);
+      return await pb.ai.chat(id, prompt, model);
     },
 
     applySessionChanges: async (id: string) => {
-        return await pb.ai.applySessionChanges(id);
+      return await pb.ai.applySessionChanges(id);
     },
 
     publishSession: async (id: string) => {
-        return await pb.ai.publishSession(id);
+      return await pb.ai.publishSession(id);
     },
 
     listPlugins: async () => {
-        return await pb.ai.listPlugins();
+      return await pb.ai.listPlugins();
     },
 
     codeEdit: async (prompt: string, currentCode: string, contextType: string, model: string) => {
-        return await pb.ai.editCode(prompt, currentCode, contextType, model);
+      return await pb.ai.editCode(prompt, currentCode, contextType, model);
     }
   },
 
@@ -634,12 +700,12 @@ export const apiClient = {
   // Add this new method
   getVersions: async (): Promise<AppVersions> => {
     try {
-        const res = await fetch('/version');
-        if (!res.ok) throw new Error('Failed to fetch versions');
-        return await res.json();
+      const res = await fetch('/version');
+      if (!res.ok) throw new Error('Failed to fetch versions');
+      return await res.json();
     } catch (e) {
-        console.error(e);
-        return { root: '0.0.0', api: '0.0.0', core: '0.0.0', vector: '0.0.0' };
+      console.error(e);
+      return { root: '0.0.0', api: '0.0.0', core: '0.0.0', vector: '0.0.0' };
     }
   },
 };

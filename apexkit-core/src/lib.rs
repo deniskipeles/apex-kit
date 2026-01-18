@@ -173,7 +173,7 @@ pub trait Db: Send + Sync {
     async fn log_system_event(&self, level: &str, target: &str, message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     // --- API keys ---
-    async fn create_api_key(&self, name: &str, role: &str) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>>;
+    async fn create_api_key(&self, name: &str, role: &str, scope: &str, bypass_cors: bool) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>>;
     async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>>;
     async fn delete_api_key(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn verify_api_key(&self, key: &str) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>>;
@@ -913,16 +913,15 @@ async fn reconcile_sql_indexes(
 #[async_trait]
 impl Db for ApexKit {
     // --- API keys / Super tokens ---
-    async fn create_api_key(&self, name: &str, role: &str) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
+    async fn create_api_key(&self, name: &str, role: &str, scope: &str, bypass_cors: bool) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
-        
         let raw_key = format!("ak_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
         let prefix = raw_key[0..8].to_string();
         let hash = crate::auth::hash_password(&raw_key)?;
 
         conn.execute(
-            "INSERT INTO _api_keys (name, prefix, hash, role) VALUES (?1, ?2, ?3, ?4)", 
-            params![name, prefix.clone(), hash, role] // [FIX] Clone here
+            "INSERT INTO _api_keys (name, prefix, hash, role, scope, bypass_cors) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", 
+            params![name, prefix.clone(), hash, role, scope, bypass_cors]
         ).await?;
         
         let id = conn.last_insert_rowid();
@@ -930,9 +929,11 @@ impl Db for ApexKit {
         let key_obj = ApiKey {
             id,
             name: name.to_string(),
-            prefix, // Use original here
-            hash: String::new(), 
+            prefix,
+            hash: String::new(),
             role: role.to_string(),
+            scope: scope.to_string(),
+            bypass_cors,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -941,16 +942,21 @@ impl Db for ApexKit {
 
     async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core()?;
-        let mut rows = conn.query("SELECT id, name, prefix, hash, role, created_at FROM _api_keys ORDER BY created_at DESC", ()).await?;
+        // [UPDATED] Select new columns. Using COALESCE/LEFT JOIN logic if migration isn't guaranteed is safer, 
+        // but since we updated schema, we select columns.
+        let mut rows = conn.query("SELECT id, name, prefix, hash, role, created_at, scope, bypass_cors FROM _api_keys ORDER BY created_at DESC", ()).await?;
         let mut keys = Vec::new();
         while let Some(row) = rows.next().await? {
             keys.push(ApiKey {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 prefix: row.get(2)?,
-                hash: String::new(), // Don't return hash
+                hash: String::new(), 
                 role: row.get(4)?,
                 created_at: row.get(5)?,
+                // [NEW] Fields
+                scope: row.get(6).unwrap_or("root".to_string()),
+                bypass_cors: row.get(7).unwrap_or(false),
             });
         }
         Ok(keys)
@@ -965,7 +971,8 @@ impl Db for ApexKit {
         let conn = self.get_core()?;
         let prefix = if key.len() > 8 { &key[0..8] } else { key };
         
-        let mut rows = conn.query("SELECT id, name, prefix, hash, role, created_at FROM _api_keys WHERE prefix = ?1", params![prefix]).await?;
+        // [UPDATED] Select new columns
+        let mut rows = conn.query("SELECT id, name, prefix, hash, role, created_at, scope, bypass_cors FROM _api_keys WHERE prefix = ?1", params![prefix]).await?;
         
         while let Some(row) = rows.next().await? {
             let hash: String = row.get(3)?;
@@ -977,6 +984,8 @@ impl Db for ApexKit {
                     hash: String::new(),
                     role: row.get(4)?,
                     created_at: row.get(5)?,
+                    scope: row.get(6).unwrap_or("root".to_string()),
+                    bypass_cors: row.get(7).unwrap_or(false),
                 }));
             }
         }
@@ -2179,8 +2188,15 @@ async fn setup_core(db: &Database) -> Result<()> {
         prefix TEXT NOT NULL, 
         hash TEXT NOT NULL, 
         role TEXT NOT NULL DEFAULT 'admin',
+        scope TEXT DEFAULT 'root', 
+        bypass_cors BOOLEAN DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )", ()).await?;
+    
+    // Migration for existing tables
+    let _ = conn.execute("ALTER TABLE _api_keys ADD COLUMN scope TEXT DEFAULT 'root'", ()).await;
+    let _ = conn.execute("ALTER TABLE _api_keys ADD COLUMN bypass_cors BOOLEAN DEFAULT 0", ()).await;
+
     Ok(())
 }
 
@@ -2339,7 +2355,7 @@ impl Db for Mutex<Connection> {
     async fn register_tenant(&self, _id: &str, _owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
-    async fn create_api_key(&self, _n: &str, _r: &str) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
+    async fn create_api_key(&self, _n: &str, _r: &str, _s: &str, _b: bool) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
     async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
     async fn delete_api_key(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     async fn verify_api_key(&self, _k: &str) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
