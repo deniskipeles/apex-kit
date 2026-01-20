@@ -159,3 +159,31 @@ pub struct ApiKey {
     pub bypass_cors: bool,
     pub created_at: String,
 }
+
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct Tenant {
+    pub id: String,
+    pub name: Option<String>,
+    pub status: String,
+    pub tier: String,
+    pub stats: TenantStats,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct TenantStats {
+    pub storage_mb: f64,
+    pub max_storage_mb: i64,
+    pub vector_count: i64,
+    pub max_vectors: i64,
+    pub ai_requests: i64,
+    pub max_ai_requests: i64,
+}
+
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct SandboxMetadata {
+    pub id: String,
+    pub name: Option<String>,
+    pub status: String,
+    pub expires_at: Option<String>,
+}

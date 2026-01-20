@@ -1,13 +1,12 @@
 // apexkit-api/src/key_routes.rs
 use axum::{
-    extract::{Path, State, Json},
+    extract::{Path, Json},
     Extension,
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use apexkit_core::{auth::Claims, models::ApiKey};
-use crate::{AppState, AppError, DatabaseConnection};
+use crate::{AppError, DatabaseConnection};
 use utoipa::ToSchema;
 
 #[derive(Deserialize, ToSchema)]

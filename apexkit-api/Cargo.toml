@@ -82,6 +82,12 @@ moka = { version = "0.12", features = ["future"] } # High performance cache
 # --- CLI ENGINE ---
 clap = { version = "4.5", features = ["derive"] }
 
+# Compression/Archive (Optimized for size)
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+# Filesystem Traversal
+walkdir = "2.4"
+
 [dev-dependencies]
 assert-json-diff = "2.0.2"
 hyper = "1.8.1"

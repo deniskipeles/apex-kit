@@ -41,3 +41,8 @@ export interface AiAction {
     template: string;
     config?: any;
 };
+
+export interface SiteFile {
+    path: string;
+    size: number;
+}

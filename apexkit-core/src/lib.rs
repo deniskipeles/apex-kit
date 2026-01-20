@@ -42,6 +42,7 @@ pub mod filter;
 pub mod batching;
 pub mod embeddings;
 pub mod utils;
+pub mod query_engine;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)] 
 pub struct Collection {
@@ -85,19 +86,10 @@ pub trait ScriptContext: Send + Sync {
     fn get_realtime_tx(&self) -> tokio::sync::broadcast::Sender<crate::realtime::DbEvent>;
     
     // Optional: Only available if Managers are initialized
-    // Returns Option because Core doesn't know about Manager structs
-    // Note: We need a trait for managers if we want to return them here, 
-    // or expose specific methods directly on ScriptContext.
-    // Let's expose specific methods to keep Core clean.
-    
-    // Resolve specific DB context
     fn resolve_tenant_db(&self, tenant_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>>;
     fn resolve_sandbox_db(&self, session_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>>;
 
-    // Expose Admin Manager access if needed (e.g. for $root.createTenant)
-    // We can't return the Struct, but we can return a trait object or handle logic here.
-    // For simplicity, let's assume `create_tenant` is handled via `resolve_tenant_db` or a specific method.
-    // Better Approach: Expose specific admin functions on ScriptContext directly
+    // Expose Admin Manager access if needed
     fn admin_create_tenant(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
 }
 
@@ -130,7 +122,6 @@ pub trait Db: Send + Sync {
     async fn delete_record_search(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
 
     // --- Users (Auth) ---
-    // Added metadata argument
     async fn create_user(&self, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>>;
     
     // Tenants
@@ -159,12 +150,9 @@ pub trait Db: Send + Sync {
     async fn set_user_verified(&self, user_id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     // --- Secure Config ---
-    // --- Unified Configuration (System Secrets & App Settings) ---
     async fn get_config(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>;
     async fn set_config(&self, key: &str, value: &serde_json::Value, encrypted: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    // List all configs
     async fn list_configs(&self) -> std::result::Result<Vec<models::ConfigItem>, Box<dyn std::error::Error + Send + Sync>>;
-    // Delete config
     async fn delete_config(&self, key: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     
     // --- Audit Logs ---
@@ -232,14 +220,11 @@ fn row_to_collection(row: &Row) -> std::result::Result<Collection, Box<dyn std::
     Ok(Collection { id: row.get(0)?, name: row.get(1)?, schema })
 }
 
-// [UPDATED] row_to_record to handle new timestamp columns
 fn row_to_record(
     row: &Row,
 ) -> std::result::Result<Record, Box<dyn std::error::Error + Send + Sync>> {
-    // Column 0: ID
     let id = row.get(0)?;
     
-    // Column 1: Data (JSON)
     let val_data = row.get_value(1).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     let data: serde_json::Value = match val_data {
         libsql::Value::Text(s) => serde_json::from_str(&s)?,
@@ -247,7 +232,6 @@ fn row_to_record(
         _ => serde_json::json!({}),
     };
 
-    // Column 2: Expand (JSON) - Optional
     let expand = if let Ok(val_expand) = row.get_value(2) {
         match val_expand {
             libsql::Value::Text(s) => Some(serde_json::from_str(&s)?),
@@ -258,7 +242,6 @@ fn row_to_record(
         None
     };
 
-    // [NEW] Columns 3 & 4: Timestamps
     let created: String = row.get(3).unwrap_or_else(|_| "".to_string());
     let updated: String = row.get(4).unwrap_or_else(|_| "".to_string());
 
@@ -269,11 +252,24 @@ fn row_to_record(
 #[derive(Clone)] 
 pub struct ApexKit {
     // Sharded Databases (Wrapped in Arc for Clone)
+    // We suppress dead code warning as these Arcs are kept for reference/maintenance
+    #[allow(dead_code)]
     core_db: Arc<Database>,  
+    #[allow(dead_code)]
     data_db: Arc<Database>,  
+    #[allow(dead_code)]
     log_db: Arc<Database>,   
+    #[allow(dead_code)]
     sys_db: Arc<Database>,  
+    #[allow(dead_code)]
     vector_db: Arc<Database>,  
+
+    // Persistent Connections (The Monster Fix)
+    hot_conn_core: Arc<Mutex<Connection>>,
+    hot_conn_data: Arc<Mutex<Connection>>,
+    hot_conn_log: Arc<Mutex<Connection>>,
+    hot_conn_sys: Arc<Mutex<Connection>>,
+    hot_conn_vec: Arc<Mutex<Connection>>,
     
     // Batchers
     data_batcher: batching::WriteManager,
@@ -285,87 +281,162 @@ pub struct ApexKit {
     pub vector_provider: Arc<dyn VectorProvider>, 
 }
 
-// Helper struct to normalize access between Root Records and Nested JSON Objects
 struct ExpandableItem<'a> {
     data: &'a Value,
     expand: &'a mut Option<Value>,
 }
 
+// --- Constructor ---
+pub async fn a_new_database_connection(
+    vector_provider: Arc<dyn VectorProvider>
+) -> std::result::Result<ApexKit, Box<dyn std::error::Error + Send + Sync>> {
+    
+    // Ensure the new centralized directory structure exists
+    let base_dirs = vec![
+        "storage/system",
+        "storage/system/uploads",
+        "storage/system/indexes",
+        "storage/tenants",
+        "storage/sandboxes",
+        "storage/tmp"
+    ];
+
+    for dir in base_dirs {
+        std::fs::create_dir_all(dir).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    }
+
+    // Connect to DBs (Errors here are libsql::Error, need boxing)
+    let core = Builder::new_local("storage/system/core.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let data = Builder::new_local("storage/system/data.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let log = Builder::new_local("storage/system/logs.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let sys = Builder::new_local("storage/system/system.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let vec = Builder::new_local("storage/system/vectors.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+    // Helper to map errors for async blocks below
+    let map_err = |e: libsql::Error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) };
+
+    apply_pragmas(&core).await.map_err(map_err)?;
+    apply_pragmas(&data).await.map_err(map_err)?;
+    apply_pragmas(&log).await.map_err(map_err)?;
+    apply_pragmas(&sys).await.map_err(map_err)?;
+    apply_pragmas(&vec).await.map_err(map_err)?;
+
+    setup_core(&core).await.map_err(map_err)?;
+    setup_data(&data).await.map_err(map_err)?;
+    setup_logs(&log).await.map_err(map_err)?;
+    setup_sys(&sys).await.map_err(map_err)?;
+    setup_vectors(&vec).await.map_err(map_err)?;
+
+    let mut instance = ApexKit::new(
+        Arc::new(core), 
+        Arc::new(data), 
+        Arc::new(log), 
+        Arc::new(sys), 
+        Arc::new(vec), 
+        vector_provider
+    );
+    
+    // Apply Busy Timeout to Hot Connections
+    instance.get_core_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await.map_err(map_err)?;
+    instance.get_data_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await.map_err(map_err)?;
+    instance.get_log_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await.map_err(map_err)?;
+    instance.get_sys_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await.map_err(map_err)?;
+    instance.get_vector_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await.map_err(map_err)?;
+
+    instance.set_search_manager(Arc::new(SearchManager::new("storage/system/indexes")));
+
+    Ok(instance)
+}
+
 impl ApexKit {
     pub fn new(core: Arc<Database>, data: Arc<Database>, log: Arc<Database>, sys: Arc<Database>, vec: Arc<Database>, vector_provider: Arc<dyn VectorProvider>) -> Self {
-        // Init Batchers
         let data_batcher = batching::WriteManager::new(data.clone());
         let log_batcher = batching::WriteManager::new(log.clone());
         let vector_batcher = batching::WriteManager::new(vec.clone());
 
+        // Open Hot Connections immediately
+        let open_hot = |db: &Arc<Database>| -> Arc<Mutex<Connection>> {
+            Arc::new(Mutex::new(db.connect().expect("Failed to open hot connection")))
+        };
+
         Self {
-            core_db: core,
-            data_db: data,
-            log_db: log,
-            sys_db: sys,
-            vector_db: vec,
+            core_db: core.clone(),
+            data_db: data.clone(),
+            log_db: log.clone(),
+            sys_db: sys.clone(),
+            vector_db: vec.clone(),
+            
+            hot_conn_core: open_hot(&core),
+            hot_conn_data: open_hot(&data),
+            hot_conn_log: open_hot(&log),
+            hot_conn_sys: open_hot(&sys),
+            hot_conn_vec: open_hot(&vec),
+
             vector_provider,
             data_batcher,
             log_batcher,
             vector_batcher,
             search: Arc::new(SearchManager::new("./storage/system/indexes")),
-            embedder: Arc::new(embeddings::EmbedderService::new()), // Init service
+            embedder: Arc::new(embeddings::EmbedderService::new()), 
         }
     }
 
-    /// Factory method to initialize a ApexKit instance from a specific folder path.
     pub async fn init_filesystem(
         base_path: &str, 
         vector_provider: Arc<dyn VectorProvider>
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         
-        // 1. Ensure directory exists
         if !Path::new(base_path).exists() {
             std::fs::create_dir_all(base_path)?;
         }
 
-        // 2. Connect to DBs
         let core = Builder::new_local(&format!("{}/core.db", base_path)).build().await?;
         let data = Builder::new_local(&format!("{}/data.db", base_path)).build().await?;
         let log = Builder::new_local(&format!("{}/logs.db", base_path)).build().await?;
         let sys = Builder::new_local(&format!("{}/system.db", base_path)).build().await?;
         let vec = Builder::new_local(&format!("{}/vectors.db", base_path)).build().await?;
 
-        // 3. Apply Pragmas (Performance settings)
         apply_pragmas(&core).await?;
         apply_pragmas(&data).await?;
         apply_pragmas(&log).await?;
         apply_pragmas(&sys).await?;
         apply_pragmas(&vec).await?;
 
-        // 4. Run Migrations (Create Tables if not exist)
         setup_core(&core).await?;
         setup_data(&data).await?;
         setup_logs(&log).await?;
         setup_sys(&sys).await?;
         setup_vectors(&vec).await?;
 
-        // 5. Construct Instance
-        Ok(Self::new(
+        let instance = Self::new(
             Arc::new(core),
             Arc::new(data),
             Arc::new(log),
             Arc::new(sys),
             Arc::new(vec),
             vector_provider
-        ))
+        );
+
+        // Apply Busy Timeout to Hot Connections
+        instance.get_core_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await?;
+        instance.get_data_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await?;
+        instance.get_log_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await?;
+        instance.get_sys_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await?;
+        instance.get_vector_read().await.execute_batch("PRAGMA busy_timeout = 5000;").await?;
+
+        Ok(instance)
     }
 
     pub fn set_search_manager(&mut self, manager: Arc<SearchManager>) {
         self.search = manager;
     }
 
-    // Helper: Which connection to use?
-    fn get_core(&self) -> Result<Connection> { self.core_db.connect() }
-    fn get_data(&self) -> Result<Connection> { self.data_db.connect() }
-    fn get_log(&self) -> Result<Connection> { self.log_db.connect() }
-    fn get_sys(&self) -> Result<Connection> { self.sys_db.connect() }
-    fn get_vector(&self) -> Result<Connection> { self.vector_db.connect() }
+    // Helper: Get persistent connection
+    async fn get_core_read<'a>(&'a self) -> tokio::sync::MutexGuard<'a, Connection> { self.hot_conn_core.lock().await }
+    async fn get_data_read<'a>(&'a self) -> tokio::sync::MutexGuard<'a, Connection> { self.hot_conn_data.lock().await }
+    async fn get_log_read<'a>(&'a self) -> tokio::sync::MutexGuard<'a, Connection> { self.hot_conn_log.lock().await }
+    async fn get_sys_read<'a>(&'a self) -> tokio::sync::MutexGuard<'a, Connection> { self.hot_conn_sys.lock().await }
+    async fn get_vector_read<'a>(&'a self) -> tokio::sync::MutexGuard<'a, Connection> { self.hot_conn_vec.lock().await }
     
     
     async fn ensure_search_index(&self, collection_id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -379,9 +450,12 @@ impl ApexKit {
         Ok(())
     }
 
-    async fn sync_relations(&self, _conn: &Connection, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let read_conn = self.get_data()?;
-        let mut rows = read_conn.query("SELECT schema FROM collections WHERE id = ?1", params![collection_id]).await?;
+    // [FIXED] Use the `conn` passed in argument instead of acquiring a new lock
+    async fn sync_relations(&self, conn: &Connection, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // REMOVED: let read_conn = self.get_data_read().await; <-- Caused Deadlock
+        // USE: conn (passed from create_record/update_record)
+        
+        let mut rows = conn.query("SELECT schema FROM collections WHERE id = ?1", params![collection_id]).await?;
         
         if let Some(row) = rows.next().await? {
             let schema_str: Option<String> = row.get(0)?;
@@ -390,7 +464,6 @@ impl ApexKit {
 
                 for (rel_name, rel_def) in schema.relations {
                     if let Some(val) = data.get(&rel_name) {
-                        // DELETE old
                         self.data_batcher.execute(
                             "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2 AND rel_name=?3".into(),
                             vec![collection_id.into(), record_id.into(), rel_name.clone().into()]
@@ -405,10 +478,12 @@ impl ApexKit {
 
                         let identifier = &rel_def.target_collection;
                         let mut target_col_id: Option<i64> = None;
-                        let mut name_rows = read_conn.query("SELECT id FROM collections WHERE name = ?1", params![identifier.clone()]).await?;
+                        
+                        // Reuse `conn` for lookups
+                        let mut name_rows = conn.query("SELECT id FROM collections WHERE name = ?1", params![identifier.clone()]).await?;
                         if let Some(r) = name_rows.next().await? { target_col_id = Some(r.get(0)?); } 
                         else if let Ok(id_num) = identifier.parse::<i64>() {
-                             let mut id_rows = read_conn.query("SELECT id FROM collections WHERE id = ?1", params![id_num]).await?;
+                             let mut id_rows = conn.query("SELECT id FROM collections WHERE id = ?1", params![id_num]).await?;
                              if let Some(_) = id_rows.next().await? { target_col_id = Some(id_num); }
                         }
 
@@ -425,7 +500,6 @@ impl ApexKit {
         Ok(())
     }
 
-    // --- HELPER FOR OWNER EXPANSION ---
     async fn populate_owners_in_memory(
         &self,
         records: &mut [Record],
@@ -449,7 +523,6 @@ impl ApexKit {
         Ok(())
     }
 
-    // Recursive Helper
     fn hydrate_owners_recursive<'a>(
         &'a self,
         items: &'a mut Vec<ExpandableItem<'a>>, 
@@ -493,7 +566,6 @@ impl ApexKit {
                 }
             }
 
-            // --- PHASE 1: HYDRATE OWNERS (CURRENT LEVEL) ---
             if !owner_fields.is_empty() {
                 for item in items.iter_mut() {
                     if item.expand.is_none() {
@@ -544,7 +616,6 @@ impl ApexKit {
                 }
             }
 
-            // --- PHASE 2: RECURSE INTO RELATIONS ---
             for (rel_name, target_id, sub_paths_list) in relation_fields {
                 let sub_tree = crate::query::build_expand_tree_from_list(sub_paths_list);
                 if sub_tree.is_empty() { continue; }
@@ -567,7 +638,6 @@ impl ApexKit {
         })
     }
 
-    // Helper for Nested JSON Arrays (recursive)
     fn hydrate_json_values_recursive<'a>(
         &'a self,
         json_records: &'a mut [Value], 
@@ -729,7 +799,6 @@ async fn enforce_uniqueness(conn: &Connection, col_id: i64, record_id: Option<i6
         let mut missing_data = false;
 
         for field_name in field_group {
-            // FIX: Check BOTH fields AND relations
             let uid_opt = if let Some(def) = schema.fields.get(field_name) {
                 Some(def.uid.clone())
             } else if let Some(rel) = schema.relations.get(field_name) {
@@ -774,13 +843,11 @@ async fn commit_uniqueness(
     schema: &CollectionSchema
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
-    // 1. Cleanup old unique values for this record
     batcher.execute(
         "DELETE FROM _unique_values WHERE record_id = ?1".into(), 
         vec![record_id.into()]
     ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
 
-    // 2. Handle Single Field Unique Constraints
     for (name, def) in &schema.fields {
         if def.unique.unwrap_or(false) {
             if let Some(val) = data.get(name) {
@@ -796,7 +863,6 @@ async fn commit_uniqueness(
         }
     }
 
-    // 3. Handle Single Relation Unique Constraints (One-to-One)
     for (name, def) in &schema.relations {
         if def.relation_type == crate::schema::RelationType::One {
             if let Some(val) = data.get(name) {
@@ -812,13 +878,11 @@ async fn commit_uniqueness(
         }
     }
 
-    // 4. Handle Composite Unique Constraints
     for field_group in &schema.composite_unique {
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         let mut missing = false;
 
         for field_name in field_group {
-            // FIX: Check BOTH fields AND relations
             let uid_opt = if let Some(def) = schema.fields.get(field_name) {
                 Some(def.uid.clone())
             } else if let Some(rel) = schema.relations.get(field_name) {
@@ -857,7 +921,6 @@ async fn commit_uniqueness(
     Ok(())
 }
 
-// Generates an index name: idx_col_{collection_id}_{field_uid}
 fn sql_index_name(col_id: i64, field_uid: &str) -> String {
     format!("idx_col_{}_{}", col_id, field_uid)
 }
@@ -869,18 +932,15 @@ async fn reconcile_sql_indexes(
     old_schema: Option<&CollectionSchema>
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
-    // 1. Identify Indexes to Create
     for (name, def) in &new_schema.fields {
         if def.sql_indexed {
             let idx_name = sql_index_name(col_id, &def.uid);
             
-            // Check if already existed (if old schema exists)
             let exists = old_schema.map(|s| {
                 s.fields.get(name).map(|f| f.sql_indexed).unwrap_or(false)
             }).unwrap_or(false);
 
             if !exists {
-                // CREATE INDEX IF NOT EXISTS idx_name ON records (json_extract(data, '$.field')) WHERE collection_id = X
                 let sql = format!(
                     "CREATE INDEX IF NOT EXISTS {} ON records (json_extract(data, '$.{}')) WHERE collection_id = {}", 
                     idx_name, name, col_id
@@ -890,13 +950,12 @@ async fn reconcile_sql_indexes(
         }
     }
 
-    // 2. Identify Indexes to Drop (If field removed or sql_indexed set to false)
     if let Some(old) = old_schema {
         for (name, def) in &old.fields {
             let should_drop = if let Some(new_def) = new_schema.fields.get(name) {
-                def.sql_indexed && !new_def.sql_indexed // Existed, but now turned off
+                def.sql_indexed && !new_def.sql_indexed 
             } else {
-                def.sql_indexed // Field removed entirely
+                def.sql_indexed
             };
 
             if should_drop {
@@ -914,7 +973,7 @@ async fn reconcile_sql_indexes(
 impl Db for ApexKit {
     // --- API keys / Super tokens ---
     async fn create_api_key(&self, name: &str, role: &str, scope: &str, bypass_cors: bool) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let raw_key = format!("ak_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
         let prefix = raw_key[0..8].to_string();
         let hash = crate::auth::hash_password(&raw_key)?;
@@ -941,9 +1000,7 @@ impl Db for ApexKit {
     }
 
     async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
-        // [UPDATED] Select new columns. Using COALESCE/LEFT JOIN logic if migration isn't guaranteed is safer, 
-        // but since we updated schema, we select columns.
+        let conn = self.get_core_read().await;
         let mut rows = conn.query("SELECT id, name, prefix, hash, role, created_at, scope, bypass_cors FROM _api_keys ORDER BY created_at DESC", ()).await?;
         let mut keys = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -954,7 +1011,6 @@ impl Db for ApexKit {
                 hash: String::new(), 
                 role: row.get(4)?,
                 created_at: row.get(5)?,
-                // [NEW] Fields
                 scope: row.get(6).unwrap_or("root".to_string()),
                 bypass_cors: row.get(7).unwrap_or(false),
             });
@@ -963,15 +1019,14 @@ impl Db for ApexKit {
     }
 
     async fn delete_api_key(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.get_core()?.execute("DELETE FROM _api_keys WHERE id = ?1", params![id]).await?;
+        self.get_core_read().await.execute("DELETE FROM _api_keys WHERE id = ?1", params![id]).await?;
         Ok(())
     }
 
     async fn verify_api_key(&self, key: &str) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let prefix = if key.len() > 8 { &key[0..8] } else { key };
         
-        // [UPDATED] Select new columns
         let mut rows = conn.query("SELECT id, name, prefix, hash, role, created_at, scope, bypass_cors FROM _api_keys WHERE prefix = ?1", params![prefix]).await?;
         
         while let Some(row) = rows.next().await? {
@@ -999,18 +1054,15 @@ impl Db for ApexKit {
         let id = self.data_batcher.insert("INSERT INTO collections (name, schema) VALUES (?1, ?2)".into(), vec![name.into(), schema_str.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         
         if let Some(s) = schema {
-            // 1. OSE Index (Tantivy)
             if s.fields.values().any(|f| f.ose_indexed) { 
                 self.search.load_index(id, s)?; 
             }
-            // 2. SQL Index (B-Tree)
             reconcile_sql_indexes(&self.data_batcher, id, s, None).await?;
         }
         Ok(id)
     }
 
     async fn update_collection(&self, id: i64, name: Option<String>, schema: Option<CollectionSchema>) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
-        // Fetch existing for diffing
         let existing = self.get_collection(id).await?.ok_or("Not found")?;
         let old_schema = existing.schema;
 
@@ -1020,11 +1072,8 @@ impl Db for ApexKit {
             let s_str = serde_json::to_string(&s)?; 
             self.data_batcher.execute("UPDATE collections SET schema = ?1 WHERE id = ?2".into(), vec![s_str.into(), id.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?; 
             
-            // Reconcile SQL Indexes
             reconcile_sql_indexes(&self.data_batcher, id, s, old_schema.as_ref()).await?;
             
-            // Reload OSE (Tantivy) if needed
-            // Ideally we'd only do this if ose_indexed changed, but simple reload is safe
             if s.fields.values().any(|f| f.ose_indexed) {
                 self.search.load_index(id, s)?;
             }
@@ -1034,13 +1083,13 @@ impl Db for ApexKit {
     }
 
     async fn get_collection(&self, id: i64) -> std::result::Result<Option<Collection>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?;
+        let conn = self.get_data_read().await;
         let mut rows = conn.query("SELECT id, name, schema FROM collections WHERE id = ?1", params![id]).await?;
         match rows.next().await? { Some(row) => Ok(Some(row_to_collection(&row)?)), None => Ok(None) }
     }
 
     async fn list_collections(&self) -> std::result::Result<Vec<Collection>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?;
+        let conn = self.get_data_read().await;
         let mut rows = conn.query("SELECT id, name, schema FROM collections", ()).await?;
         let mut cols = Vec::new();
         while let Some(row) = rows.next().await? { cols.push(row_to_collection(&row)?); }
@@ -1062,22 +1111,34 @@ impl Db for ApexKit {
 
     // --- Records ---
 
+    // [OPTIMIZED] Bypass Mutex. Use fresh connection for READ checks. Writes go to batcher.
     async fn create_record(&self, collection_id: i64, data: &Value) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?; 
-        let col = self.get_collection(collection_id).await?.ok_or("Collection not found")?;
-        let schema = col.schema.unwrap_or_default();
+        // Transient connection for Reads (Schema check, Uniqueness check)
+        let conn = self.data_db.connect()?; 
         
+        let col = {
+            let mut rows = conn.query("SELECT id, name, schema FROM collections WHERE id = ?1", params![collection_id]).await?;
+            if let Some(row) = rows.next().await? {
+                Some(row_to_collection(&row)?)
+            } else { None }
+        }.ok_or("Collection not found")?;
+
+        let schema = col.schema.unwrap_or_default();
         let json_str = serde_json::to_string(data)?;
 
+        // READ Check
         enforce_uniqueness(&conn, collection_id, None, data, &schema).await?;
 
-        // [UPDATED] Uses defaults for created/updated
+        // WRITE (Async Batcher)
         let record_id = self.data_batcher.insert(
             "INSERT INTO records (collection_id, data) VALUES (?1, jsonb(?2))".into(),
             vec![collection_id.into(), json_str.into()]
         ).await?;
         
+        // Writes
         let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, data, &schema);
+        
+        // READ + Write (using transient conn for reads)
         let relation_future = self.sync_relations(&conn, collection_id, record_id, data);
 
         tokio::try_join!(unique_future, relation_future)?;
@@ -1085,36 +1146,21 @@ impl Db for ApexKit {
         Ok(record_id)
     }
 
-    // Import (Forced ID)
-    async fn import_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?; 
-        let col = self.get_collection(collection_id).await?.ok_or("Collection not found")?;
-        let schema = col.schema.unwrap_or_default();
-        let json_str = serde_json::to_string(data)?;
-
-        // 1. Enforce Uniqueness logic (skip if you trust the source, but safer to keep)
-        enforce_uniqueness(&conn, collection_id, Some(record_id), data, &schema).await?;
-
-        // 2. Insert with Specific ID
-        // Note: We use 'execute' here because we don't need the DB to generate an ID
-        self.data_batcher.execute(
-            "INSERT INTO records (id, collection_id, data) VALUES (?1, ?2, jsonb(?3))".into(),
-            vec![record_id.into(), collection_id.into(), json_str.into()] 
-        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
-        
-        // 3. Sync relations/uniqueness
-        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, data, &schema);
-        let relation_future = self.sync_relations(&conn, collection_id, record_id, data);
-        tokio::try_join!(unique_future, relation_future)?;
-
-        Ok(())
-    }
-
+    // [OPTIMIZED] Update
     async fn update_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<Record, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?;
-        let col = self.get_collection(collection_id).await?.ok_or("Col not found")?;
+        let conn = self.data_db.connect()?;
+
+        let col = {
+            let mut rows = conn.query("SELECT id, name, schema FROM collections WHERE id = ?1", params![collection_id]).await?;
+            if let Some(row) = rows.next().await? { Some(row_to_collection(&row)?) } else { None }
+        }.ok_or("Col not found")?;
+
         let schema = col.schema.unwrap_or_default();
-        let existing = self.get_record(collection_id, record_id, None).await?.ok_or("Rec not found")?;
+
+        let existing = {
+            let mut rows = conn.query("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2", params![collection_id, record_id]).await?;
+            if let Some(row) = rows.next().await? { Some(row_to_record(&row)?) } else { None }
+        }.ok_or("Rec not found")?;
         
         let mut merged_data = existing.data.clone();
         if let Some(obj) = merged_data.as_object_mut() {
@@ -1127,7 +1173,6 @@ impl Db for ApexKit {
 
         enforce_uniqueness(&conn, collection_id, Some(record_id), &merged_data, &schema).await?;
 
-        // [UPDATED] Set updated = CURRENT_TIMESTAMP
         self.data_batcher.execute(
             "UPDATE records SET data = jsonb(?1), updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND id = ?3".into(), 
             vec![json_str.into(), collection_id.into(), record_id.into()]
@@ -1143,8 +1188,34 @@ impl Db for ApexKit {
             data: merged_data, 
             expand: serde_json::json!({}).into(),
             created: existing.created,
-            updated: chrono::Utc::now().to_rfc3339() // Optimistic update
+            updated: chrono::Utc::now().to_rfc3339()
         })
+    }
+
+    // [OPTIMIZED] Import
+    async fn import_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.data_db.connect()?; 
+        
+        let col = {
+             let mut rows = conn.query("SELECT id, name, schema FROM collections WHERE id = ?1", params![collection_id]).await?;
+             if let Some(row) = rows.next().await? { Some(row_to_collection(&row)?) } else { None }
+        }.ok_or("Collection not found")?;
+
+        let schema = col.schema.unwrap_or_default();
+        let json_str = serde_json::to_string(data)?;
+
+        enforce_uniqueness(&conn, collection_id, Some(record_id), data, &schema).await?;
+
+        self.data_batcher.execute(
+            "INSERT INTO records (id, collection_id, data) VALUES (?1, ?2, jsonb(?3))".into(),
+            vec![record_id.into(), collection_id.into(), json_str.into()] 
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, data, &schema);
+        let relation_future = self.sync_relations(&conn, collection_id, record_id, data);
+        tokio::try_join!(unique_future, relation_future)?;
+
+        Ok(())
     }
 
     async fn delete_record(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1188,91 +1259,120 @@ impl Db for ApexKit {
         self.search.delete_record(collection_id, record_id).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn StdError + Send + Sync>)
     }
 
+    // [FIXED] Scoped lock to prevent deadlock during populate_owners
     async fn list_records(&self, collection_id: i64, options: QueryOptions) -> std::result::Result<ListResult, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?;
-        
-        let mut schema_map = HashMap::new();
-        let mut id_map = HashMap::new();
-        let mut current_col_name = String::new();
+        let (mut records, total) = {
+            let conn = self.get_data_read().await;
+            
+            let mut schema_map = HashMap::new();
+            let mut id_map = HashMap::new();
+            let mut current_col_name = String::new();
 
-        if let Some(ref ex) = options.expand {
-            if !ex.trim().is_empty() {
-                let all_cols = self.list_collections().await?;
-                for c in all_cols {
-                    if c.id == collection_id { current_col_name = c.name.clone(); }
-                    if let Some(s) = c.schema { 
-                        schema_map.insert(c.name.clone(), s.clone()); 
-                        schema_map.insert(c.id.to_string(), s); 
-                    }
-                    id_map.insert(c.name.clone(), c.id); 
-                    id_map.insert(c.id.to_string(), c.id);
+            // We need to fetch collection metadata. 
+            // Since we hold the lock 'conn', we CANNOT call self.list_collections() or self.get_collection().
+            // We must execute raw SQL on 'conn' here.
+            
+            // 1. Fetch current collection name
+            {
+                let mut rows = conn.query("SELECT name FROM collections WHERE id = ?1", params![collection_id]).await?;
+                if let Some(row) = rows.next().await? {
+                    current_col_name = row.get(0)?;
+                } else {
+                     return Ok(ListResult { items: vec![], total: 0 });
                 }
             }
-        }
-        
-        if current_col_name.is_empty() {
-             if let Some(c) = self.get_collection(collection_id).await? {
-                 current_col_name = c.name;
-             } else {
-                 return Ok(ListResult { items: vec![], total: 0 });
-             }
-        }
 
-        let builder = query::SqlBuilder::new(collection_id, &current_col_name, options.clone(), &schema_map, &id_map);
-        
-        let mut count_rows = conn.query(&builder.count_sql, builder.params.clone()).await?;
-        let total = if let Some(row) = count_rows.next().await? { row.get::<i64>(0)? } else { 0 };
+            // 2. Fetch schemas if expanding (Raw SQL)
+            if let Some(ref ex) = options.expand {
+                if !ex.trim().is_empty() {
+                    let mut rows = conn.query("SELECT id, name, schema FROM collections", ()).await?;
+                    while let Some(row) = rows.next().await? {
+                        let id: i64 = row.get(0)?;
+                        let name: String = row.get(1)?;
+                        let schema_str: Option<String> = row.get(2)?;
+                        let schema = match schema_str { Some(s) => serde_json::from_str(&s).unwrap_or_default(), None => CollectionSchema::default() };
+                        
+                        schema_map.insert(name.clone(), schema.clone());
+                        schema_map.insert(id.to_string(), schema);
+                        id_map.insert(name, id);
+                        id_map.insert(id.to_string(), id);
+                    }
+                }
+            }
 
-        let mut rows = conn.query(&builder.base_sql, builder.params).await?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next().await? { 
-            records.push(row_to_record(&row)?); 
-        }
-        
+            let builder = query::SqlBuilder::new(collection_id, &current_col_name, options.clone(), &schema_map, &id_map);
+            
+            let mut count_rows = conn.query(&builder.count_sql, builder.params.clone()).await?;
+            let total = if let Some(row) = count_rows.next().await? { row.get::<i64>(0)? } else { 0 };
+
+            let mut rows = conn.query(&builder.base_sql, builder.params).await?;
+            let mut recs = Vec::new();
+            while let Some(row) = rows.next().await? { 
+                recs.push(row_to_record(&row)?); 
+            }
+            (recs, total)
+        }; // Lock 'conn' is dropped here
+
+        // Now safe to call populate_owners_in_memory which might acquire new locks internally
         self.populate_owners_in_memory(&mut records, collection_id, options.expand.as_ref()).await?;
 
         Ok(ListResult { items: records, total })
     }
 
+    // [FIXED] Scoped lock to prevent deadlock
     async fn get_record(&self, collection_id: i64, record_id: i64, expand: Option<String>) -> std::result::Result<Option<Record>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?;
-        
-        let mut record_opt = if expand.is_none() || expand.as_ref().unwrap().trim().is_empty() {
-            let mut rows = conn.query(
-                "SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2", 
-                params![collection_id, record_id]
-            ).await?;
-            match rows.next().await? { Some(row) => Some(row_to_record(&row)?), None => None }
-        } else {
-            let expand_str = expand.clone().unwrap();
-            let all_cols = self.list_collections().await?;
-            let mut schema_map = HashMap::new(); 
-            let mut id_map = HashMap::new(); 
-            let mut current_col_name = String::new();
-
-            for c in all_cols {
-                if c.id == collection_id { current_col_name = c.name.clone(); }
-                if let Some(s) = c.schema { 
-                    schema_map.insert(c.name.clone(), s.clone()); 
-                    schema_map.insert(c.id.to_string(), s); 
-                }
-                id_map.insert(c.name.clone(), c.id); 
-                id_map.insert(c.id.to_string(), c.id);
-            }
-
-            let paths = crate::query::smart_split(&expand_str);
-            let expand_json_sql = crate::query::build_expand_json_object(
-                paths, "records", 0, &current_col_name, collection_id, &schema_map, &id_map
-            );
-
-            let sql = format!(
-                "SELECT id, json(data), {}, created, updated FROM records WHERE collection_id = ?1 AND id = ?2", 
-                expand_json_sql
-            );
+        let mut record_opt = {
+            let conn = self.get_data_read().await;
             
-            let mut rows = conn.query(&sql, params![collection_id, record_id]).await?;
-            match rows.next().await? { Some(row) => Some(row_to_record(&row)?), None => None }
-        };
+            if expand.is_none() || expand.as_ref().unwrap().trim().is_empty() {
+                let mut rows = conn.query(
+                    "SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2", 
+                    params![collection_id, record_id]
+                ).await?;
+                match rows.next().await? { Some(row) => Some(row_to_record(&row)?), None => None }
+            } else {
+                let expand_str = expand.clone().unwrap();
+                
+                // Raw SQL for metadata to avoid recursive lock
+                let mut schema_map = HashMap::new(); 
+                let mut id_map = HashMap::new(); 
+                let mut current_col_name = String::new();
+
+                // Get current name
+                {
+                    let mut rows = conn.query("SELECT name FROM collections WHERE id = ?1", params![collection_id]).await?;
+                    if let Some(row) = rows.next().await? { current_col_name = row.get(0)?; }
+                }
+
+                // Get schemas
+                {
+                    let mut rows = conn.query("SELECT id, name, schema FROM collections", ()).await?;
+                    while let Some(row) = rows.next().await? {
+                        let id: i64 = row.get(0)?;
+                        let name: String = row.get(1)?;
+                        let schema_str: Option<String> = row.get(2)?;
+                        let schema = match schema_str { Some(s) => serde_json::from_str(&s).unwrap_or_default(), None => CollectionSchema::default() };
+                        schema_map.insert(name.clone(), schema.clone());
+                        schema_map.insert(id.to_string(), schema);
+                        id_map.insert(name, id);
+                        id_map.insert(id.to_string(), id);
+                    }
+                }
+
+                let paths = crate::query::smart_split(&expand_str);
+                let expand_json_sql = crate::query::build_expand_json_object(
+                    paths, "records", 0, &current_col_name, collection_id, &schema_map, &id_map
+                );
+
+                let sql = format!(
+                    "SELECT id, json(data), {}, created, updated FROM records WHERE collection_id = ?1 AND id = ?2", 
+                    expand_json_sql
+                );
+                
+                let mut rows = conn.query(&sql, params![collection_id, record_id]).await?;
+                match rows.next().await? { Some(row) => Some(row_to_record(&row)?), None => None }
+            }
+        }; // Lock 'conn' dropped
 
         if let Some(rec) = &mut record_opt {
              let mut single_vec = vec![rec.clone()];
@@ -1293,7 +1393,7 @@ impl Db for ApexKit {
         // 2. Fetch raw records from DB (Returned in arbitrary order)
         let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
         let sql = format!("SELECT id, json(data), NULL, created, updated FROM records WHERE id IN ({})", id_list);
-        let conn = self.get_data()?;
+        let conn = self.get_data_read().await;
         let mut rows = conn.query(&sql, ()).await?;
         
         let mut records = Vec::new();
@@ -1337,13 +1437,12 @@ impl Db for ApexKit {
                     
                     // 1. Get DB Count
                     let db_count_res = {
-                        if let Ok(conn) = db.get_data() {
-                            let stmt = conn.prepare("SELECT COUNT(*) FROM records WHERE collection_id = ?").await.ok()?;
-                            let mut rows = stmt.query(params![col.id]).await.ok()?;
-                            if let Some(row) = rows.next().await.ok()? {
-                                Some(row.get::<i64>(0).unwrap_or(0) as u64)
-                            } else { Some(0) }
-                        } else { None }
+                        let conn = db.get_data_read().await;
+                        let stmt = conn.prepare("SELECT COUNT(*) FROM records WHERE collection_id = ?").await.ok()?;
+                        let mut rows = stmt.query(params![col.id]).await.ok()?;
+                        if let Some(row) = rows.next().await.ok()? {
+                            Some(row.get::<i64>(0).unwrap_or(0) as u64)
+                        } else { Some(0) }
                     };
 
                     let db_count = db_count_res.unwrap_or(0);
@@ -1398,7 +1497,7 @@ impl Db for ApexKit {
         self.search.delete_index(id).map_err(|e| format!("Search Delete Error: {}", e))?; 
         self.search.load_index(id, &schema).map_err(|e| format!("Search Load Error: {}", e))?;
         
-        let conn = self.get_data().map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
+        let conn = self.get_data_read().await;
         let mut rows = conn.query("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1", params![id])
             .await
             .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
@@ -1435,7 +1534,7 @@ impl Db for ApexKit {
 
     // --- Core DB (Users, Auth, Settings) ---
     async fn create_user(&self, e: &str, p: &str, r: &str, metadata: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let meta = metadata.unwrap_or(json!({}));
         let meta_str = serde_json::to_string(&meta)?;
         conn.execute("INSERT INTO users (email, password_hash, role, metadata) VALUES (?1, ?2, ?3, ?4)", params![e, p, r, meta_str]).await?;
@@ -1450,7 +1549,7 @@ impl Db for ApexKit {
 
     // Import User (Forced ID)
     async fn import_user(&self, id: i64, e: &str, p: &str, r: &str, metadata: Option<Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let meta = metadata.unwrap_or(json!({}));
         let meta_str = serde_json::to_string(&meta)?;
         
@@ -1463,7 +1562,7 @@ impl Db for ApexKit {
     }
 
     async fn get_user_by_email(&self, email: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let mut r = conn.query("SELECT id, email, password_hash, role, metadata FROM users WHERE email = ?1", params![email]).await?;
         if let Some(row) = r.next().await? { 
             let meta_str: String = row.get(4).unwrap_or("{}".to_string());
@@ -1478,7 +1577,7 @@ impl Db for ApexKit {
     }
 
     async fn list_users(&self, query: Option<String>, limit: i64, offset: i64) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let sql = if let Some(q) = query {
             format!("SELECT id, email, password_hash, role, metadata FROM users WHERE email LIKE '%{}%' ORDER BY id DESC LIMIT {} OFFSET {}", q, limit, offset)
         } else {
@@ -1501,7 +1600,7 @@ impl Db for ApexKit {
     }
 
     async fn count_users(&self, query: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let sql = if let Some(q) = query {
             format!("SELECT COUNT(*) FROM users WHERE email LIKE '%{}%'", q)
         } else {
@@ -1516,7 +1615,7 @@ impl Db for ApexKit {
         let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
         let sql = format!("SELECT id, email, password_hash, role, metadata FROM users WHERE id IN ({})", id_list);
         
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let mut rows = conn.query(&sql, ()).await?;
         let mut users = Vec::new();
         while let Some(row) = rows.next().await? { 
@@ -1532,9 +1631,9 @@ impl Db for ApexKit {
         Ok(users)
     }
 
-    async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core()?.execute("DELETE FROM users WHERE id = ?1", params![id]).await?; Ok(()) }
+    async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core_read().await.execute("DELETE FROM users WHERE id = ?1", params![id]).await?; Ok(()) }
     async fn get_user_by_oauth(&self, p: &str, pid: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let mut r = conn.query("SELECT u.id, u.email, u.password_hash, u.role, u.metadata FROM users u JOIN auth_identities ai ON u.id = ai.user_id WHERE ai.provider = ?1 AND ai.provider_id = ?2", params![p, pid]).await?;
         if let Some(row) = r.next().await? { 
             let meta_str: String = row.get(4).unwrap_or("{}".to_string());
@@ -1547,16 +1646,16 @@ impl Db for ApexKit {
             })) 
         } else { Ok(None) }
     }
-    async fn link_oauth(&self, uid: i64, p: &str, pid: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core()?.execute("INSERT INTO auth_identities (user_id, provider, provider_id) VALUES (?1, ?2, ?3)", params![uid, p, pid]).await?; Ok(()) }
-    async fn create_auth_token(&self, uid: i64, t: &str, tk: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core()?.execute("INSERT INTO auth_tokens (token, user_id, type, expires_at) VALUES (?1, ?2, ?3, datetime('now', '+1 hour'))", params![tk, uid, t]).await?; Ok(()) }
+    async fn link_oauth(&self, uid: i64, p: &str, pid: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core_read().await.execute("INSERT INTO auth_identities (user_id, provider, provider_id) VALUES (?1, ?2, ?3)", params![uid, p, pid]).await?; Ok(()) }
+    async fn create_auth_token(&self, uid: i64, t: &str, tk: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core_read().await.execute("INSERT INTO auth_tokens (token, user_id, type, expires_at) VALUES (?1, ?2, ?3, datetime('now', '+1 hour'))", params![tk, uid, t]).await?; Ok(()) }
     async fn consume_auth_token(&self, tk: &str, t: &str) -> std::result::Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let mut r = conn.query("SELECT user_id FROM auth_tokens WHERE token = ?1 AND type = ?2 AND expires_at > datetime('now')", params![tk, t]).await?;
         if let Some(row) = r.next().await? { let uid: i64 = row.get(0)?; conn.execute("DELETE FROM auth_tokens WHERE token = ?1", params![tk]).await?; Ok(Some(uid)) } else { Ok(None) }
     }
-    async fn set_user_verified(&self, uid: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core()?.execute("UPDATE users SET is_verified = 1 WHERE id = ?1", params![uid]).await?; Ok(()) }
+    async fn set_user_verified(&self, uid: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core_read().await.execute("UPDATE users SET is_verified = 1 WHERE id = ?1", params![uid]).await?; Ok(()) }
     async fn get_config(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let mut rows = conn.query("SELECT value FROM _system_config_settings WHERE key = ?1", params![key]).await?;
         if let Some(row) = rows.next().await? { 
             let v_str: String = row.get(0)?; 
@@ -1566,7 +1665,7 @@ impl Db for ApexKit {
         }
     }
     async fn set_config(&self, key: &str, value: &serde_json::Value, encrypted: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let v_str = serde_json::to_string(value)?;
         conn.execute(
             "INSERT INTO _system_config_settings (key, value, encrypted, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP) 
@@ -1576,7 +1675,7 @@ impl Db for ApexKit {
         Ok(())
     }
     async fn list_configs(&self) -> std::result::Result<Vec<models::ConfigItem>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         let mut rows = conn.query("SELECT key, value, encrypted, updated_at FROM _system_config_settings ORDER BY key ASC", ()).await?;
         let mut items = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -1607,7 +1706,7 @@ impl Db for ApexKit {
         Ok(items)
     }
     async fn delete_config(&self, key: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         conn.execute("DELETE FROM _system_config_settings WHERE key = ?1", params![key]).await?;
         Ok(())
     }
@@ -1617,19 +1716,19 @@ impl Db for ApexKit {
         self.data_batcher.insert("INSERT INTO _storage_files (filename, original_name, mime_type, size, user_id) VALUES (?1, ?2, ?3, ?4, ?5)".into(), vec![f.into(), o.into(), m.into(), s.into(), u.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)
     }
     async fn list_files(&self, limit: i64, offset: i64) -> std::result::Result<Vec<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?;
+        let conn = self.get_data_read().await;
         let mut rows = conn.query("SELECT id, filename, original_name, mime_type, size, created_at FROM _storage_files ORDER BY created_at DESC LIMIT ?1 OFFSET ?2", params![limit, offset]).await?;
         let mut files = Vec::new();
         while let Some(row) = rows.next().await? { files.push(models::StoredFile { id: row.get(0)?, filename: row.get(1)?, original_name: row.get(2)?, mime_type: row.get(3)?, size: row.get(4)?, created_at: row.get(5)? }); }
         Ok(files)
     }
     async fn count_files(&self) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?;
+        let conn = self.get_data_read().await;
         let mut row = conn.query("SELECT COUNT(*) FROM _storage_files", ()).await?;
         if let Some(r) = row.next().await? { Ok(r.get(0)?) } else { Ok(0) }
     }
     async fn get_file_metadata(&self, id: i64) -> std::result::Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?;
+        let conn = self.get_data_read().await;
         let mut rows = conn.query("SELECT id, filename, original_name, mime_type, size, created_at FROM _storage_files WHERE id = ?1", params![id]).await?;
         if let Some(row) = rows.next().await? { Ok(Some(models::StoredFile { id: row.get(0)?, filename: row.get(1)?, original_name: row.get(2)?, mime_type: row.get(3)?, size: row.get(4)?, created_at: row.get(5)? })) } else { Ok(None) }
     }
@@ -1648,7 +1747,7 @@ impl Db for ApexKit {
         Ok(())
     }
     async fn list_audit_logs(&self) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_log()?;
+        let conn = self.get_log_read().await;
         let mut rows = conn.query("SELECT id, level, message, source, meta, timestamp FROM _audit_logs ORDER BY timestamp DESC LIMIT 100", ()).await?;
         let mut logs = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -1668,7 +1767,7 @@ impl Db for ApexKit {
 
     // --- System DB ---
     async fn list_ai_actions(&self) -> std::result::Result<Vec<ai_models::AiAction>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut rows = conn.query("SELECT id, slug, name, model, system_prompt, template, config FROM _ai_actions", ()).await?;
         let mut res = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -1678,7 +1777,7 @@ impl Db for ApexKit {
         Ok(res)
     }
     async fn get_ai_action(&self, slug: &str) -> std::result::Result<Option<ai_models::AiAction>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut rows = conn.query("SELECT id, slug, name, model, system_prompt, template, config FROM _ai_actions WHERE slug = ?1", params![slug]).await?;
         if let Some(row) = rows.next().await? {
             let conf_str: String = row.get(6).unwrap_or("{}".to_string());
@@ -1686,13 +1785,13 @@ impl Db for ApexKit {
         } else { Ok(None) }
     }
     async fn create_ai_action(&self, req: ai_models::CreateActionReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         conn.execute("INSERT INTO _ai_actions (slug, name, model, system_prompt, template, config) VALUES (?1, ?2, ?3, ?4, ?5, '{}')", params![req.slug, req.name, req.model, req.system_prompt, req.template]).await?;
         Ok(conn.last_insert_rowid())
     }
-    async fn delete_ai_action(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("DELETE FROM _ai_actions WHERE id = ?1", params![id]).await?; Ok(()) }
+    async fn delete_ai_action(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("DELETE FROM _ai_actions WHERE id = ?1", params![id]).await?; Ok(()) }
     async fn create_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
-        self.get_sys()?.execute(
+        self.get_sys_read().await.execute(
             "INSERT INTO _ai_sessions (id, name, messages, current_manifest, pending_manifest, diff_summary, last_error, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", 
             params![
                 s.id.clone(), 
@@ -1708,7 +1807,7 @@ impl Db for ApexKit {
         Ok(()) 
     }
     async fn get_ai_session(&self, id: &str) -> std::result::Result<Option<AiSession>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut r = conn.query("SELECT id, name, messages, current_manifest, pending_manifest, diff_summary, last_error, created_at FROM _ai_sessions WHERE id = ?1", params![id]).await?;
         
         if let Some(row) = r.next().await? {
@@ -1730,7 +1829,7 @@ impl Db for ApexKit {
     }
 
     async fn update_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
-        self.get_sys()?.execute(
+        self.get_sys_read().await.execute(
             "UPDATE _ai_sessions SET messages = ?1, current_manifest = ?2, pending_manifest = ?3, diff_summary = ?4, last_error = ?5 WHERE id = ?6", 
             params![
                 serde_json::to_string(&s.messages)?, 
@@ -1745,7 +1844,7 @@ impl Db for ApexKit {
     }
 
     async fn list_ai_sessions(&self) -> std::result::Result<Vec<AiSession>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut r = conn.query("SELECT id, name, messages, current_manifest, pending_manifest, diff_summary, last_error, created_at FROM _ai_sessions ORDER BY created_at DESC", ()).await?;
         let mut s = Vec::new();
         while let Some(row) = r.next().await? {
@@ -1766,16 +1865,16 @@ impl Db for ApexKit {
         }
         Ok(s)
     }
-    async fn save_plugin(&self, p: &Plugin) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("INSERT INTO _plugins (id, name, version, manifest, description) VALUES (?1, ?2, ?3, ?4, ?5)", params![p.id.clone(), p.name.clone(), p.version.clone(), serde_json::to_string(&p.manifest)?, p.description.clone()]).await?; Ok(()) }
+    async fn save_plugin(&self, p: &Plugin) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("INSERT INTO _plugins (id, name, version, manifest, description) VALUES (?1, ?2, ?3, ?4, ?5)", params![p.id.clone(), p.name.clone(), p.version.clone(), serde_json::to_string(&p.manifest)?, p.description.clone()]).await?; Ok(()) }
     async fn list_plugins(&self) -> std::result::Result<Vec<Plugin>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut r = conn.query("SELECT id, name, version, manifest, description FROM _plugins ORDER BY created_at DESC", ()).await?;
         let mut p = Vec::new();
         while let Some(row) = r.next().await? { let m_str: String = row.get(3)?; p.push(Plugin { id: row.get(0)?, name: row.get(1)?, version: row.get(2)?, manifest: serde_json::from_str(&m_str)?, description: row.get(4)? }); }
         Ok(p)
     }
     async fn list_scripts(&self) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts", ()).await?;
         let mut v = Vec::new();
         while let Some(row) = r.next().await? { 
@@ -1792,7 +1891,7 @@ impl Db for ApexKit {
     }
 
     async fn create_script(&self, req: script_models::CreateScriptReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut rows = conn.query(
             "INSERT INTO _scripts (name, trigger_type, code, target_collection) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, target_collection=excluded.target_collection, created_at=CURRENT_TIMESTAMP RETURNING id", 
             params![req.name, req.trigger_type, req.code, req.target_collection]
@@ -1800,10 +1899,10 @@ impl Db for ApexKit {
         if let Some(row) = rows.next().await? { Ok(row.get(0)?) } else { Err("Failed".into()) }
     }
 
-    async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("DELETE FROM _scripts WHERE id = ?1", params![id]).await?; Ok(()) }
+    async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("DELETE FROM _scripts WHERE id = ?1", params![id]).await?; Ok(()) }
     
     async fn get_script_by_name(&self, name: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts WHERE name = ?1", params![name]).await?;
         if let Some(row) = r.next().await? { 
             Ok(Some(script_models::Script { 
@@ -1818,7 +1917,7 @@ impl Db for ApexKit {
     }
 
     async fn get_scripts_by_trigger(&self, t: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts WHERE trigger_type = ?1 AND active = 1", params![t]).await?;
         let mut v = Vec::new();
         while let Some(row) = r.next().await? { 
@@ -1834,24 +1933,24 @@ impl Db for ApexKit {
         Ok(v)
     }
     async fn list_templates(&self) -> std::result::Result<Vec<models::Template>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut r = conn.query("SELECT id, slug, content, script_id, created_at FROM _templates", ()).await?;
         let mut v = Vec::new();
         while let Some(row) = r.next().await? { v.push(models::Template { id: row.get(0)?, slug: row.get(1)?, content: row.get(2)?, script_id: row.get(3)?, created_at: row.get(4)? }); }
         Ok(v)
     }
     async fn get_template_by_slug(&self, s: &str) -> std::result::Result<Option<models::Template>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut r = conn.query("SELECT id, slug, content, script_id, created_at FROM _templates WHERE slug = ?1", params![s]).await?;
         if let Some(row) = r.next().await? { Ok(Some(models::Template { id: row.get(0)?, slug: row.get(1)?, content: row.get(2)?, script_id: row.get(3)?, created_at: row.get(4)? })) } else { Ok(None) }
     }
     async fn create_template(&self, req: models::CreateTemplateReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys()?;
+        let conn = self.get_sys_read().await;
         let mut rows = conn.query("INSERT INTO _templates (slug, content, script_id) VALUES (?1, ?2, ?3) ON CONFLICT(slug) DO UPDATE SET content=excluded.content, script_id=excluded.script_id, created_at=CURRENT_TIMESTAMP RETURNING id", params![req.slug, req.content, req.script_id]).await?;
         if let Some(row) = rows.next().await? { Ok(row.get(0)?) } else { Err("Failed".into()) }
     }
-    async fn update_template(&self, id: i64, content: String, script_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("UPDATE _templates SET content = ?1, script_id = ?2 WHERE id = ?3", params![content, script_id, id]).await?; Ok(()) }
-    async fn delete_template(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys()?.execute("DELETE FROM _templates WHERE id = ?1", params![id]).await?; Ok(()) }
+    async fn update_template(&self, id: i64, content: String, script_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("UPDATE _templates SET content = ?1, script_id = ?2 WHERE id = ?3", params![content, script_id, id]).await?; Ok(()) }
+    async fn delete_template(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("DELETE FROM _templates WHERE id = ?1", params![id]).await?; Ok(()) }
 
     async fn create_relation(&self, oc: i64, oi: i64, tc: i64, ti: i64, rn: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.data_batcher.execute("INSERT INTO _relations (origin_col_id, origin_rec_id, target_col_id, target_rec_id, rel_name) VALUES (?1, ?2, ?3, ?4, ?5)".into(), vec![oc.into(), oi.into(), tc.into(), ti.into(), rn.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?; Ok(())
@@ -1864,7 +1963,7 @@ impl Db for ApexKit {
         Ok(())
     }
     async fn get_related_ids(&self, oc: i64, oi: i64, rn: &str) -> std::result::Result<Vec<(i64, i64)>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_data()?;
+        let conn = self.get_data_read().await;
         let mut rows = conn.query("SELECT target_col_id, target_rec_id FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2 AND rel_name=?3", params![oc, oi, rn]).await?;
         let mut results = Vec::new(); while let Some(row) = rows.next().await? { results.push((row.get(0)?, row.get(1)?)); } Ok(results)
     }
@@ -1872,7 +1971,7 @@ impl Db for ApexKit {
         if ids.is_empty() { return Ok(vec![]); }
         let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
         let sql = format!("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ? AND id IN ({})", id_list);
-        let conn = self.get_data()?;
+        let conn = self.get_data_read().await;
         let mut rows = conn.query(&sql, params![collection_id]).await?;
         let mut records = Vec::new();
         while let Some(row) = rows.next().await? { records.push(row_to_record(&row)?); }
@@ -1881,19 +1980,16 @@ impl Db for ApexKit {
 
     // --- Tenants ---
     async fn register_tenant(&self, id: &str, owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Implementation logic (e.g. insert into _tenants table in root core.db)
-        // Since register_tenant was discussed earlier as part of the core logic update but missed in the trait,
-        // we add a basic implementation here targeting the core DB.
-        let conn = self.get_core()?;
+        let conn = self.get_core_read().await;
         conn.execute("INSERT INTO _tenants (id, owner_id) VALUES (?1, ?2)", params![id, owner_id]).await?;
         Ok(())
     }
 
     // --- Dashboard ---
     async fn get_dashboard_stats(&self) -> std::result::Result<DashboardData, Box<dyn std::error::Error + Send + Sync>> {
-        let data_conn = self.get_data()?;
-        let log_conn = self.get_log()?;
-        let sys_conn = self.get_sys()?;
+        let data_conn = self.get_data_read().await;
+        let log_conn = self.get_log_read().await;
+        let sys_conn = self.get_sys_read().await;
 
         // 1. Collections Count
         let mut row = data_conn.query("SELECT COUNT(*) FROM collections", ()).await?;
@@ -2005,7 +2101,7 @@ impl Db for ApexKit {
     }
     // Check vector existence
     async fn has_vector(&self, collection_id: i64, record_id: i64, field_name: &str, model: &str) -> std::result::Result<bool, Box<dyn StdError + Send + Sync>> {
-        let conn = self.get_vector()?;
+        let conn = self.get_vector_read().await;
         let mut rows = conn.query(
             "SELECT 1 FROM vectors WHERE collection_id = ?1 AND record_id = ?2 AND field_name = ?3 AND model = ?4", 
             params![collection_id, record_id, field_name, model]
@@ -2015,7 +2111,7 @@ impl Db for ApexKit {
     }
 
     async fn get_record_vectors(&self, collection_id: i64, record_id: i64) -> std::result::Result<Vec<models::VectorRecord>, Box<dyn StdError + Send + Sync>> {
-        let conn = self.get_vector()?;
+        let conn = self.get_vector_read().await;
         let mut rows = conn.query(
             "SELECT field_name, vector, model FROM vectors WHERE collection_id = ?1 AND record_id = ?2",
             params![collection_id, record_id]
@@ -2053,7 +2149,7 @@ impl Db for ApexKit {
     // VECTORS: Implement get_vectors_for_collection
     // Filter by model so we don't load incompatible vectors into HNSW
     async fn get_vectors_for_collection(&self, collection_id: i64, model: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> {
-        let conn = self.get_vector()?; 
+        let conn = self.get_vector_read().await; 
         let mut rows = conn.query(
             "SELECT record_id, field_name, vector FROM vectors WHERE collection_id = ?1 AND model = ?2", 
             params![collection_id, model.to_string()]
@@ -2090,72 +2186,6 @@ impl Db for ApexKit {
     }
 }
 
-// DUMMY Provider for Core initialization
-#[allow(dead_code)]
-struct NoOpVectorProvider;
-#[async_trait]
-impl VectorProvider for NoOpVectorProvider {
-    async fn embed(&self, _text: &str) -> std::result::Result<Vec<f32>, String> { Err("Vector search not enabled in core".into()) }
-    async fn search(&self, _c: i64, _f: &str, _v: &[f32], _l: usize) -> std::result::Result<Vec<(i64, f32)>, String> { Ok(vec![]) }
-    async fn index(&self, _c: i64, _r: i64, _f: &str, _v: &[f32]) -> std::result::Result<(), String> { Ok(()) }
-}
-
-// --- Constructor ---
-pub async fn a_new_database_connection(
-    vector_provider: Arc<dyn VectorProvider>
-) -> std::result::Result<ApexKit, Box<dyn std::error::Error + Send + Sync>> {
-    
-    // Ensure the new centralized directory structure exists
-    let base_dirs = vec![
-        "storage/system",
-        "storage/system/uploads",
-        "storage/system/indexes",
-        "storage/tenants",
-        "storage/sandboxes",
-        "storage/tmp"
-    ];
-
-    for dir in base_dirs {
-        // [FIX] Convert IO error to Box<dyn Error>
-        std::fs::create_dir_all(dir).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    }
-
-    // Connect to DBs (Errors here are libsql::Error, need boxing)
-    let core = Builder::new_local("storage/system/core.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    let data = Builder::new_local("storage/system/data.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    let log = Builder::new_local("storage/system/logs.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    let sys = Builder::new_local("storage/system/system.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    let vec = Builder::new_local("storage/system/vectors.db").build().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-    // Helper to map errors for async blocks below
-    let map_err = |e: libsql::Error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) };
-
-    apply_pragmas(&core).await.map_err(map_err)?;
-    apply_pragmas(&data).await.map_err(map_err)?;
-    apply_pragmas(&log).await.map_err(map_err)?;
-    apply_pragmas(&sys).await.map_err(map_err)?;
-    apply_pragmas(&vec).await.map_err(map_err)?;
-
-    setup_core(&core).await.map_err(map_err)?;
-    setup_data(&data).await.map_err(map_err)?;
-    setup_logs(&log).await.map_err(map_err)?;
-    setup_sys(&sys).await.map_err(map_err)?;
-    setup_vectors(&vec).await.map_err(map_err)?;
-
-    let mut instance = ApexKit::new(
-        Arc::new(core), 
-        Arc::new(data), 
-        Arc::new(log), 
-        Arc::new(sys), 
-        Arc::new(vec), 
-        vector_provider
-    );
-    
-    instance.set_search_manager(Arc::new(SearchManager::new("storage/system/indexes")));
-
-    Ok(instance)
-}
-
 // --- OPTIMIZATION: PRAGMAS ---
 async fn apply_pragmas(db: &Database) -> Result<()> {
     let conn = db.connect()?;
@@ -2173,10 +2203,7 @@ async fn apply_pragmas(db: &Database) -> Result<()> {
 async fn setup_core(db: &Database) -> Result<()> {
     let conn = db.connect()?;
     
-    // [UPDATED] Added metadata column
     conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL, is_verified BOOLEAN DEFAULT 0, metadata JSON DEFAULT '{}')", ()).await?;
-    
-    // Migration for existing tables
     let _ = conn.execute("ALTER TABLE users ADD COLUMN metadata JSON DEFAULT '{}'", ()).await;
 
     conn.execute("CREATE TABLE IF NOT EXISTS auth_identities (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, provider TEXT NOT NULL, provider_id TEXT NOT NULL)", ()).await?;
@@ -2193,21 +2220,44 @@ async fn setup_core(db: &Database) -> Result<()> {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )", ()).await?;
     
-    // Migration for existing tables
     let _ = conn.execute("ALTER TABLE _api_keys ADD COLUMN scope TEXT DEFAULT 'root'", ()).await;
     let _ = conn.execute("ALTER TABLE _api_keys ADD COLUMN bypass_cors BOOLEAN DEFAULT 0", ()).await;
 
+    conn.execute("CREATE TABLE IF NOT EXISTS _tenants (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        owner_id INTEGER,
+        status TEXT DEFAULT 'active',
+        tier TEXT DEFAULT 'free',
+        max_storage_mb INTEGER DEFAULT 500,
+        current_storage_mb REAL DEFAULT 0,
+        max_vectors INTEGER DEFAULT 10000,
+        current_vectors INTEGER DEFAULT 0,
+        max_ai_requests INTEGER DEFAULT 100,
+        current_ai_requests INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )", ()).await?;
+
+    conn.execute("CREATE TABLE IF NOT EXISTS _sandboxes (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        owner_id INTEGER,
+        status TEXT DEFAULT 'active',
+        max_storage_mb INTEGER DEFAULT 100,
+        current_storage_mb REAL DEFAULT 0,
+        expires_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )", ()).await?;
+    
     Ok(())
 }
 
 async fn setup_data(db: &Database) -> Result<()> {
     let conn = db.connect()?;
     conn.execute("CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, schema JSON)", ()).await?;
-    
-    // [UPDATED] Added created/updated columns
     conn.execute("CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id INTEGER NOT NULL, data JSONB NOT NULL, created DATETIME DEFAULT CURRENT_TIMESTAMP, updated DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     
-    // Migrations for existing tables
     let _ = conn.execute("ALTER TABLE records ADD COLUMN created DATETIME DEFAULT CURRENT_TIMESTAMP", ()).await;
     let _ = conn.execute("ALTER TABLE records ADD COLUMN updated DATETIME DEFAULT CURRENT_TIMESTAMP", ()).await;
 
@@ -2262,101 +2312,4 @@ async fn setup_vectors(db: &Database) -> Result<()> {
     let _ = conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_vec_unique_model ON vectors(collection_id, record_id, field_name, model)", ()).await;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vec_record ON vectors(record_id)", ()).await?;
     Ok(())
-}
-
-// --- Mock Implementation ---
-#[async_trait]
-impl Db for Mutex<Connection> {
-    async fn create_collection(&self, _n: &str, _s: &Option<CollectionSchema>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }
-    async fn get_collection(&self, _id: i64) -> std::result::Result<Option<Collection>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn list_collections(&self) -> std::result::Result<Vec<Collection>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn update_collection(&self, _id: i64, _n: Option<String>, _s: Option<CollectionSchema>) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
-    async fn delete_collection(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn create_record(&self, _c: i64, _d: &Value) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }
-    async fn list_records(&self, _c: i64, _o: QueryOptions) -> std::result::Result<ListResult, Box<dyn std::error::Error + Send + Sync>> { Ok(ListResult{ items: vec![], total: 0 }) }
-    async fn get_record(&self, _c: i64, _r: i64, _e: Option<String>) -> std::result::Result<Option<Record>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn update_record(&self, _c: i64, _r: i64, _d: &Value) -> std::result::Result<Record, Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
-    async fn delete_record(&self, _c: i64, _r: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn search_records(&self, _c: i64, _q: &str) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn instant_search(&self, _c: i64, _q: &str, _l: usize) -> std::result::Result<Vec<models::InstantResult>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn recover_indexes(&self) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { Ok(()) }
-    async fn index_record_search(&self, _c: i64, _r: i64, _d: &serde_json::Value, _s: &crate::schema::CollectionSchema
-    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
-        Ok(()) 
-    }
-    async fn delete_record_search(&self, _c: i64, _r: i64
-    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
-        Ok(()) 
-    }
-    async fn reindex_collection(&self, _id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { Ok(()) }
-    async fn create_user(&self, _e: &str, _p: &str, _r: &str, _m: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
-    async fn get_user_by_email(&self, _e: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn list_users(&self, _q: Option<String>, _l: i64, _o: i64) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn count_users(&self, _q: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(0) }
-    async fn get_users_by_ids(&self, _ids: &[i64]) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn delete_user(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn create_file_metadata(&self, _f: &str, _o: &str, _m: &str, _s: i64, _u: Option<i64>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }
-    async fn list_files(&self, _l: i64, _o: i64) -> std::result::Result<Vec<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn count_files(&self) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(0) }
-    async fn get_file_metadata(&self, _id: i64) -> std::result::Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn delete_file_metadata(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn get_user_by_oauth(&self, _p: &str, _pid: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn link_oauth(&self, _u: i64, _p: &str, _pid: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn create_auth_token(&self, _u: i64, _t: &str, _tk: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn consume_auth_token(&self, _t: &str, _tt: &str) -> std::result::Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn set_user_verified(&self, _u: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn import_record(&self, _c: i64, _r: i64, _d: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn import_user(&self, _id: i64, _e: &str, _p: &str, _r: &str, _m: Option<Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn get_config(&self, _k: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn set_config(&self, _k: &str, _v: &serde_json::Value, _e: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn list_configs(&self) -> std::result::Result<Vec<models::ConfigItem>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn delete_config(&self, _key: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn log_audit_event(&self, _l: &str, _m: &str, _s: &str, _meta: Option<serde_json::Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn list_audit_logs(&self) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn log_system_event(&self, _level: &str, _target: &str, _message: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn list_ai_actions(&self) -> std::result::Result<Vec<ai_models::AiAction>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn get_ai_action(&self, _slug: &str) -> std::result::Result<Option<ai_models::AiAction>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn create_ai_action(&self, _a: ai_models::CreateActionReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }
-    async fn delete_ai_action(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn create_ai_session(&self, _s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn get_ai_session(&self, _id: &str) -> std::result::Result<Option<AiSession>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn update_ai_session(&self, _s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn list_ai_sessions(&self) -> std::result::Result<Vec<AiSession>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn save_plugin(&self, _p: &Plugin) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn list_plugins(&self) -> std::result::Result<Vec<Plugin>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn create_relation(&self, _oc: i64, _oi: i64, _tc: i64, _ti: i64, _rn: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn delete_relation(&self, _oc: i64, _oi: i64, _tc: i64, _ti: i64, _rn: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn get_related_ids(&self, _oc: i64, _oi: i64, _rn: &str) -> std::result::Result<Vec<(i64, i64)>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn get_records_by_ids(&self, _c: i64, _i: &[i64]) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn list_scripts(&self) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn create_script(&self, _r: script_models::CreateScriptReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }
-    async fn delete_script(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn get_script_by_name(&self, _n: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn get_scripts_by_trigger(&self, _t: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn list_templates(&self) -> std::result::Result<Vec<models::Template>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn get_template_by_slug(&self, _slug: &str) -> std::result::Result<Option<models::Template>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-    async fn create_template(&self, _req: models::CreateTemplateReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> { Ok(1) }
-    async fn update_template(&self, _id: i64, _c: String, _s: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn delete_template(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn get_dashboard_stats(&self) -> std::result::Result<DashboardData, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(DashboardData { stats: DashboardStats { total_requests: 0, db_size_mb: 0.0, collections_count: 0, total_records: 0 }, chart: vec![], recent_logs: vec![] })
-    }
-    async fn search_vector(&self, _c: i64, _f: &str, _v: Vec<f32>, _l: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn has_vector(&self, _c: i64, _r: i64, _f: &str, _m: &str) -> std::result::Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(false) 
-    }
-    async fn get_record_vectors(&self, _c: i64, _r: i64) -> std::result::Result<Vec<models::VectorRecord>, Box<dyn StdError + Send + Sync>> { Ok(vec![]) }
-    async fn save_vector(&self, _c: i64, _r: i64, _f: &str, _v: Vec<f32>, _m: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> { 
-        Ok(()) 
-    }
-    async fn get_vectors_for_collection(&self, _c: i64, _m: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> { 
-        Ok(vec![]) 
-    }
-    async fn register_tenant(&self, _id: &str, _owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-    async fn create_api_key(&self, _n: &str, _r: &str, _s: &str, _b: bool) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> { Err("Mock".into()) }
-    async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-    async fn delete_api_key(&self, _id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    async fn verify_api_key(&self, _k: &str) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
 }

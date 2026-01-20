@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/apex/apex-kit/apexkit-api/src/config_routes.rs ===========================
 use axum::{
     extract::{State, Json, Path},
     http::StatusCode,

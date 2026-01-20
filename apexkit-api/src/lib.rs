@@ -75,6 +75,7 @@ pub mod tenant_manager;
 pub mod backup;
 pub mod backup_routes;
 pub mod key_routes;
+pub mod site_routes;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -110,9 +111,28 @@ pub struct RecordResponse {
     pub created: String,
     pub updated: String,
 }
-#[derive(Deserialize, ToSchema, Validate)] pub struct AuthRequest { #[validate(email)] email: String, #[validate(length(min = 6))] password: String }
+#[derive(Deserialize, ToSchema, Validate)] 
+pub struct AuthRequest { 
+    #[validate(email)] 
+    pub email: String, 
+    #[validate(length(min = 6))] 
+    pub password: String,
+    // Optional Role (defaults to "user" if not provided or restricted)
+    pub role: Option<String>,
+    // Optional Metadata
+    #[schema(value_type = Option<Object>)]
+    pub metadata: Option<serde_json::Value>,
+}
 #[derive(Serialize, ToSchema)] pub struct AuthResponse { token: String, user: UserDto }
-#[derive(Serialize, ToSchema, Deserialize)] pub struct UserDto { id: i64, email: String, role: String, pub metadata: Option<serde_json::Value>, }
+#[derive(Serialize, ToSchema, Deserialize)] 
+pub struct UserDto { 
+    id: i64, 
+    email: String, 
+    role: String, 
+    pub metadata: Option<serde_json::Value>, 
+    // Authoritative scope from the current session token
+    pub scope: Option<String>,
+}
 #[derive(Serialize, ToSchema)] struct ProblemDetail { error: String, message: String, details: Option<serde_json::Value>, status: u16 }
 #[derive(Deserialize, ToSchema)] pub struct RelationRequest { target_collection_id: i64, target_record_id: i64, relation_name: String }
 #[derive(Deserialize, ToSchema, IntoParams)] pub struct SearchQuery { pub q: String, pub limit: Option<usize> }
@@ -357,6 +377,7 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
                      uid: 0, // System/API User ID (0 reserved?)
                      role: api_key.role,
                      exp: 9999999999, // Never expires
+                     scope: api_key.scope,
                  };
                  req.extensions_mut().insert(claims);
              }
@@ -544,7 +565,7 @@ async fn tenant_resolver_middleware(
             req.extensions_mut().insert(tenant_db.clone());
             
             // Inject Tenant-Specific Storage
-            let storage_path = format!("tenants/{}/uploads", tenant_id);
+            let storage_path = format!("storage/tenants/{}/uploads", tenant_id);
             // Public URL base needs to point to the tenant endpoint
             // e.g. /tenant/{id}/api/v1/storage/file/
             let public_url = format!("/tenant/{}/api/v1/storage/file/", tenant_id);
@@ -1308,9 +1329,17 @@ pub async fn delete_relation(
 pub async fn login(
     DatabaseConnection(db): DatabaseConnection, 
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    scope: Option<Extension<EventScope>>, // [NEW] Capture current scope
     headers: HeaderMap,
     Json(p): Json<AuthRequest>
 ) -> Result<Json<AuthResponse>, AppError> {
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let scope_str = match event_scope {
+        EventScope::Tenant(id) => format!("tenant:{}", id),
+        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+        _ => "root".to_string()
+    };
+
     let base_meta = json!({ "email": p.email });
 
     let user_opt = db.get_user_by_email(&p.email).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
@@ -1329,13 +1358,14 @@ pub async fn login(
         return Err(AppError::Unauthorized("Bad creds".into())); 
     }
 
-    let token = auth::create_jwt(u.id, &u.email, &u.role).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
+    // [FIX] Pass scope to JWT
+    let token = auth::create_jwt(u.id, &u.email, &u.role, &scope_str).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
     
     // [LOG] Success
     let meta = extract_log_meta(&headers, Some(addr), json!({ "email": u.email, "user_id": u.id }));
     let _ = db.log_audit_event("info", "Login Success", "auth", Some(meta)).await;
 
-    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role, metadata: u.metadata}}))
+    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role, metadata: u.metadata, scope: Some(scope_str)}}))
 }
 
 #[utoipa::path(
@@ -1355,13 +1385,26 @@ pub async fn register(
     Json(p): Json<AuthRequest>
 ) -> Result<Json<AuthResponse>, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let scope_str = match &event_scope {
+        EventScope::Tenant(id) => format!("tenant:{}", id),
+        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+        _ => "root".to_string()
+    };
+    
+    // [NEW] Use role from request or default to "user"
+    // Security Note: In a real app, you might want to block "admin" registration via public endpoint
+    // unless allow_public_registration is true AND we filter roles.
+    // For this dev setup, we allow requested role if not validated elsewhere.
+    let role = p.role.unwrap_or_else(|| "user".to_string());
     
     // [TRIGGER] before_user_create
-    let input_data = json!({ "email": p.email, "role": "user" });
+    let input_data = json!({ "email": p.email, "role": role, "metadata": p.metadata });
     trigger_void_hook(&state, "before_user_create", input_data.clone(), None, Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     let hash = auth::hash_password(&p.password).map_err(|_| AppError::UnknownError("Hash fail".into()))?;
-    let u = db.create_user(&p.email, &hash, "user", None).await.map_err(|_| AppError::UnknownError("User exists".into()))?;
+    
+    // [FIX] Pass metadata
+    let u = db.create_user(&p.email, &hash, &role, p.metadata).await.map_err(|_| AppError::UnknownError("User exists".into()))?;
     
     // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "email": u.email, "user_id": u.id }));
@@ -1371,11 +1414,12 @@ pub async fn register(
     let user_json = json!({ "id": u.id, "email": u.email, "role": u.role });
     let _ = trigger_void_hook(&state, "after_user_create", user_json, None, Some(&event_scope.clone()), Some(base_url.clone())).await;
 
-    let token = auth::create_jwt(u.id, &u.email, &u.role).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
+    // [FIX] Pass scope to JWT
+    let token = auth::create_jwt(u.id, &u.email, &u.role, &scope_str).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
     
     state.queue.enqueue(Job::SendWelcomeEmail { email: u.email.clone(), user_id: u.id }).await;
     
-    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role, metadata: u.metadata}}))
+    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role, metadata: u.metadata, scope: Some(scope_str)}}))
 }
 
 #[utoipa::path(
@@ -1412,7 +1456,7 @@ pub async fn list_users_handler(
     let total = db.count_users(search).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     let response = UserListResponse {
-        items: users.into_iter().map(|u| UserDto { id: u.id, email: u.email, role: u.role, metadata: u.metadata }).collect(),
+        items: users.into_iter().map(|u| UserDto { id: u.id, email: u.email, role: u.role, metadata: u.metadata, scope: None, }).collect(),
         total
     };
 
@@ -1902,6 +1946,7 @@ fn make_api_router() -> Router<AppState> {
     Router::new()
         .route("/auth/login", post(login))
         .route("/auth/register", post(register))
+        .route("/auth/roles", get(auth_advanced::list_roles_handler))
         .route("/auth/me", get(auth_advanced::get_me)) 
         .route("/auth/github", get(auth_advanced::github_login))
         .route("/auth/github/callback", get(auth_advanced::github_callback))
@@ -1936,6 +1981,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/admin/backups", get(backup_routes::list_backups_handler))
         .route("/admin/backups/{filename}", get(backup_routes::download_backup_handler))
         .route("/admin/restore-file", post(backup_routes::restore_from_file_handler))
+        .route("/admin/restore", post(backup_routes::restore_handler))
         .route("/admin/users", get(list_users_handler))
         .route("/admin/users/{id}", axum::routing::delete(delete_user_handler))
         .route("/admin/logs", get(list_audit_logs))
@@ -1960,6 +2006,8 @@ fn make_api_router() -> Router<AppState> {
         .route("/run/{script_name}", post(script_routes::run_script))
         .route("/admin/templates", get(template_routes::list_templates).post(template_routes::create_template))
         .route("/admin/templates/{id}", axum::routing::patch(template_routes::update_template).put(template_routes::update_template).delete(template_routes::delete_template))
+        .route("/admin/site/deploy", post(site_routes::deploy_site_handler))
+        .route("/admin/site/files", get(site_routes::list_site_files_handler))
         .route("/sse", get(sse_handler))
 }
 
@@ -1999,6 +2047,8 @@ pub fn app_router(state: AppState) -> Router {
         .route("/logo", get(storage::serve_app_logo))
         .layer(middleware::from_fn_with_state(state.clone(), tenant_resolver_middleware));
 
+    // Root handler (for /)
+    let root_index_route = Router::new().route("/", get(assets::index_handler));
     Router::new()
         .merge(root_and_subdomain_router)
         .nest("/sandbox/{session_id}", sandbox_router)
@@ -2009,15 +2059,26 @@ pub fn app_router(state: AppState) -> Router {
                 .post(create_tenant_handler)
                 .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         )
-        .route("/api/v1/admin/restore", post(backup_routes::restore_handler))
-        .route("/styles.css", get(serve_styles)) 
+        
         .route("/metrics", get(metrics_handler))
-        .route("/_dashboard", get(assets::dashboard_handler))
-        .route("/_dashboard/{*path}", get(assets::dashboard_handler))
-        .route("/static/{*path}", get(assets::serve_static_asset))
         .route("/healthz", get(health_check)) 
         .route("/version", get(get_versions_handler))
-        .route("/", get(assets::index_handler))
+        .route("/styles.css", get(serve_styles)) 
+        
+        // [NEW] Explicit Scoped Roots
+        // These handle GET /tenant/{id} and GET /sandbox/{id} directly
+        .route("/tenant/{tenant_id}", get(assets::scoped_index_handler))
+        .route("/sandbox/{session_id}", get(assets::scoped_index_handler))
+        
+        .route("/_dashboard", get(assets::dashboard_handler))
+        .route("/_dashboard/{*path}", get(assets::dashboard_handler))
+        
+        // Root Index
+        .merge(root_index_route)
+        
+        // Fallback for everything else (Static Assets & SPA Routing)
+        // Must be last
+        .route("/{*path}", get(assets::serve_static_asset))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
 }

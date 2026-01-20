@@ -15,6 +15,7 @@ use std::io::Cursor;
 use tracing::{info, error};
 use std::collections::HashMap;
 use regex::Regex;
+use futures::{stream, StreamExt}; 
 
 // --- DTOs ---
 
@@ -29,7 +30,8 @@ pub struct ImportResponseDto {
     pub collection_id: i64,
     pub records_imported: usize,
     pub collection_created: bool,
-    pub schema_updated: bool, // New field to indicate if we added columns
+    pub schema_updated: bool, 
+    pub time_taken_to_insert_all: String,
 }
 
 // --- LOGIC ---
@@ -288,24 +290,43 @@ pub async fn import_data_handler(
         id
     };
 
-    // 5. Bulk Insert
-    let mut records_imported = 0;
-    for record_data in parsed_records {
-        if record_data.is_object() {
-            match db.create_record(collection_id, &record_data).await {
-                Ok(_) => records_imported += 1,
-                Err(e) => {
-                    error!("Failed to insert record into {}: {}", col_name, e);
+    // 5. Bulk Insert via `create_record` (High Concurrency Stress Test)
+    // We execute 500 insertions in parallel. This fills the WriteManager buffer,
+    // forcing it to commit batches instead of individual rows.
+    let start_time = std::time::Instant::now();
+    
+    let records_imported = stream::iter(parsed_records)
+        .map(|record_data| {
+            let db = db.clone();
+            async move {
+                if record_data.is_object() {
+                    // Standard API call
+                    match db.create_record(collection_id, &record_data).await {
+                        Ok(_) => 1,
+                        Err(e) => {
+                            error!("Insert failed: {}", e);
+                            0
+                        }
+                    }
+                } else {
+                    0
                 }
             }
-        }
-    }
+        })
+        .buffer_unordered(500) // Concurrent Workers: 500
+        .collect::<Vec<usize>>()
+        .await
+        .into_iter()
+        .sum();
+
+    let duration = start_time.elapsed();
 
     Ok(Json(ImportResponseDto {
         collection_id,
         records_imported,
         collection_created,
         schema_updated,
+        time_taken_to_insert_all: format!("{:?}", duration),
     }))
 }
 

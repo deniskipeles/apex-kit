@@ -1,17 +1,28 @@
 import React, { useState, useEffect } from 'react';
-import { Archive, Clock, Play, Trash2, Plus, Save, Download, RotateCcw, FileArchive, Loader2 } from 'lucide-react';
+import { Archive, Clock, Play, Trash2, Plus, Save, Download, RotateCcw, FileArchive, Loader2, ShieldAlert } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Input, Label, Switch, Button, Badge, Select } from '../../../components/ui/Elements';
-import { Dialog } from '../../../components/ui/Dialog';
 import { AppSettings, CronJob } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
 import { apiClient } from '@/src/lib/apiClient';
 import { formatFileSize } from '@/src/lib/formatters';
+import { configService } from '../services/configService';
 
 interface BackupSettingsProps {
     settings: AppSettings;
     onChange: (settings: Partial<AppSettings>) => void;
     onSave: (data: Partial<AppSettings>) => Promise<void>;
 }
+
+// Simple Cron Regex (Basic validation)
+const CRON_REGEX = /^(\*|([0-9]|1[0-9]|2[0-9]|3[0-9]|4[0-9]|5[0-9])|\*\/([0-9]|1[0-9]|2[0-9]|3[0-9]|4[0-9]|5[0-9])) (\*|([0-9]|1[0-9]|2[0-3])|\*\/([0-9]|1[0-9]|2[0-3])) (\*|([1-9]|1[0-9]|2[0-9]|3[0-1])|\*\/([1-9]|1[0-9]|2[0-9]|3[0-1])) (\*|([1-9]|1[0-2])|\*\/([1-9]|1[0-2])) (\*|([0-6])|\*\/([0-6]))$/;
+
+const validateCron = (cron: string) => {
+    // Basic check for 5 parts
+    const parts = cron.trim().split(/\s+/);
+    if (parts.length !== 5 && parts.length !== 6) return false;
+    // Allow basic * and numbers
+    return true; // Use robust library if needed, or simple regex
+};
 
 export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsProps) => {
     const { toast } = useToast();
@@ -26,40 +37,82 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
     const [isRestoring, setIsRestoring] = useState(false);
     const [restoreTarget, setRestoreTarget] = useState<string | null>(null);
 
+    // Root Policy State
+    const [isRootScope, setIsRootScope] = useState(false);
+    const [allowNonRootBackup, setAllowNonRootBackup] = useState(false);
+
+    useEffect(() => {
+        // Check scope
+        const path = window.location.pathname;
+        const isRoot = !path.includes('/tenant/') && !path.includes('/sandbox/') && (apiClient.getScope().type == 'root');
+        setIsRootScope(isRoot);
+
+        if (isRoot) {
+            // Load dedicated config key
+            configService.list().then(list => {
+                const conf = list.find(c => c.key === 'ALLOW_NON_ROOT_BACKUP');
+                if (conf && conf.value) {
+                    setAllowNonRootBackup(conf.value === 'true');
+                }
+            });
+        }
+    }, []);
+
     const updateBackup = (updates: any) => {
         onChange({ backups: { ...settings.backups, ...updates } });
     };
 
-    const addCronJob = async () => {
+    const addCronJob = () => {
         if (!newCronCmd || !newCronName) return;
+        if (!validateCron(newCronSchedule)) {
+            toast('Invalid Cron Expression', 'error');
+            return;
+        }
 
         const newJob: CronJob = {
-            id: `cron_${Math.random().toString(36).substr(2, 6)}`,
+            id: `cron_${Math.random().toString(36).substr(2, 9)}`,
             name: newCronName,
             schedule: newCronSchedule,
             payload: newCronCmd,
             active: true
         };
 
-        const updatedJobs = [...settings.cronJobs, newJob];
+        // Update parent state immediately
+        const updatedJobs = [...(settings.cronJobs || []), newJob];
         onChange({ cronJobs: updatedJobs });
+
         setNewCronName('');
         setNewCronCmd('');
-        toast('Cron job added to list (click Save to persist)', 'info');
+        toast('Cron job added (pending save)', 'info');
     };
 
     const removeCronJob = (id: string) => {
-        onChange({ cronJobs: settings.cronJobs.filter(c => c.id !== id) });
+        const updated = settings.cronJobs.filter(c => c.id !== id);
+        onChange({ cronJobs: updated });
     };
 
     const toggleCronJob = (id: string) => {
-        onChange({ cronJobs: settings.cronJobs.map(c => c.id === id ? { ...c, active: !c.active } : c) });
+        const updated = settings.cronJobs.map(c => c.id === id ? { ...c, active: !c.active } : c);
+        onChange({ cronJobs: updated });
     };
 
     const handleSaveClick = async () => {
         setIsSaving(true);
         try {
-            await onSave({ backups: settings.backups, cronJobs: settings.cronJobs });
+            // 1. Save Backup & Cron Settings via Main Settings Endpoint
+            await onSave({
+                backups: settings.backups,
+                cronJobs: settings.cronJobs
+            });
+
+            // 2. Save Root Policy (Independent Key)
+            if (isRootScope) {
+                await configService.set('ALLOW_NON_ROOT_BACKUP', allowNonRootBackup ? 'true' : 'false', false);
+            }
+
+            toast('System settings saved successfully', 'success');
+        } catch (e: any) {
+            toast(e.message || 'Failed to save settings', 'error');
         } finally {
             setIsSaving(false);
         }
@@ -71,7 +124,7 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
             const list = await apiClient.system.listBackups();
             setBackups(list);
         } catch (e) {
-            toast("Failed to load backups list", "error");
+            setBackups([]);
         } finally {
             setIsLoadingBackups(false);
         }
@@ -80,20 +133,20 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
     const handleCreateBackup = async () => {
         try {
             await apiClient.system.createBackup();
-            toast("Backup job started. It will appear in the list shortly.", "success");
-            setTimeout(loadBackups, 2000); // Refresh list after delay
-        } catch (e) {
+            toast("Backup job started.", "success");
+            setTimeout(loadBackups, 2000);
+        } catch (e: any) {
             toast("Failed to trigger backup", "error");
         }
     };
 
     const handleRestore = async (filename: string) => {
-        if (!confirm(`Are you SURE you want to restore from ${filename}? Current data will be replaced.`)) return;
+        if (!confirm(`Restoring from ${filename} will overwrite current data. Continue?`)) return;
         setIsRestoring(true);
         setRestoreTarget(filename);
         try {
             await apiClient.system.restoreFromFile(filename);
-            toast("Restore complete. Server is restarting...", "success");
+            toast("Restore successful. Reloading...", "success");
             setTimeout(() => window.location.reload(), 3000);
         } catch (e) {
             toast("Restore failed", "error");
@@ -118,6 +171,29 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
 
     return (
         <div className="space-y-6">
+
+            {/* ROOT ONLY: Policy Control */}
+            {isRootScope && (
+                <Card className="border-amber-500/20 bg-amber-500/5">
+                    <CardHeader>
+                        <CardTitle className="flex items-center gap-2 text-amber-600">
+                            <ShieldAlert className="h-4 w-4" /> Root Policy
+                        </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                        <div className="flex items-center justify-between">
+                            <div className="space-y-0.5">
+                                <Label>Allow Tenants Local Backups</Label>
+                                <p className="text-xs text-muted-foreground">
+                                    If enabled, tenants can save backups to the server disk.
+                                </p>
+                            </div>
+                            <Switch checked={allowNonRootBackup} onCheckedChange={setAllowNonRootBackup} />
+                        </div>
+                    </CardContent>
+                </Card>
+            )}
+
             <Card>
                 <CardHeader>
                     <div className="flex items-center justify-between">
@@ -127,9 +203,23 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
                 </CardHeader>
                 <CardContent className="space-y-6">
                     <div className={`grid grid-cols-1 md:grid-cols-3 gap-6 transition-opacity ${settings.backups.enabled ? 'opacity-100' : 'opacity-50 pointer-events-none'}`}>
-                        <div className="space-y-2"><Label>Schedule (Cron)</Label><Input value={settings.backups.schedule} onChange={(e: any) => updateBackup({ schedule: e.target.value })} className="font-mono" /><p className="text-[10px] text-muted-foreground">Current: Daily at 00:00</p></div>
+                        <div className="space-y-2">
+                            <Label>Schedule (Cron)</Label>
+                            <Input
+                                value={settings.backups.schedule}
+                                onChange={(e: any) => updateBackup({ schedule: e.target.value })}
+                                className={`font-mono ${!validateCron(settings.backups.schedule) ? 'border-destructive' : ''}`}
+                            />
+                            {!validateCron(settings.backups.schedule) && <span className="text-[10px] text-destructive">Invalid Format (min hour day month day)</span>}
+                        </div>
                         <div className="space-y-2"><Label>Retention (Days)</Label><Input type="number" value={settings.backups.retention} onChange={(e: any) => updateBackup({ retention: Number(e.target.value) })} /></div>
-                        <div className="space-y-2"><Label>Destination</Label><Select value={settings.backups.destination} onChange={(e: any) => updateBackup({ destination: e.target.value })}><option value="local">Local Storage</option><option value="s3">S3 Storage</option></Select></div>
+                        <div className="space-y-2">
+                            <Label>Destination</Label>
+                            <Select value={settings.backups.destination} onChange={(e: any) => updateBackup({ destination: e.target.value })}>
+                                <option value="local">Local Storage</option>
+                                <option value="s3">S3 Storage</option>
+                            </Select>
+                        </div>
                     </div>
 
                     {settings.backups.enabled && (
@@ -144,7 +234,9 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
 
                             <div className="bg-secondary/10 rounded-md border border-border overflow-hidden max-h-[300px] overflow-y-auto">
                                 {backups.length === 0 ? (
-                                    <div className="p-8 text-center text-muted-foreground text-sm">No backups found.</div>
+                                    <div className="p-8 text-center text-muted-foreground text-sm">
+                                        No backups found.
+                                    </div>
                                 ) : (
                                     <div className="divide-y divide-border">
                                         {backups.map((b) => (
@@ -172,26 +264,21 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
                 </CardContent>
             </Card>
 
-            {/* ... Cron Jobs Card ... */}
+            {/* Cron Jobs */}
             <Card>
                 <CardHeader><CardTitle className="flex items-center gap-2"><Clock className="h-4 w-4" /> Cron Jobs</CardTitle></CardHeader>
                 <CardContent className="space-y-4">
                     <div className="space-y-4">
-                        {settings.cronJobs.map(job => (
+                        {(settings.cronJobs || []).map(job => (
                             <div key={job.id} className="flex items-center gap-4 p-3 rounded-lg border border-border bg-card hover:bg-accent/5 transition-colors">
                                 <div className="flex-1 grid grid-cols-1 md:grid-cols-12 gap-4 items-center">
-                                    {/* Name & Payload */}
                                     <div className="md:col-span-5">
                                         <div className="font-bold text-sm text-foreground">{job.name}</div>
                                         <div className="text-xs text-muted-foreground font-mono truncate" title={job.payload}>{job.payload}</div>
                                     </div>
-
-                                    {/* Schedule */}
                                     <div className="md:col-span-4 flex items-center gap-2">
                                         <Badge variant="secondary" className="font-mono text-[10px] bg-secondary/50 border-secondary">{job.schedule}</Badge>
                                     </div>
-
-                                    {/* Controls */}
                                     <div className="md:col-span-3 flex items-center gap-2 justify-end">
                                         <Switch checked={job.active} onCheckedChange={() => toggleCronJob(job.id)} />
                                         <Button size="icon" variant="ghost" className="h-8 w-8 text-destructive hover:bg-destructive/10" onClick={() => removeCronJob(job.id)}>
@@ -201,7 +288,7 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
                                 </div>
                             </div>
                         ))}
-                        {settings.cronJobs.length === 0 && <div className="text-center py-4 text-sm text-muted-foreground italic">No active jobs.</div>}
+                        {(settings.cronJobs || []).length === 0 && <div className="text-center py-4 text-sm text-muted-foreground italic">No active jobs.</div>}
                     </div>
 
                     {/* Add Job Form */}

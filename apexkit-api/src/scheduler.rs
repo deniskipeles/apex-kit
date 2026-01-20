@@ -1,7 +1,6 @@
-use crate::{AppState, DatabaseConnection};
+use crate::{AppState};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use apexkit_core::{models::CronJob, Db, VectorProvider, security::Vault, realtime::EventScope};
-use crate::settings::BackupConfigDto;
 use std::sync::Arc;
 use chrono::Utc;
 use cron::Schedule;
@@ -149,7 +148,7 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
     }
 }
 
-async fn execute_job(state: &AppState, db: Arc<dyn Db>, context_id: &str, job: &CronJob, scope: EventScope) {
+async fn execute_job(state: &AppState, db: Arc<dyn Db>, _context_id: &str, job: &CronJob, scope: EventScope) {
     tracing::info!("[Scheduler] Executing {} in scope {:?}", job.name, scope);
 
     // Context Injection Wrapper
@@ -189,7 +188,7 @@ async fn execute_job(state: &AppState, db: Arc<dyn Db>, context_id: &str, job: &
         // We use the crate::auth::create_jwt which uses the static SECRET constant in auth.rs (in v0.1.0).
         // If auth.rs uses env var, we are good.
         
-        let token = apexkit_core::auth::create_jwt(0, admin_email, "admin").unwrap_or_default();
+        let token = apexkit_core::auth::create_jwt(0, admin_email, "admin", "root").unwrap_or_default();
 
         let client = reqwest::Client::new();
         let res = client.post(&url)

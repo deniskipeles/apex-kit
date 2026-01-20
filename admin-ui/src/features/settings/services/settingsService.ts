@@ -17,7 +17,10 @@ const mapToFrontend = (apiData: any): AppSettings => {
             port: apiData.smtp?.port || 587,
             username: apiData.smtp?.username || '',
             password: apiData.smtp?.password || '', // Will be ******
-            fromEmail: apiData.smtp?.from_email || ''
+            fromEmail: apiData.smtp?.from_email || '',
+            template_welcome: apiData.smtp?.template_welcome || '',
+            template_reset: apiData.smtp?.template_reset || '',
+            template_verify: apiData.smtp?.template_verify || '',
         },
         storage: {
             activeDriver: apiData.storage?.active_driver || 'local',

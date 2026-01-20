@@ -1,10 +1,11 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { authService } from './services/authService';
-import { AdminUser } from '../../types';
+import { AuthUser } from '../../types';
 import { APEX_TOKEN, APEX_USER } from '@/src/constants';
+import { apiClient } from '@/src/lib/apiClient';
 
 interface AuthContextType {
-  user: AdminUser | null;
+  user: AuthUser | null;
   login: (e: string, p: string) => Promise<void>;
   logout: () => void;
   isLoading: boolean;
@@ -13,18 +14,32 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType>(null!);
 
 export const AuthProvider = ({ children }: { children?: ReactNode }) => {
-  const [user, setUser] = useState<AdminUser | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const storedUser = localStorage.getItem(APEX_USER);
-    const storedToken = localStorage.getItem(APEX_TOKEN);
-    
-    if (storedUser && storedToken) {
-        setUser(JSON.parse(storedUser));
-        // Token is set in apiClient.ts on load, but good to double check if moving logic
-    }
-    setIsLoading(false);
+    const initAuth = async () => {
+      const storedToken = localStorage.getItem(APEX_TOKEN);
+      if (storedToken) {
+        // Set token first so the request is authenticated
+        // We don't have user object yet, so scope isn't set in SDK yet
+        apiClient.setToken(storedToken);
+
+        try {
+          // Fetch fresh user data + Authoritative Scope
+          const user = await apiClient.auth.getMe();
+          setUser(user);
+          // SDK scope is updated inside getMe() via _request response handling
+        } catch (e) {
+          console.error("Token invalid or expired", e);
+          localStorage.removeItem(APEX_TOKEN);
+          localStorage.removeItem(APEX_USER);
+          setUser(null);
+        }
+      }
+      setIsLoading(false);
+    };
+    initAuth();
   }, []);
 
   const login = async (e: string, p: string) => {
@@ -38,6 +53,7 @@ export const AuthProvider = ({ children }: { children?: ReactNode }) => {
     await authService.logout();
     setUser(null);
     localStorage.removeItem(APEX_USER);
+    localStorage.removeItem(APEX_TOKEN);
   };
 
   return (

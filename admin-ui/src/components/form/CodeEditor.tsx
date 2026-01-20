@@ -68,19 +68,162 @@ export const CodeEditor = ({
                 // 1. Load Static System Types
                 // We don't need to track this one as it never changes
                 const baseLibSource = `
+                    // --- Primitives ---
+                    type JsonValue = string | number | boolean | null | { [key: string]: JsonValue } | JsonValue[];
+                    
+                    interface Request {
+                        method: string;
+                        headers: Headers;
+                        body: any; // Raw parsed body
+                        args: any; // Alias for body
+                        json(): Promise<any>;
+                        text(): Promise<string>;
+                    }
+
+                    interface ResponseInit {
+                        status?: number;
+                        headers?: Record<string, string>;
+                    }
+
+                    declare class Response {
+                        constructor(body: any, init?: ResponseInit);
+                    }
+
+                    interface Headers {
+                        get(name: string): string | null;
+                        set(name: string, value: string): void;
+                    }
+
+                    // --- Global Tools ---
+                    declare const console: {
+                        log(...args: any[]): void;
+                        error(...args: any[]): void;
+                    };
+
                     declare const $http: {
                         get(url: string): Promise<string>;
                         post(url: string, body: object): Promise<string>;
                     };
+
                     declare const $util: {
                         uuid(): string;
+                        slugify(text: string): string;
+                        hash(text: string, alg: 'sha256' | 'sha512'): string;
+                        hmac(text: string, key: string): string;
+                        sleep(ms: number): Promise<void>;
                     };
+
                     declare const $ai: {
-                        embed(text: string, provider?: string): Promise<number[]>;
+                        embed(text: string): Promise<number[]>;
                     };
+
                     declare const $env: {
                         get(key: string): Promise<string>;
+                        APP_URL: string;
                     };
+                    
+                    declare const $fs: {
+                        readText(filename: string): Promise<string>;
+                    };
+                    
+                    declare const $archive: {
+                        create(jsonTree: object, filename: string): Promise<string>;
+                    };
+                    
+                    declare const $realtime: {
+                        send(channel: string, event: string, data: object): Promise<boolean>;
+                    };
+                    
+                    declare const $mail: {
+                        send(to: string, subject: string, body: string): Promise<boolean>;
+                    };
+
+                    // --- ApexKit SDK ---
+                    
+                    interface QueryOptions {
+                        filter?: string | object;
+                        sort?: string;
+                        page?: number;
+                        per_page?: number;
+                        expand?: string;
+                    }
+
+                    interface ApexQuery {
+                        from: string;
+                        select?: string[];
+                        where?: object;
+                        sort?: string;
+                        limit?: number;
+                        offset?: number;
+                        populate?: string[];
+                        aggregate?: Record<string, { $sum?: string, $count?: string, $avg?: string, $min?: string, $max?: string }>;
+                        group_by?: string;
+                    }
+
+                    interface CollectionAPI {
+                        list(options?: QueryOptions): Promise<{ items: any[], total: number }>;
+                        get(id: number | string, options?: { expand?: string }): Promise<any>;
+                        create(data: object): Promise<{ id: number }>;
+                        update(id: number | string, data: object): Promise<any>;
+                        delete(id: number | string): Promise<boolean>;
+                        search(query: string): Promise<any[]>;
+                        searchVector(field: string, vector: number[], limit?: number): Promise<any[]>;
+                        getVector(id: number | string): Promise<any[]>;
+                    }
+
+                    interface UsersAPI {
+                        list(query?: string, limit?: number, offset?: number): Promise<any[]>;
+                        get(email: string): Promise<any>;
+                        create(email: string, password?: string, role?: string): Promise<any>;
+                    }
+                    
+                    interface FilesAPI {
+                        list(limit?: number, offset?: number): Promise<any[]>;
+                    }
+                    
+                    interface CollectionsAPI {
+                        list(): Promise<any[]>;
+                        create(name: string, schema?: object): Promise<{ id: number }>;
+                    }
+
+                    declare class ApexKit {
+                        constructor(contextId?: string | null);
+                        tenant(id: string): ApexKit;
+                        sandbox(id: string): ApexKit;
+                        
+                        collection(name: string): CollectionAPI;
+                        
+                        readonly users: UsersAPI;
+                        readonly files: FilesAPI;
+                        readonly collections: CollectionsAPI;
+                        
+                        query(q: ApexQuery): Promise<any>;
+                    }
+                    
+                    // --- Entry Points ---
+                    declare const $apex: ApexKit;
+                    declare const pb: ApexKit; // Alias
+
+                    // Low-level $db (internal use)
+                    declare const $db: {
+                        records: {
+                            list(ctx: string | null, col: string, opts: any): Promise<any>;
+                            // ... other low level methods
+                        };
+                        query(ctx: string | null, q: any): Promise<any>;
+                    };
+                    
+                    // --- Hook Event Context ---
+                    // e is passed to hook scripts
+                    declare const e: {
+                        trigger: string;
+                        auth?: { id: number, email: string, role: string };
+                        record?: { id: number, data: any };
+                        collection?: { id: number, name: string };
+                        data?: any; // For list hooks
+                    };
+                    
+                    // Helper for log
                     declare function log(msg: any): void;
                 `;
                 const baseLibUri = 'ts:filename/apexkit_base.d.ts';

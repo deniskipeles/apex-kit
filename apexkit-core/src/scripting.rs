@@ -7,6 +7,7 @@ use regex::Regex;
 use std::path::Path;
 use std::process::Command;
 use std::cell::RefCell;
+use crate::query_engine::{QueryEngine, ApexQuery};
 
 use boa_engine::{
     Context, JsValue, JsResult, NativeFunction, JsError, JsString, JsArgs,
@@ -62,10 +63,28 @@ const JS_PRELUDE: &str = r#"
             };
         }
         
+        // [NEW] Analytical Query
+        async query(queryObject) {
+            // Inject contextId if not present? Or handle in $db.query wrapper?
+            // Since ApexQuery struct doesn't have context field, we rely on $db.query handling it.
+            // But $db.query takes 1 arg in register_db (q_val). 
+            // We need to update $db.query signature or wrap the object.
+            // Let's assume we update $db.query to take (contextId, queryObject) in Rust.
+            return await $db.query(this.contextId, queryObject);
+        }
+        
         get users() {
             return {
                 create: async (e, p, r) => $db.users.create(this.contextId, e, p, r),
+                get: async (e) => $db.users.get(this.contextId, e),
                 list: async (q, l, o) => $db.users.list(this.contextId, q, l, o)
+            }
+        }
+        
+        get collections() {
+            return {
+                list: async () => $db.collections.list(this.contextId),
+                create: async (n, s) => $db.collections.create(this.contextId, n, s)
             }
         }
 
@@ -80,7 +99,7 @@ const JS_PRELUDE: &str = r#"
     globalThis.Request = Request;
     globalThis.Response = Response;
     globalThis.ApexKit = ApexKit;
-    globalThis.apex = new ApexKit();
+    globalThis.$apex = new ApexKit();
 "#;
 
 thread_local! {
@@ -309,7 +328,7 @@ fn register_console(ctx: &mut Context) -> Result<(), String> {
 }
 
 fn register_util(ctx: &mut Context) -> Result<(), String> {
-    use crate::utils::{to_hex, slugify, sha256, sha512, hmac_sha256, generate_random_hex};
+    use crate::utils::{slugify, sha256, sha512, hmac_sha256, generate_random_hex};
 
     // UUID
     let uuid_fn = NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::from(JsString::from(uuid::Uuid::new_v4().to_string()))));
@@ -421,58 +440,248 @@ fn register_fs(ctx: &mut Context) -> Result<(), String> {
 
 fn register_db(ctx: &mut Context) -> Result<(), String> {
     
-    // $db.records.list(ctxId, col, opts)
-    let list_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
-        let col = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
-        // [FIX] Correct Option<Value> handling
-        let opts_val = args.get_or_undefined(2).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
-        
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    let db = resolve_db(ctx_id, app.clone()).await?;
-                    let col_id = resolve_collection_local(db.clone(), &col).await?;
-                    
-                    let opts: QueryOptions = serde_json::from_value(opts_val).unwrap_or_default();
-                    
-                    let res = db.list_records(col_id, opts).await.map_err(|e| e.to_string())?;
-                    Ok(serde_json::to_value(res).unwrap())
-                })
-            } else { Err("Context lost".into()) }
-        });
-        return_json_promise(ctx, result)
-    });
-    
-    // $db.records.create(ctxId, col, data)
-    let create_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
-        let col = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
-        // [FIX] Ensure unwrapped Value for create_record
-        let data_opt = args.get_or_undefined(2).to_json(ctx).unwrap();
-        let data = data_opt.unwrap_or(serde_json::Value::Null);
-
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    let db = resolve_db(ctx_id, app.clone()).await?;
-                    let col_id = resolve_collection_local(db.clone(), &col).await?;
-                    
-                    let id = db.create_record(col_id, &data).await.map_err(|e| e.to_string())?;
-                    Ok(serde_json::json!({ "id": id }))
-                })
-            } else { Err("Context lost".into()) }
-        });
-        return_json_promise(ctx, result)
-    });
-
+    // --- 1. $db.records ---
     let records_obj = ObjectInitializer::new(ctx)
-        .function(list_fn, JsString::from("list"), 3)
-        .function(create_fn, JsString::from("create"), 3)
+        // list(ctxId, col, opts)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let col = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let opts_val = args.get_or_undefined(2).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+            
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let col_id = resolve_collection_local(db.clone(), &col).await?;
+                        let opts: QueryOptions = serde_json::from_value(opts_val).unwrap_or_default();
+                        let list = db.list_records(col_id, opts).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(list).unwrap())
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("list"), 3)
+
+        // get(ctxId, col, id, expand)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let col = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let id = args.get_or_undefined(2).to_number(ctx).unwrap_or(0.0) as i64;
+            let expand = args.get(3).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let col_id = resolve_collection_local(db.clone(), &col).await?;
+                        let rec = db.get_record(col_id, id, expand).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(rec).unwrap_or(serde_json::Value::Null))
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("get"), 4)
+
+        // create(ctxId, col, data)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let col = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let data = args.get_or_undefined(2).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let col_id = resolve_collection_local(db.clone(), &col).await?;
+                        let id = db.create_record(col_id, &data).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::json!({ "id": id }))
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("create"), 3)
+
+        // update(ctxId, col, id, data)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let col = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let id = args.get_or_undefined(2).to_number(ctx).unwrap_or(0.0) as i64;
+            let data = args.get_or_undefined(3).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let col_id = resolve_collection_local(db.clone(), &col).await?;
+                        let rec = db.update_record(col_id, id, &data).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(rec).unwrap())
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("update"), 4)
+
+        // delete(ctxId, col, id)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let col = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let id = args.get_or_undefined(2).to_number(ctx).unwrap_or(0.0) as i64;
+
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let col_id = resolve_collection_local(db.clone(), &col).await?;
+                        db.delete_record(col_id, id).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::Value::Bool(true))
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("delete"), 3)
+
+        // searchVector(ctxId, col, field, vector, limit)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let col = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let field = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
+            let vec_val = args.get_or_undefined(3).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+            let limit = args.get_or_undefined(4).to_number(ctx).unwrap_or(10.0) as usize;
+
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let col_id = resolve_collection_local(db.clone(), &col).await?;
+                        let vector: Vec<f32> = serde_json::from_value(vec_val).unwrap_or_default();
+                        let recs = db.search_vector(col_id, &field, vector, limit).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(recs).unwrap())
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("searchVector"), 5)
+
+        // getVector(ctxId, col, id)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let col = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let id = args.get_or_undefined(2).to_number(ctx).unwrap_or(0.0) as i64;
+            
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let col_id = resolve_collection_local(db.clone(), &col).await?;
+                        let vecs = db.get_record_vectors(col_id, id).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(vecs).unwrap())
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("getVector"), 3)
         .build();
 
+    // --- 2. $db.query (Analytics Engine) ---
+    // $db.query(ctxId, json_query)
+    let query_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+        let q_val = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+        
+        let res = ACTIVE_CONTEXT.with(|c| {
+            if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                handle.block_on(async {
+                    let db = resolve_db(ctx_id, app.clone()).await?;
+                    let query: ApexQuery = serde_json::from_value(q_val).map_err(|e| e.to_string())?;
+                    QueryEngine::execute(db, query).await.map_err(|e| e.to_string())
+                })
+            } else { Err("Context lost".into()) }
+        });
+        return_json_promise(ctx, res)
+    });
+
+    // --- 3. $db.users ---
+    let users_obj = ObjectInitializer::new(ctx)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let email = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let u = db.get_user_by_email(&email).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(u).unwrap_or(serde_json::Value::Null))
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("get"), 2)
+        
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let email = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+            let pass = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
+            let role = args.get_or_undefined(3).to_string(ctx)?.to_std_string_escaped();
+            
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let hash = crate::auth::hash_password(&pass).map_err(|e| e.to_string())?;
+                        let u = db.create_user(&email, &hash, &role, None).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(u).unwrap())
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("create"), 4)
+        .build();
+
+    // --- 4. $db.collections ---
+    let cols_obj = ObjectInitializer::new(ctx)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+             let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+             let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let cols = db.list_collections().await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(cols).unwrap())
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("list"), 1)
+        .build();
+
+    // --- 5. $db.files ---
+    let files_obj = ObjectInitializer::new(ctx)
+        // list(ctxId, limit, offset)
+        .function(NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let ctx_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+            let limit = args.get_or_undefined(1).to_number(ctx).unwrap_or(20.0) as i64;
+            let offset = args.get_or_undefined(2).to_number(ctx).unwrap_or(0.0) as i64;
+
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let files = db.list_files(limit, offset).await.map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(files).unwrap())
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        }), JsString::from("list"), 3)
+        .build();
+
+    // Build Final Object
     let db_obj = ObjectInitializer::new(ctx)
         .property(JsString::from("records"), records_obj, Attribute::all())
+        .property(JsString::from("users"), users_obj, Attribute::all())
+        .property(JsString::from("collections"), cols_obj, Attribute::all())
+        .property(JsString::from("files"), files_obj, Attribute::all())
+        .function(query_fn, JsString::from("query"), 1)
         .build();
 
     ctx.register_global_property(JsString::from("$db"), db_obj, Attribute::all()).map_err(|e| e.to_string())

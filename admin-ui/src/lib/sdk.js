@@ -1,5 +1,5 @@
 /**
- * ApexKit Client SDK v1.4.0
+ * ApexKit Client SDK v0.1.0
  * A vanilla JavaScript client for the ApexKit API.
  * Compatible with modern Browsers and Node.js (v18+).
  */
@@ -7,12 +7,26 @@ export class ApexKit {
     /**
      * Initialize the ApexKit client.
      * @param {string} baseUrl - The URL of your ApexKit API (e.g., 'http://127.0.0.1:5000').
+     * @param {string} [scopeType='root'] - 'root', 'tenant', or 'sandbox'.
+     * @param {string} [scopeId=''] - The ID if tenant/sandbox.
      */
-    constructor(baseUrl) {
+    constructor(baseUrl, scopeType = 'root', scopeId = '') {
         // Ensure no trailing slash for consistent path building
         this.baseUrl = baseUrl.replace(/\/$/, "");
         this.token = null;
         this.currentUser = null;
+        
+        // [NEW] Explicit Scope State
+        this.scopeType = scopeType;
+        this.scopeId = scopeId;
+    }
+    
+    /**
+     * Helper to check current scope context easily.
+     * @returns {{type: 'root'|'tenant'|'sandbox', id: string}}
+     */
+    get scope() {
+        return { type: this.scopeType, id: this.scopeId };
     }
 
     /**
@@ -24,12 +38,12 @@ export class ApexKit {
     sandbox(uuid) {
         // Construct the sandbox URL: http://host/sandbox/{uuid}
         const sandboxUrl = `${this.baseUrl}/sandbox/${uuid}`;
-        const instance = new ApexKit(sandboxUrl);
+        // [FIX] Pass scope explicitly
+        const instance = new ApexKit(sandboxUrl, 'sandbox', uuid);
         
         // Copy auth state to the sandbox instance
         instance.token = this.token;
         instance.currentUser = this.currentUser;
-        instance.sandboxId = uuid;
         
         return instance;
     }
@@ -43,7 +57,8 @@ export class ApexKit {
     tenant(tenantId) {
         // Construct the tenant URL: http://host/tenant/{tenantId}
         const tenantUrl = `${this.baseUrl}/tenant/${tenantId}`;
-        const instance = new ApexKit(tenantUrl);
+        // [FIX] Pass scope explicitly
+        const instance = new ApexKit(tenantUrl, 'tenant', tenantId);
         
         // Copy auth state to the tenant instance
         instance.token = this.token;
@@ -53,11 +68,31 @@ export class ApexKit {
     }
 
     /**
-     * Manually set the JWT token (e.g., after loading from localStorage).
+     * Manually set the JWT token and sync scope from user object if provided.
      * @param {string} token - The JWT string.
+     * @param {object} [user] - The user object from login/me response.
      */
-    setToken(token) {
+    setToken(token, user = null) {
         this.token = token;
+        if (user && user.scope) {
+            this.setScopeFromTag(user.scope);
+        }
+    }
+
+    /**
+     * Internal: Parse "tenant:123" into {type: 'tenant', id: '123'} and set instance state.
+     */
+    setScopeFromTag(tag) {
+        if (tag === 'root') {
+            this.scopeType = 'root';
+            this.scopeId = '';
+        } else if (tag.startsWith('tenant:')) {
+            this.scopeType = 'tenant';
+            this.scopeId = tag.split(':')[1];
+        } else if (tag.startsWith('sandbox:')) {
+            this.scopeType = 'sandbox';
+            this.scopeId = tag.split(':')[1];
+        }
     }
 
     /**
@@ -177,6 +212,11 @@ export class ApexKit {
     get auth() {
         return {
             /**
+             * List available user roles.
+             * @returns {Promise<{roles: string[]}>}
+             */
+            listRoles: () => this._request('/auth/roles', { method: 'GET' }),
+            /**
              * Log in an existing user.
              * @param {string} email 
              * @param {string} password 
@@ -189,6 +229,7 @@ export class ApexKit {
                 });
                 this.token = res.token;
                 this.currentUser = res.user;
+                if (res.user.scope) this.setScopeFromTag(res.user.scope);
                 return res;
             },
 
@@ -212,10 +253,14 @@ export class ApexKit {
              * Retrieve the currently authenticated user's profile.
              * Requires a valid JWT token to be set.
              * 
-             * @returns {Promise<{id: number, email: string, role: string, metadata: object}>} User object
+             * @returns {Promise<{id: number, email: string, role: string, scope: string, metadata: object}>} User object
              * @throws {Error} 401 Unauthorized if not logged in.
              */
-            getMe: () => this._request('/auth/me'),
+            getMe: async () => {
+                const user = await this._request('/auth/me');
+                if (user.scope) this.setScopeFromTag(user.scope);
+                return user;
+            },
 
             /**
              * Logout (clears local state only).
@@ -339,6 +384,18 @@ export class ApexKit {
             deleteConfig: (key) => this._request(`/admin/config/${encodeURIComponent(key)}`, { method: 'DELETE' }),
 
             // --- Users ---
+            /**
+             * Create/Register a new user account.
+             * @param {string} email 
+             * @param {string} password 
+             * @param {string} role 
+             * @param {object} metadata 
+             * @returns {Promise<{token: string, user: object}>}
+             */
+            registerUser: async (email, password, role, metadata) => {
+                const res = await this._request('/auth/register', { method: 'POST', body: { email, password, role, metadata }});
+                return res;
+            },
             /**
              * List all registered users (Admin only). with pagination, sorting, and filtering.
              * @param {object} [options={}] 
@@ -1022,6 +1079,33 @@ export class ApexKit {
                 return doc.body.textContent || '';
             }
         }
+    }
+
+    // ==========================================
+    // 11. Static Sites
+    // ==========================================
+    get sites() {
+        return {
+            /**
+             * Deploy a static site by uploading a ZIP file.
+             * The content will be extracted to the public/ folder of the current scope.
+             * 
+             * @param {File} file - The .zip file containing the build artifacts (e.g. dist/).
+             * @returns {Promise<{success: boolean, message: string}>}
+             */
+            deploy: (file) => {
+                const formData = new FormData();
+                formData.append('file', file);
+                return this._request('/admin/site/deploy', { method: 'POST', body: formData });
+            },
+
+            /**
+             * List files currently served in the public directory.
+             * 
+             * @returns {Promise<Array<{path: string, size: number}>>}
+             */
+            listFiles: () => this._request('/admin/site/files', { method: 'GET' }),
+        };
     }
 }
 

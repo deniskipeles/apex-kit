@@ -181,7 +181,7 @@ impl DynamicStorage {
             
             Arc::new(s3)
         } else {
-            let path = self.fs_root_override.clone().unwrap_or_else(|| "./uploads".to_string());
+            let path = self.fs_root_override.clone().unwrap_or_else(|| "./storage/system/uploads".to_string());
             let url_base = self.public_url_prefix.clone().unwrap_or_else(|| "/api/v1/storage/file/".to_string());
             
             Arc::new(LocalStorage::new(&path, &url_base).await)
@@ -216,6 +216,11 @@ impl StorageBackend for DynamicStorage {
     async fn delete(&self, filename: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = self.resolve_backend().await?;
         backend.delete(filename).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let backend = self.resolve_backend().await?;
+        backend.list_prefix(prefix).await
     }
 
     fn get_public_url_base(&self) -> String {
@@ -348,7 +353,7 @@ pub async fn migrate_storage(
         match req_type {
             "local" => {
                 // Use default paths
-                let path = "./uploads"; 
+                let path = "./storage/system/uploads"; 
                 let url_base = "/api/v1/storage/file/";
                 // We have to call async new, so we wrap in async block if needed, but here we await immediately
                 // However, LocalStorage::new is async.

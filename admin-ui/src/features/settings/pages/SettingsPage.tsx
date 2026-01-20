@@ -2,7 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { 
     Loader2, Settings as SettingsIcon, Shield, Database, 
     BrainCircuit, HardDrive, Key,
-    Mail
+    Mail,
+    Globe
 } from 'lucide-react';
 import { Button } from '../../../components/ui/Elements';
 import { GeneralSettings } from '../components/GeneralSettings';
@@ -13,11 +14,12 @@ import { BackupSettings } from '../components/BackupSettings';
 import { TokenSettings } from '../components/TokenSettings';
 import { AiSettings } from '../components/AiSettings';
 import { ConfigSettings } from '../components/ConfigSettings';
+import { SiteSettings } from '../components/SiteSettings';
 import { settingsService } from '../services/settingsService';
 import { AppSettings } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
 
-type Tab = 'general' | 'security' | 'smtp' | 'storage' | 'backups' | 'tokens' | 'ai' | 'config';
+type Tab = 'general' | 'security' | 'smtp' | 'storage' | 'backups' | 'tokens' | 'ai' | 'config' | 'hosting';
 
 export const SettingsPage = () => {
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -72,6 +74,7 @@ export const SettingsPage = () => {
       { id: 'backups', label: 'System', icon: Database, desc: 'Backups and cron jobs' },
       { id: 'config', label: 'Config Registry', icon: SettingsIcon, desc: 'Raw system configurations' },
       { id: 'tokens', label: 'API Keys', icon: Key, desc: 'Manage access tokens' },
+      { id: 'hosting', label: 'Static Hosting', icon: Globe, desc: 'Deploy frontend assets' },
   ];
 
   if (isLoading || !settings) {
@@ -142,6 +145,7 @@ export const SettingsPage = () => {
                     {activeTab === 'config' && <ConfigSettings />}
                     {activeTab === 'tokens' && <TokenSettings settings={settings} onChange={updateLocalSettings} />}
                     {activeTab === 'ai' && <AiSettings settings={settings} onChange={updateLocalSettings} onSave={handleSaveSection} />}
+                    {activeTab === 'hosting' && <SiteSettings />}
                 </div>
             </div>
 

@@ -11,6 +11,7 @@ pub trait StorageBackend: Send + Sync {
     async fn save(&self, filename: &str, data: &[u8], content_type: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
     async fn get(&self, filename: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
     async fn delete(&self, filename: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>>; 
     fn get_public_url_base(&self) -> String;
 }
 
@@ -54,6 +55,13 @@ impl StorageBackend for LocalStorage {
             fs::remove_file(file_path).await?;
         }
         Ok(())
+    }
+
+    // Minimal implementation for Local (Not used by backup logic, but required by trait)
+    async fn list_prefix(&self, _prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        // Local listing is handled via std::fs in backup_routes for now, 
+        // but implementing this allows unified logic later.
+        Ok(vec![])
     }
 
     fn get_public_url_base(&self) -> String {
@@ -155,6 +163,26 @@ impl StorageBackend for S3Storage {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         Ok(())
+    }
+
+    // S3 List Implementation
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let resp = self.client.list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .send()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        let mut results = Vec::new();
+        for obj in resp.contents.unwrap_or_default() {
+            let key = obj.key.unwrap_or_default();
+            let size = obj.size.unwrap_or(0) as u64;
+            // Convert S3 DateTime to string, or just use current if parsing fails (for display)
+            let time = obj.last_modified.map(|t| t.to_string()).unwrap_or_default();
+            results.push((key, size, time));
+        }
+        Ok(results)
     }
 
     fn get_public_url_base(&self) -> String {

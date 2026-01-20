@@ -1,0 +1,96 @@
+name: Build ApexKit
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Ensure we use the vendored OpenSSL to avoid cross-compilation linkage headaches
+  OPENSSL_STATIC: 1
+
+jobs:
+  build:
+    name: Build ${{ matrix.os_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Linux Static (Musl)
+          - target: x86_64-unknown-linux-musl
+            os_name: Linux
+            binary_name: apexkit
+            extension: ""
+          # Windows (GNU)
+          - target: x86_64-pc-windows-gnu
+            os_name: Windows
+            binary_name: apexkit
+            extension: ".exe"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.11.0 # Pinned for stability with cargo-zigbuild
+
+      - name: Install cargo-zigbuild
+        run: |
+          cargo install cargo-zigbuild
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (${{ matrix.target }})
+        # We specify -p apexkit-api to build the binary package from the workspace
+        run: |
+          cargo zigbuild --target ${{ matrix.target }} --release -p apexkit-api
+
+      - name: Prepare Artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Find the binary in the target folder
+          SRC_BIN="target/${{ matrix.target }}/release/apexkit-api${{ matrix.extension }}"
+          DEST_BIN="dist/${{ matrix.binary_name }}-${{ matrix.target }}${{ matrix.extension }}"
+          
+          if [ -f "$SRC_BIN" ]; then
+            echo "Moving $SRC_BIN to $DEST_BIN"
+            cp "$SRC_BIN" "$DEST_BIN"
+          else
+            echo "Error: Binary not found at $SRC_BIN"
+            ls -R target/
+            exit 1
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apexkit-${{ matrix.target }}
+          path: dist/*
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

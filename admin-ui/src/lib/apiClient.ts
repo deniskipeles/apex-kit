@@ -1,5 +1,5 @@
 import { APEX_TOKEN } from '../constants';
-import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions, ApiKey } from '../types';
+import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions, ApiKey, SiteFile } from '../types';
 import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
 
 // const env = (import.meta as any).env;
@@ -19,6 +19,7 @@ if (storedToken) {
 // --- DYNAMIC CLIENT PROXY ---
 // This allows the entire app to automatically switch to Tenant Mode
 // if the URL path is /_dashboard/tenant/:id/...
+// --- DYNAMIC CLIENT PROXY ---
 export const pb = new Proxy(basePb, {
   get(target, prop, receiver) {
     if (typeof window !== 'undefined') {
@@ -27,13 +28,15 @@ export const pb = new Proxy(basePb, {
       // 1. Check for TENANT URL
       const tenantMatch = path.match(/^\/_dashboard\/tenant\/([^/]+)/);
       if (tenantMatch && tenantMatch[1]) {
+        // The .tenant() method in updated SDK sets scopeType='tenant'
         const tenantInstance = target.tenant(tenantMatch[1]);
         return Reflect.get(tenantInstance, prop, receiver);
       }
 
-      // 2. Check for SANDBOX URL (NEW)
+      // 2. Check for SANDBOX URL
       const sandboxMatch = path.match(/^\/_dashboard\/sandbox\/([^/]+)/);
       if (sandboxMatch && sandboxMatch[1]) {
+        // The .sandbox() method in updated SDK sets scopeType='sandbox'
         const sandboxInstance = target.sandbox(sandboxMatch[1]);
         return Reflect.get(sandboxInstance, prop, receiver);
       }
@@ -185,6 +188,9 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
 };
 
 export const apiClient = {
+  // Helper to get current scope info securely from the instance
+  getScope: () => pb.scope, // returns { type: 'root'|'tenant'|'sandbox', id: string }
+  setToken: (token: string) => basePb.setToken(token),
   apiUrl: apiUrl,
   logoUrl: apiUrl + "/logo?thumb=100x100",
   stripHtmlTags: basePb.utils.stripHtmlTags,
@@ -282,12 +288,30 @@ export const apiClient = {
   },
 
   auth: {
+    listRoles: async () => {
+      return await pb.auth.listRoles();
+    },
+    getMe: async () => {
+      // Calls SDK getMe, which updates internal scope state
+      const u = await pb.auth.getMe();
+      // Map to frontend type
+      return {
+        id: u.id.toString(),
+        email: u.email,
+        role: u.role,
+        lastActive: new Date().toISOString(),
+        // Pass scope to UI if needed, though SDK holds the truth
+        scope: u.scope
+      };
+    },
     login: async (email: string, password: string) => {
       const response = await pb.auth.login(email, password);
       localStorage.setItem(APEX_TOKEN, response.token);
       const user = {
         id: response.user.id.toString(),
         email: response.user.email,
+        role: response.user.role,
+        metadata: response.user.metadata,
         lastActive: new Date().toISOString()
       };
       return { token: response.token, user };
@@ -310,6 +334,7 @@ export const apiClient = {
           id: u.id.toString(),
           email: u.email,
           role: u.role,
+          metadata: u.metadata,
           lastActive: new Date().toISOString(),
         }));
 
@@ -320,17 +345,12 @@ export const apiClient = {
       }
     },
     create: async (data: Partial<AuthUser>): Promise<AuthUser> => {
-      // Use Auth Register endpoint to create user
-      // Note: We assume a default password if not provided, or require it in UI
-      const password = (data as any).password || 'password123';
-
-      const res = await pb.auth.register(data.email!, password);
-
+      const res = await pb.admins.registerUser(data.email!, data.password, data.role, data.metadata);
       return {
         id: res.user.id.toString(),
         email: res.user.email,
         role: res.user.role,
-        lastActive: new Date().toISOString()
+        metadata: res.user.metadata,
       };
     },
     update: async (id: string, data: Partial<AuthUser>): Promise<AuthUser> => {
@@ -339,7 +359,8 @@ export const apiClient = {
       return {
         id,
         email: data.email || '',
-        lastActive: new Date().toISOString(),
+        metadata: data.metadata,
+        role: data.role,
         ...data
       } as AuthUser;
     },
@@ -358,6 +379,21 @@ export const apiClient = {
     },
     delete: async (key: string) => {
       return await pb.admins.deleteConfig(key);
+    }
+  },
+
+  // --- Static Sites ---
+  sites: {
+    deploy: async (file: File) => {
+      return await pb.sites.deploy(file);
+    },
+    list: async (): Promise<SiteFile[]> => {
+      try {
+        return await pb.sites.listFiles();
+      } catch (e) {
+        console.error("Failed to list site files", e);
+        return [];
+      }
     }
   },
 

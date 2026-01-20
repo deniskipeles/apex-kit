@@ -4,7 +4,7 @@ use axum::{
     response::{Redirect, Response, IntoResponse},
     Json,
 };
-use serde::{Deserialize};
+use serde::{Deserialize, Serialize};
 use apexkit_core::{auth, jobs::Job};
 use crate::{AppState, AppError, AuthResponse, UserDto};
 use apexkit_core::security::EncryptedValue;
@@ -14,6 +14,9 @@ use crate::DatabaseConnection;
 use axum::Extension;
 use apexkit_core::jobs;
 use utoipa::ToSchema;
+use apexkit_core::realtime::EventScope;
+use std::sync::Arc;
+use apexkit_core::{Db, security::Vault};
 
 // --- GitHub Models ---
 #[derive(Deserialize)]
@@ -44,8 +47,8 @@ struct GithubUser {
 }
 
 // Helper to fetch and decrypt
-async fn get_secret(state: &AppState, key: &str) -> Result<String, AppError> {
-    let json_opt = state.db.get_config(key).await
+async fn get_secret(db: Arc<dyn Db>, vault: Arc<Vault>, key: &str) -> Result<String, AppError> {
+    let json_opt = db.get_config(key).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
         
     let json_val = json_opt.ok_or_else(|| AppError::UnknownError(format!("Configuration '{}' missing", key)))?;
@@ -53,16 +56,17 @@ async fn get_secret(state: &AppState, key: &str) -> Result<String, AppError> {
     let enc: EncryptedValue = serde_json::from_value(json_val)
         .map_err(|_| AppError::UnknownError("Invalid secret format".into()))?;
     
-    state.vault.decrypt(&enc).map_err(|_| AppError::UnknownError("Decryption failed".into()))
+    vault.decrypt(&enc).map_err(|_| AppError::UnknownError("Decryption failed".into()))
 }
 
 // --- GitHub Handlers ---
 
 pub async fn github_login(
+    DatabaseConnection(db): DatabaseConnection, // [FIX] Inject scoped DB
     State(state): State<AppState>,
     Query(query): Query<LoginQuery>,
 ) -> Result<Redirect, AppError> {
-    let client_id = get_secret(&state, "github_client_id").await?;
+    let client_id = get_secret(db, state.vault.clone(), "github_client_id").await?;
     
     // Pass the redirect URL in the 'state' parameter (simple approach)
     // For production, this should be signed/encrypted to prevent open redirect vulnerabilities
@@ -76,12 +80,22 @@ pub async fn github_login(
 }
 
 pub async fn github_callback(
+    DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>, // [FIX] Capture current scope (Root/Tenant)
     Query(params): Query<OauthCallback>,
 ) -> Result<Response, AppError> {
-    let client_id = get_secret(&state, "github_client_id").await?;
-    let client_secret = get_secret(&state, "github_client_secret").await?;
+    let client_id = get_secret(db.clone(), state.vault.clone(), "github_client_id").await?;
+    let client_secret = get_secret(db.clone(), state.vault.clone(), "github_client_secret").await?;
     
+    // [FIX] Determine Scope String from Context
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let scope_str = match &event_scope {
+        EventScope::Tenant(id) => format!("tenant:{}", id),
+        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+        _ => "root".to_string()
+    };
+
     // 1. Exchange Code
     let client = reqwest::Client::new();
     let token_res = client.post("https://github.com/login/oauth/access_token")
@@ -109,18 +123,14 @@ pub async fn github_callback(
         .await
         .map_err(|_| AppError::UnknownError("Failed to parse user".into()))?;
 
-    // 3. Find or Create User
+    // 3. Find or Create User (In the scoped DB)
     let provider_id = gh_user.id.to_string();
-    let existing = state.db.get_user_by_oauth("github", &provider_id).await
+    let existing = db.get_user_by_oauth("github", &provider_id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     let user = match existing {
-        Some(u) => {
-            // [OPTIONAL] Update metadata on login if changed?
-            u
-        },
+        Some(u) => u,
         None => {
-            // [NEW] Construct Metadata
             let metadata = json!({
                 "avatar": gh_user.avatar_url,
                 "name": gh_user.name.unwrap_or(gh_user.login.clone()),
@@ -132,33 +142,29 @@ pub async fn github_callback(
             let pwd = uuid::Uuid::new_v4().to_string(); 
             let hash = auth::hash_password(&pwd).unwrap();
             
-            // Pass metadata to create_user
-            let u = state.db.create_user(&email, &hash, "user", Some(metadata)).await
+            let u = db.create_user(&email, &hash, "user", Some(metadata)).await
                 .map_err(|_| AppError::UnknownError("Email already taken".into()))?;
             
-            state.db.link_oauth(u.id, "github", &provider_id).await
+            db.link_oauth(u.id, "github", &provider_id).await
                 .map_err(|e| AppError::UnknownError(e.to_string()))?;
             u
         }
     };
 
-    // 4. Issue JWT
-    let token = auth::create_jwt(user.id, &user.email, &user.role)
+    // 4. Issue JWT with CORRECT SCOPE
+    let token = auth::create_jwt(user.id, &user.email, &user.role, &scope_str)
         .map_err(|_| AppError::UnknownError("Token failed".into()))?;
 
-    // 5. Handle Response Type (JSON vs Redirect)
-    // If 'state' param was passed (containing redirect URL), use it
+    // 5. Handle Response
     if let Some(target) = params.state.filter(|s| !s.is_empty()) {
-        // Append token to redirect URL (e.g. ?token=...)
         let separator = if target.contains('?') { '&' } else { '?' };
         let redirect_url = format!("{}{}{}={}", target, separator, "token", token);
         return Ok(Redirect::to(&redirect_url).into_response());
     }
 
-    // Default: Return JSON
     Ok(Json(AuthResponse {
         token,
-        user: UserDto { id: user.id, email: user.email, role: user.role, metadata: user.metadata },
+        user: UserDto { id: user.id, email: user.email, role: user.role, metadata: user.metadata, scope: Some(scope_str), },
     }).into_response())
 }
 
@@ -170,14 +176,14 @@ pub struct VerifyRequest {
 }
 
 pub async fn verify_email(
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection, // [FIX] Inject scoped DB
     Query(params): Query<VerifyRequest>,
 ) -> Result<String, AppError> {
-    let user_id = state.db.consume_auth_token(&params.token, "verify").await
+    let user_id = db.consume_auth_token(&params.token, "verify").await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::Unauthorized("Invalid or expired token".into()))?;
 
-    state.db.set_user_verified(user_id).await
+    db.set_user_verified(user_id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     Ok("Email verified successfully!".to_string())
@@ -189,12 +195,13 @@ pub struct ResendRequest {
 }
 
 pub async fn resend_verification(
+    DatabaseConnection(db): DatabaseConnection, // [FIX] Inject scoped DB
     State(state): State<AppState>,
     Json(payload): Json<ResendRequest>,
 ) -> Result<StatusCode, AppError> {
-    if let Some(user) = state.db.get_user_by_email(&payload.email).await.unwrap() {
+    if let Some(user) = db.get_user_by_email(&payload.email).await.unwrap() {
         let token = uuid::Uuid::new_v4().to_string();
-        state.db.create_auth_token(user.id, "verify", &token).await.unwrap();
+        db.create_auth_token(user.id, "verify", &token).await.unwrap();
         state.queue.enqueue(Job::SendVerification { email: user.email, token }).await;
     }
     // Always return OK to prevent enumeration
@@ -229,8 +236,42 @@ pub async fn get_me(
         id: user.id,
         email: user.email.clone(),
         role: user.role.clone(),
-        metadata: user.metadata.clone()
+        metadata: user.metadata.clone(),
+        scope: Some(claims.scope),
     }))
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RolesResponse {
+    pub roles: Vec<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/roles",
+    responses((status = 200, body = RolesResponse))
+)]
+pub async fn list_roles_handler(
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Json<RolesResponse>, AppError> {
+    // 1. Try to fetch from config
+    let roles = if let Ok(Some(val)) = db.get_config("APEX_AUTH_ROLES").await {
+        // [FIX] Handle potential double-encoding or string-wrapped JSON
+        if let Some(s) = val.as_str() {
+             // If it's a string, try to parse it as JSON array
+             serde_json::from_str::<Vec<String>>(s).unwrap_or_else(|_| vec!["admin".to_string(), "user".to_string()])
+        } else if val.is_array() {
+             // If it's already an array value
+             serde_json::from_value::<Vec<String>>(val).unwrap_or_else(|_| vec!["admin".to_string(), "user".to_string()])
+        } else {
+            // Default roles
+             vec!["admin".to_string(), "user".to_string()]
+        }
+    } else {
+        // Default roles
+        vec!["admin".to_string(), "user".to_string()]
+    };
+    Ok(Json(RolesResponse { roles }))
 }
 
 #[derive(Deserialize, ToSchema)]

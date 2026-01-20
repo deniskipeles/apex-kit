@@ -14,15 +14,12 @@ export const usersService = {
   delete: (id: string) => {
     return apiClient.users.delete(id);
   },
-  // method to fetch roles via the script engine
   getRoles: async (): Promise<string[]> => {
     try {
-        // Runs the server-side script 'apex-auth-roles'
-        // Expecting response: { roles: ["admin", "user", "editor"] }
-        const res = await apiClient.scripts.run('apex-auth-roles', {});
-        return res?.roles || ['admin', 'user']; // Fallback defaults
+        const res = await apiClient.auth.listRoles();
+        return res.roles || ['admin', 'user'];
     } catch (e) {
-        console.warn("Failed to fetch roles from script, using defaults.", e);
+        console.warn("Failed to fetch roles, using defaults.", e);
         return ['admin', 'user'];
     }
   }

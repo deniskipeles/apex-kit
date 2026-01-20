@@ -21,6 +21,8 @@ pub struct Claims {
     pub uid: i64,    // user id
     pub role: String,
     pub exp: usize,
+    #[serde(default)]
+    pub scope: String,
 }
 
 // --- Logic ---
@@ -35,7 +37,7 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     bcrypt::verify(password, hash).unwrap_or(false)
 }
 
-pub fn create_jwt(id: i64, email: &str, role: &str) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn create_jwt(id: i64, email: &str, role: &str, scope: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let expiration = Utc::now()
         .checked_add_signed(Duration::hours(24))
         .expect("valid timestamp")
@@ -46,6 +48,7 @@ pub fn create_jwt(id: i64, email: &str, role: &str) -> Result<String, jsonwebtok
         uid: id,
         role: role.to_owned(),
         exp: expiration as usize,
+        scope: scope.to_owned(),
     };
 
     encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET))

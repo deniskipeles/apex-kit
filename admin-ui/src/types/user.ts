@@ -3,5 +3,6 @@ export interface AuthUser {
   id: string;
   email: string;
   role: string;
-  lastActive: string;
+  password?: string;
+  metadata?: object;
 }
