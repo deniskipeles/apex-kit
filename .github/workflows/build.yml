@@ -11,12 +11,15 @@ env:
   CARGO_TERM_COLOR: always
   # Ensure we use the vendored OpenSSL to avoid cross-compilation linkage headaches
   OPENSSL_STATIC: 1
+  # Explicitly tell pkg-config to look for static libs
+  PKG_CONFIG_ALL_STATIC: 1
 
 jobs:
   build:
     name: Build ${{ matrix.os_name }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false # Don't cancel Linux if Windows fails (or vice versa)
       matrix:
         include:
           # Linux Static (Musl)
@@ -34,6 +37,13 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # [FIX] Install MinGW for Windows cross-compilation (provides dlltool)
+      # [FIX] Install musl-tools for Linux static linking
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 musl-tools
+
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,7 +52,7 @@ jobs:
       - name: Install Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
-          version: 0.11.0 # Pinned for stability with cargo-zigbuild
+          version: 0.11.0 
 
       - name: Install cargo-zigbuild
         run: |
@@ -60,7 +70,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (${{ matrix.target }})
-        # We specify -p apexkit-api to build the binary package from the workspace
         run: |
           cargo zigbuild --target ${{ matrix.target }} --release -p apexkit-api
 
