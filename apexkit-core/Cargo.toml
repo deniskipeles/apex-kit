@@ -28,8 +28,11 @@ moka = { version = "0.12", features = ["future"] } # Caching
 utoipa = "5.4.0"
 
 # Storage & AWS
-aws-config = "1.1"
-aws-sdk-s3 = "1.1"
+# aws-config = "1.1"
+# aws-sdk-s3 = "1.1"
+# [FIX] Switch to rustls to fix Windows cross-compilation (removes aws-lc-sys dependency)
+aws-config = { version = "1.1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.1", default-features = false, features = ["rustls", "rt-tokio"] }
 aws-credential-types = "1.1" 
 
 # Email
