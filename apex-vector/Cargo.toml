@@ -9,7 +9,16 @@ candle-core = "0.5.1"
 candle-nn = "0.5.1"
 candle-transformers = "0.5.1"
 tokenizers = "0.19.1"
-hf-hub = "0.4"
+# [FIX] Disable default features for hf-hub to control TLS
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq"] }
+# Note: hf-hub might not allow granular control of ureq features easily. 
+# If this fails, we might need to rely on the global rustls override or use "native-tls" if supported.
+# Let's try switching hf-hub to "native-tls" if possible? 
+# hf-hub 0.3 supports "native-tls" via ureq? No, ureq is rustls only usually.
+# Let's stick to the plan: Disable aws-lc.
+
+# [FIX] Force ring
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
 # Vector Search
 hnsw_rs = "0.3"

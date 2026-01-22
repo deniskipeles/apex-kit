@@ -28,12 +28,19 @@ moka = { version = "0.12", features = ["future"] } # Caching
 utoipa = "5.4.0"
 
 # Storage & AWS
-# aws-config = "1.1"
-# aws-sdk-s3 = "1.1"
-# [FIX] Switch to rustls to fix Windows cross-compilation (removes aws-lc-sys dependency)
-aws-config = { version = "1.1", default-features = false, features = ["rustls", "rt-tokio"] }
-aws-sdk-s3 = { version = "1.1", default-features = false, features = ["rustls", "rt-tokio"] }
-aws-credential-types = "1.1" 
+# [FIXED] Use "native-tls" instead of "rustls" or "rustls-ring".
+# This uses the system's native crypto (Schannel on Windows), avoiding aws-lc compilation.
+aws-config = { version = "1.8.12", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.1", default-features = false, features = ["rt-tokio"] }
+aws-credential-types = "1.1"
+
+# [FIXED] Use native-tls-vendored for Reqwest to avoid aws-lc/ring conflict
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "native-tls-vendored"] }
+
+# [Note] You can keep rustls for other things if needed, but AWS/Reqwest will now use native-tls
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+
+
 
 # Email
 lettre = { version = "0.11", features = ["tokio1", "smtp-transport", "builder", "tokio1-native-tls", "sendmail-transport"] }
@@ -56,7 +63,7 @@ boa_engine = { version = "0.21.0" }
 boa_gc = "0.21.0"
 
 # HTTP Client (Added blocking feature for easier scripting)
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+# reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 # Validation Extensions
 regex = "1.10"

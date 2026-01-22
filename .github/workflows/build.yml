@@ -42,7 +42,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 musl-tools
+          sudo apt-get install -y mingw-w64 musl-tools nasm perl
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
