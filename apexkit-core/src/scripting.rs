@@ -253,6 +253,7 @@ impl ScriptEngine {
         register_ai(ctx)?;
         register_mail(ctx)?;
         register_realtime(ctx)?;
+        register_cache(ctx)?;
 
         Ok(())
     }
@@ -772,15 +773,62 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
     let is_root = ACTIVE_CONTEXT.with(|c| c.borrow().as_ref().map(|t| t.4 == EventScope::Root).unwrap_or(false));
     
     if is_root {
+        // Updated Signature: createTenant(id: string, config?: object)
         let create_tenant = NativeFunction::from_copy_closure(move |_, args, ctx| {
             let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+            
+            // Extract config object if present
+            let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
+            
+            let (name, tier, owner_id) = if let Some(serde_json::Value::Object(map)) = config_val {
+                (
+                    map.get("name").and_then(|v| v.as_str()).map(String::from),
+                    map.get("tier").and_then(|v| v.as_str()).map(String::from),
+                    map.get("owner_id").and_then(|v| v.as_i64()) // Expecting number
+                )
+            } else {
+                (None, None, None)
+            };
+
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        // [FIX] Error mapping
+                        // 1. Create Physical Resources
                         app.admin_create_tenant(id.clone()).await.map_err(|e| e.to_string())?;
-                        // [FIX] Error mapping and method call
-                        app.get_db().register_tenant(&id, None).await.map_err(|e| e.to_string())?;
+                        
+                        // 2. Register Metadata with injected values
+                        app.get_db().register_tenant(&id, owner_id, name, tier).await.map_err(|e| e.to_string())?;
+                        
+                        Ok(true)
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res.map(|b| serde_json::Value::Bool(b)))
+        });
+
+        // [NEW] createSandbox(id: string, config?: object)
+        let create_sandbox = NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+            // Extract config object
+            let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
+            let (name, owner_id, expires_at) = if let Some(serde_json::Value::Object(map)) = config_val {
+                (
+                    map.get("name").and_then(|v| v.as_str()).map(String::from),
+                    map.get("owner_id").and_then(|v| v.as_i64()),
+                    map.get("expires_at").and_then(|v| v.as_str()).map(String::from) // ISO String
+                )
+            } else {
+                (None, None, None)
+            };
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        // 1. Create Physical Resources
+                        app.admin_create_sandbox(id.clone()).await.map_err(|e| e.to_string())?;
+
+                        // 2. Register Metadata
+                        app.get_db().register_sandbox(&id, owner_id, name, expires_at).await.map_err(|e| e.to_string())?;
+                        
                         Ok(true)
                     })
                 } else { Err("Context lost".into()) }
@@ -789,12 +837,91 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
         });
 
         let obj = ObjectInitializer::new(ctx)
-            .function(create_tenant, JsString::from("createTenant"), 1)
+            .function(create_tenant, JsString::from("createTenant"), 2) //  Arity 2
+            .function(create_sandbox, JsString::from("createSandbox"), 2)
             .build();
         ctx.register_global_property(JsString::from("$root"), obj, Attribute::all()).map_err(|e| e.to_string())
     } else {
         ctx.register_global_property(JsString::from("$root"), JsValue::null(), Attribute::all()).map_err(|e| e.to_string())
     }
+}
+
+// Function to register $cache
+fn register_cache(ctx: &mut Context) -> Result<(), String> {
+    // 1. GET
+    let get = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let res = ACTIVE_CONTEXT.with(|c| {
+            if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                handle.block_on(async {
+                    app.cache_get(&key).await
+                })
+            } else { None }
+        });
+        
+        match res {
+            Some(val) => Ok(JsValue::from(JsString::from(val))),
+            None => Ok(JsValue::null())
+        }
+    });
+
+    // 2. SET
+    let set = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        // Accept string or JSON object (stringify it)
+        let val = args.get_or_undefined(1);
+        let val_str = if val.is_object() {
+             serde_json::to_string(&val.to_json(ctx).unwrap()).unwrap_or_default()
+        } else {
+             val.to_string(ctx)?.to_std_string_escaped()
+        };
+
+        let ttl = args.get(2).and_then(|v| v.to_number(ctx).ok()).map(|n| n as u64);
+
+        ACTIVE_CONTEXT.with(|c| {
+            if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                handle.block_on(async {
+                    app.cache_set(&key, &val_str, ttl).await;
+                })
+            }
+        });
+        Ok(JsValue::undefined())
+    });
+
+    // 3. DELETE
+    let del = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        ACTIVE_CONTEXT.with(|c| {
+            if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                handle.block_on(async { app.cache_del(&key).await; })
+            }
+        });
+        Ok(JsValue::undefined())
+    });
+
+    // 4. INCREMENT (For Quotas)
+    let incr = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let delta = args.get(1).and_then(|v| v.to_number(ctx).ok()).unwrap_or(1.0) as i64;
+
+        let res = ACTIVE_CONTEXT.with(|c| {
+            if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                handle.block_on(async {
+                    app.cache_incr(&key, delta).await
+                })
+            } else { 0 }
+        });
+        Ok(JsValue::from(res))
+    });
+
+    let obj = ObjectInitializer::new(ctx)
+        .function(get, JsString::from("get"), 1)
+        .function(set, JsString::from("set"), 3)
+        .function(del, JsString::from("delete"), 1)
+        .function(incr, JsString::from("incr"), 2)
+        .build();
+
+    ctx.register_global_property(JsString::from("$cache"), obj, Attribute::all()).map_err(|e| e.to_string())
 }
 
 fn register_env(ctx: &mut Context) -> Result<(), String> {

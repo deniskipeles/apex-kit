@@ -195,11 +195,23 @@ pub async fn start_session(
         _ => CloneStrategy::None,
     };
     
-    // [UPDATED] Call sandbox manager with strategy and source DB (root DB)
+    // 1. Create Physical Sandbox (Manager)
     let _ = state.sandbox_manager.create_sandbox(&id, strategy, state.db.clone()).await
         .map_err(|e| AppError::UnknownError(e))?;
 
-    // 2. Create Session Record in MAIN DB
+    // 2. [NEW] Register in Root DB _sandboxes table
+    // Capture user ID from claims if available (e.g., if we allow non-admins to create sandboxes later)
+    let owner_id = claims.uid; 
+    
+    // Default expiry: 24 hours
+    let expires_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::hours(24))
+        .map(|d| d.to_rfc3339());
+
+    state.db.register_sandbox(&id, Some(owner_id), Some(req.name.clone()), expires_at).await
+        .map_err(|e| AppError::UnknownError(format!("Failed to register sandbox metadata: {}", e)))?;
+
+    // 3. Create Session Record (AI Context)
     let session = AiSession {
         id: id.clone(),
         name: req.name,
@@ -213,7 +225,7 @@ pub async fn start_session(
 
     state.db.create_ai_session(&session).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // 3. If prompt exists, run generation
+    // 4. If prompt exists, run generation
     if let Some(prompt) = req.initial_prompt {
         return chat_handler(id, prompt, req.model, state).await;
     }

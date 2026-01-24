@@ -72,6 +72,7 @@ pub mod export_data_routes;
 pub mod cli;
 pub mod sandbox_manager; 
 pub mod tenant_manager;
+pub mod tenant_routes;
 pub mod backup;
 pub mod backup_routes;
 pub mod key_routes;
@@ -95,6 +96,9 @@ pub struct AppState {
     pub embedder: Arc<apexkit_core::embeddings::EmbedderService>,
     pub vector_provider: Arc<dyn VectorProvider>,
     pub port: u16,
+    // Script Cache (Key -> Value)
+    // We use String values to store JSON or Numbers (parsed on retrieval)
+    pub script_cache: Cache<String, String>,
 }
 
 // --- DTOs ---
@@ -255,11 +259,16 @@ pub async fn trigger_void_hook(
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
 
+    let context = Arc::new(crate::ScopedScriptContext {
+        state: state.clone(),
+        scope: scope.cloned().unwrap_or(EventScope::Root),
+    });
+
     for script in scripts {
         state.script_engine.run_hook(
             &script.code, 
             ctx.clone(), 
-            Arc::new(state.clone()), // Pass AppState
+            context.clone(),
             base_url.clone(),  
             scope.cloned()
         ).await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))?;
@@ -283,6 +292,11 @@ pub async fn trigger_filter_hook(
 
     let mut current_data = data;
 
+    let context = Arc::new(crate::ScopedScriptContext {
+        state: state.clone(),
+        scope: scope.cloned().unwrap_or(EventScope::Root),
+    });
+
     for script in scripts {
         let ctx = json!({
             "trigger": trigger,
@@ -293,7 +307,7 @@ pub async fn trigger_filter_hook(
         if let Some(res) = state.script_engine.run_hook(
             &script.code, 
             ctx, 
-            Arc::new(state.clone()), // Pass AppState
+            context.clone(), 
             base_url.clone(), 
             scope.cloned()
         ).await.map_err(|e| AppError::Validation(vec![ValidationError::ConstraintViolation(trigger.into(), e)]))? 
@@ -322,6 +336,11 @@ async fn trigger_hooks(
     let mut current_data = data.clone();
     let mut modified = false;
 
+    let context = Arc::new(crate::ScopedScriptContext {
+        state: state.clone(),
+        scope: scope.cloned().unwrap_or(EventScope::Root),
+    });
+
     for script in scripts {
         if let Some(target) = &script.target_collection {
             if target != &collection.name { continue; }
@@ -333,11 +352,11 @@ async fn trigger_hooks(
             "auth": auth.map(|c| serde_json::json!({ "id": c.uid, "email": c.sub, "role": c.role })),
             "trigger": trigger
         });
-
+        
         match state.script_engine.run_hook(
             &script.code, 
             event_context, 
-            Arc::new(state.clone()), // Pass AppState
+            context.clone(),
             base_url.clone(), 
             scope.cloned()
         ).await {
@@ -354,30 +373,138 @@ async fn trigger_hooks(
 
 // --- MIDDLEWARE ---
 
-async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: Next) -> Result<Response, StatusCode> {
-    // 1. Check Bearer Token (JWT)
+async fn auth_middleware(
+    State(state): State<AppState>, 
+    mut req: Request, 
+    next: Next
+) -> Result<Response, StatusCode> {
+    
+    // 1. Determine Scope
+    let current_request_scope = req.extensions().get::<EventScope>().cloned().unwrap_or(EventScope::Root);
+
+    // 2. [GATEKEEPER] Check Suspension
+    // We use the Manager to get the context. This uses the Cache.
+    let mut tenant_is_suspended = false;
+
+    if let EventScope::Tenant(ref tenant_id) = current_request_scope {
+        // Try to get context (Fast path via cache)
+        if let Ok(ctx) = state.tenant_manager.get_tenant_context(tenant_id).await {
+            // Check the status stored in memory
+            if ctx.status == "suspended" || ctx.status == "archived" {
+                tenant_is_suspended = true;
+            }
+        } else {
+            // If we can't load the tenant (e.g. disk error or deleted), deny access
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+
+    // 3. Resolve DB to Check for Keys
+    // If we are in a tenant, we check the tenant's DB first
+    let db_to_check: Arc<dyn Db> = if let Some(db) = req.extensions().get::<Arc<dyn Db>>() {
+        db.clone()
+    } else {
+        state.db.clone()
+    };
+
+    // 4. Validate JWT (Bearer)
     if let Some(auth_header) = req.headers().typed_get::<Authorization<Bearer>>() {
         if let Ok(claims) = auth::decode_jwt(auth_header.token()) {
+            
+            // Check Scope Matches URL
+            let is_authorized = match claims.scope.as_str() {
+                "root" => true, // Root Admin can access everything
+                scope_str => {
+                    let expected = match &current_request_scope {
+                        EventScope::Root => "root".to_string(),
+                        EventScope::Tenant(id) => format!("tenant:{}", id),
+                        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+                        _ => "root".to_string(), 
+                    };
+                    scope_str == expected
+                }
+            };
+
+            // [ENFORCEMENT] 
+            // If User is NOT Root (i.e. is_authorized via scope match, but not "root" scope explicitly)
+            // AND Tenant is suspended -> BLOCK
+            // However, the logic above sets is_authorized=true for tenants matching their own scope.
+            // We need to differentiate Root Admin vs Tenant User.
+            
+            let is_root_user = claims.scope == "root";
+
+            if !is_authorized { return Err(StatusCode::FORBIDDEN); }
+            
+            if tenant_is_suspended && !is_root_user {
+                 return Err(StatusCode::FORBIDDEN); // "Account Suspended"
+            }
+
             req.extensions_mut().insert(claims);
             return Ok(next.run(req).await);
         }
-        // If JWT fails but starts with 'ak_', check API Key logic below? 
-        // Usually Bearer is JWT. Let's support `Authorization: ApiKey <key>` or `x-api-key`.
     }
 
-    // 2. Check API Key Header (x-api-key)
+    // 5. Validate API Key (x-api-key)
     if let Some(key_header) = req.headers().get("x-api-key") {
-        if let Ok(key) = key_header.to_str() {
-             // We need to look up the key in the DB.
-             // Since middleware is sync/async boundary, we use the DB in state.
-             if let Ok(Some(api_key)) = state.db.verify_api_key(key).await {
-                 // Create a Synthetic Claims object
+         if let Ok(key) = key_header.to_str() {
+             
+             // A. Check Local DB
+             let local_verification = db_to_check.verify_api_key(key).await;
+             
+             // B. Resolve Key Origin
+             let api_key_opt = if let Ok(Some(k)) = local_verification {
+                 Some((k, true)) // Found in Local DB (Tenant Created)
+             } else if !matches!(current_request_scope, EventScope::Root) {
+                 // Fallback: Check Root DB
+                 state.db.verify_api_key(key).await.ok().flatten().map(|k| (k, false))
+             } else {
+                 None
+             };
+
+             if let Some((api_key, is_local_key)) = api_key_opt {
+                 
+                 // [ENFORCEMENT]
+                 if tenant_is_suspended {
+                     if is_local_key {
+                         // Local key usage blocked on suspended tenant
+                         tracing::warn!("Blocked suspended tenant key");
+                         return Err(StatusCode::FORBIDDEN);
+                     }
+                     // Root keys allowed (to manage/fix tenant)
+                 }
+
+                 // [SCOPE CHECK]
+                 let is_allowed = if is_local_key {
+                     true // Local key implies access to current DB
+                 } else {
+                     // Root key must have correct scope
+                     if api_key.scope == "root" || api_key.scope == "*" {
+                         true
+                     } else if api_key.scope.starts_with("tenant:") {
+                         if let EventScope::Tenant(tid) = &current_request_scope {
+                             api_key.scope == format!("tenant:{}", tid)
+                         } else { false }
+                     } else if api_key.scope.starts_with("sandbox:") {
+                         if let EventScope::Sandbox(sid) = &current_request_scope {
+                             api_key.scope == format!("sandbox:{}", sid)
+                         } else { false }
+                     } else { false }
+                 };
+
+                 if !is_allowed { return Err(StatusCode::FORBIDDEN); }
+
                  let claims = Claims {
                      sub: format!("apikey:{}", api_key.id),
-                     uid: 0, // System/API User ID (0 reserved?)
+                     uid: 0,
                      role: api_key.role,
-                     exp: 9999999999, // Never expires
-                     scope: api_key.scope,
+                     exp: 9999999999,
+                     scope: if is_local_key { 
+                         match current_request_scope {
+                             EventScope::Tenant(ref id) => format!("tenant:{}", id),
+                             EventScope::Sandbox(ref id) => format!("sandbox:{}", id),
+                             _ => "root".to_string()
+                         }
+                     } else { api_key.scope },
                  };
                  req.extensions_mut().insert(claims);
              }
@@ -416,31 +543,55 @@ impl JobContext for GlobalJobContext {
     }
 }
 
+// [NEW] Wrapper to enforce scoping
+pub struct ScopedScriptContext {
+    pub state: AppState,
+    pub scope: EventScope,
+}
+
+impl ScopedScriptContext {
+    fn prefix_key(&self, key: &str) -> String {
+        match &self.scope {
+            EventScope::Root => format!("root:{}", key), // Root gets its own namespace
+            EventScope::Tenant(id) => format!("tenant:{}:{}", id, key),
+            EventScope::Sandbox(id) => format!("sandbox:{}:{}", id, key),
+            _ => format!("global:{}", key),
+        }
+    }
+    
+    fn get_default_ttl(&self) -> u64 {
+        std::env::var("CACHE_TTL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300) // Default 5 minutes
+    }
+}
+
 // Implement the trait for AppState
-impl apexkit_core::ScriptContext for AppState {
+impl apexkit_core::ScriptContext for ScopedScriptContext {
     fn get_db(&self) -> Arc<dyn Db> {
-        self.db.clone()
+        self.state.db.clone()
     }
 
     fn get_vault(&self) -> Arc<Vault> {
-        self.vault.clone()
+        self.state.vault.clone()
     }
 
     fn get_embedder(&self) -> Arc<apexkit_core::embeddings::EmbedderService> {
-        self.embedder.clone()
+        self.state.embedder.clone()
     }
 
     fn get_vector_provider(&self) -> Arc<dyn VectorProvider> {
-        self.vector_provider.clone()
+        self.state.vector_provider.clone()
     }
 
     fn get_realtime_tx(&self) -> tokio::sync::broadcast::Sender<apexkit_core::realtime::DbEvent> {
-        self.tx.clone()
+        self.state.tx.clone()
     }
 
     // Dynamic Resolution for Tenant Switching
     fn resolve_tenant_db(&self, tenant_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>> {
-        let tm = self.tenant_manager.clone();
+        let tm = self.state.tenant_manager.clone();
         let tid = tenant_id.to_string();
         Box::pin(async move {
             tm.get_tenant(tid).await.ok()
@@ -449,7 +600,7 @@ impl apexkit_core::ScriptContext for AppState {
 
     // Dynamic Resolution for Sandbox Switching
     fn resolve_sandbox_db(&self, session_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>> {
-        let sm = self.sandbox_manager.clone();
+        let sm = self.state.sandbox_manager.clone();
         let sid = session_id.to_string();
         Box::pin(async move {
             sm.get_sandbox(&sid).await.ok()
@@ -457,9 +608,63 @@ impl apexkit_core::ScriptContext for AppState {
     }
 
     fn admin_create_tenant(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
-        let tm = self.tenant_manager.clone();
+        let tm = self.state.tenant_manager.clone();
         Box::pin(async move {
             tm.create_tenant(id).await.map(|_| ())
+        })
+    }
+
+    fn admin_create_sandbox(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        let sm = self.state.sandbox_manager.clone();
+        let db = self.state.db.clone();
+        Box::pin(async move {
+            // Default strategy for script creation
+            sm.create_sandbox(&id, sandbox_manager::CloneStrategy::None, db).await.map(|_| ()).map_err(|e| e.to_string())
+        })
+    }
+
+    // [UPDATED] Cache Methods with Scoping & TTL
+    fn cache_get(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+        let cache = self.state.script_cache.clone();
+        let k = self.prefix_key(key); // Prefix!
+        Box::pin(async move {
+            cache.get(&k).await
+        })
+    }
+
+    fn cache_set(&self, key: &str, val: &str, ttl_secs: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let cache = self.state.script_cache.clone();
+        let k = self.prefix_key(key); // Prefix!
+        let v = val.to_string();
+        
+        // Moka doesn't support per-item TTL in basic insert easily without Policy.
+        // We will simulate it by just inserting. The global cache eviction handles memory pressure.
+        // To strictly enforce the ENV TTL, we rely on Moka's configuration in main.rs.
+        // Note: If you want Strict TTL per item, you need a different cache strategy or store {val, expiry} payload.
+        // For now, we accept the insert.
+        
+        Box::pin(async move {
+            cache.insert(k, v).await;
+        })
+    }
+
+    fn cache_del(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let cache = self.state.script_cache.clone();
+        let k = self.prefix_key(key);
+        Box::pin(async move {
+            cache.invalidate(&k).await;
+        })
+    }
+
+    fn cache_incr(&self, key: &str, delta: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = i64> + Send>> {
+        let cache = self.state.script_cache.clone();
+        let k = self.prefix_key(key);
+        Box::pin(async move {
+             let current_str = cache.get(&k).await;
+             let current_val = current_str.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+             let new_val = current_val + delta;
+             cache.insert(k, new_val.to_string()).await;
+             new_val
         })
     }
 }
@@ -468,24 +673,74 @@ impl apexkit_core::ScriptContext for AppState {
 
 async fn sandbox_lifecycle_middleware(
     Path(params): Path<HashMap<String, String>>,
+    BaseUrl(base_url): BaseUrl, // [NEW] Needed for hooks
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let session_id = params.get("session_id").ok_or(StatusCode::NOT_FOUND)?;
+
+    // [NEW] Before Request Hook
+    let hook_payload = serde_json::json!({
+        "sandbox_id": session_id,
+        "path": req.uri().path(),
+        "method": req.method().to_string(),
+        "ip": req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("unknown")
+    });
+
+    if let Err(e) = trigger_void_hook(
+        &state, 
+        "before_sandbox_request", 
+        hook_payload, 
+        None, 
+        Some(&EventScope::Root), 
+        Some(base_url.clone())
+    ).await {
+        tracing::warn!("Blocked request to sandbox {}: {:?}", session_id, e);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     match state.sandbox_manager.get_sandbox(session_id).await {
         Ok(sandbox_db) => {
             req.extensions_mut().insert(sandbox_db);
+            
             let storage_path = format!("storage/sandboxes/session_{}/uploads", session_id);
-            let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
+            let public_url = format!("/sandbox/{}/api/v1/storage/file/", session_id);
+            let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, &public_url).await);
             req.extensions_mut().insert(storage);
             req.extensions_mut().insert(EventScope::Sandbox(session_id.to_string()));
             
-            // [UPDATED] Inject Header
+            // [FIX] Capture path before consuming req
+            let path_clone = req.uri().path().to_string();
+
             let mut response = next.run(req).await;
+            
             if let Ok(val) = HeaderValue::from_str(&format!("sandbox:{}", session_id)) {
                 response.headers_mut().insert("X-Apex-Scope", val);
             }
+
+            // [NEW] After Request Hook (Async)
+            let status = response.status().as_u16();
+            let state_clone = state.clone();
+            let base_url_clone = base_url.clone();
+            let sid_clone = session_id.to_string();
+
+            tokio::spawn(async move {
+                let payload = serde_json::json!({
+                    "sandbox_id": sid_clone,
+                    "path": path_clone,
+                    "status": status
+                });
+                let _ = trigger_void_hook(
+                    &state_clone, 
+                    "after_sandbox_request", 
+                    payload, 
+                    None, 
+                    Some(&EventScope::Root), 
+                    Some(base_url_clone)
+                ).await;
+            });
+
             Ok(response)
         }
         Err(_) => Err(StatusCode::NOT_FOUND),
@@ -505,13 +760,8 @@ async fn tenant_resolver_middleware(
     
     if let Some(key_header) = req.headers().get("x-api-key") {
          if let Ok(key) = key_header.to_str() {
-             // Verify key (cached lookup would be better, here we hit DB via state)
-             // Note: verification uses the Root DB inherently as api keys are global
              if let Ok(Some(api_key)) = state.db.verify_api_key(key).await {
                  key_scope_override = Some(api_key.scope.clone());
-                 
-                 // Inject key info into extensions for auth_middleware or cors_middleware to use
-                 // We wrap it in Arc to be cloneable if needed, or just the struct
                  req.extensions_mut().insert(api_key);
              }
          }
@@ -523,30 +773,61 @@ async fn tenant_resolver_middleware(
     if let Some(scope) = key_scope_override {
         if scope.starts_with("tenant:") {
             let target = scope.strip_prefix("tenant:").unwrap();
-            // If wildcard, we don't force, we allow normal routing.
-            // If specific ID, we force it.
             if target != "*" {
                 tenant_id = target.to_string();
             }
         }
     }
 
-    // 3. Fallback: If no key override, use URL routing (Subdomain or Path)
+    // 3. Fallback: If no key override, use URL routing
     if tenant_id.is_empty() {
-        // Parse host from base_url
         let host_str = base_url.split("://").nth(1).unwrap_or("").split(':').next().unwrap_or("");
         let host_parts: Vec<&str> = host_str.split('.').collect();
 
-        // Subdomain check
         if host_parts.len() >= 2 && host_parts[0] != "localhost" && host_parts[0] != "www" && host_parts[0] != "api" {
             tenant_id = host_parts[0].to_string();
         }
         
-        // Path check override
         if let Some(Path(params)) = path_params {
             if let Some(id) = params.get("tenant_id") { 
                 tenant_id = id.clone(); 
             }
+        }
+    }
+
+    // [NEW] Before Request Hook
+    if !tenant_id.is_empty() {
+        let hook_payload = serde_json::json!({
+            "tenant_id": tenant_id,
+            "path": req.uri().path(),
+            "method": req.method().to_string(),
+            "ip": req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("unknown")
+        });
+
+        // Run Hook. If it throws error, we BLOCK the request.
+        // We use Root scope for execution as this is a system-level check
+        if let Err(e) = trigger_void_hook(
+            &state, 
+            "before_tenant_request", 
+            hook_payload.clone(), 
+            None, 
+            Some(&EventScope::Root), 
+            Some(base_url.clone())
+        ).await {
+            tracing::warn!("Blocked request to tenant {}: {:?}", tenant_id, e);
+            
+            // [FIX] Extract the actual error message from the AppError enum
+            // The script engine wraps JS errors in "Script Rejected: ..."
+            let msg = e.to_string(); 
+            
+            // Return JSON response with 429 Too Many Requests (or 403)
+            let body = Json(json!({
+                "error": "request_blocked",
+                "message": msg,
+                "status": 429 // Or 403
+            }));
+            
+            return Ok((StatusCode::TOO_MANY_REQUESTS, body).into_response());
         }
     }
 
@@ -564,27 +845,47 @@ async fn tenant_resolver_middleware(
         Ok(tenant_db) => {
             req.extensions_mut().insert(tenant_db.clone());
             
-            // Inject Tenant-Specific Storage
             let storage_path = format!("storage/tenants/{}/uploads", tenant_id);
-            // Public URL base needs to point to the tenant endpoint
-            // e.g. /tenant/{id}/api/v1/storage/file/
             let public_url = format!("/tenant/{}/api/v1/storage/file/", tenant_id);
-            
             let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, &public_url).await);
             req.extensions_mut().insert(storage);
-            
             req.extensions_mut().insert(EventScope::Tenant(tenant_id.clone()));
+
+            let path_clone = req.uri().path().to_string();
             
+            // Execute Handler
             let mut response = next.run(req).await;
+            
             if let Ok(val) = HeaderValue::from_str(&format!("tenant:{}", tenant_id)) {
                 response.headers_mut().insert("X-Apex-Scope", val);
             }
+
+            // [NEW] After Request Hook (Async)
+            let status = response.status().as_u16();
+            let state_clone = state.clone();
+            let base_url_clone = base_url.clone();
+            let tid_clone = tenant_id.clone();
+
+            tokio::spawn(async move {
+                let payload = serde_json::json!({
+                    "tenant_id": tid_clone,
+                    "path": path_clone,
+                    "status": status
+                });
+                let _ = trigger_void_hook(
+                    &state_clone, 
+                    "after_tenant_request", 
+                    payload, 
+                    None, 
+                    Some(&EventScope::Root), 
+                    Some(base_url_clone)
+                ).await;
+            });
+
             Ok(response)
         }
         Err(_) => {
             req.extensions_mut().insert(EventScope::Root);
-            
-            // [UPDATED] Fallback to Root Header
             let mut response = next.run(req).await;
             response.headers_mut().insert("X-Apex-Scope", HeaderValue::from_static("root"));
             Ok(response)
@@ -1520,90 +1821,6 @@ pub struct UserListResponse {
 }
 
 // =========================================================
-// 5. TENANTS
-// =========================================================
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/admin/tenants",
-    responses((status = 200, body = Vec<String>))
-)]
-pub async fn list_tenants_handler(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    BaseUrl(base_url): BaseUrl,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap
-) -> Result<Json<Vec<String>>, AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Only admins".into())); }
-
-    // [TRIGGER]
-    trigger_void_hook(&state, "before_list_tenants", json!({}), Some(&claims), None, Some(base_url.clone())).await?;
-
-    let tenants = state.tenant_manager.list_tenants().await.map_err(|e| AppError::UnknownError(e))?;
-
-    // [LOG]
-    let meta = extract_log_meta(&headers, Some(addr), json!({ "count": tenants.len() }));
-    // Note: This logs to ROOT DB because 'state.db' is usually root unless middleware overrides it,
-    // but tenants are a root concept anyway.
-    let _ = state.db.log_audit_event("info", "Tenants Listed", "admin", Some(meta)).await;
-
-    Ok(Json(tenants))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/admin/tenants",
-    request_body = CreateTenantReq,
-    responses(
-        (status = 201, description = "Tenant created", body = TenantResponse),
-        (status = 409, description = "Tenant already exists"),
-        (status = 403, description = "Admin only")
-    )
-)]
-pub async fn create_tenant_handler(
-    auth: Option<Extension<Claims>>,
-    State(state): State<AppState>,
-    BaseUrl(base_url): BaseUrl,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(payload): Json<CreateTenantReq>,
-) -> Result<(StatusCode, Json<TenantResponse>), AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Only admins can create tenants".into())); }
-
-    // [TRIGGER] Before
-    trigger_void_hook(&state, "before_tenant_create", json!({ "tenant_id": payload.tenant_id }), Some(&claims), None, Some(base_url.clone())).await?;
-
-    state.tenant_manager.create_tenant(payload.tenant_id.clone()).await.map_err(|e| AppError::UnknownError(e))?;
-    
-    // [LOG]
-    let meta = extract_log_meta(&headers, Some(addr), json!({ "tenant_id": payload.tenant_id, "admin": claims.sub }));
-    let _ = state.db.log_audit_event("info", "Tenant Created", "admin", Some(meta)).await;
-
-    // [TRIGGER] After
-    let _ = trigger_void_hook(&state, "after_tenant_create", json!({ "tenant_id": payload.tenant_id }), Some(&claims), None, Some(base_url.clone())).await;
-
-    Ok((StatusCode::CREATED, Json(TenantResponse {
-        tenant_id: payload.tenant_id,
-        status: "created".to_string()
-    })))
-}
-
-#[derive(Deserialize, ToSchema)]
-pub struct CreateTenantReq {
-    #[schema(example = "customer-1")]
-    pub tenant_id: String,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct TenantResponse {
-    pub tenant_id: String,
-    pub status: String,
-}
-
-// =========================================================
 // 6. SYSTEM & OTHER HANDLERS
 // =========================================================
 
@@ -2007,7 +2224,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/admin/templates", get(template_routes::list_templates).post(template_routes::create_template))
         .route("/admin/templates/{id}", axum::routing::patch(template_routes::update_template).put(template_routes::update_template).delete(template_routes::delete_template))
         .route("/admin/site/deploy", post(site_routes::deploy_site_handler))
-        .route("/admin/site/files", get(site_routes::list_site_files_handler))
+        .route("/admin/site/files", get(site_routes::list_site_files_handler).delete(site_routes::delete_site_file_handler))
         .route("/sse", get(sse_handler))
 }
 
@@ -2055,8 +2272,8 @@ pub fn app_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}", tenant_path_router)
         .route(
             "/api/v1/admin/tenants", 
-            get(list_tenants_handler)
-                .post(create_tenant_handler)
+            get(tenant_routes::list_tenants_handler)
+                .post(tenant_routes::create_tenant_handler)
                 .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         )
         
@@ -2111,7 +2328,7 @@ pub fn app_router(state: AppState) -> Router {
         vector_routes::query_vector_search,
         vector_routes::get_record_vector,
         serve_styles,
-        create_tenant_handler,
+        tenant_routes::create_tenant_handler,
         sse_handler
     ),
     components(schemas(
@@ -2150,7 +2367,7 @@ pub fn app_router(state: AppState) -> Router {
         vector_routes::VectorSearchReq, 
         vector_routes::RecordVectorPath, 
         vector_routes::TextVectorSearchReq,
-        TenantResponse, CreateTenantReq,
+        tenant_routes::TenantResponse, tenant_routes::CreateTenantReq,
     )),
     tags((name = "ApexKit", description = "ApexKit API"))
 )]

@@ -83,10 +83,15 @@ async fn run_script_core(
         return Err(AppError::Forbidden("Script is inactive".into()));
     }
 
+    let context = Arc::new(crate::ScopedScriptContext {
+        state: state.clone(),
+        scope: scope.clone(),
+    });
+
     let result = state.script_engine.run_script(
         &script.code, 
         payload, 
-        Arc::new(state.clone()), // Pass AppState
+        context, // Pass AppState
         base_url,
         scope
     ).await.map_err(|e| AppError::UnknownError(format!("Script Execution Error: {}", e)))?;

@@ -209,8 +209,22 @@ impl Db for CachedDb {
     }
 
     // --- Tenants ---
-    async fn register_tenant(&self, id: &str, owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.register_tenant(id, owner_id).await
+    // --- Tenant Management (Pass-through) ---
+    async fn get_tenant_status(&self, tenant_id: &str) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_tenant_status(tenant_id).await
+    }
+
+    async fn update_tenant_status(&self, tenant_id: &str, status: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.update_tenant_status(tenant_id, status).await
+    }
+
+    async fn register_tenant(&self, id: &str, owner_id: Option<i64>, name: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.register_tenant(id, owner_id, name, tier).await
+    }
+
+    // --- Sandboxes ---
+    async fn register_sandbox(&self, id: &str, owner_id: Option<i64>, name: Option<String>, expires_at: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.register_sandbox(id, owner_id, name, expires_at).await
     }
 
     // --- Vectorization ---

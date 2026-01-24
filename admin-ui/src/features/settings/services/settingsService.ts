@@ -34,8 +34,14 @@ const mapToFrontend = (apiData: any): AppSettings => {
                 secretKey: apiData.storage?.s3?.secret_key || '' // Will be ******
             }
         },
-        // Defaults for things not yet in API
-        backups: { enabled: false, schedule: '0 0 * * *', retention: 7, destination: 'local' },
+        backups: { 
+            enabled: apiData.backups?.enabled || false, 
+            schedule: apiData.backups?.schedule || '0 0 * * *', 
+            retention: apiData.backups?.retention || 7, 
+            destination: apiData.backups?.destination || 'local',
+            includeUploads: apiData.backups?.include_uploads || false,
+            includeIndexes: apiData.backups?.include_indexes || false,
+        },
         cronJobs: apiData.cron_jobs || [],
         apiTokens: [],
         security: {
@@ -103,6 +109,17 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
             api_key: settings.ai.apiKey,
             provider: settings.ai.provider
         }
+    }
+
+    if (settings.backups) {
+        payload.backups = {
+            enabled: settings.backups.enabled,
+            schedule: settings.backups.schedule,
+            retention: settings.backups.retention,
+            destination: settings.backups.destination,
+            include_uploads: settings.backups.includeUploads,
+            include_indexes: settings.backups.includeIndexes,
+        };
     }
 
     return payload;

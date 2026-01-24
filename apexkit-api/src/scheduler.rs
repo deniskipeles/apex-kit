@@ -152,10 +152,23 @@ async fn execute_job(state: &AppState, db: Arc<dyn Db>, _context_id: &str, job: 
     tracing::info!("[Scheduler] Executing {} in scope {:?}", job.name, scope);
 
     // Context Injection Wrapper
-    // This allows $db in the script to point to the correct Tenant/Sandbox DB
     struct ScopedContext {
         inner: AppState,
         scoped_db: Arc<dyn Db>,
+        // [NEW] Track the scope for cache keys
+        scope: EventScope,
+    }
+    
+    // [HELPER] Reuse prefix logic
+    impl ScopedContext {
+        fn prefix_key(&self, key: &str) -> String {
+            match &self.scope {
+                EventScope::Root => format!("root:{}", key),
+                EventScope::Tenant(id) => format!("tenant:{}:{}", id, key),
+                EventScope::Sandbox(id) => format!("sandbox:{}:{}", id, key),
+                _ => format!("global:{}", key),
+            }
+        }
     }
 
     impl apexkit_core::ScriptContext for ScopedContext {
@@ -164,9 +177,58 @@ async fn execute_job(state: &AppState, db: Arc<dyn Db>, _context_id: &str, job: 
         fn get_embedder(&self) -> Arc<apexkit_core::embeddings::EmbedderService> { self.inner.embedder.clone() }
         fn get_vector_provider(&self) -> Arc<dyn VectorProvider> { self.inner.vector_provider.clone() }
         fn get_realtime_tx(&self) -> tokio::sync::broadcast::Sender<apexkit_core::realtime::DbEvent> { self.inner.tx.clone() }
-        fn resolve_tenant_db(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>> { self.inner.resolve_tenant_db(id) }
-        fn resolve_sandbox_db(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>> { self.inner.resolve_sandbox_db(id) }
-        fn admin_create_tenant(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>> { self.inner.admin_create_tenant(id) }
+        
+        // [FIX] Implement Logic Directly instead of calling inner
+        fn resolve_tenant_db(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>> { 
+             let tm = self.inner.tenant_manager.clone();
+             let tid = id.to_string();
+             Box::pin(async move { tm.get_tenant(tid).await.ok() })
+        }
+        fn resolve_sandbox_db(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>> { 
+             let sm = self.inner.sandbox_manager.clone();
+             let sid = id.to_string();
+             Box::pin(async move { sm.get_sandbox(&sid).await.ok() })
+        }
+        fn admin_create_tenant(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>> { 
+             let tm = self.inner.tenant_manager.clone();
+             Box::pin(async move { tm.create_tenant(id).await.map(|_| ()) })
+        }
+        fn admin_create_sandbox(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>> {
+             let sm = self.inner.sandbox_manager.clone();
+             let db = self.inner.db.clone();
+             Box::pin(async move {
+                 sm.create_sandbox(&id, crate::sandbox_manager::CloneStrategy::None, db).await.map(|_| ()).map_err(|e| e.to_string())
+             })
+        }
+
+        // [FIX] Implement Cache Methods
+        fn cache_get(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+            let cache = self.inner.script_cache.clone();
+            let k = self.prefix_key(key);
+            Box::pin(async move { cache.get(&k).await })
+        }
+        fn cache_set(&self, key: &str, val: &str, _ttl: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let cache = self.inner.script_cache.clone();
+            let k = self.prefix_key(key);
+            let v = val.to_string();
+            Box::pin(async move { cache.insert(k, v).await; })
+        }
+        fn cache_del(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let cache = self.inner.script_cache.clone();
+            let k = self.prefix_key(key);
+            Box::pin(async move { cache.invalidate(&k).await; })
+        }
+        fn cache_incr(&self, key: &str, delta: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = i64> + Send>> {
+            let cache = self.inner.script_cache.clone();
+            let k = self.prefix_key(key);
+            Box::pin(async move {
+                 let current_str = cache.get(&k).await;
+                 let current_val = current_str.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                 let new_val = current_val + delta;
+                 cache.insert(k, new_val.to_string()).await;
+                 new_val
+            })
+        }
     }
 
     if job.payload.starts_with("/") {
@@ -216,7 +278,8 @@ async fn execute_job(state: &AppState, db: Arc<dyn Db>, _context_id: &str, job: 
         if let Ok(Some(script)) = db.get_script_by_name(&job.payload).await {
             let context = Arc::new(ScopedContext {
                 inner: state.clone(),
-                scoped_db: db.clone()
+                scoped_db: db.clone(),
+                scope: scope.clone(),
             });
 
             let _ = state.script_engine.run_script(

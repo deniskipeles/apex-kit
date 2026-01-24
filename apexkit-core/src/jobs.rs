@@ -175,7 +175,7 @@ pub async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &
         SmtpSettings { enabled: false, host: "".into(), port: 587, username: None, password: None, from_email: "noreply@localhost".into() }
     };
 
-    // [FIX] Safer From Address Construction
+    // Safer From Address Construction
     let from_address = if settings.from_email.is_empty() {
         "noreply@localhost".to_string()
     } else {
@@ -190,7 +190,7 @@ pub async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &
         .body(body.to_string())
         .map_err(|e: lettre::error::Error| e.to_string())?;
 
-    // [FIX] Logic: If SMTP enabled, use SMTP. Else, fallback to Sendmail.
+    // Logic: If SMTP enabled, use SMTP. Else, fallback to Sendmail.
     if settings.enabled && !settings.host.is_empty() {
         let decrypted_password = if let Some(encrypted_str) = settings.password {
              // ... decrypt logic ...

@@ -254,6 +254,12 @@ pub async fn list_backups_handler(
     Ok(Json(backups))
 }
 
+// Struct to handle path params robustly (ignores parent params like tenant_id)
+#[derive(Deserialize, ToSchema)]
+pub struct BackupDownloadPath {
+    pub filename: String,
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/admin/backups/{filename}",
@@ -263,9 +269,12 @@ pub async fn download_backup_handler(
     Extension(claims): Extension<Claims>,
     State(_state): State<AppState>,
     scope: Option<Extension<EventScope>>,
-    Path(filename): Path<String>,
+    // [FIX] Use struct extractor instead of Path<String>
+    Path(path_params): Path<BackupDownloadPath>, 
 ) -> Result<Response, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let filename = path_params.filename;
 
     if filename.contains("..") || filename.contains("/") {
         return Err(AppError::InputValidation(validator::ValidationErrors::new()));
@@ -280,7 +289,7 @@ pub async fn download_backup_handler(
         _ => return Err(AppError::NotFound("Invalid scope".into())),
     };
 
-    let path = std::path::Path::new(&backup_dir).join(&*filename);
+    let path = std::path::Path::new(&backup_dir).join(&filename);
     
     if !path.exists() {
         return Err(AppError::NotFound("Backup not found locally".into()));
@@ -294,6 +303,7 @@ pub async fn download_backup_handler(
         .body(Body::from(bytes))
         .map_err(|e| AppError::UnknownError(e.to_string()))
 }
+
 
 #[derive(Deserialize, ToSchema)]
 pub struct RestoreRequest {

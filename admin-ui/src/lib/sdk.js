@@ -1105,6 +1105,12 @@ export class ApexKit {
              * @returns {Promise<Array<{path: string, size: number}>>}
              */
             listFiles: () => this._request('/admin/site/files', { method: 'GET' }),
+            delete: async (path) => {
+                return await this._request('/admin/site/files', {
+                method: 'DELETE',
+                params: { path }
+                });
+            }
         };
     }
 }

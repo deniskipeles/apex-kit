@@ -73,6 +73,12 @@ const TRIGGER_TYPES = [
     { value: 'before_tenant_create', label: 'Before Tenant Provision', group: 'Tenant' },
     { value: 'after_tenant_create', label: 'After Tenant Provision', group: 'Tenant' },
     { value: 'before_list_tenants', label: 'Before List Tenants', group: 'Tenant' },
+
+    // --- [NEW] Tenant & Sandbox Requests (Traffic/Quota) ---
+    { value: 'before_tenant_request', label: 'Before Tenant Request', group: 'Traffic' },
+    { value: 'after_tenant_request', label: 'After Tenant Request', group: 'Traffic' },
+    { value: 'before_sandbox_request', label: 'Before Sandbox Request', group: 'Traffic' },
+    { value: 'after_sandbox_request', label: 'After Sandbox Request', group: 'Traffic' },
 ];
 
 const DEFAULT_CODE = {
@@ -104,6 +110,21 @@ const DEFAULT_CODE = {
         received: args.someArg,
         timestamp: new Date().toISOString()
     });
+    }`,
+
+    // [ADD] Default for Traffic Hooks
+    traffic: `// Traffic Control Hook
+    // Context: e.data.path, e.data.ip, e.data.method
+    export default async function(e) {
+        // Example: Rate Limit or Audit
+        // const key = "ip:" + e.data.ip;
+        // const count = await $cache.incr(key, 1);
+        // if (count > 100) throw new Error("Rate limit exceeded");
+        
+        // For 'after_' hooks, e.data.status is available
+        if (e.trigger.startsWith('after_')) {
+            log(e.trigger + " " + e.data.path + " " + e.data.status);
+        }
     }`
 };
 
@@ -166,10 +187,15 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
                 newCode = DEFAULT_CODE.manual;
             } else if (type === 'cron') {
                 newCode = DEFAULT_CODE.cron;
+            } else if (type === 'graphql') {
+                newCode = DEFAULT_CODE.graphql;
             } else if (isRecordHook(type)) {
                 newCode = DEFAULT_CODE.hook;
             } else if (type.includes('_list_') || type.includes('_get_')) {
                 newCode = DEFAULT_CODE.filter;
+            // [NEW] Check for traffic hooks
+            } else if (type.includes('_request')) {
+                newCode = DEFAULT_CODE.traffic;
             } else {
                 newCode = DEFAULT_CODE.system;
             }

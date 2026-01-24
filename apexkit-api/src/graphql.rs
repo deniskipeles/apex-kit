@@ -401,10 +401,15 @@ pub async fn build_schema(
                             .ok_or_else(|| async_graphql::Error::new("Linked script not found"))?;
                         let event_scope = ctx.data::<EventScope>().unwrap_or(&EventScope::Root).clone();
 
+                        let context = Arc::new(crate::ScopedScriptContext {
+                            state: state.clone(),
+                            scope: event_scope.clone(), // [FIX] Clone it here so it isn't moved
+                        });
+
                         let result = state.script_engine.run_script(
                             &script_record.code,
                             serde_json::Value::Object(script_input), 
-                            Arc::new(state.clone()), // Pass AppState as ScriptContext
+                            context,
                             None,
                             event_scope
                         ).await.map_err(|e| async_graphql::Error::new(e))?;

@@ -63,7 +63,7 @@ mime_guess = "2.0"
 # Using native-tls-vendored to avoid 'aws-lc-sys' compilation bugs on some Linux distros
 reqwest = { version = "0.12.4", default-features = false, features = ["json", "multipart", "native-tls-vendored"] }
 
-# [FIX] Keep forcing ring for direct use
+# Keep forcing ring for direct use
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
 # Encryption

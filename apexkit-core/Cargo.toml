@@ -28,7 +28,6 @@ moka = { version = "0.12", features = ["future"] } # Caching
 utoipa = "5.4.0"
 
 # Storage & AWS
-# [FIXED] Use "native-tls" instead of "rustls" or "rustls-ring".
 # This uses the system's native crypto (Schannel on Windows), avoiding aws-lc compilation.
 aws-config = { version = "1.8.12", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
 aws-sdk-s3 = { version = "1.1", default-features = false, features = ["rt-tokio"] }
@@ -61,9 +60,6 @@ tantivy = "0.22"
 # FIX: Removed features = ["intl"] to prevent "missing Intl provider" panic
 boa_engine = { version = "0.21.0" }
 boa_gc = "0.21.0"
-
-# HTTP Client (Added blocking feature for easier scripting)
-# reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 # Validation Extensions
 regex = "1.10"

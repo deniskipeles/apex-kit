@@ -311,6 +311,7 @@ export const apiClient = {
         id: response.user.id.toString(),
         email: response.user.email,
         role: response.user.role,
+        scope: response.user.scope,
         metadata: response.user.metadata,
         lastActive: new Date().toISOString()
       };
@@ -394,6 +395,10 @@ export const apiClient = {
         console.error("Failed to list site files", e);
         return [];
       }
+    },
+    delete: async (path: string): Promise<void> => {
+      // _request handles the query string encoding
+      return await pb.sites.delete('/admin/site/files');
     }
   },
 

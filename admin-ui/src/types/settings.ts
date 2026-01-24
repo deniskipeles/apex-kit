@@ -47,6 +47,8 @@ export interface BackupConfig {
   schedule: string; // Cron expression
   retention: number; // Days to keep
   destination: 'local' | 's3';
+  includeUploads?: boolean;
+  includeIndexes?: boolean;
 }
 
 export interface CronJob {
@@ -95,7 +97,8 @@ export interface AppSettings {
   cronJobs: CronJob[];
   apiTokens: ApiToken[];
   security: SecurityConfig;
-  logRetentionDays: Number;
+  logRetentionDays: number;
+  maxSiteSizeMb?: number;
   ai:AIProvider;
 }
 

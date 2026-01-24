@@ -197,11 +197,16 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
                 .map_err(|e| e.to_string())?
                 .ok_or(format!("Script '{}' not found.", name))?;
 
+            let context = Arc::new(crate::ScopedScriptContext {
+                state: state.clone(),
+                scope: EventScope::Root,
+            });
+
             // Execute using the actual engine
             let result = state.script_engine.run_script(
                 &script.code, 
                 payload, 
-                Arc::new(state.clone()), // Pass AppState
+                context,
                 None,
                 EventScope::Root
             ).await.map_err(|e| format!("Script Error: {}", e))?;

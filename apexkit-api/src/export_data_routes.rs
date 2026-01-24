@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State, Query},
+    extract::{Path, Query},
     response::{Response},
     http::{header},
     Extension,
@@ -9,11 +9,11 @@ use apexkit_core::{
     auth::Claims, 
     query::QueryOptions,
 };
-use crate::{AppState, AppError};
+use crate::{AppError};
 use utoipa::{IntoParams, ToSchema}; 
 use csv::WriterBuilder;
-
 use crate::DatabaseConnection;
+// use tracing::{info};
 
 // --- DTOs ---
 
@@ -23,13 +23,9 @@ pub struct ExportQuery {
     #[serde(default)]
     #[param(example = "json")]
     pub format: String,
-    
     /// Sorting field, e.g. -created
-    // FIX: Removed invalid #[param(style = Query)]
-    pub sort: Option<String>, 
-    
+    pub sort: Option<String>,
     /// Filter object string, e.g. {"status":"active"}
-    // FIX: Removed invalid #[param(style = Query)]
     pub filter: Option<String>,
 }
 
@@ -87,6 +83,11 @@ fn create_csv_data(records: &[apexkit_core::Record]) -> Result<Vec<u8>, String> 
     Ok(writer.into_inner().map_err(|e| e.to_string())?)
 }
 
+// Struct to handle nested path params safely
+#[derive(Deserialize)]
+pub struct ExportPath {
+    pub id: i64,
+}
 
 #[utoipa::path(
     get,
@@ -96,19 +97,22 @@ fn create_csv_data(records: &[apexkit_core::Record]) -> Result<Vec<u8>, String> 
 )]
 pub async fn export_data_handler(
     Extension(claims): Extension<Claims>,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
+    DatabaseConnection(db): DatabaseConnection, 
+    Path(path): Path<ExportPath>,
     Query(params): Query<ExportQuery>,
 ) -> Result<Response, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
-    let collection = state.db.get_collection(id).await
+    let id = path.id;
+
+    // Use 'db' (Tenant Context) instead of 'state.db' (Root Context)
+    let collection = db.get_collection(id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Collection not found".into()))?;
         
-    // 1. Prepare Query Options (to fetch ALL records with filter/sort)
+    // 1. Prepare Query Options
     let options = QueryOptions {
-        limit: None, // Will be set to Max i64 in DB layer for "all"
+        limit: Some(1000), 
         per_page: None,
         offset: None,
         page: None,
@@ -117,8 +121,8 @@ pub async fn export_data_handler(
         expand: None,
     };
     
-    // 2. Fetch All Records
-    let result = state.db.list_records(id, options).await
+    // 2. Fetch All Records from Tenant DB
+    let result = db.list_records(id, options).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
         
     let records = result.items;

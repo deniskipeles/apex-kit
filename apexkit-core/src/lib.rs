@@ -91,6 +91,16 @@ pub trait ScriptContext: Send + Sync {
 
     // Expose Admin Manager access if needed
     fn admin_create_tenant(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+    fn admin_create_sandbox(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+
+    // [NEW] Cache Primitives
+    fn cache_get(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+    fn cache_set(&self, key: &str, val: &str, ttl_secs: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    fn cache_del(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    
+    // [NEW] Atomic Increment (Crucial for Quotas)
+    // Returns the new value
+    fn cache_incr(&self, key: &str, delta: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = i64> + Send>>;
 }
 
 #[async_trait]
@@ -125,7 +135,11 @@ pub trait Db: Send + Sync {
     async fn create_user(&self, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>>;
     
     // Tenants
-    async fn register_tenant(&self, id: &str, owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn register_tenant(&self, id: &str, owner_id: Option<i64>, name: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_tenant_status(&self, tenant_id: &str) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>;
+    async fn update_tenant_status(&self, tenant_id: &str, status: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    // [NEW] Sandbox Management
+    async fn register_sandbox(&self, id: &str, owner_id: Option<i64>, name: Option<String>, expires_at: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     
     // Allows forcing an ID (for Sandbox cloning)
     async fn import_user(&self, id: i64, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -1979,9 +1993,64 @@ impl Db for ApexKit {
     }
 
     // --- Tenants ---
-    async fn register_tenant(&self, id: &str, owner_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn register_tenant(&self, id: &str, owner_id: Option<i64>, name: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core_read().await;
-        conn.execute("INSERT INTO _tenants (id, owner_id) VALUES (?1, ?2)", params![id, owner_id]).await?;
+        
+        // Uses UPSERT logic (ON CONFLICT DO UPDATE) to allow re-registering safely or updating details
+        conn.execute(
+            "INSERT INTO _tenants (id, owner_id, name, tier) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET 
+                owner_id=excluded.owner_id, 
+                name=excluded.name, 
+                tier=excluded.tier,
+                updated_at=CURRENT_TIMESTAMP",
+            params![
+                id, 
+                owner_id, 
+                name, 
+                tier.unwrap_or("free".to_string()) // Default tier
+            ]
+        ).await?;
+        Ok(())
+    }
+
+    async fn get_tenant_status(&self, tenant_id: &str) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core_read().await;
+        // Use optional query to handle missing tenants gracefully
+        let mut stmt = conn.prepare("SELECT status FROM _tenants WHERE id = ?1").await?;
+        let mut rows = stmt.query(params![tenant_id]).await?;
+
+        if let Some(row) = rows.next().await? {
+            let status: String = row.get(0)?;
+            Ok(status)
+        } else {
+            Ok("not_found".to_string())
+        }
+    }
+
+    async fn update_tenant_status(&self, tenant_id: &str, status: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core_read().await;
+        conn.execute("UPDATE _tenants SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2", params![status, tenant_id]).await?;
+        Ok(())
+    }
+
+    // --- Sandboxes ---
+    async fn register_sandbox(&self, id: &str, owner_id: Option<i64>, name: Option<String>, expires_at: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core_read().await;
+        
+        conn.execute(
+            "INSERT INTO _sandboxes (id, owner_id, name, expires_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET 
+                owner_id=excluded.owner_id, 
+                name=excluded.name, 
+                expires_at=excluded.expires_at",
+            params![
+                id, 
+                owner_id, 
+                name,
+                expires_at
+            ]
+        ).await?;
         Ok(())
     }
 

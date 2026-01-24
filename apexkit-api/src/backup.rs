@@ -4,8 +4,23 @@ use std::sync::Arc;
 use apexkit_core::{Db, security::Vault, security::EncryptedValue, realtime::EventScope};
 use crate::settings::{StorageConfigDto, BackupConfigDto};
 use chrono::Utc;
-use tracing::info;
+use tracing::{info};
 use apexkit_core::storage::StorageBackend;
+
+// Helper to recursively copy directories
+fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
 
 pub async fn perform_backup(
     db: Arc<dyn Db>, 
@@ -40,20 +55,39 @@ pub async fn perform_backup(
         _ => return Err("Unsupported scope for backup".into()),
     };
 
-    let temp_dir = format!("{}/backup_staging_{}", source_dir, timestamp); // Stage inside tenant dir to ensure same vol
-    let archive_path = format!("{}/{}", source_dir, backup_filename); // Temp location
+    let temp_dir = format!("{}/backup_staging_{}", source_dir, timestamp); 
+    let archive_path = format!("{}/{}", source_dir, backup_filename); 
 
     // 2. Prepare Temp Directory
     fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
 
-    // 3. Copy DB Files
+    // 3. Copy DB Files (Always included)
     let files_to_backup = vec!["core.db", "data.db", "system.db", "vectors.db"];
-
     for filename in files_to_backup {
         let src = Path::new(&source_dir).join(filename);
         if src.exists() {
             fs::copy(&src, Path::new(&temp_dir).join(filename))
                 .map_err(|e| format!("Failed to copy {}: {}", filename, e))?;
+        }
+    }
+
+    // Conditionally Copy Uploads
+    if config.include_uploads {
+        let uploads_src = Path::new(&source_dir).join("uploads");
+        if uploads_src.exists() {
+            let uploads_dst = Path::new(&temp_dir).join("uploads");
+            info!("Backing up uploads directory...");
+            copy_dir_all(&uploads_src, &uploads_dst).map_err(|e| format!("Failed to copy uploads: {}", e))?;
+        }
+    }
+
+    // Conditionally Copy Indexes
+    if config.include_indexes {
+        let indexes_src = Path::new(&source_dir).join("indexes");
+        if indexes_src.exists() {
+            let indexes_dst = Path::new(&temp_dir).join("indexes");
+            info!("Backing up search indexes...");
+            copy_dir_all(&indexes_src, &indexes_dst).map_err(|e| format!("Failed to copy indexes: {}", e))?;
         }
     }
 
@@ -75,7 +109,7 @@ pub async fn perform_backup(
     // 5. Upload / Move
     match config.destination.as_str() {
         "s3" => {
-            let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
+             let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
             if let Some(val) = storage_settings {
                 let storage_conf: StorageConfigDto = serde_json::from_value(val).unwrap_or_default();
                 if storage_conf.s3.enabled {
@@ -94,7 +128,6 @@ pub async fn perform_backup(
                     ).await;
 
                     let bytes = fs::read(&archive_path).map_err(|e| e.to_string())?;
-                    // Upload to scoped prefix
                     s3.save(&format!("{}/{}", s3_prefix, backup_filename), &bytes, "application/gzip").await
                         .map_err(|e| e.to_string())?;
                         
@@ -110,7 +143,23 @@ pub async fn perform_backup(
                 .map_err(|e| e.to_string())?;
             info!("Backup saved locally: {}/{}", backup_dir_local, backup_filename);
             
-            prune_local_backups(&backup_dir_local, config.retention as u64)?;
+            // Prune
+            if config.retention > 0 {
+                let cutoff = Utc::now() - chrono::Duration::days(config.retention as i64);
+                if let Ok(entries) = fs::read_dir(&backup_dir_local) {
+                    for entry in entries.flatten() {
+                        if let Ok(meta) = entry.metadata() {
+                            if let Ok(modified) = meta.modified() {
+                                let dt: chrono::DateTime<Utc> = modified.into();
+                                if dt < cutoff {
+                                    let _ = fs::remove_file(entry.path());
+                                    info!("Pruned old backup: {:?}", entry.path());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -123,25 +172,6 @@ pub async fn perform_backup(
     Ok(())
 }
 
-fn prune_local_backups(dir: &str, days: u64) -> Result<(), String> {
-    if days == 0 { return Ok(()); }
-    let cutoff = Utc::now() - chrono::Duration::days(days as i64);
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    let dt: chrono::DateTime<Utc> = modified.into();
-                    if dt < cutoff {
-                        let _ = fs::remove_file(entry.path());
-                        info!("Pruned old backup: {:?}", entry.path());
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 pub async fn restore_backup(
     file_path: &str, 
     is_s3: bool,
@@ -151,7 +181,6 @@ pub async fn restore_backup(
 ) -> Result<(), String> {
     info!("Starting restoration for scope {:?} from {}", scope, file_path);
 
-    // Resolve Target Directory based on Scope
     let target_dir = match &scope {
         EventScope::Root => "storage/system".to_string(),
         EventScope::Tenant(id) => format!("storage/tenants/{}", id),
@@ -161,10 +190,8 @@ pub async fn restore_backup(
 
     let temp_restore_dir = format!("{}/restore_staging", target_dir);
     
-    // 1. Fetch File (S3 or Local)
     let local_archive_path = if is_s3 {
-        // Fetch from S3 to a temp location
-        let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
+         let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
         
         let s3_client = if let Some(val) = storage_settings {
             let storage_conf: StorageConfigDto = serde_json::from_value(val).unwrap_or_default();
@@ -183,14 +210,12 @@ pub async fn restore_backup(
                     &secret
                 ).await
             } else {
-                return Err("S3 not enabled in config, cannot restore from S3".into());
+                return Err("S3 not enabled".into());
             }
         } else {
             return Err("Storage config missing".into());
         };
 
-        // Determine S3 key based on scope and filename
-        // file_path passed here is just the filename "backup_xyz.tar.gz" if s3 is true
         let s3_prefix = match &scope {
              EventScope::Root => "backups".to_string(),
              EventScope::Tenant(id) => format!("tenants/{}/backups", id),
@@ -199,8 +224,6 @@ pub async fn restore_backup(
         };
         
         let s3_key = format!("{}/{}", s3_prefix, file_path);
-        info!("Downloading backup from S3: {}", s3_key);
-
         let data = s3_client.get(&s3_key).await
              .map_err(|e: Box<dyn std::error::Error + Send + Sync>| e.to_string())?;
              
@@ -209,7 +232,6 @@ pub async fn restore_backup(
         
         temp_download_path
     } else {
-        // Local path passed directly
         file_path.to_string()
     };
 
@@ -232,7 +254,7 @@ pub async fn restore_backup(
         return Err(format!("Tar extract failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
-    // 4. Validate
+    // 4. Validate Critical Files
     let critical_files = vec!["core.db", "data.db", "system.db"];
     for f in &critical_files {
         if !Path::new(&temp_restore_dir).join(f).exists() {
@@ -240,7 +262,7 @@ pub async fn restore_backup(
         }
     }
 
-    // 5. Swap
+    // 5. Swap Databases
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
 
     for f in critical_files {
@@ -254,6 +276,7 @@ pub async fn restore_backup(
         fs::rename(&staged_path, &live_path).map_err(|e| format!("Failed to restore DB {}: {}", f, e))?;
     }
     
+    // Optional Vector DB
     let vec_file = "vectors.db";
     let vec_staged = Path::new(&temp_restore_dir).join(vec_file);
     if vec_staged.exists() {
@@ -263,9 +286,24 @@ pub async fn restore_backup(
          fs::rename(&vec_staged, &live_path).map_err(|e| e.to_string())?;
     }
 
+    // Swap Directories (Uploads / Indexes)
+    let dirs_to_restore = vec!["uploads", "indexes"];
+    for dir in dirs_to_restore {
+        let staged = Path::new(&temp_restore_dir).join(dir);
+        let live = Path::new(&target_dir).join(dir);
+        
+        if staged.exists() {
+            if live.exists() {
+                // Move current live to backup
+                let backup_path = Path::new(&target_dir).join(format!("{}_bak_{}", dir, timestamp));
+                fs::rename(&live, &backup_path).map_err(|e| format!("Failed to backup live directory {}: {}", dir, e))?;
+            }
+            fs::rename(&staged, &live).map_err(|e| format!("Failed to restore directory {}: {}", dir, e))?;
+            info!("Restored directory: {}", dir);
+        }
+    }
+
     let _ = fs::remove_dir_all(&temp_restore_dir);
-    
-    // Cleanup downloaded S3 file if applicable
     if is_s3 {
         let _ = fs::remove_file(&local_archive_path);
     }

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Archive, Clock, Play, Trash2, Plus, Save, Download, RotateCcw, FileArchive, Loader2, ShieldAlert } from 'lucide-react';
+import { Archive, Clock, Play, Trash2, Plus, Save, Download, RotateCcw, FileArchive, Loader2, ShieldAlert, Folder, Search } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Input, Label, Switch, Button, Badge, Select } from '../../../components/ui/Elements';
 import { AppSettings, CronJob } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
@@ -202,25 +202,52 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
                     </div>
                 </CardHeader>
                 <CardContent className="space-y-6">
-                    <div className={`grid grid-cols-1 md:grid-cols-3 gap-6 transition-opacity ${settings.backups.enabled ? 'opacity-100' : 'opacity-50 pointer-events-none'}`}>
-                        <div className="space-y-2">
-                            <Label>Schedule (Cron)</Label>
-                            <Input
-                                value={settings.backups.schedule}
-                                onChange={(e: any) => updateBackup({ schedule: e.target.value })}
-                                className={`font-mono ${!validateCron(settings.backups.schedule) ? 'border-destructive' : ''}`}
-                            />
-                            {!validateCron(settings.backups.schedule) && <span className="text-[10px] text-destructive">Invalid Format (min hour day month day)</span>}
+                    <div className={`space-y-6 transition-opacity ${settings.backups.enabled ? 'opacity-100' : 'opacity-50 pointer-events-none'}`}>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <div className="space-y-2">
+                                <Label>Schedule (Cron)</Label>
+                                <Input
+                                    value={settings.backups.schedule}
+                                    onChange={(e: any) => updateBackup({ schedule: e.target.value })}
+                                    className={`font-mono ${!validateCron(settings.backups.schedule) ? 'border-destructive' : ''}`}
+                                />
+                            </div>
+                            <div className="space-y-2"><Label>Retention (Days)</Label><Input type="number" value={settings.backups.retention} onChange={(e: any) => updateBackup({ retention: Number(e.target.value) })} /></div>
+                            <div className="space-y-2">
+                                <Label>Destination</Label>
+                                <Select value={settings.backups.destination} onChange={(e: any) => updateBackup({ destination: e.target.value })}>
+                                    <option value="local">Local Storage</option>
+                                    <option value="s3">S3 Storage</option>
+                                </Select>
+                            </div>
                         </div>
-                        <div className="space-y-2"><Label>Retention (Days)</Label><Input type="number" value={settings.backups.retention} onChange={(e: any) => updateBackup({ retention: Number(e.target.value) })} /></div>
-                        <div className="space-y-2">
-                            <Label>Destination</Label>
-                            <Select value={settings.backups.destination} onChange={(e: any) => updateBackup({ destination: e.target.value })}>
-                                <option value="local">Local Storage</option>
-                                <option value="s3">S3 Storage</option>
-                            </Select>
+
+                        {/* Included Data Options */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 rounded-lg bg-secondary/10 border border-border">
+                            <div className="flex items-center justify-between">
+                                <div className="space-y-0.5">
+                                    <Label className="flex items-center gap-2 cursor-pointer" onClick={() => updateBackup({ includeUploads: !settings.backups.includeUploads })}>
+                                        <Folder className="h-4 w-4 text-blue-500" /> Include Uploads
+                                    </Label>
+                                    <p className="text-[10px] text-muted-foreground">Backup user uploaded files (images, documents).</p>
+                                </div>
+                                <Switch checked={settings.backups.includeUploads} onCheckedChange={(c) => updateBackup({ includeUploads: c })} />
+                            </div>
+
+                            <div className="flex items-center justify-between">
+                                <div className="space-y-0.5">
+                                    <Label className="flex items-center gap-2 cursor-pointer" onClick={() => updateBackup({ includeIndexes: !settings.backups.includeIndexes })}>
+                                        <Search className="h-4 w-4 text-purple-500" /> Include Indexes
+                                    </Label>
+                                    <p className="text-[10px] text-muted-foreground">Backup Tantivy search indexes (faster restore, larger size).</p>
+                                </div>
+                                <Switch checked={settings.backups.includeIndexes} onCheckedChange={(c) => updateBackup({ includeIndexes: c })} />
+                            </div>
                         </div>
                     </div>
+
+                    {/* ... History Table ... */}
 
                     {settings.backups.enabled && (
                         <div className="border-t pt-4">
@@ -303,7 +330,7 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
                         </div>
                         <div className="w-full md:w-32 space-y-1">
                             <Label className="text-xs">Schedule</Label>
-                            <Input placeholder="* * * * *" value={newCronSchedule} onChange={(e: any) => setNewCronSchedule(e.target.value)} className="h-9 font-mono" />
+                            <Input placeholder="0 * * * * *" value={newCronSchedule} onChange={(e: any) => setNewCronSchedule(e.target.value)} className="h-9 font-mono" />
                         </div>
                         <Button onClick={addCronJob} disabled={!newCronName || !newCronCmd} className="h-9 px-4">
                             <Plus className="mr-2 h-4 w-4" /> Add

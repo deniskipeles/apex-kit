@@ -148,13 +148,18 @@ async fn render_view_core(
         else { merge_json(&mut context_data, json!({"body_raw": body})); }
     }
 
+    let context = Arc::new(crate::ScopedScriptContext {
+        state: state.clone(),
+        scope: scope.clone(),
+    });
+
     if let Some(script_id) = target_template.script_id {
         let scripts = db.list_scripts().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         if let Some(script) = scripts.into_iter().find(|s| s.id == script_id) {
             let script_res = state.script_engine.run_script(
                 &script.code, 
                 context_data.clone(), 
-                Arc::new(state.clone()), // Pass AppState
+                context,
                 base_url, 
                 scope
             ).await.map_err(|e| AppError::UnknownError(format!("Script Error: {}", e)))?;

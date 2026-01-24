@@ -7,6 +7,7 @@ use serde_json::json;
 use apexkit_core::auth::Claims;
 use crate::{AppState, AppError, DatabaseConnection}; // Added DatabaseConnection
 use utoipa::ToSchema;
+use crate::BaseUrl;
 
 // --- API Models (Unchanged) ---
 
@@ -25,6 +26,8 @@ pub struct AppSettingsDto {
     pub logo_width: Option<String>,
     pub logo_height: Option<String>,
     pub log_retention_days: Option<u64>,
+    pub max_site_size_mb: Option<u64>,
+    pub backups: Option<BackupConfigDto>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
@@ -77,12 +80,29 @@ pub struct AiConfigDto {
     pub api_key: Option<String>, // Masked on GET
 }
 
-#[derive(Serialize, Deserialize, ToSchema, Clone, Default)]
+#[derive(Serialize, Deserialize, ToSchema, Clone)]
 pub struct BackupConfigDto {
     pub enabled: bool,
     pub schedule: String, // e.g. "0 0 * * *"
     pub retention: u32,   // Days
     pub destination: String, // "local" | "s3"
+    #[serde(default)]
+    pub include_uploads: bool,
+    #[serde(default)]
+    pub include_indexes: bool,
+}
+
+impl Default for BackupConfigDto {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: "0 0 * * *".to_string(),
+            retention: 7,
+            destination: "local".to_string(),
+            include_uploads: false, // Default off to save space
+            include_indexes: false, // Default off (can be rebuilt)
+        }
+    }
 }
 
 // --- Handlers ---
@@ -96,6 +116,7 @@ pub async fn get_settings(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
     State(_state): State<AppState>, // Only need state if we need vault/etc not in DB
+    BaseUrl(base_url): BaseUrl,
 ) -> Result<Json<AppSettingsDto>, AppError> {
     // 1. Auth Check
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
@@ -108,22 +129,33 @@ pub async fn get_settings(
     let security = db.get_config("security").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     let cron_json = db.get_config("cron_jobs").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     let ai = db.get_config("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let backups_json = db.get_config("backups").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    // [LOGIC] Resolve App URL: DB Config > Request Origin > Default
+    let configured_url = general.get("app_url").and_then(|v| v.as_str()).map(String::from);
+    let final_app_url = if configured_url.is_some() && !configured_url.as_ref().unwrap().is_empty() {
+        configured_url
+    } else {
+        Some(base_url) // Defaults to http://localhost:PORT or https://domain.com based on request
+    };
 
     // 3. Construct Response
     let mut response = AppSettingsDto {
         app_name: general.get("app_name").and_then(|v| v.as_str()).map(String::from),
-        app_url: general.get("app_url").and_then(|v| v.as_str()).map(String::from),
+        app_url: final_app_url, 
         allow_public_registration: general.get("allow_public_registration").and_then(|v| v.as_bool()),
         theme: general.get("theme").and_then(|v| v.as_str()).map(String::from),
         app_logo: general.get("app_logo").and_then(|v| v.as_str()).map(String::from),
         logo_width: general.get("logo_width").and_then(|v| v.as_str()).map(String::from),
         logo_height: general.get("logo_height").and_then(|v| v.as_str()).map(String::from),
+        log_retention_days: general.get("log_retention_days").and_then(|v| v.as_u64()),
+        max_site_size_mb: general.get("max_site_size_mb").and_then(|v| v.as_u64()),
         smtp: None,
         storage: None,
         security: None,
         cron_jobs: None,
         ai: None,
-        log_retention_days: None,
+        backups: None,
     };
 
     // SMTP (Mask Password)
@@ -180,6 +212,13 @@ pub async fn get_settings(
         response.ai = Some(AiConfigDto::default());
     }
 
+    // Map Backups
+    if let Some(val) = backups_json {
+        response.backups = serde_json::from_value(val).ok();
+    } else {
+        response.backups = Some(BackupConfigDto::default());
+    }
+
     Ok(Json(response))
 }
 
@@ -210,6 +249,7 @@ pub async fn update_settings(
     if let Some(v) = &payload.logo_width { general["logo_width"] = json!(v); }
     if let Some(v) = &payload.logo_height { general["logo_height"] = json!(v); }
     if let Some(v) = &payload.log_retention_days { general["log_retention_days"] = json!(v); }
+    if let Some(v) = &payload.max_site_size_mb { general["max_site_size_mb"] = json!(v); }
     
     db.set_config("general", &general, false).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
@@ -301,6 +341,11 @@ pub async fn update_settings(
         }
 
         db.set_config("ai", &serde_json::to_value(final_ai).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    }
+
+    if let Some(backups) = &payload.backups {
+        db.set_config("backups", &serde_json::to_value(backups).unwrap(), false)
+            .await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
     Ok(Json(payload))

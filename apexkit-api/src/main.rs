@@ -204,9 +204,9 @@ async fn main() {
     // --- INIT TENANT MANAGER ---
     // Capacity 500 active databases. Unused ones dropped after 1hr.
     let tenant_manager = Arc::new(TenantManager::new(
-        shared_embedder.clone(), // This is Option<Arc<CandleEmbedder>>
-        // vault.clone(), 
-        500
+        shared_embedder.clone(), // Arg 1: Embedder
+        cached_db.clone(),       // Arg 2: Root DB for status checks
+        500                      // Arg 3: Cache Capacity
     ));
 
     // --- INIT SANDBOX MANAGER ---
@@ -269,6 +269,14 @@ async fn main() {
     // Initialize EmbedderService (Wrapper for external APIs like OpenAI/Gemini if used in scripts)
     let embedder = Arc::new(apexkit_core::embeddings::EmbedderService::new());
 
+    let env_ttl = std::env::var("CACHE_TTL")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(300); // 5 mins default
+
+    let script_cache = Cache::builder()
+        .max_capacity(100_000)
+        .time_to_live(std::time::Duration::from_secs(env_ttl)) // Enforce ENV TTL
+        .build();
+
     // 10. Construct AppState
     let state = AppState {
         db: cached_db.clone(),
@@ -287,6 +295,7 @@ async fn main() {
         embedder,
         vector_provider: vector_provider.clone(),
         port: cli.port,
+        script_cache,
     };
 
     // 11. Build Real Schema
