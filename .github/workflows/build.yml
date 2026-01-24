@@ -44,6 +44,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mingw-w64 musl-tools nasm perl
 
+      # [NEW] Build Admin UI so assets exist in ./static
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Build Admin UI
+        working-directory: admin-ui
+        run: |
+          npm install
+          npm run build
+          # Ensure the build output moved to the correct static folder
+          # Vite config sets base to /_dashboard/, but check where output goes
+          # Assuming admin-ui/dist needs to be moved to ../static/dashboard
+
+      # [NEW] Move Admin Build to Static Folder for Rust Embedding
+      - name: Move Admin Assets
+        run: |
+          rm -rf static/dashboard
+          mkdir -p static/dashboard
+          cp -r admin-ui/dist/* static/dashboard/
+
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
