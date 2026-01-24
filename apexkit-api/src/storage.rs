@@ -450,7 +450,7 @@ pub async fn upload_file(
     ConnectInfo(addr): ConnectInfo<SocketAddr>, // Capture IP
     headers: axum::http::HeaderMap, // Capture Headers
     mut multipart: Multipart,
-) -> Result<Json<FileResponse>, AppError> {
+) -> Result<(StatusCode, Json<FileResponse>), AppError> {
     let claims = auth.map(|Extension(c)| c);
     let user_id = claims.as_ref().map(|c| c.uid);
 
@@ -490,7 +490,7 @@ pub async fn upload_file(
         // [TRIGGER] After Upload
         let _ = trigger_void_hook(&state, "after_file_upload", serde_json::json!({ "id": id, "filename": filename }), claims.as_ref(),  Some(&event_scope.clone()), Some(base_url.clone())).await;
 
-        return Ok(Json(FileResponse { id, url, filename }));
+        return Ok((StatusCode::CREATED, Json(FileResponse { id, url, filename })));
     }
     Err(AppError::InputValidation(validator::ValidationErrors::new()))
 }

@@ -973,7 +973,7 @@ pub async fn create_record(
     headers: HeaderMap,
     Path(path): Path<IdPath>, 
     Json(p): Json<apexkit_core::models::Record>
-) -> Result<Json<RecordResponse>, AppError> {
+) -> Result<(StatusCode, Json<RecordResponse>), AppError> {
     let claims = auth.map(|Extension(c)| c);
     
     // [UPDATED] Resolve Collection by ID or Name
@@ -1029,7 +1029,7 @@ pub async fn create_record(
         }
     }
 
-    Ok(Json(RecordResponse{id: rid, data: data_to_save, expand: None, created: chrono::Utc::now().to_rfc3339(), updated: chrono::Utc::now().to_rfc3339()}))
+    Ok((StatusCode::CREATED, Json(RecordResponse{id: rid, data: data_to_save, expand: None, created: chrono::Utc::now().to_rfc3339(), updated: chrono::Utc::now().to_rfc3339()})))
 }
 
 #[utoipa::path(patch, path = "/api/v1/collections/{id}/records/{record_id}")]

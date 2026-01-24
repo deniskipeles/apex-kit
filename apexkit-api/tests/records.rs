@@ -1,20 +1,19 @@
 use axum::{
     body::{to_bytes, Body},
-    http::{Request, StatusCode},
+    http::StatusCode,
 };
 use tower::ServiceExt;
 
 mod common;
-use common::setup_test_app;
+use common::{setup_test_app, base_request};
 
 async fn create_test_collection(app: &axum::Router) -> i64 {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri("/api/v1/collections")
-                .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{ "name": "Posts", "schema": { "fields": { "title": { "type": "string", "required": true } } } }"#,
                 ))
@@ -34,10 +33,9 @@ async fn test_create_record() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri(format!("/api/v1/collections/{}/records", collection_id))
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "data": { "title": "Hello!" } }"#))
                 .unwrap(),
         )
@@ -54,10 +52,9 @@ async fn test_create_record_validation_error() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri(format!("/api/v1/collections/{}/records", collection_id))
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "data": { "wrong_field": "Hello!" } }"#))
                 .unwrap(),
         )
@@ -75,10 +72,9 @@ async fn test_list_records() {
     // Create a record
     app.clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri(format!("/api/v1/collections/{}/records", collection_id))
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "data": { "title": "Hello!" } }"#))
                 .unwrap(),
         )
@@ -87,7 +83,7 @@ async fn test_list_records() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("GET")
                 .uri(format!("/api/v1/collections/{}/records", collection_id))
                 .body(Body::empty())
@@ -99,7 +95,7 @@ async fn test_list_records() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 1_048_576).await.unwrap();
     let records: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(records.as_array().unwrap().len(), 1);
+    assert_eq!(records["items"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -111,10 +107,9 @@ async fn test_get_record() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri(format!("/api/v1/collections/{}/records", collection_id))
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "data": { "title": "Hello!" } }"#))
                 .unwrap(),
         )
@@ -126,7 +121,7 @@ async fn test_get_record() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("GET")
                 .uri(format!(
                     "/api/v1/collections/{}/records/{}",
@@ -153,10 +148,9 @@ async fn test_update_record() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri(format!("/api/v1/collections/{}/records", collection_id))
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "data": { "title": "Hello!" } }"#))
                 .unwrap(),
         )
@@ -168,13 +162,12 @@ async fn test_update_record() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("PATCH")
                 .uri(format!(
                     "/api/v1/collections/{}/records/{}",
                     collection_id, record_id
                 ))
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "data": { "title": "New Hello!" } }"#))
                 .unwrap(),
         )
@@ -196,10 +189,9 @@ async fn test_delete_record() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri(format!("/api/v1/collections/{}/records", collection_id))
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "data": { "title": "Hello!" } }"#))
                 .unwrap(),
         )
@@ -212,7 +204,7 @@ async fn test_delete_record() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("DELETE")
                 .uri(format!(
                     "/api/v1/collections/{}/records/{}",
@@ -229,7 +221,7 @@ async fn test_delete_record() {
     // Verify that the record is gone
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("GET")
                 .uri(format!(
                     "/api/v1/collections/{}/records/{}",
