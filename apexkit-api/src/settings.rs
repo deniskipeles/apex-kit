@@ -230,15 +230,22 @@ pub async fn get_settings(
 )]
 pub async fn update_settings(
     auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
-    State(state): State<AppState>, // Still need State for Vault (Encryption)
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>, 
     Json(payload): Json<AppSettingsDto>,
 ) -> Result<Json<AppSettingsDto>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
     // 1. Update General
-    let mut general = db.get_config("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?.unwrap_or(json!({}));
+    let mut general = db.get_config("general").await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?
+        .unwrap_or(json!({}));
+
+    //  Ensure it is an object. If corrupted/string, force reset to empty object.
+    if !general.is_object() {
+        general = json!({});
+    }
     
     // Use references (&) to avoid consuming payload fields
     if let Some(v) = &payload.app_name { general["app_name"] = json!(v); }
@@ -248,6 +255,8 @@ pub async fn update_settings(
     if let Some(v) = &payload.app_logo { general["app_logo"] = json!(v); }
     if let Some(v) = &payload.logo_width { general["logo_width"] = json!(v); }
     if let Some(v) = &payload.logo_height { general["logo_height"] = json!(v); }
+    
+    //  Ensure these are mapped too
     if let Some(v) = &payload.log_retention_days { general["log_retention_days"] = json!(v); }
     if let Some(v) = &payload.max_site_size_mb { general["max_site_size_mb"] = json!(v); }
     
@@ -343,6 +352,7 @@ pub async fn update_settings(
         db.set_config("ai", &serde_json::to_value(final_ai).unwrap(), true).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
+    // 7. Update Backups
     if let Some(backups) = &payload.backups {
         db.set_config("backups", &serde_json::to_value(backups).unwrap(), false)
             .await.map_err(|e| AppError::UnknownError(e.to_string()))?;

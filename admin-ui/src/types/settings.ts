@@ -102,3 +102,20 @@ export interface AppSettings {
   ai:AIProvider;
 }
 
+export interface TenantStats {
+  storage_mb: number;
+  max_storage_mb: number;
+  vector_count: number;
+  max_vectors: number;
+  ai_requests: number;
+  max_ai_requests: number;
+}
+
+export interface Tenant {
+  id: string;
+  name?: string;
+  status: string; // 'active', 'suspended'
+  tier: string;   // 'free', 'pro'
+  stats: TenantStats;
+  created_at: string;
+}

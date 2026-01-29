@@ -522,6 +522,13 @@ export class ApexKit {
             createApiKey: (name, role = 'admin', scope = 'root', bypass_cors = true) => this._request('/admin/keys', { method: 'POST', body: { name, role, scope, bypass_cors } }),
 
             /**
+             * Update an API key.
+             * @param {number|string} id
+             * @param {object} updates - { name, role, scope, bypass_cors }
+             */
+            updateApiKey: (id, updates) => this._request(`/admin/keys/${id}`, { method: 'PUT', body: updates }),
+
+            /**
              * Revoke (delete) an API key.
              * @param {number|string} id - The ID of the key to delete.
              * @returns {Promise<void>}
@@ -633,12 +640,35 @@ export class ApexKit {
                 method: 'POST', 
                 body: { tenant_id: tenantId } 
             }),
-            
+
             /**
-             * List all Tenants.
-             * @returns {Promise<string[]>} List of tenant IDs.
+             * Update tenant status (active, suspended, archived).
+             * @param {string} id - The Tenant ID
+             * @param {string} status - The new status
              */
-            listTenants: () => this._request('/admin/tenants', { method: 'GET' }),
+            updateTenantStatus: (id, status) => this._request(`/admin/tenants/${id}/status`, { 
+                method: 'PATCH', 
+                body: { status } 
+            }),
+
+            /**
+             * Delete a Tenant.
+             * @param {string} id - The Tenant ID
+             */
+            deleteTenant: (id) => this._request(`/admin/tenants/${id}`, { method: 'DELETE' }),
+
+            /**
+             * Update a Tenant
+             * @param {string} id - The Tenant ID
+             * @param {object} data - The Data to patch
+             */
+            updateTenant: (id, data) => this._request(`/admin/tenants/${id}`, { method: 'PATCH', body: data }),
+            
+             /**
+             * List all Tenants with metadata.
+             * @returns {Promise<Array<{id: string, name: string, status: string, tier: string, stats: object, created_at: string}>>} List of tenant objects.
+             */
+             listTenants: () => this._request('/admin/tenants', { method: 'GET' }),
         };
     }
 
@@ -697,6 +727,8 @@ export class ApexKit {
                 method: 'POST', 
                 body: { name, initial_prompt: initialPrompt, model, clone_strategy: cloneStrategy, clone_record_limit: cloneRecordLimit } 
             }),
+
+            deleteSession: (id) => this._request(`/admin/ai/sessions/${id}`, { method: 'DELETE' }),
 
             /**
              * Send a message to the Architect in a specific session.

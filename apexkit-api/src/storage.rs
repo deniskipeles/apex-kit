@@ -85,12 +85,12 @@ pub struct MigrationResult {
 }
 
 // --- PATH STRUCTS FOR NESTED ROUTING ---
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 pub struct FilenamePath {
     pub filename: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 pub struct FileIdPath {
     pub id: i64,
 }
@@ -500,7 +500,7 @@ pub async fn upload_file(
 #[utoipa::path(
     get,
     path = "/api/v1/storage/file/{filename}",
-    params(FileParams),
+    params(FilenamePath, FileParams),
     responses((status = 200, description = "File Content"))
 )]
 pub async fn serve_file(
@@ -553,6 +553,7 @@ pub async fn list_files(
 #[utoipa::path(
     delete,
     path = "/api/v1/storage/files/{id}",
+    params(FileIdPath),
     responses((status = 204, description = "File deleted"))
 )]
 pub async fn delete_file(

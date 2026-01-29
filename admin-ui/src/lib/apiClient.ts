@@ -1,5 +1,5 @@
 import { APEX_TOKEN } from '../constants';
-import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions, ApiKey, SiteFile } from '../types';
+import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions, ApiKey, SiteFile, Tenant } from '../types';
 import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
 
 // const env = (import.meta as any).env;
@@ -46,6 +46,63 @@ export const pb = new Proxy(basePb, {
 });
 
 export const realtime = new ApexKitRealtime(pb.baseUrl, pb.getToken());
+
+// Helper for browser downloads
+const downloadBlob = (blob: Blob, filename: string) => {
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+};
+// Helper for authenticated raw fetch
+const rawFetch = async (path: string) => {
+  // Construct URL based on current context (Tenant/Sandbox via URL)
+  let baseUrl = apiUrl;
+  if (typeof window !== 'undefined') {
+    const pathName = window.location.pathname;
+    const tenantMatch = pathName.match(/^\/_dashboard\/tenant\/([^/]+)/);
+    const sandboxMatch = pathName.match(/^\/_dashboard\/sandbox\/([^/]+)/);
+
+    if (tenantMatch) baseUrl += `/tenant/${tenantMatch[1]}`;
+    else if (sandboxMatch) baseUrl += `/sandbox/${sandboxMatch[1]}`;
+  }
+
+  const token = localStorage.getItem(APEX_TOKEN);
+  const res = await fetch(`${baseUrl}/api/v1${path}`, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(txt || res.statusText);
+  }
+  return res;
+};
+
+// Helper for POST with body (if not already present)
+const rawFetchWithBody = async (path: string, body: FormData) => {
+  let baseUrl = apiUrl; // (Copy logic from rawFetch)
+  if (typeof window !== 'undefined') {
+    const pathName = window.location.pathname;
+    const tenantMatch = pathName.match(/^\/_dashboard\/tenant\/([^/]+)/);
+    const sandboxMatch = pathName.match(/^\/_dashboard\/sandbox\/([^/]+)/);
+    if (tenantMatch) baseUrl += `/tenant/${tenantMatch[1]}`;
+    else if (sandboxMatch) baseUrl += `/sandbox/${sandboxMatch[1]}`;
+  }
+
+  const token = localStorage.getItem(APEX_TOKEN);
+  const res = await fetch(`${baseUrl}/api/v1${path}`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}` },
+    body: body
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+};
 
 // --- HELPER: Transform Backend Collection to Frontend Interface ---
 const transformCollection = (col: any): Collection => {
@@ -205,14 +262,7 @@ export const apiClient = {
     const res = await pb.admins.revectorizeCollection(collectionId);
     return res;
   },
-  importData: async (collectionName: string, file: File) => {
-    const res = await pb.admins.importData(collectionName, file);
-    return res;
-  },
-  exportData: async (collectionId: number | string, format?: "json" | "csv") => {
-    const res = await pb.admins.exportData(collectionId, format);
-    return res;
-  },
+
 
   // --- System / Backups ---
   system: {
@@ -275,6 +325,9 @@ export const apiClient = {
         }
       };
     },
+    update: async (id: string, updates: Partial<ApiKey>) => {
+      return await pb.admins.updateApiKey(id, updates);
+    },
     delete: async (id: string) => {
       return await pb.admins.deleteApiKey(id);
     }
@@ -283,8 +336,14 @@ export const apiClient = {
   // Explicit Admin methods for Root
   root: {
     createTenant: (id: string) => basePb.admins.createTenant(id), // Always use basePb for creating tenants
-    // deleteTenant: (id: string) => basePb.admins.deleteTenant(id),
-    listTenants: () => basePb.admins.listTenants(),
+    deleteTenant: (id: string) => pb.admins.deleteTenant(id),
+    updateTenant: (id: string, data: any) => pb.admins.updateTenant(id, data),
+    listTenants: async (): Promise<Tenant[]> => {
+      return await basePb.admins.listTenants();
+    },
+    updateStatus: async (id: string, status: 'active' | 'suspended' | 'archived') => {
+      return await pb.admins.updateTenantStatus(id, status);
+    },
   },
 
   auth: {
@@ -439,14 +498,9 @@ export const apiClient = {
     reIndex: (id: string) => pb.admins.reIndex(id),
 
     exportSchema: async () => {
-      const blob = await pb.admins.exportSchema();
-      const downloadUrl = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = downloadUrl;
-      a.download = "apex_schema.json";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      const res = await rawFetch('/admin/export-schema');
+      const blob = await res.blob();
+      downloadBlob(blob, 'apex_schema.json');
     },
     importSchema: async (file: File, strategy: 'skip' | 'overwrite' | 'error' = 'skip') => {
       return await pb.admins.importSchema(file, strategy);
@@ -578,6 +632,26 @@ export const apiClient = {
       return await pb.collection(collectionId).getVector(recordId);
     },
 
+    importData: async (collectionName: string, file: File) => {
+      const res = await pb.admins.importData(collectionName, file);
+      return res;
+    },
+    exportData: async (collectionId: string, format: 'json' | 'csv' = 'json') => {
+      const res = await rawFetch(`/admin/export-data/${collectionId}?format=${format}`);
+      const blob = await res.blob();
+
+      // Try to get filename from header, else default
+      const disposition = res.headers.get('Content-Disposition');
+      let filename = `collection_${collectionId}.${format}`;
+      if (disposition && disposition.indexOf('filename=') !== -1) {
+        const matches = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(disposition);
+        if (matches != null && matches[1]) {
+          filename = matches[1].replace(/['"]/g, '');
+        }
+      }
+      downloadBlob(blob, filename);
+    },
+
   },
 
   testS3Connection: async (config: any) => {
@@ -656,6 +730,15 @@ export const apiClient = {
     },
     run: async (name: string, variables: any): Promise<any> => {
       return await pb.scripts.run(name, variables);
+    },
+    export: async () => {
+      const res = await rawFetch('/admin/export-scripts');
+      downloadBlob(await res.blob(), 'scripts.json');
+    },
+    import: async (file: File) => {
+      const formData = new FormData();
+      formData.append('file', file);
+      return rawFetchWithBody('/admin/import-scripts', formData);
     }
   },
 
@@ -676,6 +759,15 @@ export const apiClient = {
     },
     delete: async (id: string) => {
       await pb.templates.delete(id);
+    },
+    export: async () => {
+      const res = await rawFetch('/admin/export-templates');
+      downloadBlob(await res.blob(), 'templates.json');
+    },
+    import: async (file: File) => {
+      const formData = new FormData();
+      formData.append('file', file);
+      return rawFetchWithBody('/admin/import-templates', formData);
     }
   },
 
@@ -700,6 +792,8 @@ export const apiClient = {
       return await pb.ai.createSession(name, initialPrompt, model, cloneStrategy, cloneRecordLimit);
     },
 
+    deleteSession: (id: string) => pb.ai.deleteSession(id),
+
     chat: async (id: string, prompt: string, model: string) => {
       return await pb.ai.chat(id, prompt, model);
     },
@@ -718,6 +812,15 @@ export const apiClient = {
 
     codeEdit: async (prompt: string, currentCode: string, contextType: string, model: string) => {
       return await pb.ai.editCode(prompt, currentCode, contextType, model);
+    },
+    exportActions: async () => {
+      const res = await rawFetch('/admin/export-ai-actions');
+      downloadBlob(await res.blob(), 'ai_actions.json');
+    },
+    importActions: async (file: File) => {
+      const formData = new FormData();
+      formData.append('file', file);
+      return rawFetchWithBody('/admin/import-ai-actions', formData);
     }
   },
 

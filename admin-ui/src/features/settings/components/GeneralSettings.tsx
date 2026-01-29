@@ -62,7 +62,8 @@ export const GeneralSettings = ({ settings, onChange, onSave }: GeneralSettingsP
                 appLogo: settings.appLogo,
                 logoWidth: settings.logoWidth,
                 logoHeight: settings.logoHeight,
-                logRetentionDays: settings.logRetentionDays
+                logRetentionDays: settings.logRetentionDays,
+                maxSiteSizeMb: settings.maxSiteSizeMb
             });
         } finally {
             setIsSaving(false);

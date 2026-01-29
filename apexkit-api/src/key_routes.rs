@@ -5,6 +5,7 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json};
 use apexkit_core::{auth::Claims, models::ApiKey};
 use crate::{AppError, DatabaseConnection};
 use utoipa::ToSchema;
@@ -75,4 +76,32 @@ pub async fn delete_key(
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
     db.delete_api_key(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateKeyReq {
+    pub name: Option<String>,
+    pub role: Option<String>,
+    pub scope: Option<String>,
+    pub bypass_cors: Option<bool>,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/admin/keys/{id}",
+    request_body = UpdateKeyReq,
+    responses((status = 200, body = Value))
+)]
+pub async fn update_key(
+    Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection,
+    Path(id): Path<i64>,
+    Json(payload): Json<UpdateKeyReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    
+    db.update_api_key(id, payload.name, payload.role, payload.scope, payload.bypass_cors).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(Json(json!({ "success": true })))
 }

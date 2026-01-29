@@ -48,8 +48,9 @@ impl Db for CachedDb {
         &self,
         name: &str,
         schema: &Option<CollectionSchema>,
+        index: Option<String>,
     ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.create_collection(name, schema).await
+        self.inner.create_collection(name, schema, index).await
     }
 
     async fn get_collection(
@@ -195,6 +196,10 @@ impl Db for CachedDb {
     async fn create_api_key(&self, name: &str, role: &str, scope: &str, bypass_cors: bool) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.create_api_key(name, role, scope, bypass_cors).await
     }
+
+    async fn update_api_key(&self, id: i64, name: Option<String>, role: Option<String>, scope: Option<String>, bypass_cors: Option<bool>) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.update_api_key(id, name, role, scope, bypass_cors).await
+    }
     
     async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.list_api_keys().await
@@ -210,6 +215,10 @@ impl Db for CachedDb {
 
     // --- Tenants ---
     // --- Tenant Management (Pass-through) ---
+    async fn register_tenant(&self, id: &str, owner_id: Option<i64>, name: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.register_tenant(id, owner_id, name, tier).await
+    }
+    
     async fn get_tenant_status(&self, tenant_id: &str) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.get_tenant_status(tenant_id).await
     }
@@ -218,13 +227,37 @@ impl Db for CachedDb {
         self.inner.update_tenant_status(tenant_id, status).await
     }
 
-    async fn register_tenant(&self, id: &str, owner_id: Option<i64>, name: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.register_tenant(id, owner_id, name, tier).await
+    async fn update_tenant_full(&self, id: &str, n: Option<String>, s: Option<String>, t: Option<String>) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.update_tenant_full(id, n, s, t).await
+    }
+
+    async fn delete_tenant_metadata(&self, id: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.delete_tenant_metadata(id).await
+    }
+
+    async fn list_tenants(&self) -> std::result::Result<Vec<models::Tenant>, Box<dyn StdError + Send + Sync>> {
+        self.inner.list_tenants().await
+    }
+
+    async fn get_tenant_disk_usage(&self, tenant_id: &str) -> std::result::Result<u64, Box<dyn StdError + Send + Sync>> {
+        self.inner.get_tenant_disk_usage(tenant_id).await
     }
 
     // --- Sandboxes ---
     async fn register_sandbox(&self, id: &str, owner_id: Option<i64>, name: Option<String>, expires_at: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.register_sandbox(id, owner_id, name, expires_at).await
+    }
+
+    async fn update_sandbox_full(&self, id: &str, n: Option<String>, s: Option<String>, e: Option<String>) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.update_sandbox_full(id, n, s, e).await
+    }
+
+    async fn delete_sandbox_metadata(&self, id: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.delete_sandbox_metadata(id).await
+    }
+
+    async fn get_sandbox_disk_usage(&self, id: &str) -> std::result::Result<u64, Box<dyn StdError + Send + Sync>> {
+        self.inner.get_sandbox_disk_usage(id).await
     }
 
     // --- Vectorization ---
@@ -429,6 +462,10 @@ impl Db for CachedDb {
 
     async fn list_ai_sessions(&self) -> std::result::Result<Vec<AiSession>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.list_ai_sessions().await
+    }
+
+    async fn delete_ai_session(&self, id: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.delete_ai_session(id).await
     }
 
     // --- Plugins (Pass-through) ---

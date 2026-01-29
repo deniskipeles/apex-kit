@@ -74,7 +74,7 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     try {
       for (const col of collections) {
         // Only re-index if it has indexed fields
-        if (col.schema.some(f => f.indexed)) {
+        if (col.schema.some(f => f.ose_indexed)) {
           await apiClient.reIndex(col.id);
           count++;
         }
@@ -114,9 +114,10 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     setIsExporting(true);
     try {
       await apiClient.collections.exportSchema();
-      toast('Schema exported successfully', 'success');
-    } catch (e) {
-      toast('Failed to export schema', 'error');
+      toast('Schema downloaded successfully', 'success');
+    } catch (e: any) {
+      console.error(e);
+      toast(e.message || 'Failed to export schema', 'error');
     } finally {
       setIsExporting(false);
     }

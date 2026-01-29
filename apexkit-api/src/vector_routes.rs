@@ -11,27 +11,28 @@ use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 use crate::{trigger_void_hook, extract_log_meta};
 use crate::BaseUrl;
+use utoipa::{ToSchema, IntoParams};
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, ToSchema)]
 pub struct VectorSearchReq {
     pub vector: Vec<f32>,
     pub limit: Option<usize>,
     pub field: String, 
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, ToSchema)]
 pub struct TextVectorSearchReq {
     pub query_text: String,
     pub limit: Option<usize>,
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, ToSchema)]
 pub struct RevectorizeOptions {
     #[serde(default)]
     pub force: bool,
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, ToSchema, IntoParams)]
 pub struct RecordVectorPath {
     pub id: String,        // Collection ID/Name
     pub record_id: i64,    // Record ID
@@ -41,6 +42,7 @@ pub struct RecordVectorPath {
 #[utoipa::path(
     get,
     path = "/api/v1/collections/{id}/get-vector/{record_id}",
+    params(RecordVectorPath),
     responses((status = 200, body = Vec<VectorRecord>))
 )]
 pub async fn get_record_vector(
@@ -90,6 +92,7 @@ pub async fn get_record_vector(
     post,
     path = "/api/v1/collections/{id}/search-vector",
     request_body = VectorSearchReq,
+    params(IdPath),
     responses((status = 200, body = Vec<RecordResponse>))
 )]
 pub async fn search_vector(
@@ -124,6 +127,7 @@ pub async fn search_vector(
     post,
     path = "/api/v1/collections/{id}/search-text-vector",
     request_body = TextVectorSearchReq,
+    params(IdPath),
     responses((status = 200, body = Vec<RecordResponse>))
 )]
 pub async fn query_vector_search(
@@ -201,6 +205,7 @@ pub async fn query_vector_search(
     post,
     path = "/api/v1/admin/collections/{id}/revectorize",
     request_body = RevectorizeOptions, 
+    params(IdPath),
     responses((status = 202, description = "Revectorization jobs queued"))
 )]
 pub async fn revectorize_collection_handler(

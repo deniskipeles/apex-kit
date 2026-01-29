@@ -52,6 +52,9 @@ pub struct Collection {
     pub id: Option<i64>,
     pub name: String,
     pub schema: Option<CollectionSchema>,
+    // Stable unique identifier for schema portability
+    #[serde(default)] 
+    pub index: Option<String>,
 }
 
 /// Represents a File uploaded to Storage

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Shield, Globe, Lock, Save, Plus, X } from 'lucide-react';
+import { Shield, Globe, Lock, Save, Plus, X, Database } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Label, Switch, Button, Textarea, Input, Badge } from '../../../components/ui/Elements';
 import { AppSettings } from '../../../types';
 import { Users } from 'lucide-react';
@@ -18,6 +18,30 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
     const [roles, setRoles] = useState<string[]>([]);
     const [newRole, setNewRole] = useState('');
     const { toast } = useToast();
+    //  User Policy State
+    const [userPolicies, setUserPolicies] = useState({
+        read: 'admin || owner:id',
+        create: 'public',
+        update: 'admin || owner:id',
+        delete: 'admin'
+    });
+    const [isLoadingPolicies, setIsLoadingPolicies] = useState(true);
+
+    // Load Policies on mount
+    useEffect(() => {
+        const loadPolicies = async () => {
+            try {
+                const configs = await configService.list();
+                const policyConf = configs.find(c => c.key === 'policy_users');
+                if (policyConf && policyConf.value) {
+                    const parsed = JSON.parse(policyConf.value);
+                    setUserPolicies(parsed);
+                }
+            } catch (e) { console.error(e); }
+            finally { setIsLoadingPolicies(false); }
+        };
+        loadPolicies();
+    }, []);
 
     // Load roles on mount
     useEffect(() => {
@@ -81,6 +105,16 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
         }
     };
 
+    // Save Handler for Policies (Separate from main settings save for clarity/modularity)
+    const savePolicies = async () => {
+        try {
+            await configService.set('policy_users', JSON.stringify(userPolicies), false);
+            toast('User policies updated', 'success');
+        } catch (e) {
+            toast('Failed to save policies', 'error');
+        }
+    };
+
     return (
         <div className="space-y-6">
             {/* Roles Management Card */}
@@ -128,6 +162,67 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
                             checked={settings.allowPublicRegistration}
                             onCheckedChange={(c: boolean) => onChange({ allowPublicRegistration: c })}
                         />
+                    </div>
+                </CardContent>
+            </Card>
+
+            {/* [NEW] User Data Policies Card */}
+            <Card>
+                <CardHeader>
+                    <CardTitle className="flex items-center gap-2"><Database className="h-4 w-4" /> User Data Policies</CardTitle>
+                </CardHeader>
+                <CardContent>
+                    <div className="space-y-4">
+                        <div className="text-sm text-muted-foreground bg-secondary/10 p-3 rounded-md border border-border">
+                            Define who can access the system `users` table.
+                            Use rules like <code>admin</code>, <code>auth</code>, <code>public</code>, or <code>owner:id</code>.
+                        </div>
+
+                        {isLoadingPolicies ? (
+                            <div className="p-4 text-center text-xs text-muted-foreground">Loading policies...</div>
+                        ) : (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div className="space-y-1">
+                                    <Label>Read (List/Get)</Label>
+                                    <Input
+                                        value={userPolicies.read}
+                                        onChange={(e: any) => setUserPolicies({ ...userPolicies, read: e.target.value })}
+                                        className="font-mono text-xs"
+                                        placeholder="admin"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <Label>Create (Register)</Label>
+                                    <Input
+                                        value={userPolicies.create}
+                                        onChange={(e: any) => setUserPolicies({ ...userPolicies, create: e.target.value })}
+                                        className="font-mono text-xs"
+                                        placeholder="public"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <Label>Update (Edit)</Label>
+                                    <Input
+                                        value={userPolicies.update}
+                                        onChange={(e: any) => setUserPolicies({ ...userPolicies, update: e.target.value })}
+                                        className="font-mono text-xs"
+                                        placeholder="admin || owner:id"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <Label>Delete</Label>
+                                    <Input
+                                        value={userPolicies.delete}
+                                        onChange={(e: any) => setUserPolicies({ ...userPolicies, delete: e.target.value })}
+                                        className="font-mono text-xs"
+                                        placeholder="admin"
+                                    />
+                                </div>
+                            </div>
+                        )}
+                        <div className="flex justify-end pt-2">
+                            <Button size="sm" variant="outline" onClick={savePolicies}>Update Policies</Button>
+                        </div>
                     </div>
                 </CardContent>
             </Card>

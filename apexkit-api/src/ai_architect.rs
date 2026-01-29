@@ -522,7 +522,7 @@ async fn deploy_manifest(db: Arc<dyn Db>, manifest: &AppManifest) -> Result<(), 
                  .map_err(|e| AppError::UnknownError(format!("DB Update Error on col {}: {}", col.name, e)))?;
          } else {
              info!("Creating collection: {}", col.name);
-             db.create_collection(&col.name, &Some(col.schema.clone())).await
+             db.create_collection(&col.name, &Some(col.schema.clone()), None).await
                  .map_err(|e| AppError::UnknownError(format!("DB Create Error on col {}: {}", col.name, e)))?;
          }
      }

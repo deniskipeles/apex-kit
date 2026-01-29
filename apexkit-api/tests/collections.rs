@@ -1,11 +1,11 @@
 use axum::{
     body::{to_bytes, Body},
-    http::{Request, StatusCode},
+    http::StatusCode,
 };
 use tower::ServiceExt;
 
 mod common;
-use common::setup_test_app;
+use common::{setup_test_app, base_request};
 
 #[tokio::test]
 async fn test_create_collection() {
@@ -13,10 +13,9 @@ async fn test_create_collection() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri("/api/v1/collections")
-                .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{ "name": "Users", "schema": { "fields": { "name": { "type": "string", "required": true } } } }"#,
                 ))
@@ -35,10 +34,9 @@ async fn test_list_collections() {
     // Create a collection
     app.clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri("/api/v1/collections")
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "name": "Users" }"#))
                 .unwrap(),
         )
@@ -47,7 +45,7 @@ async fn test_list_collections() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("GET")
                 .uri("/api/v1/collections")
                 .body(Body::empty())
@@ -70,10 +68,9 @@ async fn test_get_collection() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri("/api/v1/collections")
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "name": "Users" }"#))
                 .unwrap(),
         )
@@ -85,7 +82,7 @@ async fn test_get_collection() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("GET")
                 .uri(format!("/api/v1/collections/{}", collection_id))
                 .body(Body::empty())
@@ -108,10 +105,9 @@ async fn test_update_collection() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri("/api/v1/collections")
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "name": "Users" }"#))
                 .unwrap(),
         )
@@ -123,10 +119,9 @@ async fn test_update_collection() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("PATCH")
                 .uri(format!("/api/v1/collections/{}", collection_id))
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "name": "New Users" }"#))
                 .unwrap(),
         )
@@ -147,10 +142,9 @@ async fn test_delete_collection() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("POST")
                 .uri("/api/v1/collections")
-                .header("content-type", "application/json")
                 .body(Body::from(r#"{ "name": "Users" }"#))
                 .unwrap(),
         )
@@ -163,7 +157,7 @@ async fn test_delete_collection() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("DELETE")
                 .uri(format!("/api/v1/collections/{}", collection_id))
                 .body(Body::empty())
@@ -177,7 +171,7 @@ async fn test_delete_collection() {
     // Verify that the collection is gone
     let response = app
         .oneshot(
-            Request::builder()
+            base_request()
                 .method("GET")
                 .uri(format!("/api/v1/collections/{}", collection_id))
                 .body(Body::empty())

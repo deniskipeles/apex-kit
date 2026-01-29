@@ -45,6 +45,7 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
     { icon: Folder, label: 'Files', page: 'files' },
     { icon: FileCode, label: 'Scripts', page: 'scripts' },
     { icon: LayoutTemplate, label: 'Templates', page: 'templates' },
+    { icon: Sparkles, label: 'AI Actions', page: 'ai-actions' },
     { icon: BrainCircuit, label: 'Vector Search', page: 'vector-search' },
     { icon: Activity, label: 'Logs', page: 'logs' },
     { icon: Settings, label: 'Settings', page: 'settings' },
@@ -54,9 +55,7 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
   if (contextType === 'root') {
       // Insert Tenants after Dashboard
       links.splice(1, 0, { icon: Server, label: 'Tenants', page: 'tenants' });
-      // Append System features
-      links.splice(7, 0, { icon: Sparkles, label: 'AI Actions', page: 'ai-actions' });
-      links.splice(6, 0, { icon: BoxIcon, label: 'Sandboxes', page: 'ai-architect' });
+      links.splice(2, 0, { icon: BoxIcon, label: 'Sandboxes', page: 'ai-architect' });
   }
 
   // Helper: Construct target view string based on context

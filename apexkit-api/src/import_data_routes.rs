@@ -284,7 +284,7 @@ pub async fn import_data_handler(
         col.id
     } else {
         info!("Creating new collection from import: {}", col_name);
-        let id = db.create_collection(&col_name, &Some(inferred_schema)).await
+        let id = db.create_collection(&col_name, &Some(inferred_schema), None).await
             .map_err(|e| AppError::UnknownError(format!("Failed to create collection: {}", e)))?;
         collection_created = true;
         id
@@ -380,13 +380,46 @@ pub async fn import_schema_handler(
     let payload: ImportSchemaRequest = serde_json::from_slice(&file_data)
         .map_err(|e| AppError::UnknownError(format!("Invalid JSON Schema File: {}", e)))?;
 
-    // ... (rest of logic remains same: list existing, iterate payload.collections, apply strategy) ...
     let existing_cols = db.list_collections().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     let mut stats = ImportSchemaResponse { created: 0, updated: 0, skipped: 0, errors: vec![] };
 
-    for col in payload.collections {
-        let exists = existing_cols.iter().find(|c| c.name == col.name);
-        // [FIX] Use the strategy parsed from multipart form, fallback to payload if needed (though payload structure is file content)
+    // 1. First Pass: Resolve stable Indexes for all incoming collections
+    // Create a lookup map of Index -> Name from the payload itself
+    // This allows us to resolve intra-payload references even if they don't exist in DB yet.
+    let mut payload_index_map = HashMap::new();
+    for col in &payload.collections {
+        if let Some(idx) = &col.index {
+            payload_index_map.insert(idx.clone(), col.name.clone());
+        }
+    }
+
+    // 2. Second Pass: Process & Import
+    for mut col in payload.collections {
+        // A. Match against DB by Index (Strong match) or Name (Weak match)
+        let exists = existing_cols.iter().find(|c| {
+            if let (Some(a), Some(b)) = (&c.index, &col.index) {
+                a == b
+            } else {
+                c.name == col.name
+            }
+        });
+
+        // B. Fix Relations using Stable Index
+        if let Some(schema) = &mut col.schema {
+            for (_, rel) in &mut schema.relations {
+                if let Some(target_idx) = &rel.target_index {
+                    // Try to resolve name from DB first (if it exists and was renamed there)
+                    if let Some(db_target) = existing_cols.iter().find(|c| c.index.as_ref() == Some(target_idx)) {
+                        rel.target_collection = db_target.name.clone();
+                    } 
+                    // Fallback to payload map (if it's a new collection in this import)
+                    else if let Some(payload_name) = payload_index_map.get(target_idx) {
+                        rel.target_collection = payload_name.clone();
+                    }
+                }
+            }
+        }
+
         let effective_strategy = if !strategy.is_empty() { strategy.as_str() } else { payload.strategy.as_str() };
         
         match (exists, effective_strategy) {
@@ -398,7 +431,8 @@ pub async fn import_schema_handler(
             (Some(_), "error") => return Err(AppError::UnknownError(format!("Collection {} exists", col.name))),
             (Some(_), _) => { stats.skipped += 1; },
             (None, _) => {
-                if let Err(e) = db.create_collection(&col.name, &col.schema).await {
+                // [UPDATED] Pass the index explicitly
+                if let Err(e) = db.create_collection(&col.name, &col.schema, col.index).await {
                     stats.errors.push(format!("Failed to create {}: {}", col.name, e));
                 } else { stats.created += 1; }
             }
@@ -406,4 +440,152 @@ pub async fn import_schema_handler(
     }
 
     Ok(Json(stats))
+}
+
+use apexkit_core::script_models::CreateScriptReq;
+use apexkit_core::models::CreateTemplateReq;
+use apexkit_core::ai_models::CreateActionReq;
+use apexkit_core::ai_models::AiAction;
+
+// --- DTOs ---
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ImportResult {
+    pub created: usize,
+    pub updated: usize,
+    pub errors: Vec<String>,
+}
+
+// Helper for multipart file reading
+async fn read_file_from_multipart(mut multipart: Multipart) -> Result<Vec<u8>, AppError> {
+    while let Some(field) = multipart.next_field().await.map_err(|_| AppError::UnknownError("Multipart error".into()))? {
+        if field.name() == Some("file") {
+            return field.bytes().await.map_err(|_| AppError::UnknownError("Failed to read bytes".into())).map(|b| b.to_vec());
+        }
+    }
+    Err(AppError::UnknownError("No file uploaded".into()))
+}
+
+// Handler: Import Scripts
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/import-scripts",
+    request_body(content = Vec<u8>, content_type = "multipart/form-data"),
+    responses((status = 200, body = ImportResult))
+)]
+pub async fn import_scripts_handler(
+    Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection, 
+    multipart: Multipart,
+) -> Result<Json<ImportResult>, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let data = read_file_from_multipart(multipart).await?;
+    let items: Vec<apexkit_core::script_models::Script> = serde_json::from_slice(&data)
+        .map_err(|e| AppError::UnknownError(format!("Invalid JSON: {}", e)))?;
+
+    let mut result = ImportResult { created: 0, updated: 0, errors: vec![] };
+
+    for item in items {
+        // Upsert Logic (Try create, if fails due to unique constraint, try update logic if desired or skip)
+        // Here we use create_script which has ON CONFLICT UPDATE built-in usually, or we check existence.
+        // Assuming create_script handles upsert based on name.
+        let req = CreateScriptReq {
+            name: item.name.clone(),
+            trigger_type: item.trigger_type,
+            target_collection: item.target_collection,
+            code: item.code,
+        };
+        
+        if let Err(e) = db.create_script(req).await {
+             result.errors.push(format!("Failed {}: {}", item.name, e));
+        } else {
+             result.created += 1; // Actually could be updated too
+        }
+    }
+    Ok(Json(result))
+}
+
+// Handler: Import Templates
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/import-templates",
+    request_body(content = Vec<u8>, content_type = "multipart/form-data"),
+    responses((status = 200, body = ImportResult))
+)]
+pub async fn import_templates_handler(
+    Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection, 
+    multipart: Multipart,
+) -> Result<Json<ImportResult>, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let data = read_file_from_multipart(multipart).await?;
+    let items: Vec<apexkit_core::models::Template> = serde_json::from_slice(&data)
+        .map_err(|e| AppError::UnknownError(format!("Invalid JSON: {}", e)))?;
+
+    let mut result = ImportResult { created: 0, updated: 0, errors: vec![] };
+
+    for item in items {
+        let req = CreateTemplateReq {
+            slug: item.slug.clone(),
+            content: item.content,
+            script_id: item.script_id, // Note: Script IDs might mismatch if scripts weren't imported first or IDs changed
+        };
+        
+        if let Err(e) = db.create_template(req).await {
+             result.errors.push(format!("Failed {}: {}", item.slug, e));
+        } else {
+             result.created += 1;
+        }
+    }
+    Ok(Json(result))
+}
+
+// Handler: Import AI Actions
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/import-ai-actions",
+    request_body(content = Vec<u8>, content_type = "multipart/form-data"),
+    responses((status = 200, body = ImportResult))
+)]
+pub async fn import_ai_actions_handler(
+    Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection, 
+    multipart: Multipart,
+) -> Result<Json<ImportResult>, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let data = read_file_from_multipart(multipart).await?;
+    let items: Vec<AiAction> = serde_json::from_slice(&data)
+        .map_err(|e| AppError::UnknownError(format!("Invalid JSON: {}", e)))?;
+
+    let mut result = ImportResult { created: 0, updated: 0, errors: vec![] };
+
+    for item in items {
+        let req = CreateActionReq {
+            name: item.name.clone(),
+            slug: item.slug.clone(),
+            model: item.model,
+            system_prompt: item.system_prompt,
+            template: item.template,
+        };
+        
+        // Assuming create handles upsert on slug, or we manually check
+        // Db trait: create_ai_action usually just inserts. You might need to add upsert logic in core/lib.rs
+        // For now, let's try create, if fail (duplicate slug), we ignore or log.
+        if let Err(e) = db.create_ai_action(req.clone()).await {
+             // Basic retry: delete then create (simple replace)
+             if let Ok(Some(existing)) = db.get_ai_action(&item.slug).await {
+                 let _ = db.delete_ai_action(existing.id).await;
+                 let _ = db.create_ai_action(req).await;
+                 result.updated += 1;
+             } else {
+                 result.errors.push(format!("Failed {}: {}", item.slug, e));
+             }
+        } else {
+             result.created += 1;
+        }
+    }
+    Ok(Json(result))
 }

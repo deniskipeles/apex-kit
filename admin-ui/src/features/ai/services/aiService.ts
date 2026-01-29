@@ -24,7 +24,15 @@ export const aiService = {
 
   run: async (slug: string, variables: Record<string, string>) => {
     return await apiClient.ai.run(slug, variables);
-  }
+  },
+
+  exportActions: async () => {
+    return await apiClient.ai.exportActions();
+  },
+
+  importActions: async (file: File) => {
+    return await apiClient.ai.importActions(file);
+  },
 
   // codeEdit: async (slug: string, variables: Record<string, string>) => {
   //   return await apiClient.ai.codeEdit(slug, variables);

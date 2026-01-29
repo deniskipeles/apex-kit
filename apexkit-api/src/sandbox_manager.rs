@@ -160,7 +160,7 @@ impl SandboxManager {
                 let mut col_name_map = std::collections::HashMap::new();
 
                 for col in &collections {
-                    let new_id = sandbox_db.create_collection(&col.name, &col.schema).await?;
+                    let new_id = sandbox_db.create_collection(&col.name, &col.schema, col.index.clone()).await?;
                     col_name_map.insert(col.name.clone(), new_id);
                 }
 

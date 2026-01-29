@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, State, Json},
+    http::{StatusCode},
     Extension,
 };
 use serde::Deserialize;
@@ -16,11 +17,22 @@ use std::net::SocketAddr;
 use crate::{trigger_void_hook, extract_log_meta};
 use crate::BaseUrl;
 use apexkit_core::realtime::EventScope;
+use utoipa::{IntoParams, ToSchema};
 
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, ToSchema)]
 pub struct ExecutePromptReq {
     pub variables: Value, // { "text": "...", "image": "data:image/png;base64,..." }
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct RunActionPath {
+    pub slug: String,
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct DelActionPath {
+    pub id: i64,
 }
 
 // Helper to parse "data:image/png;base64,ABC..." into ("image/png", "ABC...")
@@ -78,14 +90,16 @@ pub async fn create_action(
 #[utoipa::path(
     delete,
     path = "/api/v1/admin/ai/actions/{id}",
+    params(DelActionPath),
     responses((status = 200, body = Value))
 )]
 pub async fn delete_action(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
     State(_state): State<AppState>,
-    Path(id): Path<i64>
+    Path(path): Path<DelActionPath>
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let id = path.id;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
     db.delete_ai_action(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(json!({ "success": true })))
@@ -97,6 +111,7 @@ pub async fn delete_action(
     post,
     path = "/api/v1/ai/run/{slug}",
     request_body = ExecutePromptReq,
+    params(RunActionPath),
     responses((status = 200, body = Value))
 )]
 pub async fn run_action(
@@ -107,9 +122,11 @@ pub async fn run_action(
     headers: axum::http::HeaderMap,             // [NEW]
     BaseUrl(base_url): BaseUrl,
     scope: Option<Extension<EventScope>>,
-    Path(slug): Path<String>,
+    Path(path): Path<RunActionPath>,
     Json(payload): Json<ExecutePromptReq>,
 ) -> Result<Json<Value>, AppError> {
+    // Extract slug manually
+    let slug = path.slug;
     let claims = auth.map(|Extension(c)| c);
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     // [TRIGGER] Before AI Run
@@ -319,4 +336,29 @@ pub async fn edit_code(
     code = code.trim().trim_start_matches("```javascript").trim_start_matches("```html").trim_start_matches("```").trim_end_matches("```").to_string();
 
     Ok(Json(json!({ "code": code })))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/ai/sessions/{id}",
+    responses((status = 204, description = "Session deleted"))
+)]
+pub async fn delete_session(
+    auth: Option<Extension<Claims>>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    // 1. Delete Metadata Record
+    state.db.delete_ai_session(&id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    // 2. Delete Physical Sandbox Files & Cache
+    // Note: Also need to delete from _sandboxes metadata table in Root DB
+    state.db.delete_sandbox_metadata(&id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    state.sandbox_manager.cleanup_sandbox(&id); 
+
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use crate::schema::{CollectionSchema, FieldType, RelationType};
 use crate::filter::FilterNode;
+use utoipa::{IntoParams};
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, IntoParams)]
 pub struct QueryOptions {
     pub page: Option<u64>,
     pub per_page: Option<u64>,
@@ -12,6 +13,9 @@ pub struct QueryOptions {
     pub expand: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    // Comma-separated list of fields to include/exclude
+    // e.g. "title,created,author.name" or "-internal_meta"
+    pub fields: Option<String>,
 }
 
 impl Default for QueryOptions {
@@ -24,6 +28,7 @@ impl Default for QueryOptions {
             expand: None,
             limit: None,
             offset: None,
+            fields: None,
         }
     }
 }

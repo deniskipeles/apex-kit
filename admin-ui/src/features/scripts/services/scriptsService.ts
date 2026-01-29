@@ -5,5 +5,7 @@ export const scriptsService = {
   list: () => apiClient.scripts.list(),
   create: (data: Partial<Script>) => apiClient.scripts.create(data),
   delete: (id: string) => apiClient.scripts.delete(id),
-  run: (name: string, variables: any) => apiClient.scripts.run(name, variables)
+  run: (name: string, variables: any) => apiClient.scripts.run(name, variables),
+  export: () => apiClient.scripts.export(),
+  import: (file: File) => apiClient.scripts.import(file)
 };

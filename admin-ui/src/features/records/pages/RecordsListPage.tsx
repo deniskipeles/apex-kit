@@ -263,7 +263,7 @@ export const RecordsListPage = () => {
 
     setIsImporting(true); // Start loading
     try {
-      const res = await apiClient.importData(collection.name, fileInput.files[0]);
+      const res = await apiClient.records.importData(collection.name, fileInput.files[0]);
       if (res.ok) {
         const json = await res.json();
         toast(`Imported ${json.records_imported} records`, 'success');
@@ -284,14 +284,12 @@ export const RecordsListPage = () => {
 
   const handleExport = async () => {
     if (!collection) return;
-    await apiClient.exportData(collection.id, 'json')
-      .then(blob => {
-        const a = document.createElement('a');
-        a.href = window.URL.createObjectURL(blob);
-        a.download = `${collection.name}.json`;
-        a.click();
-      })
-      .catch(() => toast('Export failed', 'error'));
+    try {
+      await apiClient.records.exportData(collection.id, 'json');
+      toast('Data export started', 'success');
+    } catch (e: any) {
+      toast(e.message || 'Export failed', 'error');
+    }
   };
 
   // --- COLUMNS DEF ---
@@ -345,7 +343,7 @@ export const RecordsListPage = () => {
             return (
               <div className="flex items-center gap-2 group">
                 <div className="h-8 w-8 rounded overflow-hidden bg-secondary border border-border shrink-0">
-                  <FileThumbnail url={url+"?thumb=100x100"} mimeType={guessMimeType(String(val))} />
+                  <FileThumbnail url={url + "?thumb=100x100"} mimeType={guessMimeType(String(val))} />
                 </div>
                 <span className="truncate max-w-[100px] text-xs font-medium">{String(val)}</span>
               </div>

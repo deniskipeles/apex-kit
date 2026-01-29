@@ -6,7 +6,7 @@ use apex_vector::{CandleEmbedder, VectorIndex};
 use std::time::Duration;
 use apexkit_core::cache::CachedDb;
 use std::path::Path;
-use tracing::{info, error};
+use tracing::info;
 
 // --- 1. Isolated Vector Provider ---
 struct TenantVectorProvider {
@@ -118,6 +118,21 @@ impl TenantManager {
         self.cache.insert(tenant_id, ctx.clone()).await;
 
         Ok(ctx.db)
+    }
+
+    /// Deletes a tenant from Disk and Cache
+    pub async fn delete_tenant(&self, tenant_id: &str) -> Result<(), String> {
+        // 1. Remove from cache
+        self.cache.invalidate(tenant_id).await;
+
+        // 2. Delete files
+        let base_path = format!("storage/tenants/{}", tenant_id);
+        if std::path::Path::new(&base_path).exists() {
+             std::fs::remove_dir_all(&base_path).map_err(|e| e.to_string())?;
+             info!("Tenant '{}' deleted from disk", tenant_id);
+        }
+        
+        Ok(())
     }
 
     // [NEW] Invalidate cache (Called when Root updates status)

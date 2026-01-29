@@ -1,6 +1,6 @@
 use crate::auth::User;
 use crate::query::QueryOptions;
-use crate::schema::CollectionSchema;
+use crate::schema::{CollectionSchema, CollectionPolicies};
 use async_trait::async_trait;
 use libsql::{params, Builder, Connection, Database, Result, Row};
 use search::SearchManager;
@@ -49,6 +49,9 @@ pub struct Collection {
     pub id: i64,
     pub name: String,
     pub schema: Option<CollectionSchema>,
+    // Stable unique identifier for schema portability
+    #[serde(default)] 
+    pub index: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)] 
@@ -91,7 +94,14 @@ pub trait ScriptContext: Send + Sync {
 
     // Expose Admin Manager access if needed
     fn admin_create_tenant(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+    fn admin_update_tenant(&self, id: String, updates: serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+    fn admin_delete_tenant(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+    fn admin_get_tenant_usage(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<u64, String>> + Send>>;
+    
     fn admin_create_sandbox(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+    fn admin_update_sandbox(&self, id: String, updates: serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+    fn admin_delete_sandbox(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
+    fn admin_get_sandbox_usage(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<u64, String>> + Send>>;
 
     // [NEW] Cache Primitives
     fn cache_get(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
@@ -106,7 +116,7 @@ pub trait ScriptContext: Send + Sync {
 #[async_trait]
 pub trait Db: Send + Sync {
     // --- Collections ---
-    async fn create_collection(&self, name: &str, schema: &Option<CollectionSchema>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
+    async fn create_collection(&self, name: &str, schema: &Option<CollectionSchema>, index: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
     async fn get_collection(&self, id: i64) -> std::result::Result<Option<Collection>, Box<dyn std::error::Error + Send + Sync>>;
     async fn list_collections(&self) -> std::result::Result<Vec<Collection>, Box<dyn std::error::Error + Send + Sync>>;
     async fn update_collection(&self, id: i64, name: Option<String>, schema: Option<CollectionSchema>) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>>;
@@ -138,8 +148,16 @@ pub trait Db: Send + Sync {
     async fn register_tenant(&self, id: &str, owner_id: Option<i64>, name: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_tenant_status(&self, tenant_id: &str) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>;
     async fn update_tenant_status(&self, tenant_id: &str, status: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    // [NEW] Sandbox Management
+    async fn update_tenant_full(&self, id: &str, name: Option<String>, status: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn delete_tenant_metadata(&self, id: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_tenants(&self) -> std::result::Result<Vec<models::Tenant>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_tenant_disk_usage(&self, tenant_id: &str) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>>;
+    
+    // Sandbox Management
     async fn register_sandbox(&self, id: &str, owner_id: Option<i64>, name: Option<String>, expires_at: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn update_sandbox_full(&self, id: &str, name: Option<String>, status: Option<String>, expires_at: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn delete_sandbox_metadata(&self, id: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_sandbox_disk_usage(&self, sandbox_id: &str) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>>;
     
     // Allows forcing an ID (for Sandbox cloning)
     async fn import_user(&self, id: i64, email: &str, password_hash: &str, role: &str, metadata: Option<Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -176,6 +194,7 @@ pub trait Db: Send + Sync {
 
     // --- API keys ---
     async fn create_api_key(&self, name: &str, role: &str, scope: &str, bypass_cors: bool) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>>;
+    async fn update_api_key(&self, id: i64, name: Option<String>, role: Option<String>, scope: Option<String>, bypass_cors: Option<bool>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>>;
     async fn delete_api_key(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn verify_api_key(&self, key: &str) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>>;
@@ -191,6 +210,7 @@ pub trait Db: Send + Sync {
      async fn get_ai_session(&self, id: &str) -> std::result::Result<Option<AiSession>, Box<dyn std::error::Error + Send + Sync>>;
      async fn update_ai_session(&self, session: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
      async fn list_ai_sessions(&self) -> std::result::Result<Vec<AiSession>, Box<dyn std::error::Error + Send + Sync>>;
+     async fn delete_ai_session(&self, id: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
  
      // --- Plugins ---
      async fn save_plugin(&self, plugin: &Plugin) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -231,7 +251,13 @@ pub trait Db: Send + Sync {
 fn row_to_collection(row: &Row) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
     let schema_str: Option<String> = row.get(2)?;
     let schema = match schema_str { Some(s) => serde_json::from_str(&s)?, None => None, };
-    Ok(Collection { id: row.get(0)?, name: row.get(1)?, schema })
+    
+    // [UPDATED] Get index from col 3 (if existing DB, might be null or missing column until migration)
+    // If working on fresh DB, schema change below handles it. 
+    // For migration safety, we use get(3) optimistically.
+    let index: Option<String> = row.get(3).ok(); 
+
+    Ok(Collection { id: row.get(0)?, name: row.get(1)?, schema, index })
 }
 
 fn row_to_record(
@@ -360,6 +386,25 @@ pub async fn a_new_database_connection(
     instance.set_search_manager(Arc::new(SearchManager::new("storage/system/indexes")));
 
     Ok(instance)
+}
+
+// Helper function for recursive directory size calculation
+fn calculate_dir_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut total_size = 0;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                total_size += calculate_dir_size(&entry.path())?;
+            } else {
+                total_size += metadata.len();
+            }
+        }
+    } else if path.exists() {
+         total_size = path.metadata()?.len();
+    }
+    Ok(total_size)
 }
 
 impl ApexKit {
@@ -512,6 +557,21 @@ impl ApexKit {
             }
         }
         Ok(())
+    }
+
+    pub async fn get_user_policies(&self) -> CollectionPolicies {
+        if let Ok(Some(val)) = self.get_config("policy_users").await {
+            if let Ok(p) = serde_json::from_value(val) {
+                return p;
+            }
+        }
+        // Secure Defaults
+        CollectionPolicies {
+            read: "admin || owner:id".to_string(),
+            create: "public".to_string(), // Public registration usually
+            update: "admin || owner:id".to_string(),
+            delete: "admin".to_string(),
+        }
     }
 
     async fn populate_owners_in_memory(
@@ -1013,6 +1073,32 @@ impl Db for ApexKit {
         Ok((raw_key, key_obj))
     }
 
+    async fn update_api_key(&self, id: i64, name: Option<String>, role: Option<String>, scope: Option<String>, bypass_cors: Option<bool>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core_read().await;
+        
+        let mut sets = Vec::new();
+        
+        // [FIX] Explicitly type the vector as containing libsql::Value
+        let mut params: Vec<libsql::Value> = vec![]; 
+        
+        if let Some(n) = name { sets.push("name = ?"); params.push(n.into()); }
+        if let Some(r) = role { sets.push("role = ?"); params.push(r.into()); }
+        if let Some(s) = scope { sets.push("scope = ?"); params.push(s.into()); }
+        if let Some(b) = bypass_cors { sets.push("bypass_cors = ?"); params.push(b.into()); }
+
+        if sets.is_empty() { return Ok(()); }
+
+        // Add ID as the last parameter
+        params.push(id.into());
+
+        let sql = format!("UPDATE _api_keys SET {} WHERE id = ?", sets.join(", "));
+        
+        let mut stmt = conn.prepare(&sql).await?;
+        stmt.execute(params).await?;
+        
+        Ok(())
+    }
+
     async fn list_api_keys(&self) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core_read().await;
         let mut rows = conn.query("SELECT id, name, prefix, hash, role, created_at, scope, bypass_cors FROM _api_keys ORDER BY created_at DESC", ()).await?;
@@ -1063,9 +1149,14 @@ impl Db for ApexKit {
     
     // --- Data DB (Collections/Records) ---
 
-    async fn create_collection(&self, name: &str, schema: &Option<CollectionSchema>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn create_collection(&self, name: &str, schema: &Option<CollectionSchema>, index: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let schema_str = serde_json::to_string(&schema)?;
-        let id = self.data_batcher.insert("INSERT INTO collections (name, schema) VALUES (?1, ?2)".into(), vec![name.into(), schema_str.into()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+        let idx = index.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        
+        let id = self.data_batcher.insert(
+            "INSERT INTO collections (name, schema, index_key) VALUES (?1, ?2, ?3)".into(), 
+            vec![name.into(), schema_str.into(), idx.into()]
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         
         if let Some(s) = schema {
             if s.fields.values().any(|f| f.ose_indexed) { 
@@ -1098,13 +1189,13 @@ impl Db for ApexKit {
 
     async fn get_collection(&self, id: i64) -> std::result::Result<Option<Collection>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_data_read().await;
-        let mut rows = conn.query("SELECT id, name, schema FROM collections WHERE id = ?1", params![id]).await?;
+        let mut rows = conn.query("SELECT id, name, schema, index_key FROM collections WHERE id = ?1", params![id]).await?;
         match rows.next().await? { Some(row) => Ok(Some(row_to_collection(&row)?)), None => Ok(None) }
     }
 
     async fn list_collections(&self) -> std::result::Result<Vec<Collection>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_data_read().await;
-        let mut rows = conn.query("SELECT id, name, schema FROM collections", ()).await?;
+        let mut rows = conn.query("SELECT id, name, schema, index_key FROM collections", ()).await?;
         let mut cols = Vec::new();
         while let Some(row) = rows.next().await? { cols.push(row_to_collection(&row)?); }
         Ok(cols)
@@ -1879,6 +1970,12 @@ impl Db for ApexKit {
         }
         Ok(s)
     }
+
+    async fn delete_ai_session(&self, id: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.get_sys_read().await.execute("DELETE FROM _ai_sessions WHERE id = ?1", params![id]).await?;
+        Ok(())
+    }
+    
     async fn save_plugin(&self, p: &Plugin) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("INSERT INTO _plugins (id, name, version, manifest, description) VALUES (?1, ?2, ?3, ?4, ?5)", params![p.id.clone(), p.name.clone(), p.version.clone(), serde_json::to_string(&p.manifest)?, p.description.clone()]).await?; Ok(()) }
     async fn list_plugins(&self) -> std::result::Result<Vec<Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys_read().await;
@@ -2017,7 +2114,7 @@ impl Db for ApexKit {
     async fn get_tenant_status(&self, tenant_id: &str) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core_read().await;
         // Use optional query to handle missing tenants gracefully
-        let mut stmt = conn.prepare("SELECT status FROM _tenants WHERE id = ?1").await?;
+        let stmt = conn.prepare("SELECT status FROM _tenants WHERE id = ?1").await?;
         let mut rows = stmt.query(params![tenant_id]).await?;
 
         if let Some(row) = rows.next().await? {
@@ -2032,6 +2129,73 @@ impl Db for ApexKit {
         let conn = self.get_core_read().await;
         conn.execute("UPDATE _tenants SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2", params![status, tenant_id]).await?;
         Ok(())
+    }
+
+    async fn update_tenant_full(&self, id: &str, name: Option<String>, status: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core_read().await;
+        let mut sets = Vec::new();
+        let mut params: Vec<libsql::Value> = vec![];
+
+        if let Some(n) = name { sets.push("name = ?"); params.push(n.into()); }
+        if let Some(s) = status { sets.push("status = ?"); params.push(s.into()); }
+        if let Some(t) = tier { sets.push("tier = ?"); params.push(t.into()); }
+        
+        if sets.is_empty() { return Ok(()); }
+        
+        // Update timestamp
+        sets.push("updated_at = CURRENT_TIMESTAMP");
+        params.push(id.to_string().into());
+
+        let sql = format!("UPDATE _tenants SET {} WHERE id = ?", sets.join(", "));
+        let mut stmt = conn.prepare(&sql).await?;
+        stmt.execute(params).await?;
+        Ok(())
+    }
+
+    async fn delete_tenant_metadata(&self, id: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.get_core_read().await.execute("DELETE FROM _tenants WHERE id = ?1", params![id.to_string()]).await?;
+        Ok(())
+    }
+
+    async fn list_tenants(&self) -> std::result::Result<Vec<models::Tenant>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core_read().await;
+        let mut rows = conn.query(
+            "SELECT id, name, status, tier, max_storage_mb, current_storage_mb, max_vectors, current_vectors, max_ai_requests, current_ai_requests, created_at 
+             FROM _tenants 
+             ORDER BY created_at DESC", 
+            ()
+        ).await?;
+        
+        let mut tenants = Vec::new();
+        while let Some(row) = rows.next().await? {
+            tenants.push(models::Tenant {
+                id: row.get(0)?,
+                name: row.get(1).unwrap_or(None),
+                status: row.get(2)?,
+                tier: row.get(3)?,
+                stats: models::TenantStats {
+                    storage_mb: row.get(5)?,
+                    max_storage_mb: row.get(4)?,
+                    vector_count: row.get(7)?,
+                    max_vectors: row.get(6)?,
+                    ai_requests: row.get(9)?,
+                    max_ai_requests: row.get(8)?,
+                },
+                created_at: row.get(10)?,
+            });
+        }
+        Ok(tenants)
+    }
+
+    async fn get_tenant_disk_usage(&self, tenant_id: &str) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Path to tenant directory: storage/tenants/{id}
+        let path = format!("storage/tenants/{}", tenant_id);
+        
+        let size = tokio::task::spawn_blocking(move || {
+            calculate_dir_size(std::path::Path::new(&path))
+        }).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)??;
+
+        Ok(size)
     }
 
     // --- Sandboxes ---
@@ -2052,6 +2216,40 @@ impl Db for ApexKit {
             ]
         ).await?;
         Ok(())
+    }
+
+    async fn update_sandbox_full(&self, id: &str, name: Option<String>, status: Option<String>, expires_at: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core_read().await;
+        let mut sets = Vec::new();
+        let mut params: Vec<libsql::Value> = vec![];
+
+        if let Some(n) = name { sets.push("name = ?"); params.push(n.into()); }
+        if let Some(s) = status { sets.push("status = ?"); params.push(s.into()); }
+        if let Some(e) = expires_at { sets.push("expires_at = ?"); params.push(e.into()); }
+
+        if sets.is_empty() { return Ok(()); }
+
+        params.push(id.to_string().into());
+        let sql = format!("UPDATE _sandboxes SET {} WHERE id = ?", sets.join(", "));
+        let mut stmt = conn.prepare(&sql).await?;
+        stmt.execute(params).await?;
+        Ok(())
+    }
+
+    async fn delete_sandbox_metadata(&self, id: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.get_core_read().await.execute("DELETE FROM _sandboxes WHERE id = ?1", params![id.to_string()]).await?;
+        Ok(())
+    }
+
+    async fn get_sandbox_disk_usage(&self, sandbox_id: &str) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Path: storage/sandboxes/session_{id}
+        let path = format!("storage/sandboxes/session_{}", sandbox_id);
+        
+        let size = tokio::task::spawn_blocking(move || {
+            calculate_dir_size(std::path::Path::new(&path))
+        }).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)??;
+
+        Ok(size)
     }
 
     // --- Dashboard ---
@@ -2324,7 +2522,10 @@ async fn setup_core(db: &Database) -> Result<()> {
 
 async fn setup_data(db: &Database) -> Result<()> {
     let conn = db.connect()?;
-    conn.execute("CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, schema JSON)", ()).await?;
+    conn.execute("CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, schema JSON, index_key TEXT UNIQUE)", ()).await?;
+    // Ensure column exists for older DBs
+    conn.execute("ALTER TABLE collections ADD COLUMN index_key TEXT", ()).await;
+
     conn.execute("CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id INTEGER NOT NULL, data JSONB NOT NULL, created DATETIME DEFAULT CURRENT_TIMESTAMP, updated DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     
     let _ = conn.execute("ALTER TABLE records ADD COLUMN created DATETIME DEFAULT CURRENT_TIMESTAMP", ()).await;

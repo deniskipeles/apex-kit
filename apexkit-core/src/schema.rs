@@ -42,6 +42,9 @@ pub struct RelationDefinition {
     pub uid: String,
     #[serde(default)]
     pub required: bool,
+    // Stable Index of target collection
+    #[serde(default)]
+    pub target_index: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema, PartialEq)]

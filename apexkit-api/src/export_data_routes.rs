@@ -13,7 +13,10 @@ use crate::{AppError};
 use utoipa::{IntoParams, ToSchema}; 
 use csv::WriterBuilder;
 use crate::DatabaseConnection;
-// use tracing::{info};
+use std::collections::HashMap;
+use apexkit_core::ai_models::AiAction;
+use apexkit_core::script_models::Script;
+use apexkit_core::models::Template;
 
 // --- DTOs ---
 
@@ -119,6 +122,7 @@ pub async fn export_data_handler(
         sort: params.sort,
         filter: params.filter,
         expand: None,
+        fields: None
     };
     
     // 2. Fetch All Records from Tenant DB
@@ -179,13 +183,51 @@ pub async fn export_schema_handler(
 ) -> Result<Response, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
-    let collections = db.list_collections().await
+    // 1. Fetch all collections
+    let mut collections = db.list_collections().await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // Wrap in a structure compatible with ImportRequest
+    // 2. [FIX] Normalize Relations (Replace DB IDs with Names/Indexes)
+    
+    // Build lookup maps
+    // ID -> (Name, Index)
+    let mut id_lookup: HashMap<String, (String, Option<String>)> = HashMap::new();
+    // Name -> (Name, Index) - needed if target is already a name
+    let mut name_lookup: HashMap<String, (String, Option<String>)> = HashMap::new();
+
+    for col in &collections {
+        let val = (col.name.clone(), col.index.clone());
+        id_lookup.insert(col.id.to_string(), val.clone());
+        name_lookup.insert(col.name.clone(), val);
+    }
+
+    // Iterate through schema relations and normalize
+    for col in &mut collections {
+        if let Some(schema) = &mut col.schema {
+            for (_, rel) in &mut schema.relations {
+                let target_raw = &rel.target_collection;
+                
+                // Case A: Target is an ID (e.g. "17")
+                if let Some((name, idx)) = id_lookup.get(target_raw) {
+                    rel.target_collection = name.clone(); // Replace ID with Name
+                    if rel.target_index.is_none() {
+                        rel.target_index = idx.clone(); // Inject UUID Index
+                    }
+                } 
+                // Case B: Target is already a Name (e.g. "issues")
+                else if let Some((_, idx)) = name_lookup.get(target_raw) {
+                    if rel.target_index.is_none() {
+                        rel.target_index = idx.clone(); // Inject UUID Index
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Serialize & Return
     let export_obj = serde_json::json!({
         "collections": collections,
-        "strategy": "skip", // Default for documentation
+        "strategy": "skip", // Default strategy hint
         "exported_at": chrono::Utc::now().to_rfc3339()
     });
 
@@ -195,6 +237,78 @@ pub async fn export_schema_handler(
     Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_DISPOSITION, "attachment; filename=\"apex_schema.json\"")
+        .body(json_bytes.into())
+        .map_err(|e| AppError::UnknownError(format!("Response build failed: {}", e)))
+}
+
+// Handler: Export Scripts
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/export-scripts",
+    responses((status = 200, description = "Scripts JSON"))
+)]
+pub async fn export_scripts_handler(
+    Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Response, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let scripts = db.list_scripts().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    let json_bytes = serde_json::to_vec_pretty(&scripts)
+        .map_err(|e| AppError::UnknownError(format!("Serialization Error: {}", e)))?;
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_DISPOSITION, "attachment; filename=\"scripts.json\"")
+        .body(json_bytes.into())
+        .map_err(|e| AppError::UnknownError(format!("Response build failed: {}", e)))
+}
+
+// Handler: Export Templates
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/export-templates",
+    responses((status = 200, description = "Templates JSON"))
+)]
+pub async fn export_templates_handler(
+    Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Response, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let templates = db.list_templates().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    let json_bytes = serde_json::to_vec_pretty(&templates)
+        .map_err(|e| AppError::UnknownError(format!("Serialization Error: {}", e)))?;
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_DISPOSITION, "attachment; filename=\"templates.json\"")
+        .body(json_bytes.into())
+        .map_err(|e| AppError::UnknownError(format!("Response build failed: {}", e)))
+}
+
+// Handler: Export AI Actions
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/export-ai-actions",
+    responses((status = 200, description = "AI Actions JSON"))
+)]
+pub async fn export_ai_actions_handler(
+    Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Response, AppError> {
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let actions = db.list_ai_actions().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    let json_bytes = serde_json::to_vec_pretty(&actions)
+        .map_err(|e| AppError::UnknownError(format!("Serialization Error: {}", e)))?;
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_DISPOSITION, "attachment; filename=\"ai_actions.json\"")
         .body(json_bytes.into())
         .map_err(|e| AppError::UnknownError(format!("Response build failed: {}", e)))
 }

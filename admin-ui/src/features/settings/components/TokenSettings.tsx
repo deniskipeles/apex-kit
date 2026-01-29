@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Key, Plus, Copy, Trash2, Check, Loader2, ShieldAlert } from 'lucide-react';
+import { Key, Plus, Copy, Trash2, Check, Loader2, ShieldAlert, Edit2 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Input, Button, Badge, Label, Select, Switch } from '@/src/components/ui/Elements';
 import { Dialog } from '@/src/components/ui/Dialog';
 import { AppSettings, ApiKey } from '@/src/types'; // You might need to update types to include ApiToken if missing
@@ -25,6 +25,9 @@ export const TokenSettings = ({ settings, onChange }: TokenSettingsProps) => {
     const [newTargetScope, setNewTargetScope] = useState('');
     const [bypassCors, setBypassCors] = useState(true);
     const [createdKey, setCreatedKey] = useState<string | null>(null);
+
+    // Edit State
+    const [editingToken, setEditingToken] = useState<any | null>(null);
 
     // Load Keys
     useEffect(() => {
@@ -70,11 +73,59 @@ export const TokenSettings = ({ settings, onChange }: TokenSettingsProps) => {
         }
     };
 
+    const handleUpdate = async () => {
+        if (!editingToken) return;
+        setIsSubmitting(true);
+        try {
+            // Reconstruct scope if tenant mode
+            let finalScope = newScope;
+            if (newScope === 'tenant:' && newTargetScope) {
+                finalScope = `tenant:${newTargetScope}`;
+            }
+
+            await apiClient.keys.update(editingToken.id, {
+                name: newTokenName,
+                role: newTokenRole,
+                scope: finalScope,
+                bypass_cors: bypassCors
+            });
+
+            toast("Key updated", "success");
+            loadKeys();
+            handleCloseModal();
+        } catch (e) {
+            toast("Failed to update key", "error");
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
+    const openEditModal = (token: any) => {
+        setEditingToken(token);
+        setNewTokenName(token.name);
+        setNewTokenRole(token.role);
+        setBypassCors(token.bypass_cors);
+
+        // Parse Scope
+        if (token.scope.startsWith('tenant:')) {
+            setNewScope('tenant:');
+            setNewTargetScope(token.scope.replace('tenant:', ''));
+        } else {
+            setNewScope(token.scope);
+            setNewTargetScope('');
+        }
+
+        setIsCreating(true);
+    };
+
     const handleCloseModal = () => {
         setIsCreating(false);
+        setEditingToken(null); // Reset edit state
         setCreatedKey(null);
         setNewTokenName('');
         setNewTokenRole('admin');
+        setNewScope('root');
+        setBypassCors(true);
     };
 
     const copyToClipboard = (text: string) => {
@@ -117,9 +168,16 @@ export const TokenSettings = ({ settings, onChange }: TokenSettingsProps) => {
                                                 <span>• Created {new Date(token.created).toLocaleDateString()}</span>
                                             </div>
                                         </div>
-                                        <Button size="icon" variant="ghost" className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10" onClick={() => handleDelete(token.id)}>
-                                            <Trash2 className="h-4 w-4" />
-                                        </Button>
+                                        <div className="flex gap-1">
+                                            {/* Edit Button */}
+                                            <Button size="icon" variant="ghost" onClick={() => openEditModal(token)}>
+                                                <Edit2 className="h-4 w-4" />
+                                            </Button>
+
+                                            <Button size="icon" variant="ghost" className="h-8 w-8 text-muted-foreground hover:text-destructive" onClick={() => handleDelete(token.id)}>
+                                                <Trash2 className="h-4 w-4" />
+                                            </Button>
+                                        </div>
                                     </div>
                                 ))}
                             </div>
@@ -173,7 +231,10 @@ export const TokenSettings = ({ settings, onChange }: TokenSettingsProps) => {
                         </div>
                         <div className="flex justify-end gap-2 pt-2 border-t border-border mt-4">
                             <Button variant="ghost" onClick={handleCloseModal}>Cancel</Button>
-                            <Button onClick={handleCreate} disabled={!newTokenName} isLoading={isSubmitting}>Generate</Button>
+                            {/* Toggle Action based on state */}
+                            <Button onClick={editingToken ? handleUpdate : handleCreate} disabled={!newTokenName} isLoading={isSubmitting}>
+                                {editingToken ? "Save Changes" : "Generate"}
+                            </Button>
                         </div>
                     </div>
                 ) : (

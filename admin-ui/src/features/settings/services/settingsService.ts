@@ -11,6 +11,8 @@ const mapToFrontend = (apiData: any): AppSettings => {
         appLogo: apiData.app_logo || '',
         logoWidth: apiData.logo_width || '',
         logoHeight: apiData.logo_height || '',
+        logRetentionDays: apiData.log_retention_days || 30,
+        maxSiteSizeMb: apiData.max_site_size_mb || 5,
         smtp: {
             enabled: apiData.smtp?.enabled || false,
             host: apiData.smtp?.host || '',
@@ -53,7 +55,6 @@ const mapToFrontend = (apiData: any): AppSettings => {
             apiKey: apiData.ai?.api_key || '',
             provider: apiData.ai?.provider || ''
         },
-        logRetentionDays: 30
     };
 };
 
@@ -67,6 +68,9 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
     if (settings.appLogo !== undefined) payload.app_logo = settings.appLogo;
     if (settings.logoWidth !== undefined) payload.logo_width = settings.logoWidth;
     if (settings.logoHeight !== undefined) payload.logo_height = settings.logoHeight;
+
+    if (settings.logRetentionDays !== undefined) payload.log_retention_days = settings.logRetentionDays;
+    if (settings.maxSiteSizeMb !== undefined) payload.max_site_size_mb = settings.maxSiteSizeMb;
 
     if (settings.smtp) {
         payload.smtp = {

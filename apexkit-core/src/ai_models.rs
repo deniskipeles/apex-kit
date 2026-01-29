@@ -13,7 +13,7 @@ pub struct AiAction {
     pub config: serde_json::Value, // For temp, top_k, etc.
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema, Clone)]
 pub struct CreateActionReq {
     pub slug: String,
     pub name: String,

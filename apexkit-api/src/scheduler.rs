@@ -193,13 +193,39 @@ async fn execute_job(state: &AppState, db: Arc<dyn Db>, _context_id: &str, job: 
              let tm = self.inner.tenant_manager.clone();
              Box::pin(async move { tm.create_tenant(id).await.map(|_| ()) })
         }
-        fn admin_create_sandbox(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>> {
-             let sm = self.inner.sandbox_manager.clone();
-             let db = self.inner.db.clone();
+        fn admin_update_tenant(&self, _id: String, _u: serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>> {
+            Box::pin(async move { Err("Not supported in scheduler context".into()) })
+       }
+       fn admin_delete_tenant(&self, _id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>> {
+            Box::pin(async move { Err("Not supported in scheduler context".into()) })
+       }
+       fn admin_get_tenant_usage(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, String>> + Send>> {
+            // Scheduler runs as root effectively, so we can allow it
+            let db = self.scoped_db.clone(); 
+            Box::pin(async move {
+                db.get_tenant_disk_usage(&id).await.map_err(|e| e.to_string())
+            })
+        }
+
+       fn admin_create_sandbox(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>> {
+           let sm = self.inner.sandbox_manager.clone();
+           let db = self.inner.db.clone();
              Box::pin(async move {
                  sm.create_sandbox(&id, crate::sandbox_manager::CloneStrategy::None, db).await.map(|_| ()).map_err(|e| e.to_string())
-             })
+                })
         }
+        fn admin_update_sandbox(&self, _id: String, _u: serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>> {
+                Box::pin(async move { Err("Not supported in scheduler context".into()) })
+        }
+        fn admin_delete_sandbox(&self, _id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>> {
+                Box::pin(async move { Err("Not supported in scheduler context".into()) })
+        }
+        fn admin_get_sandbox_usage(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, String>> + Send>> {
+            let db = self.scoped_db.clone(); 
+            Box::pin(async move {
+                db.get_sandbox_disk_usage(&id).await.map_err(|e| e.to_string())
+            })
+       }
 
         // [FIX] Implement Cache Methods
         fn cache_get(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {

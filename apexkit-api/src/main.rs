@@ -368,6 +368,17 @@ async fn seed_admin(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error
         db.create_user(email, &hash, "admin", None).await?;
         tracing::info!("Seeded admin user: {}", email);
     }
+    // [NEW] Seed User Policies
+    if db.get_config("policy_users").await?.is_none() {
+        let default_policy = apexkit_core::schema::CollectionPolicies {
+            read: "admin || owner:id".to_string(),
+            create: "public".to_string(),
+            update: "admin || owner:id".to_string(),
+            delete: "admin".to_string(),
+        };
+        db.set_config("policy_users", &serde_json::to_value(default_policy)?, false).await?;
+        tracing::info!("Seeded default user policies");
+    }
     Ok(())
 }
 

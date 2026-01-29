@@ -6,10 +6,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
-use apexkit_core::auth::Claims;
-use crate::{AppState, AppError, DatabaseConnection, BaseUrl};
+use apexkit_core::{auth::Claims, models::Tenant};
+use crate::{AppState, AppError, BaseUrl};
 use crate::{trigger_void_hook, extract_log_meta};
 use utoipa::ToSchema;
+use crate::DatabaseConnection;
 
 // --- DTOs ---
 
@@ -39,29 +40,25 @@ pub struct UpdateTenantStatusReq {
 #[utoipa::path(
     get,
     path = "/api/v1/admin/tenants",
-    responses((status = 200, body = Vec<String>))
+    responses((status = 200, body = Vec<Tenant>)) // [UPDATED] Return Type
 )]
 pub async fn list_tenants_handler(
     auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap
-) -> Result<Json<Vec<String>>, AppError> {
+) -> Result<Json<Vec<Tenant>>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Only admins".into())); }
 
-    // [TRIGGER] Before List
     trigger_void_hook(&state, "before_list_tenants", json!({}), Some(&claims), None, Some(base_url.clone())).await?;
 
-    // We list from the Manager (Disk) to ensure we see actual initialized environments.
-    // Alternatively, we could list from state.db.list_tenants() if we implemented that in Core.
-    // For now, listing from Disk via Manager is the source of truth for "active" tenants.
-    let tenants = state.tenant_manager.list_tenants().await.map_err(|e| AppError::UnknownError(e))?;
+    // [UPDATED] Returns objects now
+    let tenants = db.list_tenants().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "count": tenants.len() }));
-    // Log to Root DB
     let _ = state.db.log_audit_event("info", "Tenants Listed", "admin", Some(meta)).await;
 
     Ok(Json(tenants))
@@ -144,4 +141,55 @@ pub async fn update_tenant_status(
     let _ = state.db.log_system_event("warning", "Tenant Status Change", &format!("Tenant {} set to {}", id, payload.status)).await;
 
     Ok(Json(json!({ "success": true, "new_status": payload.status })))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateTenantReq {
+    pub name: Option<String>,
+    pub tier: Option<String>,
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/tenants/{id}",
+    responses((status = 204, description = "Tenant deleted"))
+)]
+pub async fn delete_tenant_handler(
+    auth: Option<Extension<Claims>>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    // 1. Check Root DB Metadata
+    state.db.delete_tenant_metadata(&id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // 2. Delete Physical Resources via Manager
+    state.tenant_manager.delete_tenant(&id).await.map_err(|e| AppError::UnknownError(e))?;
+    
+    // Log
+    let _ = state.db.log_system_event("warning", "Tenant Deleted", &format!("Deleted tenant {}", id)).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/admin/tenants/{id}",
+    request_body = UpdateTenantReq,
+    responses((status = 200, body = Value))
+)]
+pub async fn update_tenant_details(
+    auth: Option<Extension<Claims>>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateTenantReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !matches!(auth.map(|c| c.0.role), Some(r) if r == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+
+    state.db.update_tenant_full(&id, payload.name, None, payload.tier).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(Json(json!({ "success": true })))
 }
