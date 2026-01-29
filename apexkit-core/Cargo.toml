@@ -51,7 +51,7 @@ aes-gcm = "0.10"
 base64 = "0.21"
 secrecy = { version = "0.8", features = ["serde"] }
 zeroize = "1.7"
-openssl = { version = "0.10", features = ["vendored"] }
+#openssl = { version = "0.10", features = ["vendored"] }
 
 # Search Engine
 tantivy = "0.22"
