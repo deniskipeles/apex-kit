@@ -2472,7 +2472,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/admin/ai/sessions/{id}/apply", post(ai_architect::apply_changes))
         .route("/admin/ai/sessions/{id}/publish", post(ai_architect::publish_plugin))
         .route("/admin/ai/plugins", get(ai_architect::list_plugins))
-        .route("/admin/ai/sessions/{id}", axum::routing::delete(ai_architect::delete_session))
+        // .route("/admin/ai/sessions/{id}", axum::routing::delete(ai_architect::delete_session))
         .route("/admin/scripts", get(script_routes::list_scripts).post(script_routes::create_script))
         .route("/admin/scripts/{id}", axum::routing::delete(script_routes::delete_script))
         .route("/run/{script_name}", post(script_routes::run_script))
