@@ -360,3 +360,33 @@ pub async fn update_settings(
 
     Ok(Json(payload))
 }
+
+// DTO
+#[derive(Serialize, ToSchema)]
+pub struct AppNameResponse {
+    pub app_name: String,
+}
+
+// Handler
+#[utoipa::path(
+    get,
+    path = "/app-name",
+    responses((status = 200, body = AppNameResponse))
+)]
+pub async fn get_public_app_name(
+    DatabaseConnection(db): DatabaseConnection,
+) -> Result<Json<AppNameResponse>, AppError> {
+    
+    // 1. Fetch 'general' settings from DB (No auth required)
+    let general = db.get_config("general").await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?
+        .unwrap_or(json!({}));
+
+    // 2. Extract app_name or default
+    let app_name = general.get("app_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ApexKit App")
+        .to_string();
+
+    Ok(Json(AppNameResponse { app_name }))
+}

@@ -66,9 +66,6 @@ reqwest = { version = "0.12.4", default-features = false, features = ["json", "m
 # Keep forcing ring for direct use
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
-# Encryption
-#openssl = { version = "0.10", features = ["vendored"] }
-
 # Scheduler
 tokio-cron-scheduler = "0.9"
 cron = "0.12"

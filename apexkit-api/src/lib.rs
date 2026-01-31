@@ -2497,6 +2497,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/scalar/openapi.json", get(sandbox_openapi_json))
         .route("/ws", get(websocket::websocket_handler))
         .route("/logo", get(storage::serve_app_logo))
+        .route("/app-name", get(settings::get_public_app_name))
         .layer(middleware::from_fn_with_state(state.clone(), sandbox_lifecycle_middleware));
 
     let tenant_path_router = Router::new()
@@ -2508,6 +2509,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/scalar/openapi.json", get(tenant_openapi_json))
         .route("/ws", get(websocket::websocket_handler)) 
         .route("/logo", get(storage::serve_app_logo))
+        .route("/app-name", get(settings::get_public_app_name))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), tenant_resolver_middleware));
 
@@ -2518,6 +2520,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/graphql", post(graphql_handler).get(graphql_playground))
         .route("/ws", get(websocket::websocket_handler)) 
         .route("/logo", get(storage::serve_app_logo))
+        .route("/app-name", get(settings::get_public_app_name))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), tenant_resolver_middleware));
 
