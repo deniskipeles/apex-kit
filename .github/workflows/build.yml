@@ -9,25 +9,25 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Ensure we use the vendored OpenSSL to avoid cross-compilation linkage headaches
   OPENSSL_STATIC: 1
-  # Explicitly tell pkg-config to look for static libs
   PKG_CONFIG_ALL_STATIC: 1
+
+# [FIX] Added explicit permissions to allow creating releases
+permissions:
+  contents: write
 
 jobs:
   build:
     name: Build ${{ matrix.os_name }}
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false # Don't cancel Linux if Windows fails (or vice versa)
+      fail-fast: false
       matrix:
         include:
-          # Linux Static (Musl)
           - target: x86_64-unknown-linux-musl
             os_name: Linux
             binary_name: apexkit
             extension: ""
-          # Windows (GNU)
           - target: x86_64-pc-windows-gnu
             os_name: Windows
             binary_name: apexkit
@@ -37,14 +37,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # [FIX] Install MinGW for Windows cross-compilation (provides dlltool)
-      # [FIX] Install musl-tools for Linux static linking
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y mingw-w64 musl-tools nasm perl
 
-      # [NEW] Build Admin UI so assets exist in ./static
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -55,14 +52,9 @@ jobs:
         run: |
           npm install
           npm run build
-          # Ensure the build output moved to the correct static folder
-          # Vite config sets base to /_dashboard/, but check where output goes
-          # Assuming admin-ui/dist needs to be moved to ../static/dashboard
 
-      # [NEW] Move Admin Build to Static Folder for Rust Embedding
       - name: Move Admin Assets
         run: |
-          rm -rf static/dashboard
           mkdir -p static/dashboard
           cp -r admin-ui/dist/* static/dashboard/
 
@@ -71,25 +63,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Zig
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.11.0 
-
       - name: Install cargo-zigbuild
         run: |
+          sudo pip install ziglang
           cargo install cargo-zigbuild
-
-      - name: Cache Cargo Registry
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (${{ matrix.target }})
         run: |
@@ -99,29 +76,33 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          # Find the binary in the target folder
           SRC_BIN="target/${{ matrix.target }}/release/apexkit-api${{ matrix.extension }}"
           DEST_BIN="dist/${{ matrix.binary_name }}-${{ matrix.target }}${{ matrix.extension }}"
-          
-          if [ -f "$SRC_BIN" ]; then
-            echo "Moving $SRC_BIN to $DEST_BIN"
-            cp "$SRC_BIN" "$DEST_BIN"
-          else
-            echo "Error: Binary not found at $SRC_BIN"
-            ls -R target/
-            exit 1
-          fi
+          cp "$SRC_BIN" "$DEST_BIN"
 
-      - name: Upload Artifact
+      # [UPDATE] Upload to temporary storage for the next job
+      - name: Upload to Actions
         uses: actions/upload-artifact@v4
         with:
-          name: apexkit-${{ matrix.target }}
+          name: binary-${{ matrix.target }}
           path: dist/*
+          retention-days: 1
+
+  publish:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: all-binaries
+          merge-multiple: true
 
       - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/*
+          files: all-binaries/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
