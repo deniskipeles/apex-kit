@@ -2449,7 +2449,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/admin/restore-file", post(backup_routes::restore_from_file_handler))
         .route("/admin/restore", post(backup_routes::restore_handler))
         .route("/admin/users", get(list_users_handler))
-        .route("/admin/users/{id}", axum::routing::delete(delete_user_handler))
+        .route("/admin/users/{id}", axum::routing::delete(delete_user_handler).patch(auth_advanced::update_user_handler).put(auth_advanced::update_user_handler))
         .route("/admin/logs", get(list_audit_logs))
         .route("/admin/dashboard", get(get_dashboard_stats_handler))
         .route("/admin/import-data", post(import_data_routes::import_data_handler))

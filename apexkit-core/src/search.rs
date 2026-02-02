@@ -1,5 +1,4 @@
 use tantivy::collector::TopDocs;
-// use tantivy::query::QueryParser;
 use tantivy::schema::{
     Schema, STORED, INDEXED, FAST, TEXT, Term, Field, Value, 
     FieldType as TantivyFieldType
@@ -7,7 +6,6 @@ use tantivy::schema::{
 use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument};
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{QueryParser, BooleanQuery, FuzzyTermQuery, Query, Occur}; // Ensure these are imported
-// use tantivy::Term;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

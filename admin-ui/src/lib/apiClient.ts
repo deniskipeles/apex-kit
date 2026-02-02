@@ -414,14 +414,14 @@ export const apiClient = {
       };
     },
     update: async (id: string, data: Partial<AuthUser>): Promise<AuthUser> => {
-      // Backend doesn't have user update yet (e.g. changing email/password as admin)
-      // We return the data to optimistic update the UI so it doesn't crash
+      const {email, role, password, metadata} = data;
+      const res = await pb.admins.updateUser(id, email, password, role, metadata);
       return {
         id,
-        email: data.email || '',
-        metadata: data.metadata,
-        role: data.role,
-        ...data
+        email: res.email || '',
+        metadata: res.metadata,
+        role: res.role,
+        ...res
       } as AuthUser;
     },
     delete: async (id: string): Promise<void> => {

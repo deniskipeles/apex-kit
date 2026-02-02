@@ -15,12 +15,12 @@ export class ApexKit {
         this.baseUrl = baseUrl.replace(/\/$/, "");
         this.token = null;
         this.currentUser = null;
-        
+
         // [NEW] Explicit Scope State
         this.scopeType = scopeType;
         this.scopeId = scopeId;
     }
-    
+
     /**
      * Helper to check current scope context easily.
      * @returns {{type: 'root'|'tenant'|'sandbox', id: string}}
@@ -40,11 +40,11 @@ export class ApexKit {
         const sandboxUrl = `${this.baseUrl}/sandbox/${uuid}`;
         // [FIX] Pass scope explicitly
         const instance = new ApexKit(sandboxUrl, 'sandbox', uuid);
-        
+
         // Copy auth state to the sandbox instance
         instance.token = this.token;
         instance.currentUser = this.currentUser;
-        
+
         return instance;
     }
 
@@ -59,11 +59,11 @@ export class ApexKit {
         const tenantUrl = `${this.baseUrl}/tenant/${tenantId}`;
         // [FIX] Pass scope explicitly
         const instance = new ApexKit(tenantUrl, 'tenant', tenantId);
-        
+
         // Copy auth state to the tenant instance
         instance.token = this.token;
         instance.currentUser = this.currentUser;
-        
+
         return instance;
     }
 
@@ -186,15 +186,15 @@ export class ApexKit {
 
             // Handle GraphQL Errors
             if (options.isRoot && data.errors) {
-                 const error = new Error(data.errors[0].message || 'GraphQL Error');
-                 error.details = data.errors;
-                 throw error;
+                const error = new Error(data.errors[0].message || 'GraphQL Error');
+                error.details = data.errors;
+                throw error;
             }
 
             if (!response.ok) {
                 const error = new Error(data.message || 'API Error');
                 error.status = response.status;
-                error.code = data.error; 
+                error.code = data.error;
                 error.details = data.details;
                 throw error;
             }
@@ -282,21 +282,21 @@ export class ApexKit {
                 // Fetch cannot handle 302 redirects opaquely to get the target URL string easily.
                 // However, since we know the structure, we can construct the URL client-side
                 // using the instance's baseUrl property.
-                
+
                 let path = '/auth/github';
-                
+
                 // Ensure proper path construction if using Tenant/Sandbox prefix
                 // The _request logic does this internally, but we need the raw URL string for window.location.
                 // We replicate the path logic from _request here:
                 if (!path.startsWith('/api/v1')) {
-                     // Check if baseUrl already includes /api/v1 or if we need to append it?
-                     // Based on your SDK constructor, baseUrl is just the host.
-                     // Based on _request logic: path = `/api/v1${path}`
-                     path = `/api/v1${path}`;
+                    // Check if baseUrl already includes /api/v1 or if we need to append it?
+                    // Based on your SDK constructor, baseUrl is just the host.
+                    // Based on _request logic: path = `/api/v1${path}`
+                    path = `/api/v1${path}`;
                 }
 
                 const url = new URL(`${this.baseUrl}${path}`);
-                
+
                 if (redirectTo) {
                     url.searchParams.append('redirect_to', redirectTo);
                 }
@@ -342,7 +342,7 @@ export class ApexKit {
              * @returns {Promise<object>}
              */
             updateCollection: (id, payload) => this._request(`/collections/${id}`, { method: 'PUT', body: payload }),
-            
+
             /**
              * Patch a collection's name or schema.
              * @param {number|string} id 
@@ -371,9 +371,9 @@ export class ApexKit {
              * @param {boolean} encrypt 
              * @returns {Promise<void>}
              */
-            setConfig: (key, value, encrypt) => this._request('/admin/config', { 
-                method: 'POST', 
-                body: { key, value, encrypt } 
+            setConfig: (key, value, encrypt) => this._request('/admin/config', {
+                method: 'POST',
+                body: { key, value, encrypt }
             }),
 
             /**
@@ -393,9 +393,22 @@ export class ApexKit {
              * @returns {Promise<{token: string, user: object}>}
              */
             registerUser: async (email, password, role, metadata) => {
-                const res = await this._request('/auth/register', { method: 'POST', body: { email, password, role, metadata }});
+                const res = await this._request('/auth/register', { method: 'POST', body: { email, password, role, metadata } });
                 return res;
             },
+
+            /**
+             * Update a user's details (Admin only).
+             * @param {number | string} id - The user ID.
+             * @param {string | null} email 
+             * @param {string | null} password 
+             * @param {string | null} role 
+             * @param {object} metadata 
+             * @returns {Promise<object>}
+             */
+            updateUser: (id, email, password, role, metadata) =>
+                this._request(`/admin/users/${id}`, { method: 'PATCH', body: { email, password, role, metadata } }),
+
             /**
              * List all registered users (Admin only). with pagination, sorting, and filtering.
              * @param {object} [options={}] 
@@ -429,7 +442,7 @@ export class ApexKit {
              * @returns {Promise<object>}
              */
             updateSettings: (settings) => this._request('/admin/settings', { method: 'PUT', body: settings }),
-            
+
             /**
              * Patch system settings.
              * @param {object} settings - The settings object to merge.
@@ -442,9 +455,9 @@ export class ApexKit {
              * @param {object} config - { bucket, region, endpoint, access_key, secret_key }
              * @returns {Promise<object>} Success message or throws error.
              */
-            testS3StorageConnection: (config) => this._request('/admin/storage/test', { 
-                method: 'POST', 
-                body: config 
+            testS3StorageConnection: (config) => this._request('/admin/storage/test', {
+                method: 'POST',
+                body: config
             }),
 
             /**
@@ -463,7 +476,7 @@ export class ApexKit {
              * @returns {Promise<{message: string}>}
              */
             createBackup: () => this._request('/admin/backup', { method: 'POST' }),
-            
+
             /**
              * List available backups on the server (Local/S3).
              * @returns {Promise<Array<{name: string, size: number, created: string}>>}
@@ -563,7 +576,7 @@ export class ApexKit {
              * @param {number|string} collectionId - The ID of the collection.
              * @returns {Promise<object>} Status message and number of jobs queued.
              */
-            revectorizeCollection: (collectionId) => this._request(`/admin/collections/${collectionId}/revectorize`, { method: 'POST', body: {force: false} }),
+            revectorizeCollection: (collectionId) => this._request(`/admin/collections/${collectionId}/revectorize`, { method: 'POST', body: { force: false } }),
 
             /**
              * Import data from a File (CSV or JSON).
@@ -572,7 +585,7 @@ export class ApexKit {
              * @param {File} file - The file object to upload.
              * @returns {Promise<object>} Import statistics (records imported, collection created status).
              */
-            
+
             importData: (collectionName, file) => {
                 const formData = new FormData();
                 formData.append('collection_name', collectionName);
@@ -589,7 +602,7 @@ export class ApexKit {
              */
             exportData: async (collectionId, format = 'json') => {
                 const response = await this._request(`/admin/export-data/${collectionId}?format=${format}`, { method: 'GET' });
-                
+
                 if (!response.ok) {
                     throw new Error(`Export failed: ${response.statusText}`);
                 }
@@ -616,7 +629,7 @@ export class ApexKit {
              */
             exportSchema: async () => {
                 const response = await this._request('/admin/export-schema', { method: 'GET' });
-                
+
                 if (!response.ok) {
                     const errText = await response.text();
                     throw new Error(`Export failed: ${response.status} ${errText}`);
@@ -629,16 +642,16 @@ export class ApexKit {
              * @returns {Promise<object>} Dashboard analytics data.
              */
             getDashboardStats: async () => {
-                return this._request('/admin/dashboard'); 
+                return this._request('/admin/dashboard');
             },
 
             /**
              * Create a new Tenant (Database instance).
              * @param {string} tenantId - Unique alphanumeric ID (e.g. "client-a").
              */
-            createTenant: (tenantId) => this._request('/admin/tenants', { 
-                method: 'POST', 
-                body: { tenant_id: tenantId } 
+            createTenant: (tenantId) => this._request('/admin/tenants', {
+                method: 'POST',
+                body: { tenant_id: tenantId }
             }),
 
             /**
@@ -646,9 +659,9 @@ export class ApexKit {
              * @param {string} id - The Tenant ID
              * @param {string} status - The new status
              */
-            updateTenantStatus: (id, status) => this._request(`/admin/tenants/${id}/status`, { 
-                method: 'PATCH', 
-                body: { status } 
+            updateTenantStatus: (id, status) => this._request(`/admin/tenants/${id}/status`, {
+                method: 'PATCH',
+                body: { status }
             }),
 
             /**
@@ -663,12 +676,12 @@ export class ApexKit {
              * @param {object} data - The Data to patch
              */
             updateTenant: (id, data) => this._request(`/admin/tenants/${id}`, { method: 'PATCH', body: data }),
-            
-             /**
-             * List all Tenants with metadata.
-             * @returns {Promise<Array<{id: string, name: string, status: string, tier: string, stats: object, created_at: string}>>} List of tenant objects.
-             */
-             listTenants: () => this._request('/admin/tenants', { method: 'GET' }),
+
+            /**
+            * List all Tenants with metadata.
+            * @returns {Promise<Array<{id: string, name: string, status: string, tier: string, stats: object, created_at: string}>>} List of tenant objects.
+            */
+            listTenants: () => this._request('/admin/tenants', { method: 'GET' }),
         };
     }
 
@@ -697,7 +710,7 @@ export class ApexKit {
              * @returns {Promise<void>}
              */
             deleteAction: (id) => this._request(`/admin/ai/actions/${id}`, { method: 'DELETE' }),
-            
+
             /**
              * Execute a defined AI action.
              * @param {string} slug - The slug of the action (e.g., 'summarize').
@@ -723,9 +736,9 @@ export class ApexKit {
              * @param {number} [cloneRecordLimit] - Number of records add from root app
              * @returns {Promise<object>} New session object.
              */
-            createSession: (name, initialPrompt, model, cloneStrategy, cloneRecordLimit) => this._request('/admin/ai/sessions', { 
-                method: 'POST', 
-                body: { name, initial_prompt: initialPrompt, model, clone_strategy: cloneStrategy, clone_record_limit: cloneRecordLimit } 
+            createSession: (name, initialPrompt, model, cloneStrategy, cloneRecordLimit) => this._request('/admin/ai/sessions', {
+                method: 'POST',
+                body: { name, initial_prompt: initialPrompt, model, clone_strategy: cloneStrategy, clone_record_limit: cloneRecordLimit }
             }),
 
             deleteSession: (id) => this._request(`/admin/ai/sessions/${id}`, { method: 'DELETE' }),
@@ -738,9 +751,9 @@ export class ApexKit {
              * @param {string} [model]
              * @returns {Promise<object>} Updated session with diff_summary.
              */
-            chat: (sessionId, prompt, model) => this._request(`/admin/ai/sessions/${sessionId}/chat`, { 
-                method: 'POST', 
-                body: { prompt, model } 
+            chat: (sessionId, prompt, model) => this._request(`/admin/ai/sessions/${sessionId}/chat`, {
+                method: 'POST',
+                body: { prompt, model }
             }),
 
             /**
@@ -767,11 +780,11 @@ export class ApexKit {
              */
             editCode: (prompt, currentCode, contextType, model) => this._request('/admin/ai/edit-code', {
                 method: 'POST',
-                body: { 
-                    prompt, 
-                    current_code: currentCode, 
-                    context_type: contextType, 
-                    model 
+                body: {
+                    prompt,
+                    current_code: currentCode,
+                    context_type: contextType,
+                    model
                 }
             })
         };
@@ -839,7 +852,7 @@ export class ApexKit {
              * @returns {Promise<void>}
              */
             update: (id, data) => this._request(`/admin/templates/${id}`, { method: 'PUT', body: data }),
-            
+
             /**
              * Patch a template.
              * @param {number|string} id 
@@ -892,7 +905,7 @@ export class ApexKit {
              * @returns {Promise<Array<object>>}
              */
             searchRecordsWithOSE: (query) => this._request(`/collections/${collectionId}/search`, { method: 'GET', params: { q: query } }),
-            
+
             /**
              * Perform an ultra-fast Instant Search via Tantivy Index (No SQL).
              * @param {string} query 
@@ -922,7 +935,7 @@ export class ApexKit {
              * @returns {Promise<object>}
              */
             update: (recordId, data) => this._request(`/collections/${collectionId}/records/${recordId}`, { method: 'PUT', body: { data } }),
-            
+
             /**
              * Patch a record.
              * @param {number|string} recordId 
@@ -971,7 +984,7 @@ export class ApexKit {
                     }
                 });
             },
-            
+
             /**
              * Perform a semantic vector search using a raw float array.
              * @param {string} field - The field name storing vectors (e.g. "description_vec").
@@ -1093,7 +1106,7 @@ export class ApexKit {
             body: { query, variables }
         });
     }
-    
+
     // ==========================================
     // 10. Custom Helpers
     // ==========================================
@@ -1139,8 +1152,8 @@ export class ApexKit {
             listFiles: () => this._request('/admin/site/files', { method: 'GET' }),
             delete: async (path) => {
                 return await this._request('/admin/site/files', {
-                method: 'DELETE',
-                params: { path }
+                    method: 'DELETE',
+                    params: { path }
                 });
             }
         };
@@ -1227,10 +1240,10 @@ export class ApexKitRealtimeWSClient {
         this.reconnectInterval = 3000;
         this.listeners = [];
         this.isConnected = false;
-        
+
         // Default filter (Listen to nothing until subscribed)
-        this.currentFilter = {}; 
-        
+        this.currentFilter = {};
+
         // Store pending search requests (ID -> Promise Resolve/Reject)
         this.pendingRequests = new Map();
     }
@@ -1241,7 +1254,7 @@ export class ApexKitRealtimeWSClient {
         this.socket.onopen = () => {
             console.log("[ApexKit] Realtime Connected");
             this.isConnected = true;
-            
+
             // Resend subscription if reconnecting
             if (this.currentFilter && Object.keys(this.currentFilter).length > 0) {
                 this.subscribe(this.currentFilter);
@@ -1270,11 +1283,11 @@ export class ApexKitRealtimeWSClient {
 
         this.socket.onclose = () => {
             this.isConnected = false;
-            
+
             // Clear pending search requests so they don't hang forever
             this.pendingRequests.forEach((req) => req.reject(new Error("Socket closed")));
             this.pendingRequests.clear();
-            
+
             console.log("[ApexKit] Disconnected. Retrying...");
             setTimeout(() => this.connect(), this.reconnectInterval);
         };
@@ -1311,11 +1324,11 @@ export class ApexKitRealtimeWSClient {
                 type: "Subscribe",
                 payload: {
                     // Standard DB Filters
-                    collection_id: filter.collectionId, 
-                    record_id: filter.recordId,         
-                    event_type: filter.eventType,       
+                    collection_id: filter.collectionId,
+                    record_id: filter.recordId,
+                    event_type: filter.eventType,
                     filter: filter.dataFilter,
-                    
+
                     // Custom Event Filters
                     channel: filter.channel,
                     custom_event: filter.customEvent
@@ -1509,7 +1522,7 @@ export class ApexKitRealtimeSSEClient {
         const url = `${this.baseUrl}/sse?${params.toString()}`;
 
         console.log(`[ApexKit] SSE Connecting to ${url}...`);
-        
+
         this.source = new EventSource(url, { withCredentials: true });
 
         this.source.onopen = () => {

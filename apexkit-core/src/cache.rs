@@ -322,6 +322,10 @@ impl Db for CachedDb {
         self.inner.delete_user(id).await
     }
 
+    async fn update_user(&self, id: i64, email: Option<String>, role: Option<String>, metadata: Option<serde_json::Value>, password: Option<String>) -> std::result::Result<User, Box<dyn StdError + Send + Sync>> {
+        self.inner.update_user(id, email, role, metadata, password).await
+    }
+
     // --- Files ---
 
     async fn create_file_metadata(

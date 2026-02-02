@@ -166,6 +166,7 @@ pub trait Db: Send + Sync {
     async fn count_users(&self, query: Option<String>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
     async fn get_users_by_ids(&self, ids: &[i64]) -> std::result::Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>>;
     async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn update_user(&self, id: i64, email: Option<String>, role: Option<String>, metadata: Option<serde_json::Value>, password: Option<String>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>>;
 
     // --- Storage Metadata ---
     async fn create_file_metadata(&self, filename: &str, original_name: &str, mime_type: &str, size: i64, user_id: Option<i64>) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>;
@@ -1737,6 +1738,62 @@ impl Db for ApexKit {
     }
 
     async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core_read().await.execute("DELETE FROM users WHERE id = ?1", params![id]).await?; Ok(()) }
+    async fn update_user(&self, id: i64, email: Option<String>, role: Option<String>, metadata: Option<serde_json::Value>, password: Option<String>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_core_read().await;
+        
+        let mut sets = Vec::new();
+        let mut params: Vec<libsql::Value> = vec![];
+        
+        if let Some(e) = email { sets.push("email = ?"); params.push(e.into()); }
+        if let Some(r) = role { sets.push("role = ?"); params.push(r.into()); }
+        
+        // [NEW] Hash password if provided
+        if let Some(p) = password {
+             let hash = crate::auth::hash_password(&p)?;
+             sets.push("password_hash = ?");
+             params.push(hash.into());
+        }
+
+        if let Some(m) = metadata { 
+            let m_str = serde_json::to_string(&m)?;
+            sets.push("metadata = ?"); 
+            params.push(m_str.into()); 
+        }
+
+        if sets.is_empty() { 
+            // Just return existing user if no updates
+            let mut r = conn.query("SELECT id, email, password_hash, role, metadata FROM users WHERE id = ?1", params![id]).await?;
+            if let Some(row) = r.next().await? {
+                let meta_str: String = row.get(4).unwrap_or("{}".to_string());
+                return Ok(User { 
+                    id: row.get(0)?, 
+                    email: row.get(1)?, 
+                    password_hash: row.get(2)?, 
+                    role: row.get(3)?,
+                    metadata: serde_json::from_str(&meta_str).ok()
+                });
+            }
+            return Err("User not found".into());
+        }
+
+        params.push(id.into());
+        let sql = format!("UPDATE users SET {} WHERE id = ? RETURNING id, email, password_hash, role, metadata", sets.join(", "));
+        
+        let mut rows = conn.query(&sql, params).await?;
+        
+        if let Some(row) = rows.next().await? {
+            let meta_str: String = row.get(4).unwrap_or("{}".to_string());
+            Ok(User { 
+                id: row.get(0)?, 
+                email: row.get(1)?, 
+                password_hash: row.get(2)?, 
+                role: row.get(3)?,
+                metadata: serde_json::from_str(&meta_str).ok()
+            })
+        } else {
+            Err("User not found".into())
+        }
+    }
     async fn get_user_by_oauth(&self, p: &str, pid: &str) -> std::result::Result<Option<User>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core_read().await;
         let mut r = conn.query("SELECT u.id, u.email, u.password_hash, u.role, u.metadata FROM users u JOIN auth_identities ai ON u.id = ai.user_id WHERE ai.provider = ?1 AND ai.provider_id = ?2", params![p, pid]).await?;

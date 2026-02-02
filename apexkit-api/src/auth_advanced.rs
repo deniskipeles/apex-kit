@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Query, State, Path},
     http::{StatusCode},
     response::{Redirect, Response, IntoResponse},
     Json,
@@ -10,7 +10,7 @@ use crate::{AppState, AppError, AuthResponse, UserDto};
 use apexkit_core::security::EncryptedValue;
 use serde_json::json;
 use apexkit_core::auth::Claims;
-use crate::DatabaseConnection;
+use crate::{DatabaseConnection, IdPath};
 use axum::Extension;
 use apexkit_core::jobs;
 use utoipa::ToSchema;
@@ -299,4 +299,44 @@ pub async fn test_email_handler(
         .map_err(|e| AppError::UnknownError(format!("Failed to send: {}", e)))?;
 
     Ok(Json(json!({ "success": true, "message": "Email sent." })))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateUserReq {
+    pub email: Option<String>,
+    pub role: Option<String>,
+    pub password: Option<String>,
+    #[schema(value_type = Option<Object>)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/admin/users/{id}",
+    request_body = UpdateUserReq,
+    params(IdPath),
+    responses((status = 200, body = UserDto))
+)]
+pub async fn update_user_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    Path(path): Path<IdPath>,
+    Json(payload): Json<UpdateUserReq>
+) -> Result<Json<UserDto>, AppError> {
+    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
+    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+
+    let user_id = path.id.parse::<i64>().map_err(|_| AppError::JsonError("Invalid User ID".into()))?;
+
+    // Pass password to DB layer
+    let u = db.update_user(user_id, payload.email, payload.role, payload.metadata, payload.password).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(Json(UserDto {
+        id: u.id,
+        email: u.email,
+        role: u.role,
+        metadata: u.metadata,
+        scope: None 
+    }))
 }
