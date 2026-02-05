@@ -100,6 +100,33 @@ const JS_PRELUDE: &str = r#"
     globalThis.Response = Response;
     globalThis.ApexKit = ApexKit;
     globalThis.$apex = new ApexKit();
+    // --- STANDARD FETCH IMPLEMENTATION ---
+    globalThis.fetch = async function(url, options = {}) {
+        // Normalize headers to a simple object for the Rust layer
+        let headersObj = {};
+        if (options.headers) {
+            if (options.headers instanceof Headers) {
+                options.headers.forEach((v, k) => headersObj[k] = v);
+            } else {
+                headersObj = options.headers;
+            }
+        }
+
+        // Call Native Rust Implementation
+        const nativeRes = await $__native_fetch(url, {
+            method: options.method || 'GET',
+            headers: headersObj,
+            body: options.body
+        });
+
+        // Rehydrate into JS Response Object
+        return new Response(nativeRes.body, {
+            status: nativeRes.status,
+            statusText: nativeRes.statusText,
+            headers: nativeRes.headers,
+            url: nativeRes.url
+        });
+    };
 "#;
 
 thread_local! {
@@ -245,6 +272,7 @@ impl ScriptEngine {
         register_console(ctx)?;
         register_util(ctx)?;
         register_http(ctx)?;
+        register_fetch(ctx)?;
         register_fs(ctx)?;
         register_archive(ctx)?;
         register_db(ctx)?;
@@ -712,6 +740,108 @@ fn register_http(ctx: &mut Context) -> Result<(), String> {
         .function(post, JsString::from("post"), 2)
         .build();
     ctx.register_global_property(JsString::from("$http"), obj, Attribute::all()).map_err(|e| e.to_string())
+}
+
+fn register_fetch(ctx: &mut Context) -> Result<(), String> {
+    let fetch_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        // 1. Extract Arguments
+        let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let opts_val = args.get_or_undefined(1);
+
+        // [FIX] Correctly unwrap: Result<Option<Value>> -> Option<Value> -> Value
+        let opts: serde_json::Value = opts_val
+            .to_json(ctx)
+            .unwrap_or(Some(json!({}))) // Handle JsError -> Default Option
+            .unwrap_or(json!({}));      // Handle None -> Default Value
+
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((_, handle, _, _, _)) = &*c.borrow() {
+                handle.block_on(async {
+                    // [FIX] Configure Redirect Policy with explicit type check
+                    let redirect_policy = if let Some("manual") = opts.get("redirect").and_then(|s| s.as_str()) {
+                        reqwest::redirect::Policy::none()
+                    } else {
+                        reqwest::redirect::Policy::default()
+                    };
+
+                    let client = reqwest::Client::builder()
+                        .redirect(redirect_policy)
+                        .build()
+                        .map_err(|e| format!("Client Build Error: {}", e))?;
+                    
+                    // [FIX] Explicit type annotation for closure argument
+                    let method_str = opts.get("method").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("GET");
+                    let method = reqwest::Method::from_bytes(method_str.as_bytes()).unwrap_or(reqwest::Method::GET);
+
+                    let mut req_builder = client.request(method, &url);
+
+                    // Headers [FIX] Type annotation
+                    if let Some(headers) = opts.get("headers").and_then(|h: &serde_json::Value| h.as_object()) {
+                        for (k, v) in headers {
+                            if let Some(val_str) = v.as_str() {
+                                req_builder = req_builder.header(k, val_str);
+                            }
+                        }
+                    }
+
+                    // Body [FIX] Type annotation
+                    if let Some(body) = opts.get("body") {
+                        if let Some(body_str) = body.as_str() {
+                            req_builder = req_builder.body(body_str.to_string());
+                        } else {
+                            req_builder = req_builder.body(body.to_string());
+                        }
+                    }
+
+                    match req_builder.send().await {
+                        Ok(res) => {
+                            let status = res.status().as_u16();
+                            let status_text = res.status().canonical_reason().unwrap_or("").to_string();
+                            let url_final = res.url().to_string();
+                            
+                            let mut res_headers = serde_json::Map::new();
+                            for (name, value) in res.headers() {
+                                res_headers.insert(
+                                    name.as_str().to_string(), 
+                                    json!(value.to_str().unwrap_or(""))
+                                );
+                            }
+
+                            // Capture Body
+                            let body_text = res.text().await.unwrap_or_default();
+
+                            Ok(json!({
+                                "ok": status >= 200 && status < 300,
+                                "status": status,
+                                "statusText": status_text,
+                                "url": url_final,
+                                "headers": res_headers,
+                                "body": body_text
+                            }))
+                        },
+                        Err(e) => Err(format!("Fetch Error: {}", e))
+                    }
+                })
+            } else {
+                Err("Context lost".into())
+            }
+        });
+
+        return_json_promise(ctx, result)
+    });
+
+    // [FIX] Wrap NativeFunction in a JsObject (FunctionObject)
+    // This satisfies the Into<JsValue> trait bound
+    let fetch_obj = boa_engine::object::FunctionObjectBuilder::new(ctx.realm(), fetch_fn)
+        .name("$__native_fetch")
+        .length(2)
+        .build();
+
+    ctx.register_global_property(
+        JsString::from("$__native_fetch"), 
+        fetch_obj, 
+        Attribute::all()
+    ).map_err(|e| e.to_string())
 }
 
 fn register_archive(ctx: &mut Context) -> Result<(), String> {

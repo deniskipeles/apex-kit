@@ -21,6 +21,13 @@ pub enum WriteRequest {
     }
 }
 
+// [NEW] Helper enum to hold pending replies until commit
+enum PendingReply {
+    Execute(oneshot::Sender<Result<u64, String>>, u64),
+    Insert(oneshot::Sender<Result<i64, String>>, i64),
+    Bulk(oneshot::Sender<Result<usize, String>>, usize),
+}
+
 #[derive(Clone)]
 pub struct WriteManager {
     sender: mpsc::Sender<WriteRequest>,
@@ -116,21 +123,30 @@ impl WriteManager {
                 continue;
             }
 
+            // [FIX] Store pending replies instead of sending immediately
+            let mut pending_replies: Vec<PendingReply> = Vec::with_capacity(buffer.len());
+
             for req in buffer.drain(..) {
                 match req {
                     WriteRequest::Execute { sql, params, reply } => {
                         let res = conn.execute(&sql, params).await;
-                        let _ = match res {
-                            Ok(r) => reply.send(Ok(r)),
-                            Err(e) => reply.send(Err(e.to_string())),
-                        };
+                        match res {
+                            // Defer success reply
+                            Ok(r) => pending_replies.push(PendingReply::Execute(reply, r)),
+                            // Fail immediately on individual SQL error
+                            Err(e) => { let _ = reply.send(Err(e.to_string())); }
+                        }
                     },
                     WriteRequest::InsertReturningId { sql, params, reply } => {
                         let res = conn.execute(&sql, params).await;
-                        let _ = match res {
-                            Ok(_) => reply.send(Ok(conn.last_insert_rowid())),
-                            Err(e) => reply.send(Err(e.to_string())),
-                        };
+                        match res {
+                            Ok(_) => {
+                                let id = conn.last_insert_rowid();
+                                // Defer success reply
+                                pending_replies.push(PendingReply::Insert(reply, id));
+                            }
+                            Err(e) => { let _ = reply.send(Err(e.to_string())); }
+                        }
                     },
                     WriteRequest::BulkInsert { sql, params_list, reply } => {
                          let mut count = 0;
@@ -142,14 +158,36 @@ impl WriteManager {
                              }
                              count += 1;
                          }
-                         if let Some(e) = err { let _ = reply.send(Err(e)); }
-                         else { let _ = reply.send(Ok(count)); }
+                         if let Some(e) = err { 
+                             let _ = reply.send(Err(e)); 
+                         } else { 
+                             // Defer success reply
+                             pending_replies.push(PendingReply::Bulk(reply, count)); 
+                         }
                     }
                 }
             }
 
             if let Err(e) = conn.execute("COMMIT", ()).await {
                 eprintln!("CRITICAL: Failed to commit batch: {}", e);
+                // [FIX] If commit fails, fail all pending successes
+                for pr in pending_replies {
+                    let err_msg = format!("Commit failed: {}", e);
+                    match pr {
+                        PendingReply::Execute(tx, _) => { let _ = tx.send(Err(err_msg)); },
+                        PendingReply::Insert(tx, _) => { let _ = tx.send(Err(err_msg)); },
+                        PendingReply::Bulk(tx, _) => { let _ = tx.send(Err(err_msg)); },
+                    }
+                }
+            } else {
+                // [FIX] Commit Success: Now it is safe to tell clients "OK"
+                for pr in pending_replies {
+                    match pr {
+                        PendingReply::Execute(tx, res) => { let _ = tx.send(Ok(res)); },
+                        PendingReply::Insert(tx, res) => { let _ = tx.send(Ok(res)); },
+                        PendingReply::Bulk(tx, res) => { let _ = tx.send(Ok(res)); },
+                    }
+                }
             }
         }
     }

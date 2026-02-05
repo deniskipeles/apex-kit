@@ -62,9 +62,7 @@ impl SearchManager {
         for (name, def) in sorted_fields {
             if def.ose_indexed {
                 match def.r#type {
-                    FieldType::String | FieldType::Text => {
-                        schema_builder.add_text_field(name, TEXT | STORED);
-                    },
+                    // Numeric types get specific handling for range queries (future proofing)
                     FieldType::Number => {
                         schema_builder.add_f64_field(name, STORED | INDEXED | FAST);
                     },
@@ -75,7 +73,11 @@ impl SearchManager {
                         schema_builder.add_f64_field(&format!("{}_lat", name), STORED | INDEXED | FAST);
                         schema_builder.add_f64_field(&format!("{}_lng", name), STORED | INDEXED | FAST);
                     },
-                    _ => {} 
+                    // [UPDATED] Catch-all: Everything else (String, Text, Date, Select, Email, Url, Json, File, Relation, Owner)
+                    // is indexed as Full Text to allow searching.
+                    _ => {
+                        schema_builder.add_text_field(name, TEXT | STORED);
+                    }
                 }
             }
         }
@@ -170,11 +172,6 @@ impl SearchManager {
                 if let Ok(field) = index_schema.get_field(name) {
                     if let Some(val) = data.get(name) {
                         match def.r#type {
-                            FieldType::String | FieldType::Text => {
-                                if let Some(s) = val.as_str() {
-                                    doc.add_text(field, s);
-                                }
-                            },
                             FieldType::Number => {
                                 if let Some(n) = val.as_f64() {
                                     doc.add_f64(field, n);
@@ -185,14 +182,12 @@ impl SearchManager {
                                     doc.add_u64(field, if b { 1 } else { 0 });
                                 }
                             },
-                            // --- OPTIMIZATION: INJECT FLATTENED DATA ---
                             FieldType::GeoPoint => {
                                 if let Some(obj) = val.as_object() {
                                     let lat = obj.get("lat").and_then(|v| v.as_f64());
                                     let lng = obj.get("lng").or_else(|| obj.get("lon")).and_then(|v| v.as_f64());
 
                                     if let (Some(l), Some(g)) = (lat, lng) {
-                                        // Find the schema fields we created in load_index
                                         if let Ok(field_lat) = index_schema.get_field(&format!("{}_lat", name)) {
                                             doc.add_f64(field_lat, l);
                                         }
@@ -202,7 +197,22 @@ impl SearchManager {
                                     }
                                 }
                             },
-                            _ => {}
+                            // [UPDATED] Catch-all for String, Text, Date, Select, Email, etc.
+                            _ => {
+                                // Convert value to string representation
+                                let text_val = if let Some(s) = val.as_str() {
+                                    s.to_string()
+                                } else if val.is_null() {
+                                    "".to_string()
+                                } else {
+                                    // Handles JSON objects, arrays, or numbers stored in text fields
+                                    val.to_string()
+                                };
+                                
+                                if !text_val.is_empty() {
+                                    doc.add_text(field, &text_val);
+                                }
+                            }
                         }
                     }
                 }
@@ -233,12 +243,8 @@ impl SearchManager {
                 if def.ose_indexed {
                     if let Ok(field) = index_schema.get_field(name) {
                         if let Some(val) = data.get(name) {
-                            // ... (Copy your field mapping logic from index_record here) ...
-                            // START COPY
+                            // [UPDATED] Matching logic from index_record
                             match def.r#type {
-                                FieldType::String | FieldType::Text => {
-                                    if let Some(s) = val.as_str() { doc.add_text(field, s); }
-                                },
                                 FieldType::Number => {
                                     if let Some(n) = val.as_f64() { doc.add_f64(field, n); }
                                 },
@@ -255,9 +261,14 @@ impl SearchManager {
                                         }
                                     }
                                 },
-                                _ => {}
+                                _ => {
+                                    let text_val = if let Some(s) = val.as_str() { s.to_string() } 
+                                    else if val.is_null() { "".to_string() } 
+                                    else { val.to_string() };
+                                    
+                                    if !text_val.is_empty() { doc.add_text(field, &text_val); }
+                                }
                             }
-                            // END COPY
                         }
                     }
                 }
@@ -292,7 +303,6 @@ impl SearchManager {
         Ok(results.into_iter().map(|r| r.id).collect())
     }
 
-    /// Returns lightweight results directly from Index (For Instant Search)
     /// Returns lightweight results directly from Index (For Instant Search)
     pub fn instant_search(&self, collection_id: i64, query_str: &str, limit: usize) -> Result<Vec<InstantResult>, String> {
         let lock = self.indexes.lock().unwrap();

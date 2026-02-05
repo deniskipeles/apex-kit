@@ -592,11 +592,22 @@ async fn process_image(
     dim_str: Option<String>
 ) -> Result<Response, AppError> {
 
+    // Define aggressive cache strategy
+    // Cloudflare-CDN-Cache-Control allows us to tell Cloudflare to cache it for a year
+    // while telling the browser (Cache-Control) to cache it for maybe less if we wanted logic separation.
+    // Here we set both to 1 year.
+    let cache_header_val = "public, max-age=31536000, immutable";
+    
+    // Generate ETag based on the content being served
+    // This allows 304 Not Modified responses
+    let etag = format!("\"{:x}\"", md5::compute(&original_bytes)); // Requires md5 crate
+
     if dim_str.is_none() || mime_type.contains("svg") {
          return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime_type)
-            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .header(header::CACHE_CONTROL, cache_header_val) // <--- ADDED
+            .header(header::ETAG, etag) // <--- ADDED
             .body(Body::from(original_bytes))
             .unwrap());
     }
@@ -605,10 +616,14 @@ async fn process_image(
     let full_cache_key = format!("{}_{}", cache_key, dim);
 
     if let Some(cached_bytes) = state.thumb_cache.get(&full_cache_key).await {
+        // Calculate ETag for the thumbnail
+        let thumb_etag = format!("\"{:x}\"", md5::compute(cached_bytes.as_ref()));
+        
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime_type)
-            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .header(header::CACHE_CONTROL, cache_header_val) // <--- ADDED
+            .header(header::ETAG, thumb_etag) // <--- ADDED
             .body(Body::from(cached_bytes.as_ref().clone()))
             .unwrap());
     }
@@ -646,13 +661,15 @@ async fn process_image(
             }
 
             let thumb_bytes = buffer.into_inner();
-            
             state.thumb_cache.insert(full_cache_key, Arc::new(thumb_bytes.clone())).await;
+
+            let thumb_etag = format!("\"{:x}\"", md5::compute(&thumb_bytes));
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime_type)
-                .header(header::CACHE_CONTROL, "public, max-age=3600")
+                .header(header::CACHE_CONTROL, cache_header_val) // <--- ADDED
+                .header(header::ETAG, thumb_etag) // <--- ADDED
                 .body(Body::from(thumb_bytes))
                 .unwrap())
         },
@@ -660,7 +677,8 @@ async fn process_image(
              Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime_type)
-                .header(header::CACHE_CONTROL, "public, max-age=3600")
+                .header(header::CACHE_CONTROL, cache_header_val)
+                .header(header::ETAG, etag)
                 .body(Body::from(original_bytes)) 
                 .unwrap())
         }

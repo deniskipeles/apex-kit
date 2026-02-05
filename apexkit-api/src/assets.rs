@@ -20,9 +20,15 @@ fn serve_embedded(path: &str) -> Response {
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
+            let cache_control = get_cache_header(path); // <--- USE HELPER
+            
+            // Generate simple ETag based on hash of content
+            let etag = format!("\"{:x}\"", md5::compute(&content.data));
+
             Response::builder()
                 .header(header::CONTENT_TYPE, mime.as_ref())
-                .header(header::CACHE_CONTROL, "public, max-age=3600")
+                .header(header::CACHE_CONTROL, cache_control)
+                .header(header::ETAG, etag) // <--- ADD ETAG
                 .body(Body::from(content.data))
                 .unwrap()
         }
@@ -35,13 +41,35 @@ async fn serve_from_disk(full_path: &StdPath) -> Option<Response> {
     if full_path.exists() && full_path.is_file() {
         if let Ok(content) = fs::read(full_path).await {
              let mime = mime_guess::from_path(full_path).first_or_octet_stream();
+             let filename = full_path.file_name().unwrap().to_str().unwrap();
+             let cache_control = get_cache_header(filename); // <--- USE HELPER
+
+             // Simple ETag from file size + modified time (cheap)
+             let meta = full_path.metadata().unwrap();
+             let etag = format!("\"{}_{}\"", meta.len(), meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+
              return Some(Response::builder()
                 .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CACHE_CONTROL, cache_control)
+                .header(header::ETAG, etag) // <--- ADD ETAG
                 .body(Body::from(content))
                 .unwrap());
         }
     }
     None
+}
+
+// Helper to determine cache headers based on path
+fn get_cache_header(path: &str) -> String {
+    if path.ends_with("index.html") || !path.contains('.') {
+        // HTML/Roots: Don't cache, or cache very briefly to ensure updates are seen
+        // "no-cache" means "check with server before using cached copy" (304 Not Modified)
+        "public, no-cache".to_string()
+    } else {
+        // Assets (JS, CSS, PNG): Cache for 1 year, immutable
+        // Vite handles hashing filenames (e.g. index-XyZ.js), so we can cache aggressively
+        "public, max-age=31536000, immutable".to_string()
+    }
 }
 
 // 2. ROOT INDEX HANDLER: Serves /
