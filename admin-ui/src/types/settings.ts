@@ -72,7 +72,7 @@ export interface ApiKey {
   prefix: string;
   role: string;
   scope: string;
-  bypass_cors: string;
+  bypass_cors: string | boolean;
   created: string;
 }
 
