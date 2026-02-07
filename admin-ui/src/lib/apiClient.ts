@@ -1,6 +1,6 @@
 import { APEX_TOKEN } from '../constants';
 import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions, ApiKey, SiteFile, Tenant } from '../types';
-import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from '@apexkit/sdk';
+import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
 
 // Initialize SDK
 const apiUrl = (import.meta as any).env.DEV
