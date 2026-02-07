@@ -1,4 +1,3 @@
-// =========================== admin-ui/src/pages/Dashboard.tsx ===========================
 import React, { useEffect, useState } from 'react';
 import { RefreshCw, Activity, HardDrive, Database, FileText, Loader2 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Button, Badge } from '../components/ui/Elements';

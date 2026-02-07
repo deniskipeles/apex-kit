@@ -1,13 +1,13 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { AdminUser } from '../types';
+import { AuthUser } from '../types';
 import { apiClient } from '../lib/apiClient';
 import { storage } from '../lib/storage';
 import { APEX_AUTH } from '../constants';
 
 interface AuthState {
-  user: AdminUser | null;
+  user: AuthUser | null;
   token: string | null;
   isLoading: boolean;
   login: (email: string, pass: string) => Promise<void>;

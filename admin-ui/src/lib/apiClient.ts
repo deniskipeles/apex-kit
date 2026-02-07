@@ -1,8 +1,7 @@
 import { APEX_TOKEN } from '../constants';
 import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions, ApiKey, SiteFile, Tenant } from '../types';
-import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
+import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from '@apexkit/sdk';
 
-// const env = (import.meta as any).env;
 // Initialize SDK
 const apiUrl = (import.meta as any).env.DEV
   ? (import.meta as any).env.VITE_API_URL?.trim() || 'http://127.0.0.1:5000'
@@ -17,26 +16,19 @@ if (storedToken) {
 }
 
 // --- DYNAMIC CLIENT PROXY ---
-// This allows the entire app to automatically switch to Tenant Mode
-// if the URL path is /_dashboard/tenant/:id/...
-// --- DYNAMIC CLIENT PROXY ---
 export const pb = new Proxy(basePb, {
   get(target, prop, receiver) {
     if (typeof window !== 'undefined') {
       const path = window.location.pathname;
 
-      // 1. Check for TENANT URL
       const tenantMatch = path.match(/^\/_dashboard\/tenant\/([^/]+)/);
       if (tenantMatch && tenantMatch[1]) {
-        // The .tenant() method in updated SDK sets scopeType='tenant'
         const tenantInstance = target.tenant(tenantMatch[1]);
         return Reflect.get(tenantInstance, prop, receiver);
       }
 
-      // 2. Check for SANDBOX URL
       const sandboxMatch = path.match(/^\/_dashboard\/sandbox\/([^/]+)/);
       if (sandboxMatch && sandboxMatch[1]) {
-        // The .sandbox() method in updated SDK sets scopeType='sandbox'
         const sandboxInstance = target.sandbox(sandboxMatch[1]);
         return Reflect.get(sandboxInstance, prop, receiver);
       }
@@ -47,7 +39,6 @@ export const pb = new Proxy(basePb, {
 
 export const realtime = new ApexKitRealtime(pb.baseUrl, pb.getToken());
 
-// Helper for browser downloads
 const downloadBlob = (blob: Blob, filename: string) => {
   const url = window.URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -58,9 +49,8 @@ const downloadBlob = (blob: Blob, filename: string) => {
   a.remove();
   window.URL.revokeObjectURL(url);
 };
-// Helper for authenticated raw fetch
+
 const rawFetch = async (path: string) => {
-  // Construct URL based on current context (Tenant/Sandbox via URL)
   let baseUrl = apiUrl;
   if (typeof window !== 'undefined') {
     const pathName = window.location.pathname;
@@ -83,9 +73,8 @@ const rawFetch = async (path: string) => {
   return res;
 };
 
-// Helper for POST with body (if not already present)
 const rawFetchWithBody = async (path: string, body: FormData) => {
-  let baseUrl = apiUrl; // (Copy logic from rawFetch)
+  let baseUrl = apiUrl;
   if (typeof window !== 'undefined') {
     const pathName = window.location.pathname;
     const tenantMatch = pathName.match(/^\/_dashboard\/tenant\/([^/]+)/);
@@ -104,13 +93,11 @@ const rawFetchWithBody = async (path: string, body: FormData) => {
   return await res.json();
 };
 
-// --- HELPER: Transform Backend Collection to Frontend Interface ---
 const transformCollection = (col: any): Collection => {
   if (!col) return col;
 
   let schemaArray: any[] = [];
 
-  // 1. Map Standard Fields
   if (col.schema && col.schema.fields) {
     schemaArray = Object.entries(col.schema.fields).map(([name, def]: [string, any]) => {
       let uiType = def.type;
@@ -128,7 +115,6 @@ const transformCollection = (col: any): Collection => {
         uid: def.uid,
         position: def.position,
         vectorize: def.vectorize,
-
         min: def.min,
         max: def.max,
         minLength: def.min_length,
@@ -139,13 +125,11 @@ const transformCollection = (col: any): Collection => {
         maxSize: def.max_size,
         dimension: def.dimension,
         relationTo: def.relation_to,
-
         originalName: name
       };
     });
   }
 
-  // 2. Map Relations (Separate map in backend -> Field in frontend)
   if (col.schema && col.schema.relations) {
     Object.entries(col.schema.relations).forEach(([name, def]: [string, any]) => {
       schemaArray.push({
@@ -161,7 +145,6 @@ const transformCollection = (col: any): Collection => {
     });
   }
 
-  // Sort schema array by position to ensure UI renders correctly
   schemaArray.sort((a, b) => (a.position || 0) - (b.position || 0));
 
   const rules = col.schema?.policies || { read: 'public', create: 'admin', update: 'admin', delete: 'admin' };
@@ -181,7 +164,6 @@ const transformCollection = (col: any): Collection => {
   };
 };
 
-// --- HELPER: Transform Frontend Schema -> Backend Format ---
 const transformToBackendSchema = (data: Partial<Collection>) => {
   const schema: any = {
     fields: {},
@@ -194,8 +176,6 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
   if (data.schema) {
     data.schema.forEach(field => {
       const { name } = field;
-
-      // CASE 1: RELATION (Explicit Type)
       if (field.type === 'relation') {
         schema.relations[name] = {
           target_collection: field.relationTo,
@@ -206,8 +186,6 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
         };
         return;
       }
-
-      // Prepare Backend Field Definition
       const backendField: any = {
         type: field.type,
         required: field.required,
@@ -219,7 +197,6 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
         uid: field.uid,
         position: field.position,
         vectorize: field.vectorize,
-
         min: field.min,
         max: field.max,
         min_length: field.minLength,
@@ -231,13 +208,10 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
         dimension: field.dimension,
         relation_to: field.relationTo
       };
-
       if (backendField.type === 'bool') {
         backendField.type = 'boolean';
       }
-
       Object.keys(backendField).forEach(key => backendField[key] === undefined && delete backendField[key]);
-
       schema.fields[name] = backendField;
     });
   }
@@ -245,12 +219,15 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
 };
 
 export const apiClient = {
-  // Helper to get current scope info securely from the instance
-  getScope: () => pb.scope, // returns { type: 'root'|'tenant'|'sandbox', id: string }
+  getScope: () => pb.scope,
   setToken: (token: string) => basePb.setToken(token),
   apiUrl: apiUrl,
   logoUrl: apiUrl + "/logo?thumb=100x100",
-  stripHtmlTags: basePb.utils.stripHtmlTags,
+  stripHtmlTags: (html: string) => {
+    // Basic shim for stripping tags if util isn't exposed yet
+    if (!html) return '';
+    return html.replace(/<[^>]*>?/gm, '');
+  },
   getAdminDashboardStats: pb.admins.getDashboardStats,
   searchVector: (collectionId: string | number, field: string, vector: Array<number>, limit?: number) => pb.collection(collectionId).searchVector(field, vector, limit),
   searchTextVector: (collectionId: string | number, queryText: string, limit?: number) => pb.collection(collectionId).searchTextVector(queryText, limit),
@@ -263,40 +240,19 @@ export const apiClient = {
     return res;
   },
 
-
-  // --- System / Backups ---
   system: {
-    reload: async () => {
-      return await pb.admins.reloadSystem();
-    },
-    testEmail: async (email: string) => {
-      return await pb.admins.testEmail(email);
-    },
-    createBackup: async () => {
-      return await pb.admins.createBackup();
-    },
-    listBackups: async () => {
-      return await pb.admins.listBackups();
-    },
+    reload: async () => await pb.admins.reloadSystem(),
+    testEmail: async (email: string) => await pb.admins.testEmail(email),
+    createBackup: async () => await pb.admins.createBackup(),
+    listBackups: async () => await pb.admins.listBackups(),
     downloadBackup: async (filename: string) => {
       const blob = await pb.admins.downloadBackup(filename);
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      downloadBlob(blob, filename);
     },
-    restoreFromFile: async (filename: string) => {
-      return await pb.admins.restoreFromFile(filename);
-    },
-    restoreBackup: async (file: File) => {
-      return await pb.admins.restoreBackup(file);
-    }
+    restoreFromFile: async (filename: string) => await pb.admins.restoreFromFile(filename),
+    restoreBackup: async (file: File) => await pb.admins.restoreBackup(file),
   },
 
-  // --- API Keys ---
   keys: {
     list: async (): Promise<ApiKey[]> => {
       const res = await pb.admins.listApiKeys();
@@ -325,41 +281,45 @@ export const apiClient = {
         }
       };
     },
-    update: async (id: string, updates: Partial<ApiKey>) => {
-      return await pb.admins.updateApiKey(id, updates);
-    },
-    delete: async (id: string) => {
-      return await pb.admins.deleteApiKey(id);
-    }
+    update: async (id: string, updates: Partial<ApiKey>) => await pb.admins.updateApiKey(id, updates),
+    delete: async (id: string) => await pb.admins.deleteApiKey(id),
   },
 
-  // Explicit Admin methods for Root
   root: {
-    createTenant: (id: string) => basePb.admins.createTenant(id), // Always use basePb for creating tenants
+    createTenant: (id: string) => basePb.admins.createTenant(id),
     deleteTenant: (id: string) => pb.admins.deleteTenant(id),
     updateTenant: (id: string, data: any) => pb.admins.updateTenant(id, data),
     listTenants: async (): Promise<Tenant[]> => {
-      return await basePb.admins.listTenants();
+      // FIX 1: Map SDK result (any[]) to local Tenant type, providing defaults for missing fields
+      const res = await basePb.admins.listTenants();
+      return res.map((t: any) => ({
+        id: t.id,
+        name: t.name,
+        status: t.status,
+        tier: t.tier || 'free', // Default tier
+        stats: t.stats || {
+          storage_mb: 0,
+          max_storage_mb: 0,
+          vector_count: 0,
+          max_vectors: 0,
+          ai_requests: 0,
+          max_ai_requests: 0
+        },
+        created_at: t.created_at
+      }));
     },
-    updateStatus: async (id: string, status: 'active' | 'suspended' | 'archived') => {
-      return await pb.admins.updateTenantStatus(id, status);
-    },
+    updateStatus: async (id: string, status: 'active' | 'suspended' | 'archived') => await pb.admins.updateTenantStatus(id, status),
   },
 
   auth: {
-    listRoles: async () => {
-      return await pb.auth.listRoles();
-    },
+    listRoles: async () => await pb.auth.listRoles(),
     getMe: async () => {
-      // Calls SDK getMe, which updates internal scope state
       const u = await pb.auth.getMe();
-      // Map to frontend type
       return {
         id: u.id.toString(),
         email: u.email,
         role: u.role,
         lastActive: new Date().toISOString(),
-        // Pass scope to UI if needed, though SDK holds the truth
         scope: u.scope
       };
     },
@@ -386,10 +346,7 @@ export const apiClient = {
   users: {
     list: async (page = 1, perPage = 20, search = ''): Promise<{ items: AuthUser[], total: number }> => {
       try {
-        // Call the new Admin API
         const res = await pb.admins.listUsers({ page, per_page: perPage, sort: "", filter: search });
-
-        // Map backend response to AuthUser type
         const items = res.items.map((u: any) => ({
           id: u.id.toString(),
           email: u.email,
@@ -397,7 +354,6 @@ export const apiClient = {
           metadata: u.metadata,
           lastActive: new Date().toISOString(),
         }));
-
         return { items, total: res.total };
       } catch (e) {
         console.error("Error fetching users", e);
@@ -414,15 +370,17 @@ export const apiClient = {
       };
     },
     update: async (id: string, data: Partial<AuthUser>): Promise<AuthUser> => {
-      const {email, role, password, metadata} = data;
+      const { email, role, password, metadata } = data;
       const res = await pb.admins.updateUser(id, email, password, role, metadata);
-      return {
-        id,
+      
+      // FIX 2: Explicitly cast 'id' because backend 'User' type has 'id' as string in SDK but might be number from raw response
+      const updatedUser: AuthUser = {
+        id: res.id.toString(), // Ensure string
         email: res.email || '',
         metadata: res.metadata,
         role: res.role,
-        ...res
-      } as AuthUser;
+      };
+      return updatedUser;
     },
     delete: async (id: string): Promise<void> => {
       await pb.admins.deleteUser(id);
@@ -430,23 +388,13 @@ export const apiClient = {
   },
 
   configs: {
-    list: async (): Promise<any[]> => {
-      // The backend returns snake_case for updated_at usually, verify mapping
-      return await pb.admins.listConfigs();
-    },
-    set: async (key: string, value: string, encrypt: boolean = false) => {
-      return await pb.admins.setConfig(key, value, encrypt);
-    },
-    delete: async (key: string) => {
-      return await pb.admins.deleteConfig(key);
-    }
+    list: async (): Promise<any[]> => await pb.admins.listConfigs(),
+    set: async (key: string, value: string, encrypt: boolean = false) => await pb.admins.setConfig(key, value, encrypt),
+    delete: async (key: string) => await pb.admins.deleteConfig(key)
   },
 
-  // --- Static Sites ---
   sites: {
-    deploy: async (file: File) => {
-      return await pb.sites.deploy(file);
-    },
+    deploy: async (file: File) => await pb.sites.deploy(file),
     list: async (): Promise<SiteFile[]> => {
       try {
         return await pb.sites.listFiles();
@@ -456,8 +404,7 @@ export const apiClient = {
       }
     },
     delete: async (path: string): Promise<void> => {
-      // _request handles the query string encoding
-      return await pb.sites.delete('/admin/site/files');
+      return await pb.sites.delete(path);
     }
   },
 
@@ -491,9 +438,7 @@ export const apiClient = {
       const res = await pb.admins.updateCollection(id, payload);
       return transformCollection(res);
     },
-    delete: async (id: string): Promise<void> => {
-      return pb.admins.deleteCollection(id);
-    },
+    delete: async (id: string): Promise<void> => pb.admins.deleteCollection(id),
     revectorize: (id: string) => pb.admins.revectorizeCollection(id),
     reIndex: (id: string) => pb.admins.reIndex(id),
 
@@ -509,8 +454,6 @@ export const apiClient = {
 
   records: {
     list: async (collectionId: string, page = 1, perPage = 20, expand = '', filter = {}, sort = '-id'): Promise<{ items: AppRecord[], totalItems: number }> => {
-
-      // Pass expand to the SDK list call
       const result = await pb.collection(collectionId).list({
         page,
         per_page: perPage,
@@ -526,18 +469,17 @@ export const apiClient = {
         created: new Date(item.created).toISOString(),
         updated: new Date(item.updated).toISOString(),
         ...item.data,
-        expand: item.expand || {} // Ensure expand object exists
+        expand: item.expand || {}
       }));
 
       return {
         items: formattedItems,
-        totalItems: result.total // Note: Backend needs to update to return count in meta
+        totalItems: result.total
       };
     },
     instantSearch: async (collectionId: string | number, query: string): Promise<InstantResult[]> => {
       if (!query) return [];
       try {
-        // Call the SDK
         return await pb.collection(collectionId).searchRecordsInstantlyWithOSE(query);
       } catch (e) {
         console.error("Instant search failed", e);
@@ -547,7 +489,6 @@ export const apiClient = {
     recordsSearchOSE: async (collectionId: string | number, query: string): Promise<InstantResult[]> => {
       if (!query) return [];
       try {
-        // Call the SDK
         const result = await pb.collection(collectionId).searchRecordsWithOSE(query);
         return result.map((item: any) => ({
           id: item.id.toString(),
@@ -556,7 +497,7 @@ export const apiClient = {
           created: new Date(item.created).toISOString(),
           updated: new Date(item.updated).toISOString(),
           ...item.data,
-          expand: item.expand || {} // Ensure expand object exists
+          expand: item.expand || {}
         }));
       } catch (e) {
         console.error("OSE Records search failed", e);
@@ -566,7 +507,6 @@ export const apiClient = {
     recordsSearchSQL: async (collectionId: string | number, query: any): Promise<InstantResult[]> => {
       if (!query) return [];
       try {
-        // Call the SDK
         const result = await pb.collection(collectionId).searchRecordsWithSQL(query);
         return result.map((item: any) => ({
           id: item.id.toString(),
@@ -575,7 +515,7 @@ export const apiClient = {
           created: new Date(item.created).toISOString(),
           updated: new Date(item.updated).toISOString(),
           ...item.data,
-          expand: item.expand || {} // Ensure expand object exists
+          expand: item.expand || {}
         }));
       } catch (e) {
         console.error("SQL Records search failed", e);
@@ -613,25 +553,21 @@ export const apiClient = {
         created: new Date(res.created).toISOString(),
         updated: new Date(res.updated).toISOString(),
         ...res.data,
-        expand: res.expand || {} // Ensure expand object exists
+        expand: res.expand || {}
       };
     },
     delete: async (collectionId: string, recordId: string): Promise<void> => {
       return await pb.collection(collectionId).delete(recordId);
     },
-
-    searchTextVector: async (collectionId: string, query: string, limit = 10) => {
+    searchTextVector: async (collectionId: string | number, query: string, limit = 10) => {
       return await pb.collection(collectionId).searchTextVector(query, limit);
     },
-
     searchVector: async (collectionId: string, field: string, vector: number[], limit = 10) => {
       return await pb.collection(collectionId).searchVector(field, vector, limit);
     },
-
     getVector: async (collectionId: string, recordId: number | string) => {
       return await pb.collection(collectionId).getVector(recordId);
     },
-
     importData: async (collectionName: string, file: File) => {
       const res = await pb.admins.importData(collectionName, file);
       return res;
@@ -639,8 +575,6 @@ export const apiClient = {
     exportData: async (collectionId: string, format: 'json' | 'csv' = 'json') => {
       const res = await rawFetch(`/admin/export-data/${collectionId}?format=${format}`);
       const blob = await res.blob();
-
-      // Try to get filename from header, else default
       const disposition = res.headers.get('Content-Disposition');
       let filename = `collection_${collectionId}.${format}`;
       if (disposition && disposition.indexOf('filename=') !== -1) {
@@ -651,11 +585,9 @@ export const apiClient = {
       }
       downloadBlob(blob, filename);
     },
-
   },
 
   testS3Connection: async (config: any) => {
-    // Map camelCase (frontend) to snake_case (backend)
     const payload = {
       bucket: config.bucket,
       region: config.region,
@@ -667,29 +599,24 @@ export const apiClient = {
   },
 
   migrateStorage: async (source: string, destination: string) => {
-    return await pb.admins.migrateStorage(source, destination);
+    // FIX 3: Cast arguments to specific union type as required by SDK
+    return await pb.admins.migrateStorage(source as "local" | "s3", destination as "local" | "s3");
   },
 
   files: {
     list: async (page = 1, perPage = 20, search = ''): Promise<{ items: StoredFile[], totalItems: number }> => {
       try {
         const res = await pb.files.list(page, perPage);
-
-        // Map backend response to UI StoredFile type
         const items = res.items.map((f: any) => ({
           id: f.id.toString(),
-          name: f.original_name, // Map original_name -> name
+          name: f.original_name,
           size: f.size,
-          mimeType: f.mime_type, // Map snake_case -> camelCase
-          url: pb.files.getFileUrl(f.filename), // Construct public URL
+          mimeType: f.mime_type,
+          url: pb.files.getFileUrl(f.filename),
           created: f.created_at,
           updated: f.created_at
         }));
-
-        return {
-          items,
-          totalItems: res.total || items.length
-        };
+        return { items, totalItems: res.total || items.length };
       } catch (e) {
         console.error("File list error", e);
         return { items: [], totalItems: 0 };
@@ -699,8 +626,8 @@ export const apiClient = {
       const res = await pb.files.upload(file);
       return {
         id: res.id.toString(),
-        name: res.filename, // Note: Upload response might differ slightly, verify backend
-        size: file.size, // Optimistic size
+        name: res.filename,
+        size: file.size,
         mimeType: file.type,
         url: res.url,
         created: new Date().toISOString(),
@@ -711,18 +638,21 @@ export const apiClient = {
       await pb.files.delete(id);
     },
     getFileUrl: (filename: string) => pb.files.getFileUrl(filename)
-
   },
 
   scripts: {
     list: async (): Promise<Script[]> => {
       const res = await pb.scripts.list();
-      // Map API response to UI types if necessary (snake_case -> camelCase)
-      // Assuming Rust returns matching fields based on struct
-      return res;
+      // FIX 4: Map backend response to local Script type (ensure target_collection)
+      return res.map((s: any) => ({
+          ...s,
+          id: s.id.toString(),
+          target_collection: s.target_collection || '' // Default string if missing
+      }));
     },
     create: async (data: Partial<Script>): Promise<Script> => {
-      const res = await pb.scripts.create(data);
+      // FIX 5: Cast Partial<Script> to any to satisfy Omit type in SDK
+      const res = await pb.scripts.create(data as any);
       return { ...data, id: res.id } as Script;
     },
     delete: async (id: string): Promise<void> => {
@@ -752,7 +682,8 @@ export const apiClient = {
       }));
     },
     create: async (data: Partial<Template>) => {
-      await pb.templates.create(data);
+      // FIX 6: Cast Partial<Template> to any
+      await pb.templates.create(data as any);
     },
     update: async (id: string, data: Partial<Template>) => {
       await pb.templates.update(id, data);
@@ -774,7 +705,13 @@ export const apiClient = {
   ai: {
     getActions: async (): Promise<AiAction[]> => {
       const res = await pb.ai.getActions();
-      return res
+      // FIX 7: Map ID to string
+      return res.map((a: any) => ({
+          ...a,
+          id: a.id.toString(),
+          system_prompt: a.system_prompt || '',
+          config: a.config || {}
+      }));
     },
     createAction: async (data: Partial<AiAction>) => {
       await pb.ai.createAction(data);
@@ -785,31 +722,23 @@ export const apiClient = {
     run: async (slug: string, variables: Record<string, string>) => {
       return await pb.ai.run(slug, variables);
     },
-    // --- Architect ---
     listSessions: async () => await pb.ai.listSessions(),
-
     createSession: async (name: string, initialPrompt?: string, model?: string, cloneStrategy?: string, cloneRecordLimit?: number) => {
       return await pb.ai.createSession(name, initialPrompt, model, cloneStrategy, cloneRecordLimit);
     },
-
     deleteSession: (id: string) => pb.ai.deleteSession(id),
-
     chat: async (id: string, prompt: string, model: string) => {
       return await pb.ai.chat(id, prompt, model);
     },
-
     applySessionChanges: async (id: string) => {
       return await pb.ai.applySessionChanges(id);
     },
-
     publishSession: async (id: string) => {
       return await pb.ai.publishSession(id);
     },
-
     listPlugins: async () => {
       return await pb.ai.listPlugins();
     },
-
     codeEdit: async (prompt: string, currentCode: string, contextType: string, model: string) => {
       return await pb.ai.editCode(prompt, currentCode, contextType, model);
     },
@@ -841,7 +770,6 @@ export const apiClient = {
     }
   },
 
-  // Add this new method
   getVersions: async (): Promise<AppVersions> => {
     try {
       const res = await fetch('/version');

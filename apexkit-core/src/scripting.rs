@@ -19,29 +19,61 @@ use boa_engine::{
 // --- PRELUDE ---
 const JS_PRELUDE: &str = r#"
     class Headers {
-        constructor(init = {}) { this.map = new Map(Object.entries(init)); }
-        get(name) { for (const [k, v] of this.map) { if (k.toLowerCase() === name.toLowerCase()) return v; } return null; }
-        set(name, value) { this.map.set(name, value); }
-        entries() { return this.map.entries(); }
-    }
-
-    class Request {
-        constructor(input, init = {}) {
-            this.bodyData = init.body || input?.body || null;
-            this.method = init.method || "GET";
-            this.headers = new Headers(init.headers || {});
-            this.args = this.bodyData || {}; 
+        constructor(init = {}) {
+            this.map = new Map();
+            if (init instanceof Headers) {
+                init.map.forEach((v, k) => this.map.set(k, v));
+            } else if (Array.isArray(init)) {
+                init.forEach(([k, v]) => this.map.set(k.toLowerCase(), v));
+            } else {
+                Object.entries(init).forEach(([k, v]) => this.map.set(k.toLowerCase(), String(v)));
+            }
         }
-        async json() { return this.bodyData; }
-        async text() { return JSON.stringify(this.bodyData); }
+        get(name) { return this.map.get(name.toLowerCase()) || null; }
+        set(name, value) { this.map.set(name.toLowerCase(), String(value)); }
+        has(name) { return this.map.has(name.toLowerCase()); }
+        delete(name) { this.map.delete(name.toLowerCase()); }
+        forEach(callback) { this.map.forEach((v, k) => callback(v, k, this)); }
     }
 
     class Response {
         constructor(body, init = {}) {
-            this.body = body;
+            this.body = body; // [FIX]: Remove underscore
             this.status = init.status || 200;
+            this.statusText = init.statusText || "OK";
             this.headers = new Headers(init.headers || {});
+            this.ok = this.status >= 200 && this.status < 300;
+            this.url = init.url || "";
+
+            this.json = async () => {
+                if (typeof this.body === 'object' && this.body !== null) return this.body;
+                return JSON.parse(this.body);
+            };
+
+            this.text = async () => {
+                if (typeof this.body === 'string') return this.body;
+                return JSON.stringify(this.body);
+            };
         }
+    }
+
+    class Request {
+        constructor(input, init = {}) {
+            if (typeof input === 'object' && input.url) {
+                this.url = input.url;
+                this.method = init.method || input.method;
+                this.bodyData = init.body || input.bodyData;
+                this.headers = new Headers(init.headers || input.headers);
+            } else {
+                this.url = input;
+                this.method = init.method || "GET";
+                this.bodyData = init.body || null;
+                this.headers = new Headers(init.headers || {});
+            }
+            this.args = this.bodyData || {};
+        }
+        async json() { return typeof this.bodyData === 'string' ? JSON.parse(this.bodyData) : this.bodyData; }
+        async text() { return typeof this.bodyData === 'string' ? this.bodyData : JSON.stringify(this.bodyData); }
     }
 
     class ApexKit {
@@ -176,12 +208,17 @@ impl ScriptEngine {
             let final_val = Self::resolve_promise(promise, ctx)?;
 
             if let Some(obj) = final_val.as_object() {
+                // If it has a 'body' property, it's likely our Response object
                 if obj.has_property(JsString::from("body"), ctx).unwrap_or(false) {
                     let body = obj.get(JsString::from("body"), ctx).unwrap_or_default();
+                    
+                    // Convert ONLY the body to JSON
                     let json = body.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
                     return Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null));
                 }
             }
+            
+            // Fallback for scripts that return raw objects instead of new Response()
             let json = final_val.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
             Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null))
         }).await

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
 import { authService } from './services/authService';
 import { AuthUser } from '../../types';
 import { APEX_TOKEN, APEX_USER } from '@/src/constants';
@@ -8,6 +8,7 @@ interface AuthContextType {
   user: AuthUser | null;
   login: (e: string, p: string) => Promise<void>;
   logout: () => void;
+  checkAuth: () => Promise<void>; // <--- Added this
   isLoading: boolean;
 }
 
@@ -31,56 +32,53 @@ export const AuthProvider = ({ children }: { children?: ReactNode }) => {
     return 'root';
   };
 
-  useEffect(() => {
-    const initAuth = async () => {
-      const storedToken = localStorage.getItem(APEX_TOKEN);
-      
-      if (storedToken) {
-        apiClient.setToken(storedToken);
+  // Define checkAuth as a reusable useCallback
+  const checkAuth = useCallback(async () => {
+    const storedToken = localStorage.getItem(APEX_TOKEN);
+    
+    if (storedToken) {
+      apiClient.setToken(storedToken);
 
-        try {
-          // 1. Fetch User
-          const user = await apiClient.auth.getMe();
-          
-          // 2. [NEW] Validate Scope
-          const urlScope = getCurrentUrlScope();
-          const userScope = user.scope || 'root'; // Fallback if missing
+      try {
+        // 1. Fetch User (this validates the token with the backend)
+        const user = await apiClient.auth.getMe();
+        
+        // 2. Validate Scope against URL
+        const urlScope = getCurrentUrlScope();
+        const userScope = user.scope || 'root'; 
 
-          // Rule: 
-          // - Root user can access everything.
-          // - Tenant/Sandbox user must match URL exactly.
-          const isAllowed = userScope === 'root' || userScope === urlScope;
+        // Rule: 
+        // - Root user can access everything.
+        // - Tenant/Sandbox user must match URL exactly.
+        const isAllowed = userScope === 'root' || userScope === urlScope;
 
-          if (!isAllowed) {
-              console.warn(`Scope Mismatch: User(${userScope}) cannot access URL(${urlScope}). Logging out.`);
-              throw new Error("Scope Mismatch");
-          }
-
-          setUser(user);
-        } catch (e) {
-          console.error("Auth check failed", e);
-          logout(); // Use internal logout to clear storage
+        if (!isAllowed) {
+            console.warn(`Scope Mismatch: User(${userScope}) cannot access URL(${urlScope}). Logging out.`);
+            throw new Error("Scope Mismatch");
         }
-      }
-      setIsLoading(false);
-    };
 
-    initAuth();
+        setUser(user);
+      } catch (e) {
+        console.error("Auth check failed", e);
+        logout(); // Invalid token or scope mismatch -> logout
+      }
+    } else {
+        setUser(null);
+    }
+    setIsLoading(false);
   }, []);
 
+  // Initial Load
+  useEffect(() => {
+    checkAuth();
+  }, [checkAuth]);
+
   const login = async (e: string, p: string) => {
-    // 1. Perform Login against the current URL endpoint
-    // The apiClient proxy automatically directs this to /tenant/X/api/v1/auth/login if in tenant URL
     const res = await authService.login(e, p);
     
-    // 2. Validate returned user scope against URL immediately
+    // Validate returned user scope against URL immediately
     const urlScope = getCurrentUrlScope();
-    // The backend returns the scope generated for that token
     const tokenScope = res.user.scope || 'root'; 
-
-    // This handles the edge case where someone might try to log in as "Root Admin" 
-    // on a "Tenant URL" (which usually fails 401 at API level because root admin isn't in tenant DB),
-    // OR if a tenant user logs in successfully, we ensure the frontend state aligns.
     
     if (tokenScope !== 'root' && tokenScope !== urlScope) {
         throw new Error(`Login restricted. This user belongs to ${tokenScope}, not ${urlScope}.`);
@@ -100,7 +98,7 @@ export const AuthProvider = ({ children }: { children?: ReactNode }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, login, logout, isLoading }}>
+    <AuthContext.Provider value={{ user, login, logout, checkAuth, isLoading }}>
       {children}
     </AuthContext.Provider>
   );

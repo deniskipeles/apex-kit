@@ -9,10 +9,9 @@ import { Router } from '../routes';
 import { SandboxAiToolbar } from '../../features/ai/components/SandboxAiToolbar';
 
 export const MainLayout = () => {
-  const { user, isLoading } = useAuth();
+  const { user, isLoading, checkAuth } = useAuth(); // <--- Destructure checkAuth
   
   // 1. Initialize View State from URL 
-  // FIX: Using '__' as separator to avoid breaking UUIDs containing '-'
   const getInitialView = () => {
       const path = window.location.pathname;
       
@@ -39,10 +38,8 @@ export const MainLayout = () => {
       const path = window.location.pathname;
       let newPath = '/_dashboard';
 
-      // FIX: Parsing logic now splits by '__' safely
       if (currentView.startsWith('tenant__')) {
           const parts = currentView.split('__');
-          // parts[0]=type, parts[1]=uuid, parts[2]=view
           if (parts.length >= 3) {
               newPath = `/_dashboard/tenant/${parts[1]}/${parts[2]}`;
           }
@@ -57,15 +54,20 @@ export const MainLayout = () => {
       
       if (path !== newPath) {
           window.history.pushState({}, '', newPath);
+          // 2b. Re-check Auth when context switches (e.g. root -> tenant)
+          checkAuth(); 
       }
-  }, [currentView]);
+  }, [currentView, checkAuth]);
 
   // Handle Browser Back/Forward
   useEffect(() => {
-      const handlePopState = () => setCurrentView(getInitialView());
+      const handlePopState = () => {
+          setCurrentView(getInitialView());
+          checkAuth(); // Re-check on history navigation
+      };
       window.addEventListener('popstate', handlePopState);
       return () => window.removeEventListener('popstate', handlePopState);
-  }, []);
+  }, [checkAuth]);
 
   // 3. Dynamic Breadcrumbs
   const breadcrumbItems = useMemo(() => {
@@ -76,27 +78,20 @@ export const MainLayout = () => {
         const parts = currentView.split('__');
         const id = parts[1];
         const viewName = parts[2];
-        
-        // Reset root link logic handled by onNavigate usually, but purely visual here
         items.push({ label: `Sandbox (${id.substring(0, 8)}...)`, view: `sandbox__${id}__dashboard` });
-        
         if (viewName && viewName !== 'dashboard') {
              items.push({ label: cap(viewName), view: currentView });
         }
-
     } else if (currentView.startsWith('tenant__')) {
         const parts = currentView.split('__');
         const id = parts[1];
         const viewName = parts[2];
-
         items.push({ label: `Tenant (${id})`, view: `tenant__${id}__dashboard` });
-        
         if (viewName && viewName !== 'dashboard') {
              items.push({ label: cap(viewName), view: currentView });
         }
-
     } else if (currentView !== 'dashboard') {
-        const parts = currentView.split('-'); // Standard views still use hyphen (collections-create)
+        const parts = currentView.split('-'); 
         const label = parts.map(cap).join(' ');
         items.push({ label: label, view: currentView });
     }
