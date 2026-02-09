@@ -453,6 +453,10 @@ pub async fn upload_file(
 ) -> Result<Json<FileResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
     let user_id = claims.as_ref().map(|c| c.uid);
+    // if not user_id return an error
+    if user_id.is_none() {
+        return Err(AppError::Unauthorized("Login required".into()));
+    }
 
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
 
@@ -568,6 +572,11 @@ pub async fn delete_file(
     Path(path): Path<FileIdPath>,
 ) -> Result<StatusCode, AppError> {
     let claims = auth.map(|Extension(c)| c);
+    let user_id = claims.as_ref().map(|c| c.uid);
+    // if not user_id return an error
+    if user_id.is_none() {
+        return Err(AppError::Unauthorized("Login required".into()));
+    }
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     // [TRIGGER] Before Delete
     trigger_void_hook(&state, "before_file_delete", serde_json::json!({ "id": path.id }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
