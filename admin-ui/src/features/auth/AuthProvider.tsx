@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/apex/apex-kit/admin-ui/src/features/auth/AuthProvider.tsx ===========================
 import React, { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
 import { authService } from './services/authService';
 import { AuthUser } from '../../types';
