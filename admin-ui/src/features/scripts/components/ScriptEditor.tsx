@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { Save, Code, Database } from 'lucide-react';
-import { Button, Input, Label, Select, Switch } from '../../../components/ui/Elements';
+import { Save, Code, Database, Globe, Lock, Info, ShieldCheck } from 'lucide-react';
+import { Button, Input, Label, Select, Switch, Badge } from '../../../components/ui/Elements';
 import { Dialog } from '../../../components/ui/Dialog';
 import { Script, Collection } from '../../../types';
 import { AiCodeAssistant } from '../../ai/components/AiCodeAssistant';
 import { collectionsService } from '../../collections/services/collectionsService';
-import { CodeEditor } from '../../../components/form/CodeEditor'; // Import Monaco Editor
+import { CodeEditor } from '../../../components/form/CodeEditor';
+import { apiClient } from '@/src/lib/apiClient';
 
 interface ScriptEditorProps {
     isOpen: boolean;
@@ -40,39 +41,6 @@ const TRIGGER_TYPES = [
     { value: 'before_collection_update', label: 'Before Update Collection', group: 'Schema' },
     { value: 'after_collection_update', label: 'After Update Collection', group: 'Schema' },
     { value: 'before_collection_delete', label: 'Before Delete Collection', group: 'Schema' },
-    { value: 'before_list_collections', label: 'Before List Collections', group: 'Schema' },
-    { value: 'after_list_collections', label: 'After List Collections', group: 'Schema' },
-    { value: 'before_get_collection', label: 'Before Get Collection', group: 'Schema' },
-    { value: 'after_get_collection', label: 'After Get Collection', group: 'Schema' },
-
-    // --- Relations ---
-    { value: 'before_relation_create', label: 'Before Create Relation', group: 'Relations' },
-    { value: 'after_relation_create', label: 'After Create Relation', group: 'Relations' },
-    { value: 'before_relation_delete', label: 'Before Delete Relation', group: 'Relations' },
-    { value: 'after_relation_delete', label: 'After Delete Relation', group: 'Relations' },
-
-    // --- Users & Auth ---
-    { value: 'before_user_create', label: 'Before User Register', group: 'Auth' },
-    { value: 'after_user_create', label: 'After User Register', group: 'Auth' },
-    { value: 'before_user_delete', label: 'Before User Delete', group: 'Auth' },
-    { value: 'after_user_delete', label: 'After User Delete', group: 'Auth' },
-    { value: 'before_list_users', label: 'Before List Users', group: 'Auth' },
-    { value: 'after_list_users', label: 'After List Users', group: 'Auth' },
-
-    // --- Files ---
-    { value: 'before_file_upload', label: 'Before File Upload', group: 'Storage' },
-    { value: 'after_file_upload', label: 'After File Upload', group: 'Storage' },
-    { value: 'before_file_delete', label: 'Before File Delete', group: 'Storage' },
-
-    // --- AI & Vectors ---
-    { value: 'before_ai_run', label: 'Before AI Action', group: 'AI' },
-    { value: 'after_ai_run', label: 'After AI Action', group: 'AI' },
-    { value: 'on_vectorization_start', label: 'On Vectorization Start', group: 'AI' },
-
-    // --- Multi-Tenancy ---
-    { value: 'before_tenant_create', label: 'Before Tenant Provision', group: 'Tenant' },
-    { value: 'after_tenant_create', label: 'After Tenant Provision', group: 'Tenant' },
-    { value: 'before_list_tenants', label: 'Before List Tenants', group: 'Tenant' },
 
     // --- [NEW] Tenant & Sandbox Requests (Traffic/Quota) ---
     { value: 'before_tenant_request', label: 'Before Tenant Request', group: 'Traffic' },
@@ -82,75 +50,46 @@ const TRIGGER_TYPES = [
 ];
 
 const DEFAULT_CODE = {
-    manual: `// Manual API Endpoint\n// POST /api/v1/run/{script_name}\nexport default async function(req) {\n    const body = await req.json();\n    return new Response({ message: "Hello!" });\n}`,
-    
-    cron: `// Scheduled Job\nexport default async function() {\n    log("Running cron job...");\n    // await $db.delete("logs", ...)\n}`,
-    
-    hook: `// Record Hook (Write)\n// Context: e.record, e.collection, e.auth\nexport default async function(e) {\n    if (!e.record.data.title) throw new Error("Title required");\n    // Return modified data to be saved\n    return e.record.data;\n}`,
-
-    filter: `// Filter/Read Hook\n// Context: e.data, e.auth\nexport default async function(e) {\n    // Modify query parameters or output data\n    // e.g. e.data.items = e.data.items.filter(i => ...)\n    return e.data;\n}`,
-
-    system: `// System Event Hook\n// Context: e.trigger, e.data, e.auth\nexport default async function(e) {\n    log("Event Triggered: " + e.trigger);\n    // Throwing error blocks operation for 'before_' hooks\n    // if (e.trigger === 'before_file_upload' && e.auth.role !== 'admin') throw new Error("Admins only");\n}`,
-
-    graphql: `// GraphQL Resolver Configuration
-    // NOTE: Use strict JSON syntax for keys/values in the graphql object
-    export const graphql = {
-    "parent": "Query",
-    "name": "myCustomField",
-    "args": {
-        "someArg": "String!"
-    },
-    "returnType": "JSON"
-    };
-
-    export default async function(req) {
-    const args = await req.json(); // Arguments passed here
-    
-    return new Response({
-        received: args.someArg,
-        timestamp: new Date().toISOString()
-    });
-    }`,
-
-    // [ADD] Default for Traffic Hooks
-    traffic: `// Traffic Control Hook
-    // Context: e.data.path, e.data.ip, e.data.method
-    export default async function(e) {
-        // Example: Rate Limit or Audit
-        // const key = "ip:" + e.data.ip;
-        // const count = await $cache.incr(key, 1);
-        // if (count > 100) throw new Error("Rate limit exceeded");
-        
-        // For 'after_' hooks, e.data.status is available
-        if (e.trigger.startsWith('after_')) {
-            log(e.trigger + " " + e.data.path + " " + e.data.status);
-        }
-    }`
+    manual: `export default async function(req) {\n    const body = await req.json();\n    return new Response({ message: "Hello!" });\n}`,
+    cron: `export default async function() {\n    log("Running cron job...");\n}`,
+    hook: `export default async function(e) {\n    // Context: e.record, e.collection, e.auth\n    return e.record.data;\n}`,
+    filter: `export default async function(e) {\n    // Context: e.data, e.auth\n    return e.data;\n}`,
+    system: `export default async function(e) {\n    log("Event Triggered: " + e.trigger);\n}`,
+    graphql: `export const graphql = {\n  "parent": "Query",\n  "name": "customField",\n  "args": {},\n  "returnType": "JSON"\n};\n\nexport default async function(req) {\n    return new Response({ success: true });\n}`,
+    traffic: `export default async function(e) {\n    log(e.trigger + " " + e.data.path);\n}`
 };
 
 export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEditorProps) => {
-    const [formData, setFormData] = useState<Partial<Script>>({
+    const [formData, setFormData] = useState<Partial<Script & { visibility: string }>>({
         name: '',
         trigger_type: 'manual',
-        target_collection: null,
+        target_collection: '',
+        visibility: 'private',
         code: DEFAULT_CODE.manual,
         active: true
     });
     const [collections, setCollections] = useState<Collection[]>([]);
     const [isSaving, setIsSaving] = useState(false);
+    const [isRoot, setIsRoot] = useState(false);
 
     useEffect(() => {
         collectionsService.list().then(setCollections);
+        setIsRoot(apiClient.getScope().type === 'root');
     }, []);
 
     useEffect(() => {
         if (initialData) {
-            setFormData(initialData);
+            setFormData({
+                ...initialData,
+                target_collection: initialData.target_collection || '',
+                visibility: (initialData as any).visibility || 'private'
+            });
         } else {
             setFormData({
                 name: '',
                 trigger_type: 'manual',
-                target_collection: null,
+                target_collection: '',
+                visibility: 'private',
                 code: DEFAULT_CODE.manual,
                 active: true
             });
@@ -162,8 +101,7 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
         try {
             const cleanData = {
                 ...formData,
-                // Only save target_collection if it is a Record Hook
-                target_collection: isRecordHook(formData.trigger_type || '') ? formData.target_collection : null
+                target_collection: isScopedByCollection(formData.trigger_type || '') ? formData.target_collection : null
             };
             await onSave(cleanData);
             onClose();
@@ -172,33 +110,27 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
         }
     };
 
-    const isRecordHook = (type: string) => [
-        'before_create', 'after_create', 'before_update', 'after_update', 'before_delete', 'after_delete'
-    ].includes(type);
+    // Determine if we should show the "Target Collection" dropdown
+    const isScopedByCollection = (type: string) => {
+        return type.includes('_create') || 
+               type.includes('_update') || 
+               type.includes('_delete') || 
+               type.includes('_records') || 
+               type.includes('_record');
+    };
 
     const handleTriggerChange = (type: string) => {
         let newCode = formData.code;
-        
-        // Only reset code if it looks like one of the defaults
         const isDefault = Object.values(DEFAULT_CODE).some(code => formData.code === code);
         
         if (isDefault) {
-            if (type === 'manual') {
-                newCode = DEFAULT_CODE.manual;
-            } else if (type === 'cron') {
-                newCode = DEFAULT_CODE.cron;
-            } else if (type === 'graphql') {
-                newCode = DEFAULT_CODE.graphql;
-            } else if (isRecordHook(type)) {
-                newCode = DEFAULT_CODE.hook;
-            } else if (type.includes('_list_') || type.includes('_get_')) {
-                newCode = DEFAULT_CODE.filter;
-            // [NEW] Check for traffic hooks
-            } else if (type.includes('_request')) {
-                newCode = DEFAULT_CODE.traffic;
-            } else {
-                newCode = DEFAULT_CODE.system;
-            }
+            if (type === 'manual') newCode = DEFAULT_CODE.manual;
+            else if (type === 'cron') newCode = DEFAULT_CODE.cron;
+            else if (type === 'graphql') newCode = DEFAULT_CODE.graphql;
+            else if (type.includes('_create') || type.includes('_update')) newCode = DEFAULT_CODE.hook;
+            else if (type.includes('_list_') || type.includes('_get_')) newCode = DEFAULT_CODE.filter;
+            else if (type.includes('_request')) newCode = DEFAULT_CODE.traffic;
+            else newCode = DEFAULT_CODE.system;
         }
         setFormData({ ...formData, trigger_type: type, code: newCode });
     };
@@ -211,18 +143,18 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6 h-full overflow-hidden">
 
                     {/* Sidebar Settings */}
-                    <div className="space-y-5 overflow-y-auto pr-2">
+                    <div className="space-y-5 overflow-y-auto pr-2 custom-scrollbar">
                         <div className="space-y-2">
-                            <Label>Script Name / ID</Label>
+                            <Label required>Script Name / ID</Label>
                             <Input
                                 value={formData.name}
                                 onChange={(e: any) => setFormData({ ...formData, name: e.target.value })}
-                                placeholder="e.g. validate-post"
-                                className="font-mono"
+                                placeholder="e.g. process-payment"
+                                className="font-mono text-sm"
                                 disabled={!!initialData}
                             />
                             <p className="text-[10px] text-muted-foreground">
-                                {formData.trigger_type === 'manual' ? 'Public URL: /api/v1/run/' + (formData.name || '...') : 'Unique identifier for this script.'}
+                                {formData.trigger_type === 'manual' ? 'Public URL: /api/v1/run/' + (formData.name || '...') : 'System identifier.'}
                             </p>
                         </div>
 
@@ -249,29 +181,53 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
                             </Select>
                         </div>
 
-                        {isRecordHook(formData.trigger_type || '') && (
+                        {/* VISIBILITY FIELD */}
+                        <div className="space-y-2">
+                            <Label className="flex items-center gap-2">
+                                {formData.visibility === 'public' ? <Globe className="h-3 w-3 text-primary" /> : <Lock className="h-3 w-3 text-muted-foreground" />}
+                                Visibility
+                            </Label>
+                            <Select
+                                value={formData.visibility || 'private'}
+                                onChange={(e: any) => setFormData({ ...formData, visibility: e.target.value })}
+                                disabled={!isRoot}
+                            >
+                                <option value="private">Private (Current Scope Only)</option>
+                                <option value="public">Public (Shared Root Script)</option>
+                            </Select>
+                            <p className="text-[10px] text-muted-foreground">
+                                {formData.visibility === 'public' 
+                                    ? 'Tenants can call this script via $run.script().' 
+                                    : 'Only accessible within this environment.'}
+                            </p>
+                        </div>
+
+                        {/* TARGET COLLECTION FIELD */}
+                        {isScopedByCollection(formData.trigger_type || '') && (
                             <div className="space-y-2 animate-in fade-in slide-in-from-top-2">
-                                <Label className="flex items-center gap-2 text-primary"><Database className="h-3 w-3" /> Target Collection</Label>
+                                <Label className="flex items-center gap-2 text-primary">
+                                    <Database className="h-3 w-3" /> Target Collection
+                                </Label>
                                 <Select
                                     value={formData.target_collection || ''}
-                                    onChange={(e: any) => setFormData({ ...formData, target_collection: e.target.value || null })}
+                                    onChange={(e: any) => setFormData({ ...formData, target_collection: e.target.value || '' })}
                                 >
                                     <option value="">(Global - All Collections)</option>
                                     {collections.map(c => (
                                         <option key={c.name} value={c.name}>{c.name}</option>
                                     ))}
                                 </Select>
-                                <p className="text-[10px] text-muted-foreground">Optional. Runs on all collections if empty.</p>
+                                <p className="text-[10px] text-muted-foreground">Attach this hook to a specific table.</p>
                             </div>
                         )}
 
                         <div className="flex items-center justify-between p-3 border border-border rounded-lg bg-secondary/5">
-                            <Label className="cursor-pointer" onClick={() => setFormData({ ...formData, active: !formData.active })}>Active</Label>
+                            <Label className="cursor-pointer" onClick={() => setFormData({ ...formData, active: !formData.active })}>Active Status</Label>
                             <Switch checked={formData.active} onCheckedChange={(c: boolean) => setFormData({ ...formData, active: c })} />
                         </div>
 
                         <div className="pt-4 border-t border-border">
-                            <Label className="mb-2 block">AI Assistant</Label>
+                            <Label className="mb-2 block text-xs uppercase tracking-widest text-muted-foreground">Copilot</Label>
                             <AiCodeAssistant
                                 currentCode={formData.code || ''}
                                 contextType="script"
@@ -280,12 +236,15 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
                         </div>
                     </div>
 
-                    {/* Code Editor Area */}
+                    {/* Editor Area */}
                     <div className="md:col-span-2 flex flex-col h-full border-l border-border pl-0 md:pl-6">
                         <div className="flex items-center justify-between mb-2">
-                            <Label className="flex items-center gap-2"><Code className="h-4 w-4" /> JavaScript Logic</Label>
+                            <div className="flex items-center gap-2">
+                                <ShieldCheck className="h-4 w-4 text-emerald-500" />
+                                <span className="text-sm font-semibold">Server Runtime (Boa)</span>
+                            </div>
                             <div className="text-[10px] text-muted-foreground font-mono">
-                                {isRecordHook(formData.trigger_type || '') ? 'Context: e.record, e.auth' : 'Globals: $db, $http'}
+                                {isScopedByCollection(formData.trigger_type || '') ? 'Context: e.record, e.auth' : 'Globals: $db, $http, $run'}
                             </div>
                         </div>
 
@@ -296,13 +255,14 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
                                 language="javascript"
                                 withTypes={true} 
                                 height="100%"
-                                label="SERVER SCRIPT"
+                                label="JS LOGIC"
                                 collections={collections}
                             />
                         </div>
                     </div>
                 </div>
 
+                {/* Modal Footer */}
                 <div className="flex justify-end gap-3 pt-4 border-t border-border mt-auto">
                     <Button variant="ghost" onClick={onClose}>Cancel</Button>
                     <Button onClick={handleSave} isLoading={isSaving} disabled={!formData.name}>

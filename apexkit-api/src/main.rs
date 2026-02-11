@@ -438,6 +438,7 @@ export default async function(req) {
             name: script_name.to_string(),
             trigger_type: "manual".to_string(),
             target_collection: None,
+            visibility: "private".to_string(),
             code,
         }).await?;
     }

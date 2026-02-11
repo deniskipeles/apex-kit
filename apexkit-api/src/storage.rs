@@ -228,6 +228,85 @@ impl StorageBackend for DynamicStorage {
     }
 }
 
+pub struct ScopedDynamicStorage {
+    state: AppState,
+    scope: EventScope,
+}
+
+impl ScopedDynamicStorage {
+    pub fn new(state: AppState, scope: EventScope) -> Self {
+        Self { state, scope }
+    }
+
+    // Async helper to get the real backend
+    async fn resolve(&self) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error + Send + Sync>> {
+        // 1. Resolve DB based on Scope
+        let db = match &self.scope {
+            EventScope::Root => self.state.db.clone(),
+            EventScope::Tenant(id) => self.state.tenant_manager.get_tenant(id.clone()).await.map_err(|e| e.to_string())?,
+            EventScope::Sandbox(id) => self.state.sandbox_manager.get_sandbox(id).await.map_err(|e| e.to_string())?,
+            _ => self.state.db.clone(),
+        };
+
+        // 2. Resolve Paths
+        let (fs_root, url_prefix) = match &self.scope {
+             EventScope::Root => (None, None), // Use defaults
+             EventScope::Tenant(id) => (
+                 Some(format!("storage/tenants/{}/uploads", id)),
+                 Some(format!("/tenant/{}/api/v1/storage/file/", id))
+             ),
+             EventScope::Sandbox(id) => (
+                 Some(format!("storage/sandboxes/session_{}/uploads", id)),
+                 Some(format!("/sandbox/{}/api/v1/storage/file/", id))
+             ),
+             _ => (None, None),
+        };
+
+        // 3. Create DynamicStorage (which handles S3/Local switching based on DB settings)
+        let ds = DynamicStorage::new(
+            db, 
+            self.state.vault.clone(), 
+            fs_root, 
+            url_prefix.unwrap_or("/api/v1/storage/file/".to_string())
+        );
+        
+        // We can't return DynamicStorage directly because it implements the trait, 
+        // but we need to return Arc<dyn StorageBackend>.
+        // Since DynamicStorage itself implements it, we can wrap it.
+        Ok(Arc::new(ds))
+    }
+}
+
+#[async_trait]
+impl StorageBackend for ScopedDynamicStorage {
+    async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let backend = self.resolve().await?;
+        backend.save(name, data, mime).await
+    }
+    async fn get(&self, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let backend = self.resolve().await?;
+        backend.get(name).await
+    }
+    async fn delete(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let backend = self.resolve().await?;
+        backend.delete(name).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let backend = self.resolve().await?;
+        backend.list_prefix(prefix).await
+    }
+    fn get_public_url_base(&self) -> String {
+        // This is synchronous, so we can't async resolve DB config here easily.
+        // We must rely on static path generation logic.
+        match &self.scope {
+            EventScope::Root => "/api/v1/storage/file/".to_string(),
+            EventScope::Tenant(id) => format!("/tenant/{}/api/v1/storage/file/", id),
+            EventScope::Sandbox(id) => format!("/sandbox/{}/api/v1/storage/file/", id),
+            _ => "/api/v1/storage/file/".to_string(),
+        }
+    }
+}
+
 // --- HANDLERS ---
 // --- HANDLER: Test S3 Connection ---
 // Uses payload if present, otherwise falls back to DB settings

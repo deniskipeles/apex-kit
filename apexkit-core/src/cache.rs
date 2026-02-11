@@ -562,4 +562,11 @@ impl Db for CachedDb {
     async fn get_dashboard_stats(&self) -> Result<crate::models::DashboardData, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.get_dashboard_stats().await
     }
+
+    // QUERY ENGINE
+    async fn query_engine(&self, query: crate::query_engine::ApexQuery) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        // We can cache analytics queries if desired using (query) as hash key.
+        // For now, pass through to raw DB for real-time analytics.
+        self.inner.query_engine(query).await
+    }
 }

@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::schema::FieldType;
 use crate::embeddings::EmbedderService;
 use crate::security::Vault;
+use query_engine::ApexQuery;
+use crate::realtime::EventScope; 
+use crate::storage::StorageBackend;
 
 const COMPOSITE_SEPARATOR: &str = "__::__";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -60,7 +63,7 @@ pub struct Record {
     pub data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expand: Option<Value>,
-    // [NEW] Timestamps
+    // Timestamps
     pub created: String,
     pub updated: String,
 }
@@ -87,6 +90,14 @@ pub trait ScriptContext: Send + Sync {
     fn get_embedder(&self) -> Arc<EmbedderService>;
     fn get_vector_provider(&self) -> Arc<dyn VectorProvider>;
     fn get_realtime_tx(&self) -> tokio::sync::broadcast::Sender<crate::realtime::DbEvent>;
+    fn get_storage(&self) -> Arc<dyn StorageBackend>;
+    fn get_scope(&self) -> EventScope;
+
+    // To fetch from Root DB regardless of current scope
+    fn get_shared_script(&self, name: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<crate::script_models::Script>> + Send>>;
+    
+    // To execute a script recursively using the AppState's engine
+    fn execute_shared_script(&self, code: String, payload: serde_json::Value, scope: crate::realtime::EventScope) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<serde_json::Value, String>> + Send>>;
     
     // Optional: Only available if Managers are initialized
     fn resolve_tenant_db(&self, tenant_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<dyn Db>>> + Send>>;
@@ -103,12 +114,12 @@ pub trait ScriptContext: Send + Sync {
     fn admin_delete_sandbox(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
     fn admin_get_sandbox_usage(&self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<u64, String>> + Send>>;
 
-    // [NEW] Cache Primitives
+    // Cache Primitives
     fn cache_get(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
     fn cache_set(&self, key: &str, val: &str, ttl_secs: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
     fn cache_del(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
     
-    // [NEW] Atomic Increment (Crucial for Quotas)
+    // Atomic Increment (Crucial for Quotas)
     // Returns the new value
     fn cache_incr(&self, key: &str, delta: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = i64> + Send>>;
 }
@@ -247,6 +258,11 @@ pub trait Db: Send + Sync {
     async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>, model: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
     async fn has_vector(&self, collection_id: i64, record_id: i64, field_name: &str, model: &str) -> std::result::Result<bool, Box<dyn StdError + Send + Sync>>;
     async fn get_record_vectors(&self, collection_id: i64, record_id: i64) -> std::result::Result<Vec<models::VectorRecord>, Box<dyn StdError + Send + Sync>>;
+
+    // QUERY ENGINE
+    // Arbitrary Analytical Query
+    // Returns a generic JSON Value (Array of Objects) because aggregations don't match the Record schema
+    async fn query_engine(&self, query: ApexQuery) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 fn row_to_collection(row: &Row) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
@@ -1747,7 +1763,7 @@ impl Db for ApexKit {
         if let Some(e) = email { sets.push("email = ?"); params.push(e.into()); }
         if let Some(r) = role { sets.push("role = ?"); params.push(r.into()); }
         
-        // [NEW] Hash password if provided
+        // Hash password if provided
         if let Some(p) = password {
              let hash = crate::auth::hash_password(&p)?;
              sets.push("password_hash = ?");
@@ -2043,7 +2059,8 @@ impl Db for ApexKit {
     }
     async fn list_scripts(&self) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys_read().await;
-        let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts", ()).await?;
+        // Added visibility
+        let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection, visibility FROM _scripts", ()).await?;
         let mut v = Vec::new();
         while let Some(row) = r.next().await? { 
             v.push(script_models::Script { 
@@ -2052,7 +2069,8 @@ impl Db for ApexKit {
                 trigger_type: row.get(2)?, 
                 code: row.get(3)?, 
                 active: row.get(4)?,
-                target_collection: row.get(5)? 
+                target_collection: row.get(5)?,
+                visibility: row.get(6).unwrap_or("private".to_string()),
             }); 
         }
         Ok(v)
@@ -2060,18 +2078,19 @@ impl Db for ApexKit {
 
     async fn create_script(&self, req: script_models::CreateScriptReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys_read().await;
+        // Added visibility
         let mut rows = conn.query(
-            "INSERT INTO _scripts (name, trigger_type, code, target_collection) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, target_collection=excluded.target_collection, created_at=CURRENT_TIMESTAMP RETURNING id", 
-            params![req.name, req.trigger_type, req.code, req.target_collection]
+            "INSERT INTO _scripts (name, trigger_type, code, target_collection, visibility) VALUES (?1, ?2, ?3, ?4, ?5) 
+             ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, target_collection=excluded.target_collection, visibility=excluded.visibility, created_at=CURRENT_TIMESTAMP RETURNING id", 
+            params![req.name, req.trigger_type, req.code, req.target_collection, req.visibility]
         ).await?;
         if let Some(row) = rows.next().await? { Ok(row.get(0)?) } else { Err("Failed".into()) }
     }
 
-    async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("DELETE FROM _scripts WHERE id = ?1", params![id]).await?; Ok(()) }
-    
     async fn get_script_by_name(&self, name: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys_read().await;
-        let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts WHERE name = ?1", params![name]).await?;
+        // Added visibility
+        let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection, visibility FROM _scripts WHERE name = ?1", params![name]).await?;
         if let Some(row) = r.next().await? { 
             Ok(Some(script_models::Script { 
                 id: row.get(0)?, 
@@ -2079,14 +2098,17 @@ impl Db for ApexKit {
                 trigger_type: row.get(2)?, 
                 code: row.get(3)?, 
                 active: row.get(4)?,
-                target_collection: row.get(5)? 
+                target_collection: row.get(5)?,
+                visibility: row.get(6).unwrap_or("private".to_string()),
             })) 
         } else { Ok(None) }
     }
 
+    async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("DELETE FROM _scripts WHERE id = ?1", params![id]).await?; Ok(()) }
+    
     async fn get_scripts_by_trigger(&self, t: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys_read().await;
-        let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection FROM _scripts WHERE trigger_type = ?1 AND active = 1", params![t]).await?;
+        let mut r = conn.query("SELECT id, name, trigger_type, code, active, target_collection, visibility FROM _scripts WHERE trigger_type = ?1 AND active = 1", params![t]).await?;
         let mut v = Vec::new();
         while let Some(row) = r.next().await? { 
             v.push(script_models::Script { 
@@ -2095,7 +2117,8 @@ impl Db for ApexKit {
                 trigger_type: row.get(2)?, 
                 code: row.get(3)?, 
                 active: row.get(4)?,
-                target_collection: row.get(5)? 
+                target_collection: row.get(5)?,
+                visibility: row.get(6).unwrap_or("private".to_string()),
             }); 
         }
         Ok(v)
@@ -2508,6 +2531,56 @@ impl Db for ApexKit {
         // 3. Fetch Records
         self.get_records_by_ids(collection_id, &ids).await
     }
+
+    // QUERY ENGINE
+    async fn query_engine(&self, query: ApexQuery) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        // We delegate the logic to the QueryEngine struct, but we pass "self" (the Db instance) 
+        // because the engine needs to generate SQL and run it against the connection.
+        // However, to keep the Engine logic pure, we will implement the raw execution here
+        // or pass the connection to the Engine.
+        
+        // Better approach: QueryEngine builds SQL, ApexKit executes it.
+        let (sql, params, pipeline) = crate::query_engine::QueryBuilder::build(&query, self).await?;
+        
+        let conn = self.get_data_read().await;
+        let mut rows = conn.query(&sql, params).await?;
+        
+        let mut results = Vec::new();
+        
+        // Dynamic Row Mapper: Maps SQL columns to JSON object
+        while let Some(row) = rows.next().await? {
+            let mut row_map = serde_json::Map::new();
+            let count = row.column_count();
+            
+            for i in 0..count {
+                let name = row.column_name(i).unwrap_or("unknown").to_string();
+                let val = row.get_value(i).unwrap();
+                let json_val = match val {
+                    libsql::Value::Integer(i) => serde_json::json!(i),
+                    libsql::Value::Real(f) => serde_json::json!(f),
+                    libsql::Value::Text(s) => {
+                        // Try to auto-parse JSON strings if they look like JSON
+                        if (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']')) {
+                            serde_json::from_str(&s).unwrap_or(serde_json::json!(s))
+                        } else {
+                            serde_json::json!(s)
+                        }
+                    },
+                    libsql::Value::Blob(b) => serde_json::json!(crate::utils::to_hex(&b)), // Helper or base64
+                    libsql::Value::Null => serde_json::Value::Null,
+                };
+                row_map.insert(name, json_val);
+            }
+            results.push(serde_json::Value::Object(row_map));
+        }
+
+        // 2. Post-Processing (Rust In-Memory Layer)
+        if !pipeline.is_empty() {
+             results = crate::query_engine::QueryProcessor::process(results, pipeline)?;
+        }
+
+        Ok(serde_json::Value::Array(results))
+    }
 }
 
 // --- OPTIMIZATION: PRAGMAS ---
@@ -2616,8 +2689,11 @@ async fn setup_sys(db: &Database) -> Result<()> {
     conn.execute("CREATE TABLE IF NOT EXISTS _ai_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE NOT NULL, name TEXT NOT NULL, model TEXT NOT NULL, system_prompt TEXT, template TEXT NOT NULL, config JSON, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS _ai_sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, messages JSON, current_manifest JSON, pending_manifest JSON, diff_summary TEXT, last_error TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS _plugins (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, manifest JSON NOT NULL, description TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
-    conn.execute("CREATE TABLE IF NOT EXISTS _scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, trigger_type TEXT NOT NULL, code TEXT NOT NULL, active BOOLEAN DEFAULT 1, target_collection TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS _templates (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE NOT NULL, content TEXT NOT NULL, script_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
+    conn.execute("CREATE TABLE IF NOT EXISTS _scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, trigger_type TEXT NOT NULL, code TEXT NOT NULL, active BOOLEAN DEFAULT 1, target_collection TEXT, visibility TEXT DEFAULT 'private', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
+    
+    // Migration for existing DBs
+    let _ = conn.execute("ALTER TABLE _scripts ADD COLUMN visibility TEXT DEFAULT 'private'", ()).await;
     Ok(())
 }
 

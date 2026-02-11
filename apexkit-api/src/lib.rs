@@ -48,6 +48,7 @@ use std::convert::Infallible;
 use apexkit_core::jobs::JobContext;
 use serde_json::{json, Value};
 use apexkit_core::models::DashboardData;
+use apexkit_core::query_engine::{ApexQuery, SelectField};
 
 // --- Module Registrations ---
 pub mod websocket;
@@ -566,7 +567,7 @@ impl ScopedScriptContext {
             .unwrap_or(300) // Default 5 minutes
     }
 }
-
+use crate::storage::ScopedDynamicStorage;
 // Implement the trait for AppState
 impl apexkit_core::ScriptContext for ScopedScriptContext {
     fn get_db(&self) -> Arc<dyn Db> {
@@ -587,6 +588,39 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
 
     fn get_realtime_tx(&self) -> tokio::sync::broadcast::Sender<apexkit_core::realtime::DbEvent> {
         self.state.tx.clone()
+    }
+
+    fn get_storage(&self) -> Arc<dyn StorageBackend> {
+        Arc::new(ScopedDynamicStorage::new(self.state.clone(), self.scope.clone()))
+    }
+
+    fn get_scope(&self) -> EventScope {
+        self.scope.clone()
+    }
+
+    fn get_shared_script(&self, name: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<apexkit_core::script_models::Script>> + Send>> {
+        let db = self.state.db.clone(); // Root DB
+        let n = name.to_string();
+        Box::pin(async move {
+            db.get_script_by_name(&n).await.ok().flatten()
+        })
+    }
+
+    fn execute_shared_script(&self, code: String, payload: serde_json::Value, scope: EventScope) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>> {
+        let engine = self.state.script_engine.clone();
+        let state = self.state.clone();
+        
+        // Create a NEW context for the child execution
+        let new_ctx = Arc::new(ScopedScriptContext {
+            state: state.clone(),
+            scope: scope.clone(),
+        });
+        
+        Box::pin(async move {
+            // Base URL is None for internal calls? Or pass existing?
+            // We pass None for now.
+            engine.run_script(&code, payload, new_ctx, None, scope).await
+        })
     }
 
     // Dynamic Resolution for Tenant Switching
@@ -1542,22 +1576,18 @@ pub async fn delete_record(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// --- DTO ---
+// DTO for Advanced Query
+// This now matches the full power of the new Query Engine
 #[derive(Deserialize, ToSchema)]
 pub struct AdvancedQueryRequest {
-    /// MongoDB-style filter object (e.g. {"status": "active", "age": {"$gt": 18}})
-    #[schema(value_type = Object)]
-    pub filter: serde_json::Value,
-    
-    /// Sort string (e.g. "-created")
+    pub from: Option<String>, // Optional if ID in path is used
+    pub select: Option<Vec<serde_json::Value>>, // Complex SelectField JSON
+    pub filter: Option<serde_json::Value>,
+    pub group_by: Option<Vec<String>>,
     pub sort: Option<String>,
-    
     pub limit: Option<u64>,
     pub offset: Option<u64>,
-    
-    /// Comma-separated relations to expand
-    pub expand: Option<String>,
-    pub fields: Option<String>,
+    pub pipeline: Option<Vec<serde_json::Value>>, // Pipeline Steps
 }
 
 // --- HANDLER ---
@@ -1567,17 +1597,18 @@ pub struct AdvancedQueryRequest {
     path = "/api/v1/collections/{id}/query",
     request_body = AdvancedQueryRequest,
     params(IdPath),
-    responses((status = 200, body = RecordListResponse))
+    // [UPDATED] Response is generic JSON Array because structure depends on SELECT
+    responses((status = 200, body = Vec<serde_json::Value>))
 )]
 pub async fn query_records_handler(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection, 
-    State(state): State<AppState>,
-    BaseUrl(base_url): BaseUrl,
+    State(_state): State<AppState>, // Hooks not yet supported for raw engine in this iteration
+    BaseUrl(_base_url): BaseUrl,
     scope: Option<Extension<EventScope>>,
     Path(path): Path<IdPath>, 
     Json(payload): Json<AdvancedQueryRequest>
-) -> Result<Json<RecordListResponse>, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let claims = auth.map(|Extension(c)| c);
     
     // 1. Resolve Collection
@@ -1589,64 +1620,24 @@ pub async fn query_records_handler(
         return Err(AppError::Forbidden("Read denied".into())); 
     }
 
-    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
-
-    // 3. Map Request to QueryOptions
-    // Note: We stringify the filter because QueryOptions expects a JSON string
-    // logic inside apexkit-core will parse this string into a FilterNode and generate SQL.
-    let mut options = QueryOptions {
-        filter: Some(payload.filter.to_string()), 
+    // 3. Construct ApexQuery
+    let query = ApexQuery {
+        from: col.name.clone(), // Force 'from' to match URL path ID
+        select: payload.select.map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default()).unwrap_or_default(),
+        r#where: payload.filter,
+        group_by: payload.group_by.unwrap_or_default(),
         sort: payload.sort,
         limit: payload.limit,
         offset: payload.offset,
-        expand: payload.expand,
-        fields: payload.fields,
-        per_page: None, // We use explicit limit/offset for POST queries
-        page: None,
+        pipeline: payload.pipeline.map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default()).unwrap_or_default(),
     };
 
-    // 4. [TRIGGER] Before List (Allow scripts to modify the query options)
-    let query_json = json!(options);
-    let modified_query_json = trigger_filter_hook(
-        &state, 
-        "before_list_records", 
-        query_json, 
-        claims.as_ref(), 
-        Some(&event_scope.clone()), 
-        Some(base_url.clone())
-    ).await?;
-    
-    options = serde_json::from_value(modified_query_json).unwrap_or(options);
-
-    // 5. Execute DB Query
-    // This calls db.list_records -> SqlBuilder -> FilterNode::parse -> FilterNode::to_sql
-    let res = db.list_records(col.id, options.clone()).await
+    // 4. Execute Engine
+    // Note: Hooks are skipped for raw engine queries currently to avoid type mismatch complexity
+    let result = db.query_engine(query).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    let mut response_data = RecordListResponse { 
-        items: res.items.into_iter().map(|r| RecordResponse {
-            id: r.id, 
-            data: r.data, 
-            expand: r.expand, 
-            created: r.created, 
-            updated: r.updated
-        }).collect(), 
-        total: res.total 
-    };
 
-    // 6. [TRIGGER] After List (Allow scripts to filter results)
-    let filtered_json = trigger_filter_hook(
-        &state, 
-        "after_list_records", 
-        json!(response_data), 
-        claims.as_ref(), 
-        Some(&event_scope.clone()), 
-        Some(base_url.clone())
-    ).await?;
-    
-    response_data = serde_json::from_value(filtered_json).unwrap_or(response_data);
-
-    Ok(Json(response_data))
+    Ok(Json(result))
 }
 
 #[utoipa::path(get, path = "/api/v1/collections/{id}/search", params(IdPath, SearchQuery), responses((status = 200, body = Vec<RecordResponse>)))]
@@ -2571,6 +2562,7 @@ pub fn app_router(state: AppState) -> Router {
         list_collections, create_collection, get_collection, update_collection, delete_collection, 
         list_records, create_record, get_record, update_record, delete_record,
         search_records, instant_search_handler,
+        query_records_handler, 
         storage::upload_file, storage::serve_file, storage::list_files, storage::delete_file,
         create_relation, delete_relation,
         config_routes::set_config, 
@@ -2598,6 +2590,7 @@ pub fn app_router(state: AppState) -> Router {
     components(schemas(
         CollectionResponse, AuthRequest, AuthResponse, RecordResponse, ProblemDetail, UserDto,
         CreateCollectionReq, UpdateCollection, RelationRequest, SearchQuery, RecordListResponse,
+        AdvancedQueryRequest,
         config_routes::SetConfigRequest, 
         storage::FileResponse, storage::FileUploadRequest, storage::FileListResponse, storage::FileListQuery,
         settings::AppSettingsDto, settings::SmtpConfigDto, settings::StorageConfigDto, settings::S3ConfigDto, settings::SecurityConfigDto, settings::AiConfigDto,

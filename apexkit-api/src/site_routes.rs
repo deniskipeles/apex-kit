@@ -15,6 +15,16 @@ use axum::http::StatusCode;
 use axum::extract::Query;
 use crate::AppState;
 use crate::State;
+use tracing::{ warn, error};
+use serde_json::Value;
+use apexkit_core::models::{CreateTemplateReq};
+use apexkit_core::script_models::CreateScriptReq;
+use apexkit_core::ai_models::CreateActionReq;
+use crate::DatabaseConnection;
+use serde_json::json;
+use crate::Arc;
+use crate::Db;
+use std::path::Path;
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct SiteFile {
@@ -42,11 +52,12 @@ pub fn get_public_dir(scope: &EventScope) -> PathBuf {
     post,
     path = "/api/v1/admin/site/deploy",
     request_body(content = Vec<u8>, content_type = "multipart/form-data"),
-    responses((status = 200, description = "Site deployed"))
+    responses((status = 200, description = "Full App Bundle deployed"))
 )]
 pub async fn deploy_site_handler(
     Extension(claims): Extension<Claims>,
-    State(state): State<AppState>, // [CRITICAL] Access Root DB via State
+    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection, // The scoped DB
     scope: Option<Extension<EventScope>>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -54,67 +65,142 @@ pub async fn deploy_site_handler(
 
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     let public_dir = get_public_dir(&event_scope);
-
-    // 1. Check Max Size Config (FROM ROOT DB)
-    // We explicitly use state.db here, not a context-aware db connection
-    let general_settings = state.db.get_config("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
-    let max_mb = general_settings
-        .and_then(|v| v.get("max_site_size_mb").and_then(|n| n.as_u64()))
-        .unwrap_or(50); // Default 50MB if root hasn't set it
-
+    // 1. Resolve Limits from Root
+    let general_settings = state.db.get_config("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let max_mb = general_settings.and_then(|v| v.get("max_site_size_mb").and_then(|n| n.as_u64())).unwrap_or(50);
     let max_bytes = max_mb * 1024 * 1024;
 
-    // 2. Process Upload
     while let Some(field) = multipart.next_field().await.map_err(|_| AppError::UnknownError("Multipart error".into()))? {
         if field.name() == Some("file") {
             let data = field.bytes().await.map_err(|_| AppError::UnknownError("Read failed".into()))?;
-            
-            // Enforce Root Limit
-            if (data.len() as u64) > max_bytes {
-                return Err(AppError::Validation(vec![
-                    apexkit_core::validation::ValidationError::ConstraintViolation(
-                        "file".into(), 
-                        format!("Upload size ({} MB) exceeds the Root limit of {} MB.", (data.len() / 1024 / 1024), max_mb)
-                    )
-                ]));
-            }
+            if (data.len() as u64) > max_bytes { return Err(AppError::UnknownError("Limit exceeded".into())); }
 
-            // 3. Clear Existing Public Dir (Scoped)
-            if public_dir.exists() {
-                fs::remove_dir_all(&public_dir).map_err(|e| AppError::UnknownError(format!("Cleanup failed: {}", e)))?;
-            }
-            fs::create_dir_all(&public_dir).map_err(|e| AppError::UnknownError(format!("Create dir failed: {}", e)))?;
+            // 2. Create Staging Area
+            let staging_id = uuid::Uuid::new_v4();
+            let staging_dir = PathBuf::from(format!("storage/tmp/deploy_{}", staging_id));
+            fs::create_dir_all(&staging_dir).map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-            // 4. Extract ZIP
+            // 3. Extract Entire ZIP to Staging
             let cursor = Cursor::new(data);
             let mut archive = zip::ZipArchive::new(cursor).map_err(|e| AppError::UnknownError(format!("Invalid ZIP: {}", e)))?;
+            archive.extract(&staging_dir).map_err(|e| AppError::UnknownError(format!("Extraction failed: {}", e)))?;
 
-            for i in 0..archive.len() {
-                let mut file = archive.by_index(i).unwrap();
-                
-                let outpath = match file.enclosed_name() {
-                    Some(path) => public_dir.join(path),
-                    None => continue,
-                };
-
-                if file.name().ends_with('/') {
-                    fs::create_dir_all(&outpath).ok();
-                } else {
-                    if let Some(p) = outpath.parent() {
-                        if !p.exists() { fs::create_dir_all(p).ok(); }
-                    }
-                    let mut outfile = fs::File::create(&outpath).map_err(|e| AppError::UnknownError(e.to_string()))?;
-                    std::io::copy(&mut file, &mut outfile).map_err(|e| AppError::UnknownError(e.to_string()))?;
+            // 4. SMART DISCOVERY
+            let mut web_root = staging_dir.clone();
+            
+            // A. Check for index.html at root vs dist
+            if !staging_dir.join("index.html").exists() {
+                if staging_dir.join("dist").join("index.html").exists() {
+                    info!("[Deploy] index.html found in /dist, using as web root.");
+                    web_root = staging_dir.join("dist");
+                } else if staging_dir.join("public").join("index.html").exists() {
+                    info!("[Deploy] index.html found in /public, using as web root.");
+                    web_root = staging_dir.join("public");
                 }
             }
 
-            info!("Site deployed to {:?} (Size Limit: {} MB)", public_dir, max_mb);
-            return Ok(Json(serde_json::json!({ "success": true, "message": "Site deployed successfully" })));
+            // B. Database Metadata Discovery (Apex Bundle)
+            // Look for apex_*.json files in the original staging root
+            let metadata_files = [
+                ("apex_schema.json", "schema"),
+                ("apex_scripts.json", "scripts"),
+                ("apex_templates.json", "templates"),
+                ("apex_ai_actions.json", "ai_actions"),
+            ];
+
+            let mut db_updates = Vec::new();
+            for (fname, label) in metadata_files {
+                let p = staging_dir.join(fname);
+                if p.exists() {
+                    if let Ok(content) = fs::read(&p) {
+                        info!("[Deploy] Found metadata: {}. Deploying to DB...", fname);
+                        if let Err(e) = deploy_metadata_item(&db, label, &content).await {
+                            error!("[Deploy] Failed to deploy {}: {}", fname, e);
+                            db_updates.push(format!("Error {}: {}", fname, e));
+                        } else {
+                            db_updates.push(format!("Success: {}", fname));
+                        }
+                    }
+                }
+            }
+
+            // 5. Finalize Static Site Move
+            if public_dir.exists() { fs::remove_dir_all(&public_dir).ok(); }
+            fs::create_dir_all(&public_dir).ok();
+            
+            // Copy files from detected web_root to the public_dir
+            copy_dir_recursive(&web_root, &public_dir).map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+            // 6. Cleanup Staging
+            let _ = fs::remove_dir_all(&staging_dir);
+
+            info!("Full Bundle deployed to {:?}", public_dir);
+            return Ok(Json(json!({
+                "success": true,
+                "web_root_detected": web_root.strip_prefix(&staging_dir).unwrap_or(Path::new(".")),
+                "database_updates": db_updates
+            })));
         }
     }
 
-    Err(AppError::UnknownError("No file provided".into()))
+    Err(AppError::UnknownError("No file".into()))
+}
+
+/// Helper to handle different metadata types
+async fn deploy_metadata_item(db: &Arc<dyn Db>, label: &str, content: &[u8]) -> Result<(), String> {
+    match label {
+        "schema" => {
+            // Reuses logic from Import Schema (Strategy: Overwrite)
+            let req: crate::import_data_routes::ImportSchemaRequest = serde_json::from_slice(content).map_err(|e| e.to_string())?;
+            for col in req.collections {
+                let existing = db.list_collections().await.unwrap_or_default().into_iter().find(|c| c.name == col.name);
+                if let Some(e) = existing {
+                    db.update_collection(e.id, None, col.schema).await.map_err(|e| e.to_string())?;
+                } else {
+                    db.create_collection(&col.name, &col.schema, col.index).await.map_err(|e| e.to_string())?;
+                }
+            }
+        },
+        "scripts" => {
+            let items: Vec<apexkit_core::script_models::Script> = serde_json::from_slice(content).map_err(|e| e.to_string())?;
+            for s in items {
+                db.create_script(CreateScriptReq {
+                    name: s.name, trigger_type: s.trigger_type, target_collection: s.target_collection, code: s.code, visibility: s.visibility
+                }).await.map_err(|e| e.to_string())?;
+            }
+        },
+        "templates" => {
+            let items: Vec<apexkit_core::models::Template> = serde_json::from_slice(content).map_err(|e| e.to_string())?;
+            for t in items {
+                db.create_template(CreateTemplateReq { slug: t.slug, content: t.content, script_id: t.script_id }).await.map_err(|e| e.to_string())?;
+            }
+        },
+        "ai_actions" => {
+            let items: Vec<apexkit_core::ai_models::AiAction> = serde_json::from_slice(content).map_err(|e| e.to_string())?;
+            for a in items {
+                db.create_ai_action(CreateActionReq { 
+                    name: a.name, slug: a.slug, model: a.model, system_prompt: a.system_prompt, template: a.template 
+                }).await.map_err(|e| e.to_string())?;
+            }
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 #[utoipa::path(

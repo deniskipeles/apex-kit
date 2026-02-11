@@ -11,6 +11,9 @@ pub struct Script {
     pub target_collection: Option<String>, 
     pub code: String,
     pub active: bool,
+    //  'private' (default) or 'public' (shared with tenants)
+    #[serde(default)] 
+    pub visibility: String,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -19,4 +22,8 @@ pub struct CreateScriptReq {
     pub trigger_type: String,
     pub target_collection: Option<String>, // Added
     pub code: String,
+    #[serde(default = "default_visibility")]
+    pub visibility: String,
 }
+
+fn default_visibility() -> String { "private".to_string() }

@@ -7,7 +7,7 @@ use regex::Regex;
 use std::path::Path;
 use std::process::Command;
 use std::cell::RefCell;
-use crate::query_engine::{QueryEngine, ApexQuery};
+use crate::query_engine::ApexQuery;
 
 use boa_engine::{
     Context, JsValue, JsResult, NativeFunction, JsError, JsString, JsArgs,
@@ -15,6 +15,10 @@ use boa_engine::{
     property::Attribute,
     builtins::promise::PromiseState
 };
+use std::io::{Cursor, Read, Write};
+use zip::{ZipArchive, ZipWriter};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use zip::write::FileOptions;
 
 // --- PRELUDE ---
 const JS_PRELUDE: &str = r#"
@@ -95,7 +99,7 @@ const JS_PRELUDE: &str = r#"
             };
         }
         
-        // [NEW] Analytical Query
+        // Analytical Query
         async query(queryObject) {
             // Inject contextId if not present? Or handle in $db.query wrapper?
             // Since ApexQuery struct doesn't have context field, we rely on $db.query handling it.
@@ -284,7 +288,7 @@ impl ScriptEngine {
         
         let handle = tokio::runtime::Handle::current();
 
-        // [NEW] Get TX from context
+        // Get TX from context
         let tx = Some(context.get_realtime_tx());
 
         let result = tokio::task::spawn_blocking(move || -> Result<R, String> {
@@ -311,8 +315,11 @@ impl ScriptEngine {
         register_http(ctx)?;
         register_fetch(ctx)?;
         register_fs(ctx)?;
+        register_zip(ctx)?;
         register_archive(ctx)?;
         register_db(ctx)?;
+        register_cmd(ctx)?;
+        register_run(ctx)?;
         register_root(ctx)?;
         register_env(ctx)?;
         register_ai(ctx)?;
@@ -365,15 +372,32 @@ async fn resolve_collection_local(db: Arc<dyn Db>, identifier: &str) -> Result<i
 }
 
 async fn resolve_db(ctx_str: Option<String>, app_ctx: Arc<dyn ScriptContext>) -> Result<Arc<dyn Db>, String> {
-    match ctx_str.as_deref() {
-        Some(s) if s.starts_with("tenant:") => {
+    // 1. Explicit Context Passed in JS (e.g. $db.find("tenant:abc", ...))
+    if let Some(s) = ctx_str {
+        if s.starts_with("tenant:") {
             let tid = s.strip_prefix("tenant:").unwrap();
-            app_ctx.resolve_tenant_db(tid).await.ok_or(format!("Tenant {} not found", tid))
-        },
-        Some(s) if s.starts_with("sandbox:") => {
+            return app_ctx.resolve_tenant_db(tid).await.ok_or(format!("Tenant {} not found", tid));
+        }
+        if s.starts_with("sandbox:") {
             let sid = s.strip_prefix("sandbox:").unwrap();
-            app_ctx.resolve_sandbox_db(sid).await.ok_or(format!("Sandbox {} not found", sid))
+            return app_ctx.resolve_sandbox_db(sid).await.ok_or(format!("Sandbox {} not found", sid));
+        }
+        // If string but not special prefix, ignore? Or treat as ID? 
+        // For now, assume explicit override matches prefix logic.
+    }
+
+    // 2. Implicit Context based on Execution Scope
+    let scope = app_ctx.get_scope();
+    
+    match scope {
+        EventScope::Tenant(id) => {
+            // We are running inside a Tenant context (e.g. webhook triggered by tenant action)
+            app_ctx.resolve_tenant_db(&id).await.ok_or(format!("Current Tenant {} context not found", id))
         },
+        EventScope::Sandbox(id) => {
+            app_ctx.resolve_sandbox_db(&id).await.ok_or(format!("Current Sandbox {} context not found", id))
+        },
+        // Root scope or Channel scope falls back to default get_db() (Root DB)
         _ => Ok(app_ctx.get_db())
     }
 }
@@ -659,7 +683,10 @@ fn register_db(ctx: &mut Context) -> Result<(), String> {
                 handle.block_on(async {
                     let db = resolve_db(ctx_id, app.clone()).await?;
                     let query: ApexQuery = serde_json::from_value(q_val).map_err(|e| e.to_string())?;
-                    QueryEngine::execute(db, query).await.map_err(|e| e.to_string())
+                    
+                    // CALL THE NEW TRAIT METHOD
+                    // map_err needs explicit type for the closure parameter 'e' to fix E0282
+                    db.query_engine(query).await.map_err(|e: Box<dyn std::error::Error + Send + Sync>| e.to_string())
                 })
             } else { Err("Context lost".into()) }
         });
@@ -753,122 +780,103 @@ fn register_db(ctx: &mut Context) -> Result<(), String> {
     ctx.register_global_property(JsString::from("$db"), db_obj, Attribute::all()).map_err(|e| e.to_string())
 }
 
-fn register_http(ctx: &mut Context) -> Result<(), String> {
-    let fetch = |method: reqwest::Method, url: String, body: Option<serde_json::Value>| {
-        let client = reqwest::blocking::Client::new();
-        let mut req = client.request(method, url);
-        if let Some(b) = body { req = req.json(&b); }
-        match req.send() {
-            Ok(res) => Ok(JsValue::from(JsString::from(res.text().unwrap_or_default()))),
-            Err(e) => Err(JsError::from_opaque(JsString::from(e.to_string()).into()))
+// Shared HTTP Request Logic
+fn execute_http_request(
+    url: String,
+    method: String,
+    headers_val: Option<serde_json::Map<String, serde_json::Value>>,
+    body_val: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    
+    // Access the async runtime from thread-local storage
+    ACTIVE_CONTEXT.with(|c| {
+        if let Some((_, handle, _, _, _)) = &*c.borrow() {
+            handle.block_on(async {
+                // 1. Build Client
+                let client = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::default())
+                    .build()
+                    .map_err(|e| format!("Client Build Error: {}", e))?;
+
+                let req_method = reqwest::Method::from_bytes(method.as_bytes())
+                    .unwrap_or(reqwest::Method::GET);
+
+                let mut req_builder = client.request(req_method, &url);
+
+                // 2. Add Headers
+                if let Some(h_map) = headers_val {
+                    for (k, v) in h_map {
+                        if let Some(val_str) = v.as_str() {
+                            req_builder = req_builder.header(&k, val_str);
+                        }
+                    }
+                }
+
+                // 3. Add Body
+                if let Some(b) = body_val {
+                    // If it's a string, send raw. If object, send JSON.
+                    if let Some(s) = b.as_str() {
+                        req_builder = req_builder.body(s.to_string());
+                    } else {
+                        req_builder = req_builder.json(&b);
+                    }
+                }
+
+                // 4. Execute
+                match req_builder.send().await {
+                    Ok(res) => {
+                        let status = res.status().as_u16();
+                        let status_text = res.status().canonical_reason().unwrap_or("").to_string();
+                        let final_url = res.url().to_string();
+                        
+                        let mut res_headers = serde_json::Map::new();
+                        for (name, value) in res.headers() {
+                            res_headers.insert(
+                                name.as_str().to_string(), 
+                                json!(value.to_str().unwrap_or(""))
+                            );
+                        }
+
+                        let body_text = res.text().await.unwrap_or_default();
+
+                        // Return standardized response object
+                        Ok(json!({
+                            "ok": status >= 200 && status < 300,
+                            "status": status,
+                            "statusText": status_text,
+                            "url": final_url,
+                            "headers": res_headers,
+                            "body": body_text 
+                        }))
+                    },
+                    Err(e) => Err(format!("Network Error: {}", e))
+                }
+            })
+        } else {
+            Err("Script Context Execution Error".into())
         }
-    };
-
-    let get = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        fetch(reqwest::Method::GET, args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped(), None)
-    });
-    let post = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let body = args.get_or_undefined(1).to_json(ctx).unwrap_or(None);
-        fetch(reqwest::Method::POST, args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped(), body)
-    });
-
-    let obj = ObjectInitializer::new(ctx)
-        .function(get, JsString::from("get"), 1)
-        .function(post, JsString::from("post"), 2)
-        .build();
-    ctx.register_global_property(JsString::from("$http"), obj, Attribute::all()).map_err(|e| e.to_string())
+    })
 }
 
 fn register_fetch(ctx: &mut Context) -> Result<(), String> {
     let fetch_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        // 1. Extract Arguments
         let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let opts_val = args.get_or_undefined(1);
+        let opts = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(json!({}));
 
-        // [FIX] Correctly unwrap: Result<Option<Value>> -> Option<Value> -> Value
-        let opts: serde_json::Value = opts_val
-            .to_json(ctx)
-            .unwrap_or(Some(json!({}))) // Handle JsError -> Default Option
-            .unwrap_or(json!({}));      // Handle None -> Default Value
+        let method = opts.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
+        
+        let headers = opts.get("headers")
+            .and_then(|h| h.as_object())
+            .cloned();
 
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((_, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    // [FIX] Configure Redirect Policy with explicit type check
-                    let redirect_policy = if let Some("manual") = opts.get("redirect").and_then(|s| s.as_str()) {
-                        reqwest::redirect::Policy::none()
-                    } else {
-                        reqwest::redirect::Policy::default()
-                    };
+        let body = opts.get("body").cloned();
 
-                    let client = reqwest::Client::builder()
-                        .redirect(redirect_policy)
-                        .build()
-                        .map_err(|e| format!("Client Build Error: {}", e))?;
-                    
-                    // [FIX] Explicit type annotation for closure argument
-                    let method_str = opts.get("method").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("GET");
-                    let method = reqwest::Method::from_bytes(method_str.as_bytes()).unwrap_or(reqwest::Method::GET);
-
-                    let mut req_builder = client.request(method, &url);
-
-                    // Headers [FIX] Type annotation
-                    if let Some(headers) = opts.get("headers").and_then(|h: &serde_json::Value| h.as_object()) {
-                        for (k, v) in headers {
-                            if let Some(val_str) = v.as_str() {
-                                req_builder = req_builder.header(k, val_str);
-                            }
-                        }
-                    }
-
-                    // Body [FIX] Type annotation
-                    if let Some(body) = opts.get("body") {
-                        if let Some(body_str) = body.as_str() {
-                            req_builder = req_builder.body(body_str.to_string());
-                        } else {
-                            req_builder = req_builder.body(body.to_string());
-                        }
-                    }
-
-                    match req_builder.send().await {
-                        Ok(res) => {
-                            let status = res.status().as_u16();
-                            let status_text = res.status().canonical_reason().unwrap_or("").to_string();
-                            let url_final = res.url().to_string();
-                            
-                            let mut res_headers = serde_json::Map::new();
-                            for (name, value) in res.headers() {
-                                res_headers.insert(
-                                    name.as_str().to_string(), 
-                                    json!(value.to_str().unwrap_or(""))
-                                );
-                            }
-
-                            // Capture Body
-                            let body_text = res.text().await.unwrap_or_default();
-
-                            Ok(json!({
-                                "ok": status >= 200 && status < 300,
-                                "status": status,
-                                "statusText": status_text,
-                                "url": url_final,
-                                "headers": res_headers,
-                                "body": body_text
-                            }))
-                        },
-                        Err(e) => Err(format!("Fetch Error: {}", e))
-                    }
-                })
-            } else {
-                Err("Context lost".into())
-            }
-        });
+        // CALL SHARED HELPER
+        let result = execute_http_request(url, method, headers, body);
 
         return_json_promise(ctx, result)
     });
 
-    // [FIX] Wrap NativeFunction in a JsObject (FunctionObject)
-    // This satisfies the Into<JsValue> trait bound
     let fetch_obj = boa_engine::object::FunctionObjectBuilder::new(ctx.realm(), fetch_fn)
         .name("$__native_fetch")
         .length(2)
@@ -879,6 +887,297 @@ fn register_fetch(ctx: &mut Context) -> Result<(), String> {
         fetch_obj, 
         Attribute::all()
     ).map_err(|e| e.to_string())
+}
+
+fn register_http(ctx: &mut Context) -> Result<(), String> {
+    
+    // $http.get(url)
+    let get = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        
+        // CALL SHARED HELPER
+        let result = execute_http_request(url, "GET".to_string(), None, None);
+
+        // Map result: Extract "body" string or return error
+        let mapped_result = result.map(|json_val| {
+            // Legacy $http.get returns the raw body string
+            json_val.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string()
+        });
+
+        // Convert to JsString for Boa
+        match mapped_result {
+            Ok(s) => return_json_promise(ctx, Ok(serde_json::Value::String(s))),
+            Err(e) => return_json_promise(ctx, Err(e))
+        }
+    });
+
+    // $http.post(url, body)
+    let post = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let body_arg = args.get_or_undefined(1).to_json(ctx).unwrap();
+
+        // CALL SHARED HELPER
+        let result = execute_http_request(url, "POST".to_string(), None, body_arg);
+
+        let mapped_result = result.map(|json_val| {
+            json_val.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string()
+        });
+
+        match mapped_result {
+            Ok(s) => return_json_promise(ctx, Ok(serde_json::Value::String(s))),
+            Err(e) => return_json_promise(ctx, Err(e))
+        }
+    });
+
+    let obj = ObjectInitializer::new(ctx)
+        .function(get, JsString::from("get"), 1)
+        .function(post, JsString::from("post"), 2)
+        .build();
+        
+    ctx.register_global_property(JsString::from("$http"), obj, Attribute::all()).map_err(|e| e.to_string())
+}
+
+fn register_zip(ctx: &mut Context) -> Result<(), String> {
+    
+    fn resolve_storage_path(scope: &EventScope) -> String {
+        match scope {
+            EventScope::Root => "storage/system/uploads".to_string(),
+            EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
+            EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
+            _ => "storage/tmp".to_string(),
+        }
+    }
+
+    let get_limit = || -> usize {
+        std::env::var("ARCHIVE_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10) * 1024 * 1024 
+    };
+
+    // 1. CREATE
+    let create_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let files_val = args.get_or_undefined(0).to_json(ctx).unwrap().unwrap_or(json!({}));
+        let limit = get_limit();
+
+        let result = (|| -> Result<String, String> {
+            let files = files_val.as_object().ok_or("Input must be an object {filename: content}")?;
+            let mut buffer = Cursor::new(Vec::new());
+            
+            // Scope for ZipWriter to enforce borrow drop
+            {
+                let mut zip = ZipWriter::new(&mut buffer);
+                let options = FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .unix_permissions(0o755);
+
+                let mut estimated_size = 0;
+
+                for (name, content_val) in files {
+                    let content_str = content_val.as_str().unwrap_or("");
+                    let data = if content_str.len() % 4 == 0 && !content_str.contains(char::is_whitespace) {
+                         BASE64.decode(content_str).unwrap_or_else(|_| content_str.as_bytes().to_vec())
+                    } else {
+                         content_str.as_bytes().to_vec()
+                    };
+
+                    // Check uncompressed size accumulation to prevent DoS before compression
+                    estimated_size += data.len();
+                    if estimated_size > limit * 2 { // Allow some slack for compression overhead? No, slack for uncompressed input vs output limit.
+                        // Actually, if we want to limit the OUTPUT zip size, we can't easily check it inside the loop efficiently without flushing.
+                        // Limiting input size is a good proxy.
+                        return Err(format!("Input data size exceeds safety limit of {} bytes", limit));
+                    }
+
+                    zip.start_file(name, options).map_err(|e| e.to_string())?;
+                    zip.write_all(&data).map_err(|e| e.to_string())?;
+                }
+                zip.finish().map_err(|e| e.to_string())?;
+            } // ZipWriter dropped here, releasing borrow on buffer
+
+            let zip_bytes = buffer.into_inner();
+            
+            // Final check on actual archive size
+            if zip_bytes.len() > limit {
+                return Err(format!("Final archive size {} exceeds limit {}", zip_bytes.len(), limit));
+            }
+            
+            Ok(BASE64.encode(zip_bytes))
+        })();
+
+        return_json_promise(ctx, result.map(|s| serde_json::Value::String(s)))
+    });
+
+    // 2. EXTRACT
+    let extract_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let b64_str = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let limit = get_limit();
+
+        let result = (|| -> Result<serde_json::Value, String> {
+            let bytes = BASE64.decode(&b64_str).map_err(|_| "Invalid Base64".to_string())?;
+            if bytes.len() > limit { return Err("Archive exceeds limit".into()); }
+
+            let cursor = Cursor::new(bytes);
+            let mut archive = ZipArchive::new(cursor).map_err(|e| format!("Invalid Zip: {}", e))?;
+            
+            let mut output = serde_json::Map::new();
+            let mut total_extracted = 0;
+
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+                if file.is_dir() { continue; }
+                
+                let name = file.name().to_string();
+                let mut content_buf = Vec::new();
+                
+                if file.size() > (limit as u64) { return Err(format!("File {} too large", name)); }
+                
+                file.read_to_end(&mut content_buf).map_err(|_| "Read fail".to_string())?;
+                total_extracted += content_buf.len();
+                
+                if total_extracted > limit { return Err("Total extracted size exceeds limit".into()); }
+
+                let val = match String::from_utf8(content_buf.clone()) {
+                    Ok(s) => json!(s),
+                    Err(_) => json!(BASE64.encode(&content_buf))
+                };
+                output.insert(name, val);
+            }
+            Ok(serde_json::Value::Object(output))
+        })();
+        return_json_promise(ctx, result)
+    });
+
+    // 3. INSPECT (Metadata)
+    let inspect_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let b64_str = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        
+        let result = (|| -> Result<serde_json::Value, String> {
+            let bytes = BASE64.decode(&b64_str).map_err(|_| "Invalid Base64".to_string())?;
+            let cursor = Cursor::new(bytes.clone());
+            let mut archive = ZipArchive::new(cursor).map_err(|e| format!("Invalid Zip: {}", e))?;
+
+            let mut files_meta = Vec::new();
+            let mut total_uncompressed: u64 = 0;
+            let mut total_compressed: u64 = 0;
+
+            for i in 0..archive.len() {
+                let file = archive.by_index(i).map_err(|e| e.to_string())?;
+                
+                let size = file.size();
+                let comp_size = file.compressed_size();
+                total_uncompressed += size;
+                total_compressed += comp_size;
+
+                // FIX: DateTime is a struct, not Option
+                let dt = file.last_modified();
+                let modified_str = format!("{}-{:02}-{:02} {:02}:{:02}:{:02}", 
+                    dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
+
+                files_meta.push(json!({
+                    "name": file.name(),
+                    "size": size,
+                    "compressed_size": comp_size,
+                    "is_dir": file.is_dir(),
+                    "comment": file.comment(),
+                    "modified": modified_str,
+                    "compression_method": format!("{:?}", file.compression())
+                }));
+            }
+
+            Ok(json!({
+                "total_size": bytes.len(),
+                "total_uncompressed": total_uncompressed,
+                "total_compressed_content": total_compressed,
+                "file_count": archive.len(),
+                "comment": String::from_utf8_lossy(archive.comment()).to_string(),
+                "files": files_meta
+            }))
+        })();
+
+        return_json_promise(ctx, result)
+    });
+
+    // 4. READ FILE (Scope Aware -> Base64)
+    let read_file_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                handle.block_on(async {
+                    // Use get_storage() from context (ScopedDynamicStorage)
+                    let storage = app.get_storage();
+                    
+                    match storage.get(&filename).await {
+                        Ok(bytes) => Ok(json!(BASE64.encode(bytes))),
+                        Err(e) => Err(format!("Read failed: {}", e))
+                    }
+                })
+            } else {
+                Err("Context lost".into())
+            }
+        });
+        return_json_promise(ctx, result)
+    });
+
+    // 5. SAVE FILE (Base64 -> Scope Aware Storage)
+    let save_file_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let b64_data = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+        let mime_type = args.get(2).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or("application/zip".to_string());
+
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                handle.block_on(async {
+                    // 1. Resolve DB (Tenant/Sandbox aware)
+                    let db = resolve_db(None, app.clone()).await?;
+                    
+                    // 2. Resolve Storage (Tenant/Sandbox aware via ScopedDynamicStorage)
+                    let storage = app.get_storage();
+                    
+                    let bytes = BASE64.decode(&b64_data).map_err(|_| "Invalid Base64".to_string())?;
+                    let size = bytes.len() as i64;
+                    
+                    // 3. Generate unique storage filename
+                    let path = std::path::Path::new(&filename);
+                    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
+                    let storage_filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
+                    
+                    // 4. Save to Storage (S3 or Local)
+                    storage.save(&storage_filename, &bytes, &mime_type).await.map_err(|e| e.to_string())?;
+                    
+                    // 5. Register in Metadata DB
+                    // Pass None for user_id as script context doesn't implicitly carry a user unless passed in args, 
+                    // or we could extract it from ACTIVE_CONTEXT if we stored auth claims there (we don't currently).
+                    let id = db.create_file_metadata(&storage_filename, &filename, &mime_type, size, None).await
+                        .map_err(|e| e.to_string())?;
+                        
+                    let public_url = format!("{}{}", storage.get_public_url_base(), storage_filename);
+
+                    Ok(json!({
+                        "id": id,
+                        "filename": storage_filename, 
+                        "original_name": filename,
+                        "url": public_url,
+                        "size": size
+                    }))
+                })
+            } else {
+                Err("Context lost".into())
+            }
+        });
+        return_json_promise(ctx, result)
+    });
+
+    let obj = ObjectInitializer::new(ctx)
+        .function(create_fn, JsString::from("create"), 1)
+        .function(extract_fn, JsString::from("extract"), 1)
+        .function(inspect_fn, JsString::from("inspect"), 1)
+        .function(read_file_fn, JsString::from("readFile"), 1)
+        .function(save_file_fn, JsString::from("saveFile"), 2)
+        .build();
+
+    ctx.register_global_property(JsString::from("$zip"), obj, Attribute::all()).map_err(|e| e.to_string())
 }
 
 fn register_archive(ctx: &mut Context) -> Result<(), String> {
@@ -936,6 +1235,173 @@ fn register_archive(ctx: &mut Context) -> Result<(), String> {
     ctx.register_global_property(JsString::from("$archive"), obj, Attribute::all()).map_err(|e| e.to_string())
 }
 
+fn register_run(ctx: &mut Context) -> Result<(), String> {
+    
+    // $run.script("script_name", { args })
+    let script_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let payload = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(json!({}));
+
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((app, handle, base_url, _, current_scope)) = &*c.borrow() {
+                handle.block_on(async {
+                    
+                    // 1. Try Local DB (Current Scope)
+                    let db = app.get_db();
+                    let mut script_opt = db.get_script_by_name(&name).await.ok().flatten();
+                    let mut exec_scope = current_scope.clone();
+
+                    // 2. If Not Found, Try Root DB (Shared Scripts)
+                    if script_opt.is_none() {
+                        // Access Root DB via app.state (This requires ScopedScriptContext to expose state directly or a helper)
+                        // ScopedScriptContext exposes `state: AppState` as public!
+                        // But here `app` is `Arc<dyn ScriptContext>`. The trait does NOT expose `state`.
+                        
+                        // We need a way to get the Root DB from the trait.
+                        // `app.resolve_tenant_db` etc exist. 
+                        // Let's assume we can get Root DB by resolving "root" or checking the implementation.
+                        
+                        // HACK/SOLUTION: We know the concrete type in `lib.rs` has `state`.
+                        // But we are in `core`. We can't cast to `ScopedScriptContext`.
+                        
+                        // FIX: We rely on `resolve_db(None)` to get current, but we need Root specifically.
+                        // We don't have a `get_root_db` in trait.
+                        
+                        // WORKAROUND: We iterate. Since we can't easily change trait signature everywhere again immediately,
+                        // we can try to resolve a known non-existent tenant/sandbox? No.
+                        
+                        // CORRECT FIX: The `app` passed here is the `ScriptContext`.
+                        // If we are in `apexkit-core`, we don't have access to `apexkit-api` AppState.
+                        // However, `app.resolve_tenant_db` works.
+                        
+                        // Let's add `get_root_script(name)` to the `ScriptContext` trait?
+                        // Or just rely on the fact that if we are Tenant, we can't see Root unless we expose it.
+                        
+                        // Let's assume for this specific feature we use a "magic" resolution or
+                        // we simply fail if not found locally, UNLESS we update the Trait to allow `get_shared_script`.
+                        
+                        // Let's update `ScriptContext` trait in `lib.rs` (core) to allow fetching shared scripts.
+                        
+                        // (See Step 5 below for trait update)
+                        if let Some(shared) = app.get_shared_script(&name).await {
+                             script_opt = Some(shared);
+                             // CRITICAL: Shared scripts run in ROOT scope to access system tools
+                             exec_scope = EventScope::Root; 
+                        }
+                    }
+
+                    if let Some(script) = script_opt {
+                        // Check Visibility if we switched scope to Root but caller was Tenant
+                        if exec_scope == EventScope::Root && current_scope != &EventScope::Root {
+                            if script.visibility != "public" {
+                                return Err(format!("Script '{}' is private/root-only.", name));
+                            }
+                        }
+                        
+                        if !script.active { return Err("Script inactive".into()); }
+
+                        // Inject Caller Info into the payload
+                        let mut call_payload = payload.clone();
+                        if let Some(obj) = call_payload.as_object_mut() {
+                             obj.insert("__caller_scope".to_string(), json!(current_scope));
+                        }
+                        
+                        // RECURSIVE EXECUTION
+                        // We need to call `ScriptEngine::run_script` again.
+                        // But `ScriptEngine` is in `AppState`, and we only have `ScriptContext` trait here.
+                        
+                        // We need `app.run_script(...)` in the trait to avoid circular deps or accessing engine directly.
+                        // Or we use the `app` (Context) to run it? No, context is data.
+                        
+                        // Solution: The `ScriptEngine` instance is actually what called us (via `register_run`).
+                        // We are inside `ScriptEngine::setup_boa`.
+                        // We can't call `self` recursively easily.
+                        
+                        // HOWEVER: We can spawn a new `ScriptEngine` instance? No, heavy.
+                        
+                        // We need `app.execute_script(script, payload, scope)`.
+                        let res = app.execute_shared_script(script.code, call_payload, exec_scope).await?;
+                        Ok(res)
+                        
+                    } else {
+                        Err(format!("Script '{}' not found", name))
+                    }
+                })
+            } else {
+                Err("Context lost".into())
+            }
+        });
+
+        return_json_promise(ctx, result)
+    });
+
+    let obj = ObjectInitializer::new(ctx)
+        .function(script_fn, JsString::from("script"), 2)
+        .build();
+
+    ctx.register_global_property(JsString::from("$run"), obj, Attribute::all()).map_err(|e| e.to_string())
+}
+
+// apexkit-core/src/scripting.rs
+
+fn register_cmd(ctx: &mut Context) -> Result<(), String> {
+    // $cmd.run(program, args_array)
+    let run_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let program = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let args_val = args.get_or_undefined(1);
+        
+        let mut cmd_args: Vec<String> = Vec::new();
+        
+        // Correctly handle Result<Option<Value>> from Boa's to_json
+        if let Ok(Some(json_val)) = args_val.to_json(ctx) {
+            if let Some(arr) = json_val.as_array() {
+                for v in arr {
+                    // Explicitly handle type conversion for the command arguments
+                    if let Some(s) = v.as_str() {
+                        cmd_args.push(s.to_string());
+                    } else if v.is_number() || v.is_boolean() {
+                        cmd_args.push(v.to_string());
+                    }
+                }
+            }
+        }
+
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
+                // SECURITY CHECK: Only allow execution in Root App context
+                if !matches!(scope, EventScope::Root) {
+                    return Err("Access Denied: $cmd is reserved for Root scripts.".into());
+                }
+
+                handle.block_on(async {
+                    tokio::task::spawn_blocking(move || {
+                        let output = Command::new(&program)
+                            .args(&cmd_args)
+                            .output()
+                            .map_err(|e| format!("Process Error: {}", e))?;
+
+                        Ok(json!({
+                            "stdout": String::from_utf8_lossy(&output.stdout),
+                            "stderr": String::from_utf8_lossy(&output.stderr),
+                            "status": output.status.code().unwrap_or(-1)
+                        }))
+                    }).await.map_err(|e| e.to_string())?
+                })
+            } else {
+                Err("Context lost".into())
+            }
+        });
+        
+        return_json_promise(ctx, result)
+    });
+
+    let obj = ObjectInitializer::new(ctx)
+        .function(run_fn, JsString::from("run"), 2)
+        .build();
+
+    ctx.register_global_property(JsString::from("$cmd"), obj, Attribute::all()).map_err(|e| e.to_string())
+}
+
 fn register_root(ctx: &mut Context) -> Result<(), String> {
     let is_root = ACTIVE_CONTEXT.with(|c| c.borrow().as_ref().map(|t| t.4 == EventScope::Root).unwrap_or(false));
     
@@ -973,7 +1439,7 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
             return_json_promise(ctx, res.map(|b| serde_json::Value::Bool(b)))
         });
 
-        // [NEW] createSandbox(id: string, config?: object)
+        // createSandbox(id: string, config?: object)
         let create_sandbox = NativeFunction::from_copy_closure(move |_, args, ctx| {
             let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
             // Extract config object
