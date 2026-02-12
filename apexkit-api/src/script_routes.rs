@@ -93,7 +93,7 @@ async fn run_script_core(
         payload, 
         context, // Pass AppState
         base_url,
-        scope
+        // scope
     ).await.map_err(|e| AppError::UnknownError(format!("Script Execution Error: {}", e)))?;
 
     Ok(Json(result))

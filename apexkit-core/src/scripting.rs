@@ -5,7 +5,6 @@ use crate::realtime::{DbEvent, EventScope};
 use tokio::sync::broadcast;
 use regex::Regex;
 use std::path::Path;
-use std::process::Command;
 use std::cell::RefCell;
 use crate::query_engine::ApexQuery;
 
@@ -19,6 +18,10 @@ use std::io::{Cursor, Read, Write};
 use zip::{ZipArchive, ZipWriter};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use zip::write::FileOptions;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+use tokio::time::timeout;
+use std::collections::HashMap;
 
 // --- PRELUDE ---
 const JS_PRELUDE: &str = r#"
@@ -186,10 +189,9 @@ impl ScriptEngine {
         code: &str, 
         input_data: JsonValue, 
         context: Arc<dyn ScriptContext>,
-        base_url: Option<String>,
-        scope: EventScope
+        base_url: Option<String>
     ) -> Result<JsonValue, String> {
-        self.execute_js_task(code, context, base_url, scope, move |ctx| {
+        self.execute_js_task(code, context, base_url, move |ctx| {
             let js_body = JsValue::from_json(&input_data, ctx).map_err(|e| e.to_string())?;
             
             let request_cls = ctx.global_object().get(JsString::from("Request"), ctx).unwrap();
@@ -246,7 +248,7 @@ impl ScriptEngine {
             }})()
         "#, code);
 
-        self.execute_js_task(&wrapped_code, context, base_url, actual_scope, move |ctx| {
+        self.execute_js_task(&wrapped_code, context, base_url, move |ctx| {
             let js_event = JsValue::from_json(&event_data, ctx).map_err(|e| e.to_string())?;
             ctx.register_global_property(JsString::from("__hook_context__"), js_event.clone(), Attribute::all()).unwrap();
 
@@ -275,7 +277,6 @@ impl ScriptEngine {
         code: &str,
         context: Arc<dyn ScriptContext>,
         base_url: Option<String>,
-        scope: EventScope,
         task_logic: F
     ) -> Result<R, String>
     where
@@ -290,10 +291,11 @@ impl ScriptEngine {
 
         // Get TX from context
         let tx = Some(context.get_realtime_tx());
+        let execution_scope = context.get_scope();
 
         let result = tokio::task::spawn_blocking(move || -> Result<R, String> {
             let mut context_boa = Context::default();
-            ACTIVE_CONTEXT.with(|c| { *c.borrow_mut() = Some((context, handle.clone(), base_url, tx, scope)); });
+            ACTIVE_CONTEXT.with(|c| { *c.borrow_mut() = Some((context, handle.clone(), base_url, tx, execution_scope)); });
             Self::setup_boa(&mut context_boa)?;
             if let Err(e) = context_boa.eval(boa_engine::Source::from_bytes(processed_code.as_bytes())) {
                  return Err(format!("Script Syntax Error: {}", e));
@@ -372,7 +374,7 @@ async fn resolve_collection_local(db: Arc<dyn Db>, identifier: &str) -> Result<i
 }
 
 async fn resolve_db(ctx_str: Option<String>, app_ctx: Arc<dyn ScriptContext>) -> Result<Arc<dyn Db>, String> {
-    // 1. Explicit Context Passed in JS (e.g. $db.find("tenant:abc", ...))
+    // 1. Explicit Context Passed in JS
     if let Some(s) = ctx_str {
         if s.starts_with("tenant:") {
             let tid = s.strip_prefix("tenant:").unwrap();
@@ -382,8 +384,6 @@ async fn resolve_db(ctx_str: Option<String>, app_ctx: Arc<dyn ScriptContext>) ->
             let sid = s.strip_prefix("sandbox:").unwrap();
             return app_ctx.resolve_sandbox_db(sid).await.ok_or(format!("Sandbox {} not found", sid));
         }
-        // If string but not special prefix, ignore? Or treat as ID? 
-        // For now, assume explicit override matches prefix logic.
     }
 
     // 2. Implicit Context based on Execution Scope
@@ -391,13 +391,17 @@ async fn resolve_db(ctx_str: Option<String>, app_ctx: Arc<dyn ScriptContext>) ->
     
     match scope {
         EventScope::Tenant(id) => {
-            // We are running inside a Tenant context (e.g. webhook triggered by tenant action)
             app_ctx.resolve_tenant_db(&id).await.ok_or(format!("Current Tenant {} context not found", id))
         },
         EventScope::Sandbox(id) => {
             app_ctx.resolve_sandbox_db(&id).await.ok_or(format!("Current Sandbox {} context not found", id))
         },
-        // Root scope or Channel scope falls back to default get_db() (Root DB)
+        // [FIX] For Root scope, use the main get_db() which is always the Root DB.
+        // This was the missing piece. When a Tenant called a Root script, the scope was
+        // correctly set to Root, but this match arm was missing, causing it to fall through
+        // and potentially use the wrong DB context from a misconfigured get_db impl.
+        EventScope::Root => Ok(app_ctx.get_db()),
+        // Fallback for Channel, etc.
         _ => Ok(app_ctx.get_db())
     }
 }
@@ -1235,9 +1239,7 @@ fn register_archive(ctx: &mut Context) -> Result<(), String> {
     ctx.register_global_property(JsString::from("$archive"), obj, Attribute::all()).map_err(|e| e.to_string())
 }
 
-fn register_run(ctx: &mut Context) -> Result<(), String> {
-    
-    // $run.script("script_name", { args })
+fn register_run(ctx: &mut Context) -> Result<(), String> { 
     let script_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
         let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
         let payload = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(json!({}));
@@ -1246,85 +1248,38 @@ fn register_run(ctx: &mut Context) -> Result<(), String> {
             if let Some((app, handle, base_url, _, current_scope)) = &*c.borrow() {
                 handle.block_on(async {
                     
-                    // 1. Try Local DB (Current Scope)
-                    let db = app.get_db();
-                    let mut script_opt = db.get_script_by_name(&name).await.ok().flatten();
+                    // 1. Get the DB for the CURRENT scope (e.g. Tenant DB)
+                    let local_db = resolve_db(None, app.clone()).await?;
+                    
+                    // 2. Try to find the script in the LOCAL scope first.
+                    let mut script_opt = local_db.get_script_by_name(&name).await.ok().flatten();
                     let mut exec_scope = current_scope.clone();
 
-                    // 2. If Not Found, Try Root DB (Shared Scripts)
-                    if script_opt.is_none() {
-                        // Access Root DB via app.state (This requires ScopedScriptContext to expose state directly or a helper)
-                        // ScopedScriptContext exposes `state: AppState` as public!
-                        // But here `app` is `Arc<dyn ScriptContext>`. The trait does NOT expose `state`.
-                        
-                        // We need a way to get the Root DB from the trait.
-                        // `app.resolve_tenant_db` etc exist. 
-                        // Let's assume we can get Root DB by resolving "root" or checking the implementation.
-                        
-                        // HACK/SOLUTION: We know the concrete type in `lib.rs` has `state`.
-                        // But we are in `core`. We can't cast to `ScopedScriptContext`.
-                        
-                        // FIX: We rely on `resolve_db(None)` to get current, but we need Root specifically.
-                        // We don't have a `get_root_db` in trait.
-                        
-                        // WORKAROUND: We iterate. Since we can't easily change trait signature everywhere again immediately,
-                        // we can try to resolve a known non-existent tenant/sandbox? No.
-                        
-                        // CORRECT FIX: The `app` passed here is the `ScriptContext`.
-                        // If we are in `apexkit-core`, we don't have access to `apexkit-api` AppState.
-                        // However, `app.resolve_tenant_db` works.
-                        
-                        // Let's add `get_root_script(name)` to the `ScriptContext` trait?
-                        // Or just rely on the fact that if we are Tenant, we can't see Root unless we expose it.
-                        
-                        // Let's assume for this specific feature we use a "magic" resolution or
-                        // we simply fail if not found locally, UNLESS we update the Trait to allow `get_shared_script`.
-                        
-                        // Let's update `ScriptContext` trait in `lib.rs` (core) to allow fetching shared scripts.
-                        
-                        // (See Step 5 below for trait update)
+                    // 3. If NOT FOUND LOCALLY and we are NOT in Root, check Root for a public script.
+                    if script_opt.is_none() && !matches!(current_scope, EventScope::Root) {
                         if let Some(shared) = app.get_shared_script(&name).await {
-                             script_opt = Some(shared);
-                             // CRITICAL: Shared scripts run in ROOT scope to access system tools
-                             exec_scope = EventScope::Root; 
+                             // Visibility Check: Only 'public' scripts can be shared.
+                             if shared.visibility == "public" {
+                                 script_opt = Some(shared);
+                                 // CRITICAL: Switch execution scope to Root for this call.
+                                 exec_scope = EventScope::Root;
+                             }
                         }
                     }
 
                     if let Some(script) = script_opt {
-                        // Check Visibility if we switched scope to Root but caller was Tenant
-                        if exec_scope == EventScope::Root && current_scope != &EventScope::Root {
-                            if script.visibility != "public" {
-                                return Err(format!("Script '{}' is private/root-only.", name));
-                            }
-                        }
+                        if !script.active { return Err("Script is inactive".into()); }
                         
-                        if !script.active { return Err("Script inactive".into()); }
-
-                        // Inject Caller Info into the payload
                         let mut call_payload = payload.clone();
                         if let Some(obj) = call_payload.as_object_mut() {
                              obj.insert("__caller_scope".to_string(), json!(current_scope));
                         }
                         
-                        // RECURSIVE EXECUTION
-                        // We need to call `ScriptEngine::run_script` again.
-                        // But `ScriptEngine` is in `AppState`, and we only have `ScriptContext` trait here.
-                        
-                        // We need `app.run_script(...)` in the trait to avoid circular deps or accessing engine directly.
-                        // Or we use the `app` (Context) to run it? No, context is data.
-                        
-                        // Solution: The `ScriptEngine` instance is actually what called us (via `register_run`).
-                        // We are inside `ScriptEngine::setup_boa`.
-                        // We can't call `self` recursively easily.
-                        
-                        // HOWEVER: We can spawn a new `ScriptEngine` instance? No, heavy.
-                        
-                        // We need `app.execute_script(script, payload, scope)`.
                         let res = app.execute_shared_script(script.code, call_payload, exec_scope).await?;
                         Ok(res)
                         
                     } else {
-                        Err(format!("Script '{}' not found", name))
+                        Err(format!("Script '{}' not found or not accessible.", name))
                     }
                 })
             } else {
@@ -1342,61 +1297,147 @@ fn register_run(ctx: &mut Context) -> Result<(), String> {
     ctx.register_global_property(JsString::from("$run"), obj, Attribute::all()).map_err(|e| e.to_string())
 }
 
-// apexkit-core/src/scripting.rs
-
 fn register_cmd(ctx: &mut Context) -> Result<(), String> {
-    // $cmd.run(program, args_array)
+    // Shared helper for option parsing
+    let parse_options = |ctx: &mut Context, val: &boa_engine::JsValue| -> (Option<String>, Option<HashMap<String, String>>, Option<u64>) {
+        let mut cwd = None;
+        let mut envs = None;
+        let mut timeout_ms = None;
+        
+        // Correctly handle Result<Option<Value>>
+        if let Ok(Some(json)) = val.to_json(ctx) {
+            if let Some(obj) = json.as_object() {
+                // Explicitly type 'v' to help the compiler infer Value methods
+                cwd = obj.get("cwd").and_then(|v: &serde_json::Value| v.as_str().map(|s| s.to_string()));
+                timeout_ms = obj.get("timeout").and_then(|v: &serde_json::Value| v.as_u64());
+
+                if let Some(e) = obj.get("env").and_then(|v: &serde_json::Value| v.as_object()) {
+                    let mut map = HashMap::new();
+                    for (k, v) in e {
+                        let val_str = if let Some(s) = v.as_str() {
+                            s.to_string()
+                        } else {
+                            v.to_string()
+                        };
+                        map.insert(k.clone(), val_str);
+                    }
+                    envs = Some(map);
+                }
+            }
+        }
+        (cwd, envs, timeout_ms)
+    };
+
+    // $cmd.run(program, args, options)
     let run_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
         let program = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
         let args_val = args.get_or_undefined(1);
+        let options_val = args.get_or_undefined(2);
         
+        let (cwd, envs, timeout_ms) = parse_options(ctx, options_val);
         let mut cmd_args: Vec<String> = Vec::new();
-        
-        // Correctly handle Result<Option<Value>> from Boa's to_json
+
         if let Ok(Some(json_val)) = args_val.to_json(ctx) {
             if let Some(arr) = json_val.as_array() {
                 for v in arr {
-                    // Explicitly handle type conversion for the command arguments
-                    if let Some(s) = v.as_str() {
-                        cmd_args.push(s.to_string());
-                    } else if v.is_number() || v.is_boolean() {
-                        cmd_args.push(v.to_string());
-                    }
+                    if let Some(s) = v.as_str() { cmd_args.push(s.to_string()); }
+                    else { cmd_args.push(v.to_string()); }
                 }
             }
         }
 
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
-                // SECURITY CHECK: Only allow execution in Root App context
                 if !matches!(scope, EventScope::Root) {
                     return Err("Access Denied: $cmd is reserved for Root scripts.".into());
                 }
 
                 handle.block_on(async {
-                    tokio::task::spawn_blocking(move || {
-                        let output = Command::new(&program)
-                            .args(&cmd_args)
-                            .output()
-                            .map_err(|e| format!("Process Error: {}", e))?;
+                    let mut command = tokio::process::Command::new(&program);
+                    command.args(&cmd_args);
+                    command.stdout(Stdio::piped());
+                    command.stderr(Stdio::piped());
+                    
+                    if let Some(dir) = cwd { command.current_dir(dir); }
+                    if let Some(vars) = envs { command.envs(vars); }
 
-                        Ok(json!({
+                    let future = command.output();
+                    let output_res = if let Some(ms) = timeout_ms {
+                        match timeout(std::time::Duration::from_millis(ms), future).await {
+                            Ok(res) => res,
+                            Err(_) => return Err(format!("Command timed out after {}ms", ms))
+                        }
+                    } else {
+                        future.await
+                    };
+
+                    match output_res {
+                        Ok(output) => Ok(json!({
                             "stdout": String::from_utf8_lossy(&output.stdout),
                             "stderr": String::from_utf8_lossy(&output.stderr),
                             "status": output.status.code().unwrap_or(-1)
-                        }))
-                    }).await.map_err(|e| e.to_string())?
+                        })),
+                        Err(e) => Err(format!("Execution failed: {}", e))
+                    }
                 })
-            } else {
-                Err("Context lost".into())
-            }
+            } else { Err("Context lost".into()) }
         });
         
         return_json_promise(ctx, result)
     });
 
+    // $cmd.spawn(program, args, options)
+    let spawn_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let program = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let args_val = args.get_or_undefined(1);
+        let options_val = args.get_or_undefined(2);
+        
+        let (cwd, envs, _) = parse_options(ctx, options_val);
+        let mut cmd_args: Vec<String> = Vec::new();
+
+        if let Ok(Some(json_val)) = args_val.to_json(ctx) {
+            if let Some(arr) = json_val.as_array() {
+                for v in arr {
+                    if let Some(s) = v.as_str() { cmd_args.push(s.to_string()); }
+                    else { cmd_args.push(v.to_string()); }
+                }
+            }
+        }
+
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
+                if !matches!(scope, EventScope::Root) {
+                    return Err("Access Denied.".into());
+                }
+
+                handle.block_on(async {
+                     let mut command = tokio::process::Command::new(&program);
+                     command.args(&cmd_args);
+                     command.stdout(Stdio::null());
+                     command.stderr(Stdio::null());
+                     command.stdin(Stdio::null());
+                     
+                     if let Some(dir) = cwd { command.current_dir(dir); }
+                     if let Some(vars) = envs { command.envs(vars); }
+
+                     match command.spawn() {
+                         Ok(mut child) => {
+                             let id = child.id().unwrap_or(0);
+                             tokio::spawn(async move { let _ = child.wait().await; });
+                             Ok(json!({ "pid": id, "started": true }))
+                         },
+                         Err(e) => Err(format!("Spawn failed: {}", e))
+                     }
+                })
+            } else { Err("Context lost".into()) }
+        });
+
+        return_json_promise(ctx, result)
+    });
+
     let obj = ObjectInitializer::new(ctx)
-        .function(run_fn, JsString::from("run"), 2)
+        .function(run_fn, JsString::from("run"), 3)
+        .function(spawn_fn, JsString::from("spawn"), 3)
         .build();
 
     ctx.register_global_property(JsString::from("$cmd"), obj, Attribute::all()).map_err(|e| e.to_string())

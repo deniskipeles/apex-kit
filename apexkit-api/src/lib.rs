@@ -319,9 +319,21 @@ pub async fn trigger_filter_hook(
     Ok(current_data)
 }
 
+// Helper function to resolve DB from scope (async)
+async fn resolve_db_from_scope(state: &AppState, scope: &EventScope) -> Result<Arc<dyn Db>, AppError> {
+    match scope {
+        EventScope::Root => Ok(state.db.clone()),
+        EventScope::Tenant(id) => state.tenant_manager.get_tenant(id.clone()).await
+            .map_err(|e| AppError::UnknownError(e)),
+        EventScope::Sandbox(id) => state.sandbox_manager.get_sandbox(id).await
+            .map_err(|e| AppError::UnknownError(e)),
+        _ => Ok(state.db.clone()),
+    }
+}
 // --- HELPER: Record Hooks (Existing) ---
-async fn trigger_hooks(
+pub async fn trigger_hooks(
     state: &AppState,
+    // [REVERTED] No 'db' parameter here. We resolve it from scope.
     trigger: &str,
     collection: &apexkit_core::Collection, 
     record_id: Option<i64>,
@@ -331,18 +343,28 @@ async fn trigger_hooks(
     scope: Option<&EventScope>
 ) -> Result<Option<serde_json::Value>, AppError> {
     
-    let scripts = state.db.get_scripts_by_trigger(trigger).await
+    let actual_scope = scope.cloned().unwrap_or(EventScope::Root);
+    
+    // 1. Resolve DB locally just to fetch the scripts configuration
+    let db = resolve_db_from_scope(state, &actual_scope).await?;
+    
+    let scripts = db.get_scripts_by_trigger(trigger).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    if scripts.is_empty() { return Ok(None); }
 
     let mut current_data = data.clone();
     let mut modified = false;
 
+    // 2. Create Context (Lightweight, no DB instance attached)
+    // The ScriptEngine will use `resolve_tenant_db` via the trait to get the DB when needed.
     let context = Arc::new(crate::ScopedScriptContext {
         state: state.clone(),
-        scope: scope.cloned().unwrap_or(EventScope::Root),
+        scope: actual_scope.clone(),
     });
 
     for script in scripts {
+        // Target Collection Filtering
         if let Some(target) = &script.target_collection {
             if target != &collection.name { continue; }
         }
@@ -354,16 +376,12 @@ async fn trigger_hooks(
             "trigger": trigger
         });
         
-        match state.script_engine.run_hook(
-            &script.code, 
-            event_context, 
-            context.clone(),
-            base_url.clone(), 
-            scope.cloned()
-        ).await {
+        // Run Hook
+        match state.script_engine.run_hook(&script.code, event_context, context.clone(), base_url.clone(), Some(actual_scope.clone())).await {
             Ok(Some(new_data)) => { current_data = new_data; modified = true; },
             Ok(None) => {},
             Err(err_msg) => {
+                // If a hook fails, we block the operation
                 return Err(AppError::Validation(vec![ValidationError::ConstraintViolation("_hook".to_string(), err_msg)]));
             }
         }
@@ -606,20 +624,18 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
         })
     }
 
-    fn execute_shared_script(&self, code: String, payload: serde_json::Value, scope: EventScope) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>> {
+    fn execute_shared_script(&self, code: String, payload: serde_json::Value, scope: EventScope) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<serde_json::Value, String>> + Send>> {
         let engine = self.state.script_engine.clone();
         let state = self.state.clone();
         
-        // Create a NEW context for the child execution
+        // When executing a shared script, the context MUST have the correct scope.
         let new_ctx = Arc::new(ScopedScriptContext {
             state: state.clone(),
             scope: scope.clone(),
         });
         
         Box::pin(async move {
-            // Base URL is None for internal calls? Or pass existing?
-            // We pass None for now.
-            engine.run_script(&code, payload, new_ctx, None, scope).await
+            engine.run_script(&code, payload, new_ctx, None).await
         })
     }
 
@@ -1307,29 +1323,30 @@ pub async fn list_records(
     Query(q): Query<QueryOptions>
 ) -> Result<Json<RecordListResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    
-    // [UPDATED] Resolve Collection by ID or Name
     let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
-
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     
     let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
     if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Read denied".into())); }
 
-    // [TRIGGER] Before List (Tunable Query)
+    // [FIX 1] Use trigger_hooks for BEFORE hook
+    // It takes a `data` reference, so we pass a reference to our query options JSON
     let query_json = json!(q);
-    let modified_query_json = trigger_filter_hook(&state, "before_list_records", query_json, claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
-    let modified_q: QueryOptions = serde_json::from_value(modified_query_json).unwrap_or(q);
+    let modified_q = match trigger_hooks(&state, "before_list_records", &col, None, &query_json, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? {
+        Some(modified_json) => serde_json::from_value(modified_json).unwrap_or(q),
+        None => q,
+    };
 
     let res = db.list_records(col.id, modified_q.clone()).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     let mut response_data = RecordListResponse{ items: res.items.into_iter().map(|r| RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}).collect(), total: res.total };
 
-    // [TRIGGER] After List (Output Filter)
-    let filtered_json = trigger_filter_hook(&state, "after_list_records", json!(response_data), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
-    response_data = serde_json::from_value(filtered_json).unwrap_or(response_data);
+    // [FIX 2] Use trigger_hooks for AFTER hook
+    let response_json = json!(response_data);
+    if let Some(modified_json) = trigger_hooks(&state, "after_list_records", &col, None, &response_json, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? {
+        response_data = serde_json::from_value(modified_json).unwrap_or(response_data);
+    }
 
-    // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "count": response_data.items.len(), "filter": modified_q.filter }));
     let _ = db.log_audit_event("info", "Records Listed", "api", Some(meta)).await;
 
@@ -1354,9 +1371,9 @@ pub async fn get_record(
     let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
     
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
-
+    let query_json = json!(q);
     // [TRIGGER] Before Get
-    trigger_void_hook(&state, "before_get_record", json!({ "collection": col.name, "id": path.record_id }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
+    trigger_hooks(&state, "before_get_record", &col, Some(path.record_id), &query_json, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await?;
 
     let r = db.get_record(col.id, path.record_id, q.expand).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("Record not found".into()))?;
     
@@ -1366,8 +1383,11 @@ pub async fn get_record(
     let response = RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated};
 
     // [TRIGGER] After Get
-    let filtered_json = trigger_filter_hook(&state, "after_get_record", json!(response), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
-    let final_resp = serde_json::from_value(filtered_json).unwrap_or(response);
+    let response_json = json!(response);
+    let final_resp = match trigger_hooks(&state, "after_get_record", &col, Some(path.record_id), &response_json, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? {
+        Some(modified_json) => serde_json::from_value(modified_json).unwrap_or(serde_json::from_value(response_json).unwrap()),
+        None => serde_json::from_value(response_json).unwrap(),
+    };
 
     // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "id": path.record_id }));
@@ -1458,7 +1478,7 @@ pub async fn create_record(
     
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     // [TRIGGER] Record-level Hook (legacy) AND System Hook (new)
-    let mut data_to_save = match trigger_hooks(&state, "before_create", &col, None, &p.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { Some(d) => d, None => p.data };
+    let mut data_to_save = match trigger_hooks(&state, "before_create_record", &col, None, &p.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { Some(d) => d, None => p.data };
 
     // [NEW] Auto-Inject Owner ID
     if let Some(schema) = &col.schema {
@@ -1478,7 +1498,7 @@ pub async fn create_record(
     // ... (broadcast, hooks, jobs) ...
     let _ = state.tx.send(DbEvent::Insert { collection_id: col.id, record_id: rid, data: data_to_save.clone(), scope: event_scope.clone() });
     
-    let _ = trigger_hooks(&state, "after_create", &col, Some(rid), &data_to_save, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
+    let _ = trigger_hooks(&state, "after_create_record", &col, Some(rid), &data_to_save, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
 
     // Jobs (Vector/Index)
     if let Some(schema) = col.schema {
@@ -1525,7 +1545,7 @@ pub async fn update_record(
     
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
 
-    let data_updates = match trigger_hooks(&state, "before_update", &col, Some(path.record_id), &p.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { Some(d) => d, None => p.data };
+    let data_updates = match trigger_hooks(&state, "before_update_record", &col, Some(path.record_id), &p.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { Some(d) => d, None => p.data };
     
     let r = db.update_record(col.id, path.record_id, &data_updates).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
@@ -1534,7 +1554,7 @@ pub async fn update_record(
     let _ = db.log_audit_event("info", "Record Updated", "api", Some(meta)).await;
 
     let _ = state.tx.send(DbEvent::Update { collection_id: col.id, record_id: path.record_id, data: r.data.clone(), scope: event_scope.clone() });
-    let _ = trigger_hooks(&state, "after_update", &col, Some(path.record_id), &r.data, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
+    let _ = trigger_hooks(&state, "after_update_record", &col, Some(path.record_id), &r.data, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
     
     Ok(Json(RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}))
 }
@@ -1562,7 +1582,7 @@ pub async fn delete_record(
     
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     
-    let _ = trigger_hooks(&state, "before_delete", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await?;
+    let _ = trigger_hooks(&state, "before_delete_record", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await?;
     
     db.delete_record(col.id, path.record_id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
@@ -1571,7 +1591,7 @@ pub async fn delete_record(
     let _ = db.log_audit_event("warning", "Record Deleted", "api", Some(meta)).await;
 
     let _ = state.tx.send(DbEvent::Delete { collection_id: col.id, record_id: path.record_id, scope: event_scope.clone() });
-    let _ = trigger_hooks(&state, "after_delete", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
+    let _ = trigger_hooks(&state, "after_delete_record", &col, Some(path.record_id), &existing.data, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -208,7 +208,7 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
                 payload, 
                 context,
                 None,
-                EventScope::Root
+                // EventScope::Root
             ).await.map_err(|e| format!("Script Error: {}", e))?;
 
             println!("{}", serde_json::to_string_pretty(&result).unwrap());

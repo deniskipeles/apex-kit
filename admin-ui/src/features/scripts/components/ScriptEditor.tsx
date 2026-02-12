@@ -22,12 +22,12 @@ const TRIGGER_TYPES = [
     { value: 'cron', label: 'Scheduled Job (Cron)', group: 'System' },
 
     // --- Data Records (Write) ---
-    { value: 'before_create', label: 'Before Create Record', group: 'Record Write' },
-    { value: 'after_create', label: 'After Create Record', group: 'Record Write' },
-    { value: 'before_update', label: 'Before Update Record', group: 'Record Write' },
-    { value: 'after_update', label: 'After Update Record', group: 'Record Write' },
-    { value: 'before_delete', label: 'Before Delete Record', group: 'Record Write' },
-    { value: 'after_delete', label: 'After Delete Record', group: 'Record Write' },
+    { value: 'before_create_record', label: 'Before Create Record', group: 'Record Write' },
+    { value: 'after_create_record', label: 'After Create Record', group: 'Record Write' },
+    { value: 'before_update_record', label: 'Before Update Record', group: 'Record Write' },
+    { value: 'after_update_record', label: 'After Update Record', group: 'Record Write' },
+    { value: 'before_delete_record', label: 'Before Delete Record', group: 'Record Write' },
+    { value: 'after_delete_record', label: 'After Delete Record', group: 'Record Write' },
     
     // --- Data Records (Read/Filter) ---
     { value: 'before_list_records', label: 'Before List Records (Filter Query)', group: 'Record Read' },
@@ -74,7 +74,7 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
 
     useEffect(() => {
         collectionsService.list().then(setCollections);
-        setIsRoot(apiClient.getScope().type === 'root');
+        // setIsRoot(apiClient.getScope().type === 'root');
     }, []);
 
     useEffect(() => {

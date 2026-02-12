@@ -657,7 +657,7 @@ pub async fn build_schema(
                             serde_json::Value::Object(script_input), 
                             context,
                             None,
-                            event_scope
+                            // event_scope
                         ).await.map_err(|e| async_graphql::Error::new(e))?;
 
                         Ok(Some(FieldValue::value(json_to_gql(result))))

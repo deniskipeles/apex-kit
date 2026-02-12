@@ -706,6 +706,77 @@ export interface SubscriptionFilter {
     customEvent?: string;
 }
 
+/**
+ * ============================================
+ * ApexKit Realtime — Usage Guide
+ * ============================================
+ *
+ * This client supports Database Change Events, Custom Ephemeral Events,
+ * and high-performance Instant Search over WebSockets.
+ *
+ * --------------------------------------------
+ * 1. Start the connection
+ * --------------------------------------------
+ *
+ * @example
+ * const realtime = new ApexKitRealtimeWSClient(apex.baseUrl, apex.getToken());
+ * realtime.connect();
+ *
+ * --------------------------------------------
+ * 2. Subscribe to Data Changes (DB)
+ * --------------------------------------------
+ *
+ * @example
+ * realtime.subscribe({
+ *   collectionId: 5,
+ *   eventType: "Update",
+ *   dataFilter: { priority: "high" }
+ * });
+ *
+ * --------------------------------------------
+ * 3. Subscribe to Custom Channels (Chat/Signals)
+ * --------------------------------------------
+ *
+ * @example
+ * realtime.subscribe({
+ *   channel: "room_123",       // Namespace: tenant_id::room_123
+ *   customEvent: "NewMessage"  // Optional: Filter specific event name
+ * });
+ *
+ * --------------------------------------------
+ * 4. Send a Signal (Client-to-Client Broadcast)
+ * --------------------------------------------
+ *
+ * @example
+ * realtime.sendSignal("room_123", "UserTyping", { user: "Alice" });
+ *
+ * --------------------------------------------
+ * 5. Instant Search (Request-Response)
+ * --------------------------------------------
+ *
+ * @example
+ * const results = await realtime.search(1, "search query", 5);
+ * console.log(results); // [{ id: 1, score: 2.5, snippet: {...} }]
+ *
+ * --------------------------------------------
+ * 6. Handle Events
+ * --------------------------------------------
+ *
+ * @example
+ * realtime.onEvent((msg) => {
+ *   // Handle DB Event
+ *   if (msg.event === "Insert") {
+ *      console.log("Record Created:", msg.payload.data);
+ *   }
+ *   
+ *   // Handle Custom Event
+ *   if (msg.event === "Custom") {
+ *      const { event, data } = msg.payload;
+ *      if (event === "UserTyping") console.log(`${data.user} is typing...`);
+ *   }
+ * });
+ * ============================================
+ */
 export class ApexKitRealtimeWSClient {
     private url: string;
     private token: string | null;
@@ -780,6 +851,14 @@ export class ApexKitRealtimeWSClient {
         }
     }
 
+    /**
+     * Broadcast an ephemeral message to a specific channel.
+     * Useful for "typing" indicators, cursors, or notifications.
+     * 
+     * @param {string} channel - The channel name (e.g. "room_1")
+     * @param {string} eventName - The event label (e.g. "UserTyping")
+     * @param {Object} data - Arbitrary JSON payload
+     */
     sendSignal(channel: string, eventName: string, data: any) {
         if (this.socket && this.socket.readyState === WebSocket.OPEN) {
             this.socket.send(JSON.stringify({
@@ -789,6 +868,15 @@ export class ApexKitRealtimeWSClient {
         }
     }
 
+    /**
+     * Perform an Instant Search over WebSocket.
+     * Returns a Promise that resolves with the results.
+     * 
+     * @param {number|string} collectionId - The collection to search
+     * @param {string} query - The search text
+     * @param {number} [limit=10] - Max results
+     * @returns {Promise<Array>} List of results
+     */
     search(collectionId: number | string, query: string, limit: number = 10): Promise<InstantResult[]> {
         return new Promise((resolve, reject) => {
             if (!this.isConnected || !this.socket) return reject(new Error("Socket not connected"));
@@ -837,6 +925,50 @@ export class ApexKitRealtimeWSClient {
     }
 }
 
+
+/**
+ * ============================================
+ * ApexKit SSE Client — Usage Guide
+ * ============================================
+ *
+ * Server-Sent Events are ideal for read-only streams where you don't
+ * need to send data back to the server (e.g., news feeds, logs).
+ *
+ * --------------------------------------------
+ * 1. Initialize & Connect
+ * --------------------------------------------
+ *
+ * @example
+ * const sse = new ApexKitRealtimeSSEClient('http://localhost:5000');
+ *
+ * // Connect to specific channel
+ * sse.connect({
+ *   channel: "room_123",       // Filters for tenant_id::room_123
+ *   eventName: "NewMessage"    // Optional: Filter specific event type
+ * });
+ *
+ * --------------------------------------------
+ * 2. Handle Events
+ * --------------------------------------------
+ *
+ * @example
+ * sse.onEvent((msg) => {
+ *   if (msg.type === "Custom") {
+ *      console.log("Custom Event:", msg.payload.data);
+ *   }
+ *   if (msg.type === "Insert") {
+ *      console.log("DB Insert:", msg.payload.data);
+ *   }
+ * });
+ *
+ * --------------------------------------------
+ * 3. Cleanup
+ * --------------------------------------------
+ *
+ * @example
+ * sse.disconnect();
+ * ============================================
+ */
 export class ApexKitRealtimeSSEClient {
     private baseUrl: string;
     private source: EventSource | null = null;
