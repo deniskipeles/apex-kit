@@ -161,7 +161,7 @@ async fn render_view_core(
                 context_data.clone(), 
                 context,
                 base_url, 
-                // scope
+                Some(headers_to_map(&headers))
             ).await.map_err(|e| AppError::UnknownError(format!("Script Error: {}", e)))?;
             merge_json(&mut context_data, script_res);
         }

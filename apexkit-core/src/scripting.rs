@@ -45,7 +45,7 @@ const JS_PRELUDE: &str = r#"
 
     class Response {
         constructor(body, init = {}) {
-            this.body = body; // [FIX]: Remove underscore
+            this.body = body;
             this.status = init.status || 200;
             this.statusText = init.statusText || "OK";
             this.headers = new Headers(init.headers || {});
@@ -189,15 +189,27 @@ impl ScriptEngine {
         code: &str, 
         input_data: JsonValue, 
         context: Arc<dyn ScriptContext>,
-        base_url: Option<String>
+        base_url: Option<String>,
+        headers: Option<HashMap<String, String>> // <--- NEW ARGUMENT
     ) -> Result<JsonValue, String> {
         self.execute_js_task(code, context, base_url, move |ctx| {
             let js_body = JsValue::from_json(&input_data, ctx).map_err(|e| e.to_string())?;
             
+            // 1. Build Headers Object
+            let mut header_init = ObjectInitializer::new(ctx);
+            if let Some(h) = headers {
+                for (k, v) in h {
+                    header_init.property(JsString::from(k), JsString::from(v), Attribute::all());
+                }
+            }
+            let js_headers = header_init.build();
+
+            // 2. Build Request Init
             let request_cls = ctx.global_object().get(JsString::from("Request"), ctx).unwrap();
             let req_init = ObjectInitializer::new(ctx)
                 .property(JsString::from("method"), JsString::from("POST"), Attribute::all())
                 .property(JsString::from("body"), js_body, Attribute::all())
+                .property(JsString::from("headers"), js_headers, Attribute::all()) // <--- INJECT HEADERS
                 .build();
             
             let request_obj = request_cls.as_constructor().unwrap()
@@ -214,17 +226,13 @@ impl ScriptEngine {
             let final_val = Self::resolve_promise(promise, ctx)?;
 
             if let Some(obj) = final_val.as_object() {
-                // If it has a 'body' property, it's likely our Response object
                 if obj.has_property(JsString::from("body"), ctx).unwrap_or(false) {
                     let body = obj.get(JsString::from("body"), ctx).unwrap_or_default();
-                    
-                    // Convert ONLY the body to JSON
                     let json = body.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
                     return Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null));
                 }
             }
             
-            // Fallback for scripts that return raw objects instead of new Response()
             let json = final_val.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
             Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null))
         }).await

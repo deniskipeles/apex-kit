@@ -635,7 +635,7 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
         });
         
         Box::pin(async move {
-            engine.run_script(&code, payload, new_ctx, None).await
+            engine.run_script(&code, payload, new_ctx, None, None).await
         })
     }
 
@@ -2563,6 +2563,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/sandbox/{session_id}", get(assets::scoped_index_handler))
         
         .route("/_dashboard", get(assets::dashboard_handler))
+        .route("/_dashboard/", get(assets::dashboard_handler))
         .route("/_dashboard/{*path}", get(assets::dashboard_handler))
         
         // Root Index

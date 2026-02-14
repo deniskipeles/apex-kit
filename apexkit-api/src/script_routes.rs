@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, State, Json},
+    http::HeaderMap,
     Extension,
 };
 use serde::Deserialize;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use tracing::info;
 use apexkit_core::realtime::EventScope;
 use crate::BaseUrl;
+use std::collections::HashMap;
 
 // --- PATH DTOS ---
 // These allow Axum to pick specific params by name and ignore 
@@ -71,7 +73,8 @@ async fn run_script_core(
     payload: Value,
     source: &str,
     base_url: Option<String>,
-    scope: EventScope 
+    scope: EventScope,
+    headers: Option<HashMap<String, String>>
 ) -> Result<Json<Value>, AppError> {
     info!("[ScriptRunner] Running '{}' in {}", script_name, source);
     
@@ -93,13 +96,23 @@ async fn run_script_core(
         payload, 
         context, // Pass AppState
         base_url,
-        // scope
+        headers 
     ).await.map_err(|e| AppError::UnknownError(format!("Script Execution Error: {}", e)))?;
 
     Ok(Json(result))
 }
 
 // --- PUBLIC HANDLERS ---
+// --- HELPER ---
+fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for (k, v) in headers.iter() {
+        if let Ok(val) = v.to_str() {
+            map.insert(k.to_string(), val.to_string());
+        }
+    }
+    map
+}
 
 #[utoipa::path(post, path = "/api/v1/run/{script_name}", request_body = Value, responses((status = 200, body = Value)))]
 pub async fn run_script(
@@ -107,24 +120,25 @@ pub async fn run_script(
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     scope: Option<Extension<EventScope>>,
-    Path(path): Path<ScriptNamePath>, // FIX: Use struct
+    headers: HeaderMap, // <--- Extract Headers
+    Path(path): Path<ScriptNamePath>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    run_script_core(db, state, path.script_name, payload, "API", Some(base_url), event_scope).await
+    let headers_map = headers_to_map(&headers);
+    run_script_core(db, state, path.script_name, payload, "API", Some(base_url), event_scope, Some(headers_map)).await
 }
 
-// Sandbox Handler
-// With the Struct-based Path, this is actually identical to run_script now, 
-// but kept distinct if you want different logging/logic later.
 pub async fn run_sandbox_script(
     BaseUrl(base_url): BaseUrl,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     scope: Option<Extension<EventScope>>,
-    Path(path): Path<ScriptNamePath>, // FIX: Use struct (auto-ignores session_id)
+    headers: HeaderMap, // <--- Extract Headers
+    Path(path): Path<ScriptNamePath>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    run_script_core(db, state, path.script_name, payload, "Sandbox", Some(base_url), event_scope).await
+    let headers_map = headers_to_map(&headers);
+    run_script_core(db, state, path.script_name, payload, "Sandbox", Some(base_url), event_scope, Some(headers_map)).await
 }

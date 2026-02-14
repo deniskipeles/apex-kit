@@ -203,7 +203,7 @@ async fn execute_job(state: &AppState, db: Arc<dyn Db>, _context_id: &str, job: 
                 serde_json::json!({ "trigger": "cron", "job": job.name }),
                 context, // Context without explicit DB
                 None,
-                // scope
+                None
             ).await;
         }
     }
