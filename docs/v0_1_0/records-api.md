@@ -1,299 +1,161 @@
-# ApexKit Records API Documentation
+# 📄 Records API Documentation
 
-**Version:** 0.1.0
-**Base URL:** `http://localhost:5000/api/v1`
+**Version:** 0.1.0  
+**Base URL:** `https://api.your-app.com/api/v1`
 
-The Records API is the core interface for interacting with data stored in ApexKit. It allows you to Perform CRUD (Create, Read, Update, Delete) operations, complex filtering, relational expansion, and high-performance search.
+The Records API is the primary interface for managing data stored in ApexKit Collections. It supports full CRUD operations, complex MongoDB-style filtering, relational expansion (joins), and high-performance full-text search.
 
 ---
 
-## 1. Authentication & Headers
+## 1. Authentication & Scoping
 
-Almost all record operations require authentication, depending on the **API Rules** configured for the specific collection.
+Requests must be authenticated using a JWT token or an API Key. Scoping is handled automatically via the URL path.
 
-**Headers:**
-```http
-Content-Type: application/json
-Authorization: Bearer <YOUR_ACCESS_TOKEN>
-```
+*   **Headers:**
+    ```http
+    Authorization: Bearer <JWT_TOKEN>
+    # OR
+    x-api-key: <YOUR_API_KEY>
+    ```
+
+*   **URL Contexts:**
+    *   **Root**: `/api/v1/collections/...`
+    *   **Tenant**: `/tenant/{tenant_id}/api/v1/collections/...`
+    *   **Sandbox**: `/sandbox/{session_id}/api/v1/collections/...`
 
 ---
 
 ## 2. The Record Object
 
-A generic record in ApexKit consists of a system ID and a flexible JSON payload.
+A record consists of system metadata and a flexible user-defined JSON payload stored in the `data` field.
 
 ```json
 {
   "id": 105,
   "data": {
     "title": "My Awesome Post",
-    "slug": "my-awesome-post",
-    "is_published": true,
+    "status": "published",
     "views": 42,
-    "author_id": 5
+    "author_id": "user_77"
+  },
+  "created": "2024-02-14T10:00:00Z",
+  "updated": "2024-02-14T11:30:00Z",
+  "expand": {
+    "author_id": { "id": "user_77", "email": "alice@app.com" }
   }
 }
 ```
-
-*   **id** `(integer)`: The unique, auto-incrementing primary key of the record.
-*   **data** `(object)`: The schema-defined content of the record.
 
 ---
 
 ## 3. CRUD Endpoints
 
 ### List Records
-Fetch a paginated list of records from a collection.
-
-**Endpoint:**
-`GET /collections/{collection_id}/records`
-
-**Query Parameters:**
-
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `page` | `int` | `1` | The page number to fetch. |
-| `per_page` | `int` | `30` | Number of items per page (Max 100). |
-| `sort` | `string` | `-id` | Field to sort by. Use `-` for descending order. |
-| `filter` | `json` | `null` | JSON object for exact matching. |
-| `expand` | `string` | `null` | Comma-separated list of relations to resolve. |
-
-**Example Request:**
-`GET /collections/1/records?page=1&per_page=10&sort=-created`
-
-**Response:**
-```json
-[
-  { "id": 1, "data": { "title": "Post A", ... } },
-  { "id": 2, "data": { "title": "Post B", ... } }
-]
-```
-
----
+Fetch a paginated list of records.
+*   **GET** `/collections/{id}/records`
+*   **Query Parameters:**
+    *   `page`: (Int) Default 1.
+    *   `per_page`: (Int) Default 30, Max 100.
+    *   `sort`: (String) e.g., `-created,title`. Use `-` for descending.
+    *   `filter`: (JSON String) MongoDB-style filter.
+    *   `expand`: (String) Comma-separated relations to resolve.
 
 ### Get Single Record
-Fetch a specific record by its ID.
-
-**Endpoint:**
-`GET /collections/{collection_id}/records/{record_id}`
-
-**Response:**
-```json
-{
-  "id": 1,
-  "data": {
-    "title": "Post A",
-    "content": "..."
-  }
-}
-```
-
----
+*   **GET** `/collections/{id}/records/{record_id}`
+*   **Params:** Supports `expand` query parameter.
 
 ### Create Record
-Add a new record to a collection.
+*   **POST** `/collections/{id}/records`
+*   **Body:** Wrap your fields in a `data` object.
+*   **Behavior:** Fields of type `owner` or `date` with `auto: true` will be injected automatically if missing.
 
-**Endpoint:**
-`POST /collections/{collection_id}/records`
-
-**Body:**
-You must wrap your fields inside a `data` object.
-
-```json
-{
-  "data": {
-    "title": "New Project",
-    "status": "active",
-    "budget": 5000
-  }
-}
-```
-
-**Behavior:**
-1.  **Validation:** The input is validated against the Collection Schema. If a field is `required` but missing, or has the wrong type, a `422 Unprocessable Entity` error is returned.
-2.  **Relations:** If the schema defines a `relation`, ApexKit automatically updates the internal graph table.
-3.  **Search:** If fields are marked as `indexed`, the full-text search index is updated immediately.
-
-**Response:** `201 Created`
-```json
-{
-  "id": 55,
-  "data": { ... }
-}
-```
-
----
-
-### Update Record
-Modify an existing record. This is a partial update; fields not sent will remain unchanged.
-
-**Endpoint:**
-`PATCH /collections/{collection_id}/records/{record_id}`
-
-**Body:**
-```json
-{
-  "data": {
-    "status": "archived"
-  }
-}
-```
-
-**Permissions:**
-If the collection has an update rule like `"owner:author_id"`, the system verifies that `record.data.author_id` matches the ID of the currently logged-in user.
-
-**Response:** `200 OK` (Returns the updated record)
-
----
+### Update Record (Partial)
+*   **PATCH** `/collections/{id}/records/{record_id}`
+*   **Body:** Only include fields you wish to change.
 
 ### Delete Record
-Permanently remove a record.
-
-**Endpoint:**
-`DELETE /collections/{collection_id}/records/{record_id}`
-
-**Behavior:**
-*   Deletes the record from the database.
-*   **Cascading Cleanup:** Removes all relationship links pointing *to* or *from* this record in the graph table to ensure data integrity.
-*   Removes the entry from the Search Index.
-
-**Response:** `204 No Content`
+*   **DELETE** `/collections/{id}/records/{record_id}`
+*   **Behavior**: Cascades to the `_relations` table, deleting all links pointing to or from this record.
 
 ---
 
-## 4. Advanced Querying
+## 4. Analytical Query Engine
 
-### Filtering
-ApexKit supports JSON-based filtering using the `filter` query parameter.
+For complex reporting and aggregations, use the advanced query endpoint.
 
-**Syntax:** `?filter={"field_name": value}`
-
-*   **Exact Match:** `filter={"status": "active"}`
-*   **Boolean:** `filter={"is_published": true}`
-*   **Nested Data:** `filter={"meta.category": "tech"}`
-
-*Note: Currently supports equality checks. Range queries (>, <) are available via SQL/Scripting but not the REST filter parameter yet.*
-
-### Sorting
-Use the `sort` parameter.
-*   `sort=price` (Ascending)
-*   `sort=-price` (Descending)
-*   `sort=-created` (Newest first)
-
-### Relationship Expansion (Joins)
-ApexKit solves the "N+1" problem using the `expand` parameter. It fetches related records in a single HTTP request using optimized Recursive CTEs (Common Table Expressions).
-
-**Prerequisite:** The collection schema must define a field with type `relation`.
-
-**Syntax:** `?expand=field_name`
-
-**Example:**
-Fetching `comments` and expanding the `user_id` field to get the user's details.
-
-`GET /collections/5/records?expand=user_id`
-
-**Response:**
+*   **POST** `/collections/{id}/query`
+*   **Body Schema:**
 ```json
 {
-  "id": 101,
-  "data": {
-    "text": "Great article!",
-    "user_id": 12
-  },
-  "expand": {
-    "user_id": [
-      {
-        "id": 12,
-        "data": { "email": "alice@example.com", "role": "editor" }
-      }
-    ]
-  }
+  "select": [
+    "category",
+    { "fn": "sum", "field": "price", "as": "total_sales" },
+    { "fn": "avg", "field": "price", "as": "average_price" },
+    { "fn": "count", "field": "id", "as": "count" }
+  ],
+  "filter": { "status": "completed" },
+  "group_by": ["category"],
+  "sort": "-total_sales",
+  "pipeline": [
+    { "op": "cumulative", "args": { "field": "total_sales", "output_field": "running_total" } }
+  ]
 }
 ```
 
-**Nested Expansion:**
-You can go deeper using dot notation: `?expand=post_id.author_id`
+---
+
+## 5. Relationships & Expansion
+
+ApexKit solves the "N+1" problem by allowing you to fetch related records in a single request.
+
+*   **Syntax**: `?expand=author_id,comments.user_id`
+*   **Pagination on Relations**: `?expand=comments(5,0)` (Fetch first 5 comments).
+
+**Types of Relations:**
+1.  **Forward**: Link stored in the record (e.g., `post.author_id`).
+2.  **Reverse**: Back-references (e.g., `author.posts`).
+3.  **Owner**: Direct link to the system `users` table.
 
 ---
 
-## 5. Search API
+## 6. Search API
 
-ApexKit offers two types of search mechanisms.
+### OSE Instant Search (Recommended)
+Uses the high-performance **Tantivy** index. Supports fuzzy matching, typo-tolerance, and high-speed autocomplete.
+*   **Requirement**: Fields must have `ose_indexed: true` in schema.
+*   **GET** `/collections/{id}/instant-search?q=query&limit=10`
 
-### A. SQL Search (Standard)
-Searches directly against the database using `LIKE` queries on the JSON blob. Good for simple lookups on non-indexed fields.
+### SQL Search
+Standard `LIKE` queries against the database JSON blob.
+*   **GET** `/collections/{id}/search?q=query`
 
-**Endpoint:**
-`GET /collections/{collection_id}/search?q={query}`
-
-### B. Instant Search (Tantivy / High-Performance)
-Uses a memory-mapped inverted index (similar to Elasticsearch/Solr) stored on disk. This allows for ultra-fast full-text search, typo tolerance, and ranking.
-
-**Prerequisite:** Fields must have `indexed: true` in the Collection Schema.
-
-**Endpoint:**
-`GET /collections/{collection_id}/instant-search?q={query}`
-
-**Response:**
-Returns a lightweight array of hits with relevance scores.
-```json
-[
-  {
-    "id": 55,
-    "score": 4.25,
-    "snippet": {
-      "title": "Introduction to Rust",
-      "summary": "Rust is a systems programming language..."
-    }
-  }
-]
-```
+### Vector Search (AI)
+Semantic search based on meaning rather than keywords.
+*   **Requirement**: Fields must have `vectorize: true`.
+*   **POST** `/collections/{id}/search-text-vector`
+*   **Body**: `{ "query_text": "Items about science", "limit": 5 }`
 
 ---
 
-## 6. Error Handling
+## 7. Data Import / Export
 
-The API returns standard HTTP status codes and a JSON error object.
+### Import
+Upload a CSV or JSON array to create records in bulk.
+*   **POST** `/admin/import-data` (Multipart)
+*   **Params**: `collection_name`, `file`.
 
-**Structure:**
-```json
-{
-  "error": "error_code",
-  "message": "Human readable description",
-  "details": { ... }, 
-  "status": 4xx
-}
-```
+### Export
+Download an entire collection.
+*   **GET** `/admin/export-data/{id}?format=json|csv`
+
+---
+
+## 8. Error Codes
 
 | Status | Code | Meaning |
 | :--- | :--- | :--- |
-| `400` | `input_validation` | Invalid JSON or query parameters. |
-| `401` | `unauthorized` | Missing or invalid JWT token. |
-| `403` | `forbidden` | Authenticated, but Policy Rule (e.g., `admin` or `owner`) denied access. |
-| `404` | `not_found` | Collection or Record ID does not exist. |
-| `422` | `schema_validation_error` | Data payload violates schema (e.g., missing required field, wrong type). |
-| `500` | `database_error` | Internal server or storage error. |
-
----
-
-## 7. Relations (Manual Linking)
-
-While schema-based relations are handled automatically, you can manually create graph edges between arbitrary records (useful for many-to-many tags or social follows).
-
-### Create Relation edge
-`POST /collections/{origin_col}/records/{origin_id}/relations`
-
-**Body:**
-```json
-{
-  "target_collection_id": 2,
-  "target_record_id": 50,
-  "relation_name": "liked_by"
-}
-```
-
-### Delete Relation edge
-`DELETE /collections/{origin_col}/records/{origin_id}/relations`
-
-*(Body same as create)*
+| `400` | `input_validation` | Malformed JSON or invalid parameters. |
+| `403` | `forbidden` | Policy Rule (RLS) denied access. |
+| `404` | `not_found` | Record or Collection does not exist. |
+| `422` | `validation_error` | Data violates schema constraints (e.g., unique, required). |
+| `500` | `database_error` | Internal storage failure. |

@@ -1,238 +1,152 @@
-# ApexKit Collections API Documentation
-
 **Version:** 0.1.0
-**Base URL:** `http://localhost:5000/api/v1`
+**Base URL:** `https://api.your-app.com/api/v1`
 
-In ApexKit, a **Collection** is the fundamental container for data. You can think of it as a Table in SQL or a Collection in MongoDB. It defines the **Structure (Schema)**, **Validation Rules**, and **Security Policies** for the records it holds.
+In ApexKit, a **Collection** is the fundamental container for your data. It functions like a Table in SQL or a Collection in MongoDB, defining the **Schema** (fields), **Validation Rules**, and **Security Policies** for the records it holds.
 
 ---
 
 ## 1. The Collection Object
 
-When creating or retrieving a collection, the JSON structure looks like this:
+A collection is defined by its name and a configuration schema.
 
 ```json
 {
-  "id": 1,
-  "name": "posts",
-  "schema": {
-    "fields": { ... },
-    "policies": { ... },
-    "relations": { ... }
-  }
-}
-```
-
-*   **name**: (String, Unique) The identifier used in API URLs and relation definitions. Should be lowercase, alphanumeric, snake_case recommended (e.g., `blog_posts`).
-*   **schema**: The configuration object containing fields and rules.
-
----
-
-## 2. Defining Fields (Schema)
-
-The `fields` object maps field names to their definitions. ApexKit enforces strict typing and validation at the API level.
-
-### Field Properties
-
-| Property | Type | Description |
-| :--- | :--- | :--- |
-| `type` | String | **Required.** The data type (see list below). |
-| `required` | Boolean | If `true`, the record cannot be saved without this value. |
-| `unique` | Boolean | If `true`, duplicate values across the collection are rejected. |
-| `indexed` | Boolean | If `true`, this field is added to the Tantivy Search Index for high-performance searching. |
-| `default` | Any | The value to use if the payload is missing this field. |
-
-### Supported Field Types
-
-| Type Value | Description | Specific Options |
-| :--- | :--- | :--- |
-| `string` | Short text (Title, Name). | `min_length`, `max_length`, `pattern` (Regex) |
-| `text` | Long text or HTML content. | `min_length`, `max_length` |
-| `number` | Integer or Float. | `min`, `max` |
-| `bool` | True or False. | - |
-| `email` | Validates email format. | - |
-| `url` | Validates URL format. | - |
-| `date` | ISO 8601 Date String. | - |
-| `select` | Enum-like restriction. | `options`: `["Draft", "Published"]` |
-| `json` | unstructured JSON object/array. | - |
-| `file` | Reference to a stored file path. | `max_size` (bytes), `mime_types`: `["image/png"]` |
-| `blob` | Binary data (Base64 encoded). | `max_size` |
-| `vector` | Array of floats for AI Embeddings. | `dimension`: `1536` (Required for Vector Search) |
-| `relation` | Foreign Key to another collection. | `relation_to`: `"target_collection_name"` |
-| `owner` | Links record to a User ID. | - |
-
----
-
-## 3. Security Policies (API Rules)
-
-ApexKit uses a granular permission system defined in `policies`. Each operation has a rule string.
-
-**Operations:** `read`, `create`, `update`, `delete`.
-
-**Rule Syntax:**
-
-| Rule | Description |
-| :--- | :--- |
-| `"public"` | Accessible by anyone (including unauthenticated guests). |
-| `"auth"` | Accessible by any logged-in user with a valid JWT. |
-| `"admin"` | Accessible only by users with the `admin` role. |
-| `"owner:{field}"` | **Row-Level Security.** The system checks if the value in the record's `{field}` matches the authenticated User's ID. |
-
-**Example Policies Object:**
-```json
-"policies": {
-  "read": "public",           // Everyone can see
-  "create": "auth",           // Only logged in can create
-  "update": "owner:user_id",  // Only the creator can edit
-  "delete": "admin"           // Only admins can delete
-}
-```
-
----
-
-## 4. API Endpoints
-
-### List Collections
-Retrieve all schema definitions.
-
-*   **GET** `/collections`
-*   **Auth:** Admin Only.
-
-**Response:**
-```json
-[
-  {
-    "id": 1,
-    "name": "users",
-    "schema": { ... }
-  },
-  {
-    "id": 2,
-    "name": "posts",
-    "schema": { ... }
-  }
-]
-```
-
----
-
-### Get Collection
-Retrieve details for a specific collection.
-
-*   **GET** `/collections/{id}`
-*   **Auth:** Admin Only (or internal use).
-
----
-
-### Create Collection
-Define a new table/collection.
-
-*   **POST** `/collections`
-*   **Auth:** Admin Only.
-
-**Body Payload:**
-```json
-{
-  "name": "products",
+  "id": "5",
+  "name": "blog_posts",
+  "index": "cbaa8fa3-85db-4a69-b7d2-dcda99dbd4d8",
   "schema": {
     "fields": {
-      "title": {
-        "type": "string",
-        "required": true,
-        "indexed": true
-      },
-      "price": {
-        "type": "number",
-        "min": 0
-      },
-      "category": {
-        "type": "select",
-        "options": ["Electronics", "Books", "Clothing"]
-      },
-      "supplier_id": {
-        "type": "relation",
-        "relation_to": "suppliers"
-      }
+      "title": { "type": "string", "required": true, "ose_indexed": true },
+      "content": { "type": "text", "vectorize": true },
+      "author_id": { "type": "owner", "required": true }
     },
     "policies": {
       "read": "public",
-      "create": "admin",
-      "update": "admin",
+      "create": "auth",
+      "update": "auth.id == field:author_id",
       "delete": "admin"
-    }
+    },
+    "relations": {
+        "category": {
+            "target_collection": "categories",
+            "relation_type": "one"
+        }
+    },
+    "composite_unique": [
+        ["title", "author_id"]
+    ]
   }
 }
 ```
 
-**Response:** `201 Created`
+*   **name**: The unique identifier used in API URLs.
+*   **index**: A stable UUID used to maintain relationship integrity across different environments (e.g., migrating from Sandbox to Production).
+*   **schema.fields**: Definitions for standard data fields.
+*   **schema.relations**: Explicit relational links to other collections.
+*   **schema.policies**: Access control rules for CRUD operations.
+*   **schema.composite_unique**: Arrays of field names that must be unique as a combination.
 
 ---
+
+## 2. API Endpoints
+
+All collection management endpoints require **Admin** privileges.
+
+### List Collections
+Retrieve all schemas in the current scope.
+*   **GET** `/collections`
+
+### Get Collection
+*   **GET** `/collections/{id_or_name}`
+
+### Create Collection
+*   **POST** `/collections`
+*   **Body**: `{ "name": "string", "schema": { ... } }`
 
 ### Update Collection
-Modify the schema or name. Note that changing field types may require manual data migration or cause validation errors on existing data if they are incompatible.
-
-*   **PATCH** `/collections/{id}`
-*   **Auth:** Admin Only.
-
-**Body:**
-```json
-{
-  "schema": {
-    "fields": {
-       // ... updated field definitions
-    }
-  }
-}
-```
-
----
+*   **PATCH** `/collections/{id_or_name}`
+*   **Body**: Partial updates to name or schema.
 
 ### Delete Collection
-Permanently drops the collection, **ALL** its records, and removes any search indexes associated with it.
-
-*   **DELETE** `/collections/{id}`
-*   **Auth:** Admin Only.
-
-**Response:** `204 No Content`
+Permanently removes the collection, all associated records, and search indexes.
+*   **DELETE** `/collections/{id_or_name}`
 
 ---
 
-## 5. Working with Relations
+## 3. Field Types & Validation
 
-ApexKit handles relations automatically if defined in the schema.
+ApexKit enforces strict types at the API entry point.
 
-### Defining a Relation
-When you create a collection, define a field with type `relation`:
+| Type | Purpose | Key Options |
+| :--- | :--- | :--- |
+| **`string`** | Short text | `min_length`, `max_length`, `pattern` (Regex) |
+| **`text`** | Long-form content | `vectorize` (Enable AI search) |
+| **`number`** | Integers or Decimals | `min`, `max` |
+| **`bool`** | True/False | - |
+| **`email`** | Email validation | - |
+| **`url`** | Web link validation | - |
+| **`date`** | ISO 8601 Timestamp | `auto` (Set on create) |
+| **`select`** | Enum selection | `options` (Array of strings) |
+| **`json`** | Dynamic objects | - |
+| **`file`** | Reference to storage | `max_size`, `mime_types` |
+| **`relation`** | Link to another record | `relation_to` (Target collection) |
+| **`owner`** | Link to system User | `auto` (Set to current user) |
 
+---
+
+## 4. Advanced Schemas
+
+### Relational Integrity
+When a field is defined as a `relation`, ApexKit manages an internal graph table (`_relations`). 
+*   **Expanding**: Use `?expand=field_name` in Record queries to join data automatically.
+*   **Cleanup**: When a record is deleted, all relationship edges pointing to it are automatically purged.
+
+### Search Indexing
+*   **OSE Index (`ose_indexed`)**: If enabled, the field is added to the Tantivy full-text index for fast fuzzy searching.
+*   **Vector Search (`vectorize`)**: If enabled, ApexKit generates a 384+ dimension embedding for the field content, enabling semantic "meaning-based" search.
+
+### Composite Uniqueness
+You can prevent duplicate combinations across multiple fields. For example, to ensure a user can only like a post once:
 ```json
-"author_id": {
-  "type": "relation",
-  "relation_to": "users"
-}
+"composite_unique": [ ["user_id", "post_id"] ]
 ```
 
-### Automatic Linking
-When you **Create** or **Update** a record in this collection:
-1.  Pass the ID of the target record in the JSON payload: `{"author_id": 55}`.
-2.  ApexKit detects the field type is `relation`.
-3.  It automatically creates an edge in the internal `_relations` graph table linking the new record to User #55.
+---
 
-### Fetching (Expanding)
-Because the schema knows about the link, you can easily fetch the data using the Records API:
-`GET /collections/posts/records?expand=author_id`
+## 5. Multi-Tenancy Behavior
+
+Collections are **physically isolated**. 
+1.  **Root App**: Collections are stored in `storage/system/data.db`.
+2.  **Tenants**: Each tenant gets a unique `data.db` in their own folder.
+3.  **Cross-Access**: A script in Tenant A **cannot** access or query a collection in Tenant B.
 
 ---
 
-## 6. Vector Search Setup (AI)
+## 6. JavaScript SDK Usage
 
-To enable semantic search (e.g., "Find products similar to this description"):
+Management of collections is handled via the `admins` namespace.
 
-1.  **Define a Vector Field:**
-    ```json
-    "embedding": {
-      "type": "vector",
-      "dimension": 1536  // Must match your AI model (e.g., OpenAI ada-002)
+```javascript
+import { pb } from './apiClient';
+
+// 1. List all collections
+const cols = await pb.admins.listCollections();
+
+// 2. Create a new collection
+const newCol = await pb.admins.createCollection("products", {
+    fields: {
+        sku: { type: "string", required: true, unique: true },
+        price: { type: "number", min: 0 }
     }
-    ```
-2.  **Indexing:** Ensure `indexed: true` is set on text fields you want to keyword search alongside vectors.
-3.  **Usage:** Populate this field using a Server-Side Script that calls the AI Embedding API, then use the `instant-search` endpoint (future update will include vector similarity search endpoints).
+});
+
+// 3. Update a schema
+await pb.admins.patchCollection(newCol.id, {
+    schema: {
+        fields: {
+            ...newCol.schema.fields,
+            stock: { type: "number", default: 0 }
+        }
+    }
+});
+```

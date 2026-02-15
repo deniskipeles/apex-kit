@@ -1,298 +1,202 @@
-Here are several sample JavaScript scripts you can run in ApexKit `ScriptEngine`.
+# 📚 Script Samples Library
 
-These are divided into **Manual Endpoints** (executed via `POST /run/{name}`) and **Event Hooks** (executed automatically on DB actions).
+**Version:** 0.1.0
+**Context:** JavaScript Server Runtime (Boa)
+
+This library provides copy-pasteable examples for common tasks in ApexKit, demonstrating the power of scoped database access, in-memory archiving, and shared Root-to-Tenant logic.
 
 ---
 
-### 📚 Category 1: Manual API Endpoints
-*Create these with Trigger Type: `manual`*
+### 1. Manual API Endpoints
+*Trigger: `manual` | Access: `POST /api/v1/run/{name}`*
 
-#### 1. "Hello World" & Input Echo
-A simple script to test input parsing and response formatting.
-
-```javascript
-export default async function(req) {
-    // 1. Parse JSON body from the request
-    const body = await req.json();
-    const name = body.name || "Stranger";
-
-    log("Received hello request for: " + name);
-
-    // 2. Return a standard Response object
-    return new Response({
-        message: `Hello, ${name}!`,
-        timestamp: new Date().toISOString(),
-        received_data: body
-    }, { status: 200 });
-}
-```
-
-#### 2. External API Integration (Crypto Price Fetcher)
-Demonstrates using `$http` to call 3rd party APIs and merging that data.
+#### Sales Performance Report (Analytical Engine)
+Uses the `$db.query` engine to aggregate data directly in SQL.
 
 ```javascript
 export default async function(req) {
-    const body = await req.json();
-    const coin = body.coin || "bitcoin";
+    const { category } = await req.json();
 
-    // 1. Call external API (Coingecko)
-    // Note: $http.get returns a raw string
-    const responseStr = await $http.get(`https://api.coingecko.com/api/v3/simple/price?ids=${coin}&vs_currencies=usd`);
-    const data = JSON.parse(responseStr);
+    const report = await $db.query(null, {
+        "from": "sales",
+        "select": [
+            "region",
+            { "fn": "sum", "field": "amount", "as": "total_revenue" },
+            { "fn": "count", "field": "id", "as": "order_count" },
+            { "fn": "avg", "field": "amount", "as": "avg_ticket" }
+        ],
+        "where": category ? { "category": category } : {},
+        "group_by": ["region"],
+        "sort": "-total_revenue"
+    });
 
-    if (!data[coin]) {
-        return new Response({ error: "Coin not found" }, { status: 404 });
-    }
-
-    const price = data[coin].usd;
-
-    // 2. Log to server console
-    log(`Fetched price for ${coin}: $${price}`);
-
-    // 3. Return combined result
     return new Response({
-        asset: coin,
-        price_usd: price,
-        formatted: `$${price.toFixed(2)}`
+        generated_at: new Date().toISOString(),
+        regions: report
     });
 }
 ```
 
-#### 3. Custom Dashboard Aggregation
-Fetching data from multiple collections to create a custom stats endpoint (avoids making multiple calls from frontend).
+#### Multi-File Asset Bundler
+Reads binary files from the current scope's storage and creates a ZIP archive.
 
 ```javascript
 export default async function(req) {
-    // 1. Fetch data from multiple collections
-    // (Assuming collections 'users' and 'orders' exist)
-    const users = await $db.find("users", {}); // Empty filter = all
-    const orders = await $db.find("orders", { status: "pending" });
-
-    // 2. Perform logic (Aggregation)
-    const totalUsers = users.length;
-    const pendingOrders = orders.length;
+    const { folder_name } = await req.json();
     
-    // Calculate total value of pending orders
-    let totalValue = 0;
-    for (let i = 0; i < orders.length; i++) {
-        totalValue += (orders[i].total_amount || 0);
+    // 1. Fetch metadata for files in this "folder"
+    const files = await $db.find("attachments", { folder: folder_name });
+    
+    const zipMap = {};
+    for (const file of files) {
+        // readFile returns Base64 from the scoped storage (Local or S3)
+        const b64 = await $zip.readFile(file.filename);
+        zipMap[file.original_name] = b64;
     }
 
+    // 2. Create ZIP and save back to storage
+    const zipB64 = await $zip.create(zipMap);
+    const saved = await $zip.saveFile(`${folder_name}_export.zip`, zipB64);
+
     return new Response({
-        stats: {
-            user_count: totalUsers,
-            pending_order_count: pendingOrders,
-            pipeline_value: totalValue
-        }
+        message: "Bundle created",
+        download_url: saved.url,
+        size_bytes: saved.size
     });
 }
 ```
 
 ---
 
-### 🪝 Category 2: Database Event Hooks
-*Create these with Trigger Type: `before_create`, `after_create`, etc.*
+### 2. Shared System Logic (Root Functions)
+*Trigger: `manual` | Visibility: `public` | Context: Created in Root App*
 
-#### 4. Slug Generator & Validation (`before_create`)
-Automatically generates a URL-friendly slug from a title and enforces validation.
+#### FFmpeg Video Processor
+Demonstrates how a Root script uses `$cmd` to provide heavy processing to Tenants.
 
 ```javascript
-export default async function(e) {
-    // 'e' contains: e.data, e.collection, e.auth
+// Root Script Name: "system-ffmpeg"
+export default async function(req) {
+    const { input_url, output_name } = await req.json();
+    const caller = req.body.__caller_scope;
 
-    // 1. Validation
-    if (!e.data.title) {
-        throw new Error("Title is required for this collection.");
-    }
+    if (!caller.Tenant) throw new Error("Tenants only");
 
-    // 2. Logic: Generate Slug if missing
-    if (!e.data.slug) {
-        e.data.slug = e.data.title
-            .toLowerCase()
-            .replace(/ /g, '-')
-            .replace(/[^\w-]+/g, '');
-        
-        // Append random string to ensure uniqueness
-        e.data.slug += "-" + $util.uuid().split('-')[0];
-    }
+    // Root can execute shell commands
+    const result = await $cmd.run("ffmpeg", [
+        "-i", input_url,
+        "-vf", "scale=1280:-1",
+        "-c:v", "libx264",
+        "-crf", "23",
+        output_name
+    ], { timeout: 60000 });
 
-    // 3. Force default fields
-    e.data.view_count = 0;
-    e.data.is_published = false;
-
-    // 4. Return modified data to be saved
-    return e.data; 
+    return new Response({
+        status: result.status === 0 ? "success" : "failed",
+        logs: result.stderr
+    });
 }
 ```
 
-#### 5. Slack/Discord Notification (`after_create`)
-Sends a notification to a chat channel when a new record is created.
+---
+
+### 3. Database Event Hooks
+*Trigger: `before_create`, `after_list_records`, etc.*
+
+#### Dynamic Row-Level Security (Filter Hook)
+Automatically restricts a `list` request to only show records owned by the user.
 
 ```javascript
+// Trigger: before_list_records | Target: "projects"
 export default async function(e) {
-    // We don't return data in 'after' hooks, just perform side effects
+    // Skip for admins
+    if (e.auth.role === 'admin') return e.data;
+
+    // Parse existing filter or start new
+    const filter = e.data.filter ? JSON.parse(e.data.filter) : {};
     
-    const webhookUrl = "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_TOKEN";
+    // Inject ownership constraint
+    filter.owner_id = e.auth.id;
     
-    const message = {
-        content: `🆕 **New Item Created!**\nCollection: ${e.collection}\nID: ${e.record.id}\nTitle: ${e.record.data.title}`
-    };
-
-    // Fire and forget
-    await $http.post(webhookUrl, message);
+    // Update the query options
+    e.data.filter = JSON.stringify(filter);
     
-    log("Notification sent for record " + e.record.id);
-}
-```
-
-#### 6. Immutable Fields Check (`before_update`)
-Prevents users from changing sensitive fields (like `role` or `subscription_status`) via the API.
-
-```javascript
-export default async function(e) {
-    // 1. Fetch the EXISTING record from DB to compare
-    const oldRecord = await $db.find_one(e.collection, e.record.id);
-
-    // 2. Check if restricted fields are being changed
-    if (e.data.role !== oldRecord.role) {
-        // Only allow Admins to change role
-        if (!e.auth || e.auth.role !== 'admin') {
-            throw new Error("You are not authorized to change the User Role.");
-        }
-    }
-
-    // 3. Return the data (allowed)
     return e.data;
 }
 ```
 
----
-
-### 🤖 Category 3: AI & Vectors
-*Using the built-in `$ai` and `$db` features.*
-
-#### 7. Semantic Search Endpoint
-A custom endpoint that takes a query, converts it to a vector, and searches the DB.
+#### Slack Notification (Side Effect)
+Triggers an external webhook after a record is successfully saved.
 
 ```javascript
-// Trigger: manual
-// Name: semantic-search
-export default async function(req) {
-    const body = await req.json();
-    const query = body.q;
-    const collectionId = 1; // ID of your 'posts' collection
-    const fieldName = "description";
-
-    if (!query) return new Response({ error: "Query 'q' required" }, { status: 400 });
-
-    // 1. Generate Embedding for the query string
-    // Provider can be "local", "openai", "gemini", etc. based on config
-    const vector = await $ai.embed(query, "gemini");
-
-    // 2. Perform Vector Search via $db (This connects to HNSW index)
-    // Note: You currently need to expose `search_vector` to $db in scripting.rs 
-    // or use the HTTP API internally if $db doesn't expose it directly yet.
+// Trigger: after_create | Target: "leads"
+export default async function(e) {
+    const webhook = await $env.get("SLACK_WEBHOOK_URL");
     
-    // Assuming we added $db.search_vector(col_id, field, vector, limit)
-    // If not, we can fetch all and compute cosine similarity (slow but works for small datasets)
-    
-    // Mocking return for demonstration if specific $db function is missing in current lib.rs:
-    return new Response({
-        message: "Vector generated",
-        vector_sample: vector.slice(0, 5),
-        note: "Implement $db.search_vector binding in Rust to finish this."
+    const message = {
+        text: `🚀 *New Lead:* ${e.record.data.email}\nSource: ${e.record.data.source}`
+    };
+
+    await fetch(webhook, {
+        method: "POST",
+        body: JSON.stringify(message)
     });
 }
 ```
 
-### 🧹 Category 4: Cron Job
-*Trigger Type: `cron`*
+---
 
-#### 8. Data Cleanup / Archiving
-Runs automatically to archive old records.
+### 4. Traffic & Quota Management
+*Trigger: `before_tenant_request` | Context: Root level*
 
-```javascript
-export default async function() {
-    log("Running nightly cleanup...");
-
-    // 1. Find old logs (simulated logic)
-    // In a real scenario, you'd filter by date, but JSON filtering for dates is string based
-    const logs = await $db.find("audit_logs", {});
-
-    let deletedCount = 0;
-    
-    // 2. Iterate and Delete
-    for (let i = 0; i < logs.length; i++) {
-        const item = logs[i];
-        // If older than 30 days (logic simplified)
-        // ... date comparison logic ...
-        
-        // await $db.delete("audit_logs", item.id);
-        // deletedCount++;
-    }
-
-    log(`Cleanup finished. Deleted ${deletedCount} records.`);
-    return new Response({ success: true });
-}
-```
-
-### 🧹 Category 4: $root
-*Trigger Type: `manual`*
-
-#### 9. Tenants Creation
-Runs to create tenant.
+#### Atomic Rate Limiter
+Prevents API abuse by tracking requests per IP in the system cache.
 
 ```javascript
 export default async function(e) {
-    // e.data is the new subscription record
-    
-    if (e.trigger === 'after_create') {
-        const tenantId = $util.slugify(e.data.company_name) + "-" + $util.randomHex(4);
-        
-        // Call root provisioner with metadata
-        await $root.createTenant(tenantId, {
-            name: e.data.company_name,
-            tier: e.data.plan_tier, // e.g. "pro"
-            owner_id: e.data.user_id 
-        });
-        
-        log("Provisioned tenant: " + tenantId);
-    }
-}
-```
-
-### 10. Example Usage (Script)
-Now you can write a Rate Limiter / Quota Manager script in the Admin UI.
-
-**Name:** `rate-limiter`
-**Trigger:** `before_tenant_request`
-
-```javascript
-export default async function(e) {
-    const tenant = e.data.tenant_id;
     const ip = e.data.ip;
-    
-    // 1. Global Quota (e.g. 1000 reqs/hour per tenant)
-    // Key format: quota:tenantId:timestamp_hour
-    const currentHour = new Date().toISOString().slice(0, 13); // "2023-10-27T10"
-    const quotaKey = `quota:${tenant}:${currentHour}`;
-    
-    // Increment
-    const count = await $cache.incr(quotaKey, 1);
-    
-    // Check limit
-    if (count > 1000) {
-        log(`Tenant ${tenant} exceeded quota: ${count}`);
-        throw new Error("Hourly quota exceeded");
+    const window = new Date().toISOString().slice(0, 16); // Minute resolution
+    const cacheKey = `rate:${ip}:${window}`;
+
+    // Increment atomically
+    const count = await $cache.incr(cacheKey, 1);
+
+    if (count > 60) {
+        throw new Error("Rate limit exceeded. Try again in a minute.");
     }
-    
-    // 2. IP Rate Limit (DDOS protection)
-    const ipKey = `ip:${tenant}:${ip}`;
-    const ipCount = await $cache.incr(ipKey, 1);
-    
-    // Block if > 10 requests in short burst (logic implies we expire keys externally or just let them grow for now)
-    if (ipCount > 50 && tenant) {
-         throw new Error("Too many requests");
-    }
+}
+```
+
+---
+
+### 5. AI & Vector Search
+*Trigger: `manual`*
+
+#### Semantic Knowledge Base Search
+Converts a query to a vector and searches the HNSW index.
+
+```javascript
+export default async function(req) {
+    const { q } = await req.json();
+
+    // 1. Generate Embedding using the scoped AI provider
+    const vector = await $ai.embed(q);
+
+    // 2. Search specific collection vector field
+    const matches = await $db.records.searchVector(
+        "knowledge_base", 
+        "content_vec", 
+        vector, 
+        5
+    );
+
+    return new Response({
+        query: q,
+        results: matches.map(m => ({
+            id: m.id,
+            title: m.data.title,
+            relevance: m._score
+        }))
+    });
 }
 ```

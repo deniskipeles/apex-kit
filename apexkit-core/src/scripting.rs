@@ -798,15 +798,24 @@ fn execute_http_request(
     method: String,
     headers_val: Option<serde_json::Map<String, serde_json::Value>>,
     body_val: Option<serde_json::Value>,
+    redirect_mode: Option<String>, // [NEW] Argument
 ) -> Result<serde_json::Value, String> {
     
-    // Access the async runtime from thread-local storage
     ACTIVE_CONTEXT.with(|c| {
         if let Some((_, handle, _, _, _)) = &*c.borrow() {
             handle.block_on(async {
-                // 1. Build Client
+                // 1. Configure Redirect Policy
+                // Default to 'follow' if not specified
+                let policy = match redirect_mode.as_deref() {
+                    Some("manual") => reqwest::redirect::Policy::none(), // Don't follow
+                    Some("error") => reqwest::redirect::Policy::custom(|attempt| {
+                         attempt.error("Redirects not allowed") // Error on redirect
+                    }),
+                    _ => reqwest::redirect::Policy::default(), // Follow (limit 10)
+                };
+
                 let client = reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::default())
+                    .redirect(policy) // Use the configured policy
                     .build()
                     .map_err(|e| format!("Client Build Error: {}", e))?;
 
@@ -882,9 +891,13 @@ fn register_fetch(ctx: &mut Context) -> Result<(), String> {
             .cloned();
 
         let body = opts.get("body").cloned();
+        
+        let redirect_mode = opts.get("redirect")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         // CALL SHARED HELPER
-        let result = execute_http_request(url, method, headers, body);
+        let result = execute_http_request(url, method, headers, body, redirect_mode);
 
         return_json_promise(ctx, result)
     });
@@ -902,13 +915,11 @@ fn register_fetch(ctx: &mut Context) -> Result<(), String> {
 }
 
 fn register_http(ctx: &mut Context) -> Result<(), String> {
-    
     // $http.get(url)
     let get = NativeFunction::from_copy_closure(move |_, args, ctx| {
         let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        
-        // CALL SHARED HELPER
-        let result = execute_http_request(url, "GET".to_string(), None, None);
+        // Pass None for redirect (default follow)
+        let result = execute_http_request(url, "GET".to_string(), None, None, None);
 
         // Map result: Extract "body" string or return error
         let mapped_result = result.map(|json_val| {
@@ -929,7 +940,7 @@ fn register_http(ctx: &mut Context) -> Result<(), String> {
         let body_arg = args.get_or_undefined(1).to_json(ctx).unwrap();
 
         // CALL SHARED HELPER
-        let result = execute_http_request(url, "POST".to_string(), None, body_arg);
+        let result = execute_http_request(url, "POST".to_string(), None, body_arg, None);
 
         let mapped_result = result.map(|json_val| {
             json_val.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string()

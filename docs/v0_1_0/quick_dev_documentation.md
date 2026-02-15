@@ -1,263 +1,233 @@
-# ApexKit Developer API Documentation
+# 🚀 ApexKit Developer API Documentation
 
-**Version:** 0.1.0
-**Base URL:** `http://localhost:5000/api/v1` (Default)
+**Version:** 0.1.0  
+**Base URL:** `http://localhost:5000/api/v1` (Default)  
+**SDK Requirement:** `apexkit-sdk` v0.1.0+
 
-ApexKit is a lightweight, high-performance Backend-as-a-Service (BaaS) providing a RESTful API, Real-time subscriptions, and Server-Side Scripting.
-
----
-
-## 1. Authentication
-
-Most endpoints require authentication based on the Collection's API Rules.
-
-**Header:**
-```http
-Authorization: Bearer <YOUR_JWT_TOKEN>
-```
-
-### Authenticate (User Login)
-**POST** `/auth/login`
-
-**Body:**
-```json
-{
-  "email": "user@example.com",
-  "password": "secretpassword"
-}
-```
-
-**Response:**
-```json
-{
-  "token": "eyJhbGciOiJIUzI1Ni...",
-  "user": {
-    "id": 1,
-    "email": "user@example.com",
-    "role": "user"
-  }
-}
-```
-
-### Register User
-**POST** `/auth/register`
-*Same body structure as Login. Creates a user with role `user`.*
+ApexKit is a monolithic Backend-as-a-Service providing a type-safe REST API, high-performance search, real-time subscriptions, and a sandboxed JavaScript runtime.
 
 ---
 
-## 2. Records (CRUD)
+## 1. SDK Initialization
 
-Interact with your data collections. Replace `:collectionId` with the Collection ID (e.g., `1` or `posts`).
-
-### List Records
-**GET** `/collections/:collectionId/records`
-
-**Query Parameters:**
-| Param | Description | Example |
-| :--- | :--- | :--- |
-| `page` | Page number (default 1) | `?page=2` |
-| `per_page` | Items per page (default 30) | `?per_page=50` |
-| `sort` | Sort field. Prefix `-` for descending. | `?sort=-created` |
-| `filter` | JSON string for filtering. | `?filter={"status":"active"}` |
-| `expand` | Comma-separated relations to fetch. | `?expand=author,comments` |
-
-**Example Request:**
-`GET /collections/posts/records?filter={"published":true}&sort=-created&expand=author`
-
-**Response:**
-```json
-[
-  {
-    "id": 101,
-    "collectionId": 5,
-    "created": "2023-10-27T10:00:00Z",
-    "updated": "2023-10-27T10:00:00Z",
-    "title": "My First Post",
-    "published": true,
-    "author": 1,
-    "expand": {
-      "author": [{ "id": 1, "email": "dave@example.com" }]
-    }
-  }
-]
-```
-
-### Get Single Record
-**GET** `/collections/:collectionId/records/:recordId`
-
-### Create Record
-**POST** `/collections/:collectionId/records`
-
-**Body:**
-```json
-{
-  "data": {
-    "title": "New Article",
-    "content": "Hello World",
-    "status": "draft"
-  }
-}
-```
-
-### Update Record
-**PATCH** `/collections/:collectionId/records/:recordId`
-
-**Body:**
-```json
-{
-  "data": {
-    "status": "published"
-  }
-}
-```
-
-### Delete Record
-**DELETE** `/collections/:collectionId/records/:recordId`
-
-### Instant Search (Vector/Full-Text)
-**GET** `/collections/:collectionId/instant-search?q=search_term`
-*Returns lightweight results from the Tantivy search index (faster than SQL).*
-
----
-
-## 3. Storage (Files)
-
-### Upload File
-**POST** `/storage/upload`
-*Content-Type: `multipart/form-data`*
-
-**Form Field:** `file` (Binary content)
-
-**Response:**
-```json
-{
-  "id": 55,
-  "filename": "uuid-image.png",
-  "url": "http://.../api/v1/storage/file/uuid-image.png"
-}
-```
-
-### Serve File
-**GET** `/storage/file/:filename`
-
----
-
-## 4. Scripting (Server-Side Logic)
-
-Execute server-side JavaScript functions defined in the Admin Dashboard.
-
-**POST** `/run/:script_name`
-
-**Body:** (Any JSON payload you want to pass to the script)
-```json
-{
-  "order_id": 123,
-  "action": "refund"
-}
-```
-
-**Response:** (Whatever the script returns)
-```json
-{
-  "success": true,
-  "processed_at": "2023-10-27..."
-}
-```
-
----
-
-## 5. AI Actions (LLM Integration)
-
-Run predefined AI prompts (configured in Admin) with dynamic variables.
-
-**POST** `/ai/run/:action_slug`
-
-**Body:**
-```json
-{
-  "variables": {
-    "text": "Code needed for a binary search in Rust",
-    "tone": "professional"
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "result": "Here is the Rust implementation for binary search..."
-}
-```
-
----
-
-## 6. Real-time (WebSocket)
-
-Subscribe to database changes instantly.
-
-**Endpoint:** `ws://localhost:5000/ws`
-
-**Messages Received:**
-```json
-{
-  "event": "Insert",
-  "payload": {
-    "collection_id": 5,
-    "record_id": 102,
-    "data": { "title": "New Post" }
-  }
-}
-```
-*(Also supports `Update` and `Delete` events)*
-
----
-
-## 7. GraphQL
-
-A GraphQL endpoint is automatically generated based on your collection schema.
-
-**Endpoint:** `POST /graphql`
-
-**Example Query:**
-```graphql
-query {
-  posts {
-    id
-    title
-    author {
-      email
-    }
-  }
-}
-```
-
----
-
-## 8. Client SDK Example (JavaScript)
-
-If using the official SDK (found in `sdk.js`), usage is simplified:
+Install the SDK via npm or use the ESM module directly.
 
 ```javascript
-import { PowerBase } from './sdk';
+import { ApexKit } from 'apexkit-sdk';
 
-const pb = new PowerBase('http://localhost:5000');
+// Initialize the client
+const apex = new ApexKit('https://api.your-app.com');
 
-// 1. Login
-await pb.auth.login('user@example.com', 'password');
+// Set an existing token if available
+apex.setToken('YOUR_JWT_TOKEN');
+```
 
-// 2. Fetch Records
-const posts = await pb.collection('posts').list({ 
-    page: 1, 
-    sort: '-created',
-    expand: 'author' 
+---
+
+## 2. Multi-Tenancy & Scoping
+
+ApexKit is scope-aware. You can switch between the Root App, Tenants, or Sandboxes fluently. The SDK automatically handles the URL routing.
+
+```javascript
+// Target a specific customer's database
+const tenant = apex.tenant('client-alpha');
+
+// Target an ephemeral AI playground
+const sandbox = apex.sandbox('session-uuid-123');
+
+// All subsequent calls on 'tenant' or 'sandbox' are isolated
+const records = await tenant.collection('posts').list();
+```
+
+---
+
+## 3. Authentication
+
+Tokens are valid only for the scope they were issued in.
+
+### Login / Register
+```javascript
+// Standard User Login
+const auth = await apex.auth.login('user@email.com', 'password');
+console.log(auth.user.id, auth.user.role);
+
+// GitHub OAuth (Browser)
+apex.auth.loginWithGithub('https://your-frontend.com/callback');
+```
+
+### Identity
+```javascript
+const me = await apex.auth.getMe();
+console.log(`Current Scope: ${me.scope}`); // e.g., "tenant:client-alpha"
+```
+
+---
+
+## 4. Collections & Records
+
+### Listing Records (with Filters & Joins)
+```javascript
+const result = await apex.collection('posts').list({
+    page: 1,
+    per_page: 20,
+    sort: '-created', // Newest first
+    filter: {
+        "status": "published",
+        "category": { "$in": ["tech", "news"] }
+    },
+    expand: 'author_id,comments(5).user_id' // Join relations + nested expansion
 });
 
-// 3. Create Record
-await pb.collection('todos').create({ 
-    title: "Buy Milk", 
-    completed: false 
+console.log(result.items, result.total);
+```
+
+### CRUD Operations
+```javascript
+// Create
+const record = await apex.collection('posts').create({
+    title: "Hello World",
+    content: "Content here..."
 });
 
-// 4. Run Server Script
-const result = await pb.scripts.run('calculate-stats', { userId: 123 });
+// Update (Partial)
+await apex.collection('posts').patch(record.id, {
+    status: "published"
+});
+
+// Delete
+await apex.collection('posts').delete(record.id);
+```
+
+---
+
+## 5. Analytical Query Engine
+
+Execute complex aggregations and post-processing pipelines directly from the client.
+
+```javascript
+const stats = await apex.collection('sales').query({
+    "select": [
+        "category",
+        { "fn": "sum", "field": "total", "as": "revenue" },
+        { "fn": "count", "field": "id", "as": "orders" }
+    ],
+    "where": { "status": "completed" },
+    "group_by": ["category"],
+    "pipeline": [
+        { "op": "pivot", "args": { "key": "category", "value": "revenue", "agg": "sum" } }
+    ]
+});
+```
+
+---
+
+## 6. High-Performance Search
+
+### Instant Search (Tantivy)
+Fast fuzzy search for autocomplete and global search. Requires `ose_indexed: true`.
+```javascript
+const hits = await apex.collection('products').searchRecordsInstantlyWithOSE("iphne");
+// Returns: [{ id: 1, score: 2.1, snippet: { name: "<b>iPhone</b> 15" } }]
+```
+
+### Vector Search (AI)
+Semantic search based on meaning. Requires `vectorize: true`.
+```javascript
+const matches = await apex.collection('docs').searchTextVector("How to reset password?");
+```
+
+---
+
+## 7. AI Actions (LLMs)
+
+Run predefined Generative AI prompt templates securely.
+
+```javascript
+const response = await apex.ai.run('content-summarizer', {
+    text: "Long article body...",
+    length: "short"
+});
+
+console.log(response.result); // AI generated text
+console.log(response.metadata); // Citations and search sources
+```
+
+---
+
+## 8. Files & Storage
+
+ApexKit handles Local or S3 storage transparently.
+
+```javascript
+// 1. Upload
+const fileInput = document.getElementById('upload');
+const storedFile = await apex.files.upload(fileInput.files[0]);
+
+// 2. Get Public URL (Scoped)
+const url = apex.files.getFileUrl(storedFile.filename);
+
+// 3. Dynamic Resizing
+const thumb = `${url}?thumb=100x100`;
+```
+
+---
+
+## 9. Real-Time (WebSockets)
+
+Subscribe to changes with server-side filtering.
+
+```javascript
+import { ApexKitRealtimeWSClient } from 'apexkit-sdk';
+
+const realtime = new ApexKitRealtimeWSClient(apex.baseUrl, apex.getToken());
+realtime.connect();
+
+// Subscribe to urgent tickets
+realtime.subscribe({
+    collectionId: 5,
+    dataFilter: { "priority": "urgent" }
+});
+
+realtime.onEvent((msg) => {
+    if (msg.type === "Insert") console.log("New Urgent Ticket!", msg.payload.data);
+});
+```
+
+---
+
+## 10. GraphQL
+
+A dynamic schema is automatically available for all environments.
+
+```javascript
+const query = `
+  query GetProfile($id: ID!) {
+    users(where: { id: $id }) {
+      items {
+        email
+        posts {
+          title
+        }
+      }
+    }
+  }
+`;
+
+const data = await apex.graphql(query, { id: "10" });
+```
+
+---
+
+## 11. Error Handling
+
+ApexKit returns standardized JSON errors.
+
+```javascript
+try {
+    await apex.collection('orders').create({ amt: -1 });
+} catch (err) {
+    console.error(err.status); // 422
+    console.error(err.code);   // "validation_error"
+    console.error(err.details); // { amt: "Must be positive" }
+}
 ```

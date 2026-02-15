@@ -1,168 +1,120 @@
-# ApexKit Multi-Tenancy & Sandbox Architecture
+# 🏗️ Multi-Tenancy & Sandbox Architecture
 
-**Version:** 2.4
-**Context:** Scaling, SaaS Architecture, and AI Prototyping.
+**Version:** 0.1.0
+**Context:** Scaling, SaaS Architecture, and AI-Driven Development.
 
-ApexKit provides a powerful, built-in architecture for **Multi-Tenancy** and **Ephemeral Sandboxes**. This allows a single ApexKit instance to host thousands of isolated applications (Tenants) or temporary development sessions (Sandboxes) with strict data separation.
+ApexKit features a built-in architecture for **Physical Multi-Tenancy** and **Ephemeral Sandboxes**. This allows a single instance to host thousands of isolated applications (Tenants) or temporary development environments (Sandboxes) with strict data separation and independent AI contexts.
 
 ---
 
-## 1. Concepts
+## 1. Entity Lifecycle
 
-| Entity | Purpose | Persistence | Isolation Level |
+| Entity | Purpose | Persistence | Isolation |
 | :--- | :--- | :--- | :--- |
-| **Root App** | The main application instance. Used for single-tenant apps or the "Platform" layer. | Permanent | Global |
-| **Sandbox** | A temporary environment used by the **AI Architect** to build and test apps in real-time. | Ephemeral (Can be deleted) | High (Separate DBs & Files) |
-| **Tenant** | A production-grade isolated environment for a specific customer or sub-application. | Permanent | High (Separate DBs & Files) |
+| **Root App** | The master environment. Used for platform management and global services. | Permanent | Global |
+| **Tenant** | A production-grade isolated application for a specific client or sub-brand. | Permanent | High (Dedicated DBs & Files) |
+| **Sandbox** | A temporary "playground" used by the AI Architect to build/test features. | Ephemeral | High (Auto-deleted on expiry) |
 
 ---
 
-## 2. Architecture & Isolation
+## 2. Physical Isolation Strategy
 
-ApexKit uses a **Physical Isolation** strategy (Database-per-Tenant) rather than Logical Isolation (Row-level `tenant_id` columns). This ensures maximum security and performance.
+ApexKit uses a **Database-per-Tenant** strategy rather than logical row-level isolation. This ensures that a heavy query in one tenant cannot impact the performance of another, and data leaks are prevented at the filesystem level.
 
-### File System Structure
-When a Tenant or Sandbox is created, ApexKit provisions a dedicated directory structure:
+### Directory Structure
+When a Tenant or Sandbox is provisioned, ApexKit creates a dedicated workspace:
 
 ```text
-apexkit/
-├── apexkit (binary file)
-├── data.db (Root App)
-├── uploads/ (Root App Files)
+storage/
+├── system/               # Root App Data
 ├── tenants/
-│   ├── customer-abc/
-│   │   ├── core.db       (Users & Auth)
-│   │   ├── data.db       (Collections & Records)
-│   │   ├── logs.db       (Audit Logs)
-│   │   ├── vectors.db    (AI Embeddings)
-│   │   ├── indexes/      (Tantivy Search Index)
-│   │   └── uploads/      (Isolated File Storage)
+│   └── client-alpha/     # Isolated Tenant Folder
+│       ├── data.db       # Collections & Records
+│       ├── core.db       # Tenant-specific Users
+│       ├── vectors.db    # AI Embeddings
+│       ├── uploads/      # Private Files
+│       └── indexes/      # Tantivy Search Index
 └── sandboxes/
-    └── session_uuid/
-        ├── ... (Same structure as Tenant)
+    └── session_uuid/     # Isolated Playground
 ```
-
-### Resource Management
-*   **Database:** Each tenant gets its own set of SQLite files. This means a heavy query on Tenant A does not lock the database for Tenant B.
-*   **Memory (LRU Cache):** ApexKit uses an LRU (Least Recently Used) cache to manage active database connections. If you have 10,000 tenants but only 50 active, only those 50 consume RAM.
-*   **AI Models:** Heavy AI models (like BERT for embeddings) are **Shared** globally to save RAM, but the **Vector Indexes (HNSW)** are isolated per tenant.
 
 ---
 
-## 3. Tenants (SaaS Mode)
+## 3. Sandboxes & AI Architect
 
-Tenants are designed for SaaS applications where you need to give every customer their own database.
+Sandboxes are the foundation of the **AI Architect** flow. They allow you to generate schemas, write code, and insert dummy data safely without touching your production environment.
+
+### Cloning Strategies
+When starting an AI session, you can choose how much data to bring into the sandbox:
+
+*   **`none`**: A completely empty environment.
+*   **`schema`**: Copies collection structures and scripts but no records.
+*   **`partial`**: Copies schema and the first **N** records from every collection (useful for testing logic with real data).
+*   **`full`**: A 1:1 clone of the source environment.
+
+### The Architect Flow
+1.  **Draft**: Architect generates a "Pending Manifest" (JSON) based on your request.
+2.  **Review**: You view the diff in the Admin UI.
+3.  **Apply**: The manifest is deployed to the Sandbox database.
+4.  **Publish**: Once satisfied, the sandbox manifest is committed to the Root App or a Production Tenant as a **Plugin**.
+
+---
+
+## 4. Multi-Tenancy Management
 
 ### Routing
-ApexKit supports two routing strategies for tenants. The middleware automatically detects the context.
+ApexKit detects the scope automatically based on the incoming request:
+1.  **Subdomain**: `client-alpha.yourapp.com` maps to Tenant `client-alpha`.
+2.  **Path**: `yourapp.com/tenant/client-alpha/...` maps to Tenant `client-alpha`.
+3.  **Header**: `X-Apex-Scope: tenant:client-alpha`.
 
-1.  **Subdomain Routing (Preferred for Production):**
-    *   URL: `https://customer-a.myapp.com/api/v1/...`
-    *   ApexKit extracts `customer-a` from the host header.
-2.  **Path-Based Routing:**
-    *   URL: `https://myapp.com/tenant/customer-a/api/v1/...`
-    *   Useful for development or internal tools.
-
-### Managing Tenants
-Tenants **must be explicitly created** by an Admin via the Root API. Random access to non-existent tenants returns a `404`.
-
-**Create a Tenant:**
-`POST /api/v1/admin/tenants`
-*Auth: Admin Only*
-```json
-{ "tenant_id": "client-google" }
-```
-
-**Accessing Tenant Data:**
-Once created, you can access the tenant's API endpoints exactly like the root app.
-*   `GET /tenant/client-google/api/v1/collections`
-*   `GET /tenant/client-google/scalar` (Documentation)
-*   `POST /tenant/client-google/graphql`
+### Status & Suspension
+Root admins can manage tenant lifecycles via **Settings > Tenants**:
+*   **Active**: Normal operation.
+*   **Suspended**: API returns `403 Forbidden` for all tenant users. Root admins can still enter to fix issues.
+*   **Archived**: Database is disconnected from memory but remains on disk.
 
 ---
 
-## 4. Sandboxes (AI Architect Mode)
+## 5. Security & Scoping
 
-Sandboxes are created automatically when starting a new **AI Architect Session**. They are designed to be "Playgrounds" where the AI can generate schemas, write code, and insert dummy data without affecting the main application.
+### JWT & API Key Scopes
+Authentication tokens are "pinned" to a scope.
+*   A token issued by **Tenant A** cannot be used to access **Tenant B**.
+*   **Root Admin Fallback**: Tokens issued by the Root App with the `admin` role are "Super Tokens" and can access any Tenant or Sandbox by switching the URL context.
 
-*   **URL Pattern:** `/sandbox/{session_id}/...`
-*   **Lifecycle:** Created via `POST /api/v1/admin/ai/sessions`.
-*   **Publishing:** You can "Merge" a sandbox into the Main App (or a Tenant) using the `publish` endpoint.
+### Cross-Scope Scripting
+Tenants are isolated, but they can consume logic shared by the Root App.
+*   **Private**: Script is only visible within its own scope.
+*   **Public (Root Only)**: Script can be called by any tenant using `$run.script("name")`. This is ideal for sharing heavy tools like FFmpeg or global AI logic.
 
 ---
 
-## 5. Client SDK Usage
+## 6. JavaScript SDK Usage
 
-The ApexKit SDK (`sdk.js`) has been updated to support fluent context switching.
-
-### Initialization
-```javascript
-import { PowerBase } from './sdk.js';
-
-// 1. Connect to Root
-const pb = new PowerBase('http://localhost:5000');
-```
-
-### Switching to a Tenant
-Use the `.tenant(id)` method. This returns a *new* SDK instance configured for that tenant.
+The `ApexKit` client supports fluent context switching.
 
 ```javascript
-// Switch context to 'client-a'
-const clientA = pb.tenant('client-a');
+import { ApexKit } from 'apexkit-sdk';
 
-// Login as a user BELONGING to Client A
-await clientA.auth.login('admin@client-a.com', 'password');
+const pb = new ApexKit('https://api.myapp.com');
 
-// Create data inside Client A's database
-await clientA.collection('products').create({ name: 'Widget A' });
+// 1. Root Context
+await pb.auth.login('admin@root.com', 'pass');
 
-// Upload file to Client A's isolated storage
-await clientA.files.upload(myFile);
-```
+// 2. Switch to Tenant
+const tenant = pb.tenant('client-beta');
+const orders = await tenant.collection('orders').list();
 
-### Switching to a Sandbox
-Use the `.sandbox(id)` method.
-
-```javascript
-const devSession = pb.sandbox('550e8400-e29b...');
-
-// The AI Architect might have created a 'todos' collection here
-const todos = await devSession.collection('todos').list();
+// 3. Switch to Sandbox
+const sandbox = pb.sandbox('session-99-abc');
+await sandbox.collection('todos').create({ title: "Try AI feature" });
 ```
 
 ---
 
-## 6. Feature Parity Matrix
+## 7. Performance & Resource Management
 
-Every feature available in the Root App is available in Tenants and Sandboxes.
-
-| Feature | Root App | Tenant | Sandbox | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| **Auth** | ✅ | ✅ | ✅ | Users are isolated. `admin@root` cannot log into `tenant`. |
-| **Collections** | ✅ | ✅ | ✅ | Dynamic schema per tenant. |
-| **Storage** | ✅ | ✅ | ✅ | Files saved to `tenants/{id}/uploads`. |
-| **Search** | ✅ | ✅ | ✅ | Independent Tantivy Indexes. |
-| **Vector Search** | ✅ | ✅ | ✅ | Independent HNSW Indexes. |
-| **GraphQL** | ✅ | ✅ | ✅ | Dynamic Schema generated per tenant. |
-| **Scalar Docs** | ✅ | ✅ | ✅ | Available at `/tenant/{id}/scalar`. |
-| **Scripting** | ✅ | ✅ | ✅ | Scripts run in isolated context. |
-| **Templates** | ✅ | ✅ | ✅ | `render` endpoint works per tenant. |
-
----
-
-## 7. Migration & Maintenance
-
-### Database Migrations
-Since every tenant has its own SQLite files, schema changes must be applied to **all** active tenants.
-*   *Current Strategy:* The `TenantManager` runs standard initialization (`setup_schema`) when loading a tenant.
-*   *Future Update:* A "Broadcast Schema Update" feature will be added to apply a `AppManifest` to all tenants.
-
-### Backups
-To backup a tenant, you simply need to zip the `tenants/{id}/` folder. This contains the data, logs, vectors, and uploaded files.
-
-### Resource Limits
-Check `main.rs` to configure the `TenantManager` capacity.
-```rust
-// Keep max 500 tenants in memory. Evict after 1 hour of idleness.
-let tenant_manager = Arc::new(TenantManager::new(..., 500));
-```
+*   **Connection Pooling**: ApexKit uses an LRU (Least Recently Used) cache for tenant database connections. Inactive tenants are evicted from RAM after 60 minutes.
+*   **Shared AI Models**: Heavy LLM models and local embedding models are loaded once in RAM and shared across all tenants to minimize memory footprint.
+*   **Quota Enforcement**: Use the `before_tenant_request` script hook to implement custom rate limits or billing checks per tenant.

@@ -1,178 +1,124 @@
-# ApexKit AI Actions Documentation
+# 🤖 AI Actions Documentation
 
 **Version:** 0.1.0
-**Base URL:** `http://localhost:5000/api/v1`
+**Base URL:** `https://api.your-app.com/api/v1`
 
-ApexKit **AI Actions** allow you to turn Generative AI prompts (LLMs) into standard REST API endpoints. This creates a secure "middle layer" between your frontend and AI providers (like Google Gemini/Imagen).
+ApexKit **AI Actions** transform Generative AI prompt templates into standard REST API endpoints. They act as a secure middle layer between your frontend and AI providers like Google Gemini.
 
 ### Why use AI Actions?
-1.  **Security:** Your Gemini API Key is encrypted on the server. It is never exposed to the client.
-2.  **Abstraction:** Frontend developers call `run/summarize` instead of constructing complex LLM payloads.
-3.  **Prompt Engineering:** Prompts are managed in the database/Admin UI, allowing you to tweak logic without redeploying client code.
-4.  **Multimodality:** Native support for Text, Images, and Vision tasks.
+1.  **Security**: Your API Keys are encrypted in the database and never exposed to the client.
+2.  **Abstraction**: Frontend developers call `run/summarize` instead of constructing complex LLM payloads.
+3.  **Prompt Engineering**: Tweak system prompts and logic in the Admin UI without redeploying code.
+4.  **Multimodality**: Built-in support for Text-to-Text, Vision (Image analysis), and Image Generation.
 
 ---
 
-## 1. Creating an AI Action
+## 1. Defining an Action
 
-Before you can use an endpoint, you must define it in the **Admin Dashboard > AI Actions**.
-
-An Action consists of:
+Actions are configured in **Admin UI > AI Actions**.
 
 | Field | Description | Example |
 | :--- | :--- | :--- |
-| **Name** | Human-readable label. | `Content Summarizer` |
-| **Slug** | The unique URL identifier. | `summarize-text` |
-| **Model** | The underlying AI model. | `gemini-2.0-flash` (Fast), `gemini-2.5-pro` (Complex), `imagen-3.0` (Images) |
-| **System Prompt** | Sets the AI's persona and constraints. Hidden from the user. | `You are a helpful editor. Respond in Markdown only.` |
-| **Template** | The User Prompt with variable placeholders (`{{var}}`). | `Summarize this text: {{input_text}}` |
+| **Name** | Human-readable label. | `Product Description Generator` |
+| **Slug** | The unique URL identifier. | `gen-desc` |
+| **Model** | The underlying AI model. | `gemini-2.0-flash`, `gemini-3-pro`, `imagen-4` |
+| **System Prompt** | The AI's persona and rules. | `You are a professional copywriter. Respond in JSON.` |
+| **Template** | The prompt with variables. | `Write a 50-word description for: {{product_name}}` |
 
 ---
 
-## 2. API Endpoint
+## 2. Using Variables
 
-To execute an action, make a POST request to the run endpoint.
+ApexKit uses double-curly braces `{{variable}}` for dynamic substitution. When you call an action, you pass a `variables` object in the request body.
 
-**Endpoint:** `POST /api/v1/ai/run/{slug}`
-
-**Headers:**
-*   `Content-Type: application/json`
-*   `Authorization: Bearer <TOKEN>` (Required if defined in collection rules, currently restricted to Admin or open based on app logic).
-
-**Body Schema:**
+**Request Body:**
 ```json
 {
   "variables": {
-    "variable_name": "Value to insert into template",
-    "another_var": "More data"
+    "product_name": "Wireless Noise-Cancelling Headphones"
   }
 }
 ```
 
 ---
 
-## 3. Usage Examples
+## 3. Multimodal Features (Vision & Images)
 
-### Scenario A: Text Generation
-**Goal:** Create an endpoint to correct grammar.
+### A. Image Analysis (Vision)
+If you pass a variable containing a **Base64 Data URI** (e.g., `data:image/png;base64,...`), ApexKit automatically extracts the binary data and sends it to the Gemini Vision model as an inline media attachment.
 
-1.  **Admin Config:**
-    *   **Slug:** `grammar-fix`
-    *   **System Prompt:** `You are a strict grammar checker. Output only the corrected text.`
-    *   **Template:** `Correct this: {{text}}`
-
-2.  **Client Request:**
-    ```bash
-    curl -X POST http://localhost:5000/api/v1/ai/run/grammar-fix \
-      -H "Content-Type: application/json" \
-      -d '{ "variables": { "text": "Me and him went to store." } }'
-    ```
-
-3.  **Response:**
-    ```json
-    {
-      "result": "He and I went to the store.",
-      "metadata": { ... } // Citations if applicable
-    }
-    ```
-
----
-
-### Scenario B: Image Generation
-**Goal:** Generate an image using Imagen or Gemini Image generation.
-
-1.  **Admin Config:**
-    *   **Slug:** `generate-image`
-    *   **Model:** `gemini-2.5-flash-image` (or Imagen)
-    *   **Template:** `{{prompt}}`
-
-2.  **Client Request:**
-    ```javascript
-    const res = await fetch('/api/v1/ai/run/generate-image', {
-        method: 'POST',
-        body: JSON.stringify({
-            variables: { prompt: "A cyberpunk cat neon city" }
-        })
-    });
-    ```
-
-3.  **Response:**
-    The backend automatically detects image output and returns a Data URI.
-    ```json
-    {
-      "result": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA..."
-    }
-    ```
-
----
-
-### Scenario C: Vision & Image Editing (Multimodal)
-**Goal:** Ask the AI to describe an image or edit it.
-
-**How it works:** If you pass a variable containing a **Base64 Data URI** (e.g., `data:image/png;base64,...`), ApexKit automatically extracts the binary data and sends it to the model as an inline media attachment.
-
-1.  **Admin Config:**
-    *   **Slug:** `describe-image`
-    *   **Model:** `gemini-2.0-flash`
-    *   **Template:** `Describe what you see in this image. Context: {{context}}`
-
-2.  **Client Request:**
-    ```json
-    {
-      "variables": {
-        "context": "For a blind user accessibility report.",
-        "image_input": "data:image/jpeg;base64,/9j/4AAQSkZJRg..." 
-      }
-    }
-    ```
-    *Note: The template does NOT need to reference `{{image_input}}`. Simply sending the image in the variables object attaches it to the prompt context for the AI to see.*
-
-3.  **Response:**
-    ```json
-    {
-      "result": "The image shows a golden retriever playing in a park..."
-    }
-    ```
-
----
-
-## 4. Frontend Integration (TypeScript/SDK)
-
-If you are using the `apiClient` provided in the admin UI or the SDK, interacting with AI is typed and simple.
-
-```typescript
-import { apiClient } from './lib/apiClient';
-
-// 1. Text
-async function fixSpelling(text: string) {
-    const res = await apiClient.ai.run('grammar-fix', { text });
-    console.log(res.result);
+**Template:** `Describe the objects found in this image: {{context}}`
+**Request:**
+```json
+{
+  "variables": {
+    "context": "Inventory Check",
+    "image_data": "data:image/jpeg;base64,/9j/4AAQ..."
+  }
 }
+```
+*Note: The template does not need to explicitly reference `{{image_data}}`; the presence of the data URI attaches it to the prompt context.*
 
-// 2. Image Gen
-async function makeArt() {
-    const res = await apiClient.ai.run('generate-image', { 
-        prompt: "Oil painting of a cottage" 
-    });
-    // Render the base64 string
-    document.getElementById('my-img').src = res.result;
-}
+### B. Image Generation
+When using a generation model like **Imagen 4**, the response automatically returns a Data URI.
 
-// 3. Vision / Edit
-async function editPhoto(base64Str: string) {
-    const res = await apiClient.ai.run('edit-image', { 
-        image: base64Str,
-        prompt: "Make it look like a sketch"
-    });
-    return res.result; 
+**Response:**
+```json
+{
+  "result": "data:image/png;base64,iVBORw0KGgo..."
 }
 ```
 
-## 5. Supported Models
+---
 
-The availability depends on your Google Cloud/AI Studio API key permissions, but ApexKit is configured to support:
+## 4. API Reference
 
-*   **Gemini 2.0 Flash:** Best for speed and multimodal (Text/Image/Audio inputs).
-*   **Gemini 3 Pro:** Best for complex reasoning and large context windows.
-*   **Gemini 2.5 Flash/Lite:** Optimized for cost and latency.
-*   **Imagen 3/4:** Dedicated image generation models.
+### Run an Action
+`POST /api/v1/ai/run/{slug}`
+
+**Headers:**
+```http
+Authorization: Bearer <JWT_TOKEN>
+Content-Type: application/json
+```
+
+---
+
+## 5. JavaScript SDK Usage
+
+The ApexKit SDK simplifies AI interaction with typed methods.
+
+```javascript
+import { pb } from './apiClient';
+
+// 1. Text Generation
+const summary = await pb.ai.run('summarize', { 
+    text: "Long article content..." 
+});
+console.log(summary.result);
+
+// 2. Vision (Image to Text)
+const description = await pb.ai.run('describe-image', {
+    image: await getBase64(fileInput.files[0]),
+    prompt: "What color is the car?"
+});
+
+// 3. Grounding Metadata (Search Citations)
+// For models with search enabled, citations are in the metadata
+if (summary.metadata?.groundingChunks) {
+    renderSources(summary.metadata.groundingChunks);
+}
+```
+
+---
+
+## 6. Supported Models
+
+| Model | Capability | Best For |
+| :--- | :--- | :--- |
+| **`gemini-2.0-flash`** | Text + Vision | Speed, low latency, grounding. |
+| **`gemini-3-pro`** | Text + Vision | Complex reasoning, large context. |
+| **`imagen-4`** | Image Gen | High-quality visual generation. |
+| **`gemma-3-27b`** | Text | Open-weights, efficient instructions. |
+
+> **Pro Tip**: Enable **Google Search Grounding** in the Admin UI for an Action to ensure the AI uses real-time information and provides source URLs in the `metadata` field.

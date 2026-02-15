@@ -1,4 +1,3 @@
-
 # ⚡ Real-Time Custom Events Guide
 
 **Version:** 0.1.0
@@ -8,7 +7,7 @@ While ApexKit automatically broadcasts database changes (Insert/Update/Delete), 
 
 **Common Use Cases:**
 *   Chat "User is typing..." indicators.
-*   Progress bars for long-running background tasks.
+*   Progress bars for long-running background tasks or media processing.
 *   Live cursors or presence indicators.
 *   Custom notifications triggered by specific logic.
 
@@ -26,25 +25,23 @@ await $realtime.send(channel, eventName, payload);
 
 *   **`channel`** *(string)*: A logical grouping for listeners (e.g., `"room_1"`, `"notifications_user_5"`).
 *   **`eventName`** *(string)*: A label to identify the type of message (e.g., `"Typing"`, `"NewMessage"`).
-*   **`payload`** *(object)*: The JSON data to send.
+*   **`payload`** *(object)*: Any JSON-serializable data.
 
-### Example: Broadcast a Chat Message
+### Example: Broadcast a Progress Update
 
 ```javascript
-// Script Name: send_message
+// Script Name: process_video
 // Trigger: manual
 
 export default async function(req) {
-    const { room, user, text } = await req.json();
+    const { videoId } = await req.json();
 
-    // 1. (Optional) Persist to DB if history is needed
-    // await $db.insert("messages", { room, user, text });
+    // ... processing logic ...
 
-    // 2. Broadcast immediately
-    await $realtime.send(room, "ChatMessage", {
-        user: user,
-        text: text,
-        timestamp: new Date().toISOString()
+    // Notify listeners on the specific video channel
+    await $realtime.send(`video_${videoId}`, "ProcessingProgress", {
+        percent: 45,
+        status: "Encoding frames..."
     });
 
     return new Response({ success: true });
@@ -59,32 +56,29 @@ ApexKit supports two methods for consuming these events: **WebSockets** (Bi-dire
 
 ### Option A: WebSockets (Recommended)
 
-WebSockets allow you to subscribe/unsubscribe dynamically without reconnecting.
+WebSockets allow you to subscribe/unsubscribe dynamically and send signals back.
 
-**Endpoint:** `ws://your-api.com/ws` (or `wss://`)
+**Endpoint:** `ws://your-api.com/ws` (Scoped automatically if using a Tenant URL).
 
-#### 1. Connect & Subscribe
-To listen to custom events, send a `Subscribe` message specifying the `channel` and optionally a `custom_event` filter.
+#### 1. Subscribe
+To listen to custom events, send a `Subscribe` message specifying the `channel`.
 
 ```javascript
 const ws = new WebSocket("ws://localhost:5000/ws");
 
 ws.onopen = () => {
-    console.log("Connected!");
-    
-    // Subscribe to a specific channel
     ws.send(JSON.stringify({
         type: "Subscribe",
         payload: {
-            channel: "room_1",       // Must match the channel used in script
-            custom_event: "ChatMessage" // Optional: Filter by specific event name
+            channel: "room_1",           // Listen to this channel
+            custom_event: "ChatMessage"  // Optional: Filter for specific event name
         }
     }));
 };
 ```
 
 #### 2. Handle Messages
-Incoming messages will have the type `Custom`.
+Incoming custom messages will have the type `Custom`.
 
 ```javascript
 ws.onmessage = (event) => {
@@ -92,14 +86,7 @@ ws.onmessage = (event) => {
 
     if (msg.type === "Custom") {
         const { event: eventName, data } = msg.payload;
-        
-        console.log(`Received ${eventName} on channel ${msg.payload.scope.Channel}`);
-        console.log("Data:", data);
-        
-        // Example: Update UI
-        if (eventName === "ChatMessage") {
-            appendMessageToChat(data.user, data.text);
-        }
+        console.log(`Received ${eventName}:`, data);
     }
 };
 ```
@@ -108,7 +95,7 @@ ws.onmessage = (event) => {
 
 ### Option B: Server-Sent Events (SSE)
 
-SSE is simpler if you only need to listen (read-only) and don't want to manage a complex WebSocket state.
+SSE is simpler for read-only scenarios (e.g., live feeds) as it uses standard HTTP.
 
 **Endpoint:** `GET /sse`
 
@@ -119,29 +106,22 @@ Pass the `channel` and `event` as query parameters.
 // Listen to all events on "room_1"
 const evtSource = new EventSource("http://localhost:5000/sse?channel=room_1");
 
-// OR: Filter for specific events
-// const evtSource = new EventSource("http://localhost:5000/sse?channel=room_1&event=ChatMessage");
-
 evtSource.onmessage = (event) => {
     const msg = JSON.parse(event.data);
-    
     if (msg.type === "Custom") {
-        console.log("New Event:", msg.payload.data);
+        console.log("New Custom Event:", msg.payload.data);
     }
 };
 ```
 
 ---
 
-## 3. Client-to-Client Signaling (WebSockets Only)
+## 3. Client-to-Client Signaling
 
-Sometimes you want to send a message directly from the Client to other Clients without writing a specific backend script (e.g., for "User is Typing" indicators).
-
-You can use the **`Signal`** command over WebSocket.
+Sometimes you want to send a message directly from one Client to other Clients without a backend script (e.g., for "User is Typing" indicators). You can use the **`Signal`** command over WebSocket.
 
 **Client Code:**
 ```javascript
-// Send a transient signal
 ws.send(JSON.stringify({
     type: "Signal",
     payload: {
@@ -151,31 +131,31 @@ ws.send(JSON.stringify({
     }
 }));
 ```
-
-*Note: Signals are not stored in the database. They are broadcast immediately to all other subscribers of that channel.*
+*Note: Signals are not stored. They are broadcast immediately to all other subscribers of that channel in the same scope.*
 
 ---
 
-## 4. Security & Isolation
+## 4. Security & Scoping
 
-ApexKit automatically namespaces channels based on the current environment.
+ApexKit automatically namespaces channels to prevent data leakage between tenants.
 
-1.  **Root App:** Channel `room_1` becomes `root::room_1`.
-2.  **Tenant A:** Channel `room_1` becomes `tenant_A::room_1`.
-3.  **Tenant B:** Channel `room_1` becomes `tenant_B::room_1`.
+1.  **Root App**: Channel `general` becomes `root::general`.
+2.  **Tenant A**: Channel `general` becomes `tenant_A::general`.
+3.  **Sandbox B**: Channel `general` becomes `sandbox_B::general`.
 
-**What this means:**
-*   A user in Tenant A **cannot** listen to messages from Tenant B, even if they both use the channel name "general".
-*   The Script Engine automatically applies the current tenant's scope when you call `$realtime.send()`.
-*   The API automatically applies the current tenant's scope when a client connects via WebSocket or SSE.
+**Impact:**
+*   A user in **Tenant A** cannot listen to or send signals to **Tenant B**, even if they use the same channel name.
+*   The Script Engine automatically applies the current execution's scope when calling `$realtime.send()`.
+*   The API middleware applies the scope based on the URL (e.g., `/tenant/xyz/ws`) when a client connects.
 
 ---
 
 ## 5. Summary Checklist
 
-| Feature | Method | Key Parameters |
+| Feature | Method | Context |
 | :--- | :--- | :--- |
-| **Send from Backend** | `$realtime.send()` | `channel`, `event`, `json_data` |
-| **Send from Frontend** | WS `Signal` | `channel`, `event`, `json_data` |
-| **Listen (Robust)** | WebSocket | Send `{ type: "Subscribe", payload: { channel: "..." } }` |
-| **Listen (Simple)** | SSE | Connect to `/sse?channel=...` |
+| **Send from Backend** | `$realtime.send()` | Any Script |
+| **Send from Frontend** | WS `Signal` | WebSocket Only |
+| **Listen (Complex)** | WebSocket | `Subscribe` command |
+| **Listen (Simple)** | SSE | `/sse?channel=...` |
+| **Isolation** | Automatic | Handled by Scope system |

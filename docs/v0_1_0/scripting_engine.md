@@ -1,184 +1,145 @@
-# ApexKit Scripting Engine Documentation
+# ⚙️ Scripting Engine Documentation
 
-The ApexKit Scripting Engine allows you to write server-side JavaScript to extend your application logic. It runs in a secure, isolated Rust environment using the **Boa** engine.
+**Version:** 0.1.0
+**Runtime:** Boa JS (Rust-integrated)
+**Execution Model:** Sandboxed, Async-first
 
-The architecture mimics "Edge Functions" (like Cloudflare Workers or Deno), using standard Web APIs like `Request` and `Response`.
+The ApexKit Scripting Engine allows you to write server-side JavaScript to extend your application logic. It runs within a secure, isolated environment inside the Rust process, providing "Edge Function" performance with direct access to the database and system tools.
 
 ---
 
-## 1. The Basics
+## 1. Script Structure
 
 Every script must **default export an async function**. This function receives a `Request` object and must return a `Response` object.
 
-### Minimal Example
 ```javascript
 export default async function(req) {
     // 1. Parse input
     const body = await req.json();
     
-    // 2. Do logic
-    const name = body.name || "World";
-    log("Processing request for: " + name);
+    // 2. Perform logic
+    log(`Hello request from ${body.name || 'Stranger'}`);
 
     // 3. Return response
     return new Response({ 
-        message: "Hello " + name 
+        message: "Action successful",
+        timestamp: new Date().toISOString()
     }, { status: 200 });
 }
 ```
 
 ---
 
-## 2. Global APIs
+## 2. Global API Reference
 
-The following objects are available globally in the script context.
+### `$db.records` (Database Access)
+Provides scope-aware access to your collections. Operations automatically target the current Tenant or Sandbox.
 
-### `$db` (Database Access)
-Direct access to your ApexKit collections. All methods return **Promises**.
+| Method | Description |
+| :--- | :--- |
+| `find(col, filter)` | Returns an array of records matching the filter. |
+| `find_one(col, id)`| Returns a single record or null. |
+| `insert(col, data)` | Creates a record and returns the new ID. |
+| `update(col, id, data)`| Performs a partial update. |
+| `delete(col, id)` | Removes a record. |
+| `query(null, queryObj)`| Executes the **Analytical Engine** for aggregations/grouping. |
 
-| Method | Description | Example |
-| :--- | :--- | :--- |
-| `find_one(collection, id)` | Fetch a single record by ID. Returns `Object` or `null`. | `await $db.find_one("users", 1)` |
-| `find(collection, filter)` | Search records. `filter` is an optional object. Returns `Array`. | `await $db.find("users", { role: "admin" })` |
-| `insert(collection, data)` | Create a new record. Returns the new `ID`. | `await $db.insert("logs", { msg: "Hi" })` |
-| `update(collection, id, data)`| Update an existing record. Returns the updated object. | `await $db.update("users", 1, { active: true })` |
-| `delete(collection, id)` | Delete a record. Returns `true` if successful. | `await $db.delete("users", 1)` |
+### `$run` (Workflow Orchestration)
+Allows calling other scripts. This is the primary way to reuse logic.
 
-### `$http` (External Requests)
-Make HTTP requests to third-party APIs.
+*   **`$run.script(name, payload)`**: Calls a script. If the script isn't found in the local scope, it looks for **Public** scripts in the **Root** scope (enabling shared system tools).
 
-| Method | Description | Example |
-| :--- | :--- | :--- |
-| `get(url)` | Performs a GET request. Returns **String** (raw body). | `await $http.get("https://api.com")` |
-| `post(url, body)` | Performs a POST request. `body` is a JS Object. Returns **String**. | `await $http.post("https://api.com", {a:1})` |
+### `$zip` (File & Archive Manager)
+A powerful tool for in-memory file manipulation and scoped storage access.
 
-> **Note:** `$http` returns the raw body string. You usually need to use `JSON.parse()` on the result.
+*   **`create({ path: data })`**: Creates a Base64 ZIP string from an object.
+*   **`extract(base64)`**: Extracts a ZIP string into an object.
+*   **`inspect(base64)`**: Returns archive metadata (sizes, file list, compression ratios).
+*   **`readFile(filename)`**: Reads a file from the current scope's storage into Base64.
+*   **`saveFile(filename, b64, mime)`**: Saves data to storage and registers it in the system file table.
 
-### `$util` (Utilities)
-Helper functions.
+### `$cmd` (Shell Execution)
+**Security Note**: Only available to scripts running in the **Root App** scope.
 
-*   `$util.uuid()`: Generates a v4 UUID string.
+*   **`run(cmd, args, options)`**: Executes a command and waits for output. Returns `{ stdout, stderr, status }`.
+*   **`spawn(cmd, args, options)`**: Spawns a background process. Returns `{ pid }`.
 
-### `log(message)`
-Prints a message to the server console (stdout).
+### `$cache` (Ephemeral Store)
+Scoped key-value storage for rate-limiting, session state, or temporary tokens.
+
+*   **`get(key)`**, **`set(key, val, ttl?)`**, **`delete(key)`**
+*   **`incr(key, delta)`**: Atomic increment. Essential for quotas.
+
+### `$http` & `fetch`
+Consolidated HTTP logic for external API calls.
+
+*   **`fetch(url, options)`**: Standard Web API implementation (supports `redirect: "manual"`).
+*   **`$http.get(url)`** / **`$http.post(url, body)`**: Legacy wrappers returning raw strings.
+
+### `$util`
+*   `uuid()`: Generates v4 UUID.
+*   `slugify(text)`: URL-friendly conversion.
+*   `hash(text, 'sha256'|'sha512')`: Secure hashing.
+*   `base64Encode(text)` / `base64Decode(b64)`
 
 ---
 
-## 3. The `Request` Object
-The `req` argument passed to your function has the following methods:
+## 3. Scoping & Visibility
 
-*   `await req.json()`: Parses the request body as JSON.
-*   `await req.text()`: Returns the request body as a string.
-*   `req.method`: The HTTP method (e.g., "POST").
-*   `req.headers`: A Headers object.
+### Context Awareness
+Scripts are automatically "anchored" to the scope they are called from. When a script calls `$db.find()`, it only sees data from the current Tenant.
 
-## 4. The `Response` Object
-You must return a `new Response(body, init)`.
-
-*   **body**: Can be a JSON Object or a String.
-*   **init** (optional): `{ status: number, headers: object }`.
+### Shared Scripts
+Root Admins can create scripts with **Public Visibility**. These scripts act as "System Functions" that Tenants can invoke to perform heavy tasks (like FFmpeg processing) that require `$cmd` access, which Tenants lack for security reasons.
 
 ---
 
-## 5. Common Patterns & Examples
+## 4. Examples
 
-### Example A: Toggle a Boolean in Database
-This script reads a record, flips a boolean flag, and saves it.
-
+### Complex Analytics (Analytical Engine)
 ```javascript
 export default async function(req) {
-    const { id } = await req.json();
-
-    // 1. Fetch current state
-    const todo = await $db.find_one("todos", id);
-
-    if (!todo) {
-        return new Response({ error: "Todo not found" }, { status: 404 });
-    }
-
-    // 2. Update logic
-    const updated = await $db.update("todos", id, { 
-        done: !todo.done 
+    const report = await $db.query(null, {
+        "from": "sales",
+        "select": [
+            "category",
+            { "fn": "sum", "field": "amount", "as": "revenue" }
+        ],
+        "group_by": ["category"]
     });
-
-    return new Response({ success: true, data: updated });
+    return new Response(report);
 }
 ```
 
-### Example B: Call External Webhook on Insert
-Create a user locally, then notify Slack/Discord.
-
+### File Backup to ZIP
 ```javascript
 export default async function(req) {
-    const input = await req.json();
+    const logo = await $zip.readFile("logo.png");
+    const data = await $db.find("settings", {});
 
-    // 1. Insert into local DB
-    const newId = await $db.insert("users", {
-        email: input.email,
-        created_at: new Date().toISOString()
+    const archive = await $zip.create({
+        "assets/logo.png": logo,
+        "backup_data.json": JSON.stringify(data)
     });
 
-    // 2. Notify external API
-    const webhookUrl = "https://hooks.slack.com/services/XYZ/ABC";
-    const payload = { text: "New user registered: " + input.email };
-    
-    // Note: $http returns a string, we don't need the result here
-    await $http.post(webhookUrl, payload);
-
-    return new Response({ id: newId }, { status: 201 });
+    const file = await $zip.saveFile("backup.zip", archive);
+    return new Response({ download_url: file.url });
 }
 ```
 
-### Example C: Secure Proxy (Auth + CORS)
-A robust example handling CORS preflight and Authorization headers.
-
+### Executing a Shell Command (Root Only)
 ```javascript
 export default async function(req) {
-  // 1. Handle CORS Preflight
-  if (req.method === "OPTIONS") {
-    return new Response(null, {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST",
-        "Access-Control-Allow-Headers": "*"
-      },
-      status: 204
-    });
-  }
-
-  // 2. Check Auth Header
-  const auth = req.headers.get("Authorization");
-  if (!auth || auth !== "Bearer my-secret-token") {
-      return new Response({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  try {
-    const body = await req.json();
-    
-    return new Response({ 
-        message: "Secure data accessed", 
-        user: body.username 
-    }, {
-      headers: { "Access-Control-Allow-Origin": "*" }
-    });
-  } catch (e) {
-    return new Response({ error: e.toString() }, { status: 500 });
-  }
+    const res = await $cmd.run("ls", ["-lh", "storage/system"]);
+    return new Response(res.stdout);
 }
 ```
 
-## 6. How to Invoke
-Scripts are exposed via the API.
+---
 
-**Endpoint:**
-`POST /api/v1/run/{script_name}`
+## 5. Limits & Constraints
 
-**Payload:**
-The JSON body you send to this endpoint becomes `req.json()` inside the script.
-
-**Bash Example:**
-```bash
-curl -X POST http://localhost:5000/api/v1/run/my-script \
-  -H "Content-Type: application/json" \
-  -d '{"id": 123, "action": "toggle"}'
-```
+*   **Memory**: Each script execution is limited by the global memory quota.
+*   **Execution Time**: Default timeout is 30 seconds.
+*   **ZIP Size**: Limited to 10MB (configurable via `ARCHIVE_LIMIT`).
+*   **Safety**: Scripts cannot access the raw Node.js environment or standard Rust filesystem directly (outside of `$fs` and `$zip` helpers).

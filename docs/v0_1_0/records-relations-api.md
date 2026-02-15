@@ -1,219 +1,140 @@
-# 🕸️ ApexKit Relations & Expansion API
+# 🕸️ Relations & Expansion API Documentation
 
-**Version:** 0.1.0
+**Version:** 0.1.0  
 **Feature:** Relational Data Retrieval (Joins)
 
-ApexKit solves the "N+1" query problem by allowing you to fetch related records, nested data, and reverse relationships in a single HTTP request using the `expand` query parameter.
+ApexKit solves the "N+1" query problem by allowing you to fetch related records, nested data, and reverse relationships in a single HTTP request using the `expand` query parameter. This is powered by a high-performance recursive subquery engine in the Rust backend.
 
 ---
 
 ## 1. Basic Syntax
 
-To expand a relationship, add the `expand` parameter to your `GET` request.
+To expand a relationship, add the `expand` parameter to any `GET` request for records.
 
-**Endpoint:** `GET /api/v1/collections/{collection_id}/records`
+**Endpoint:** `GET /api/v1/collections/{collection_id}/records`  
+**Syntax:** `?expand={field_name}`
 
-**Syntax:** `?expand=relation_name`
+**Example:**  
+Fetching `posts` and expanding the `author_id` relation.  
+`GET /api/v1/collections/posts/records?expand=author_id`
 
-**Example:**
-Fetching `posts` and expanding the `author` relation.
+**Response Structure:**  
+The expanded data is injected into a dedicated `expand` object, leaving the original `data` payload intact.
 
-```http
-GET /api/v1/collections/posts/records?expand=author
-```
-
-**Response Structure:**
-The original record data remains in `data`. The expanded relations are injected into a new `expand` object.
-
-```json
-{
-  "id": 1,
-  "data": {
-    "title": "Hello World",
-    "content": "...",
-    "author": 55 // The ID stored in the DB
-  },
-  "expand": {
-    "author": [
-      {
-        "id": 55,
-        "data": { "name": "John Doe", "email": "john@example.com" }
-      }
-    ]
-  }
-}
-```
-
----
-
-## 2. Advanced Expansion Features
-
-ApexKit supports powerful expansion logic including nesting, pagination, and reverse lookups.
-
-### A. Nested Expansion (Deep Joins)
-You can traverse the graph as deep as needed using **dot notation**.
-
-**Syntax:** `field.sub_field`
-
-**Example:**
-Get **Posts**, expand their **Comments**, and expand the **Author** of those comments.
-
-`?expand=comments.author`
-
-```json
-"expand": {
-  "comments": [
-    {
-      "id": 101,
-      "data": { "text": "Nice post!" },
-      "expand": {
-        "author": [ { "id": 20, "data": { "name": "Jane" } } ]
-      }
-    }
-  ]
-}
-```
-
-### B. Multiple Expansions
-Expand multiple different fields by separating them with commas.
-
-**Syntax:** `field1, field2`
-
-**Example:**
-`?expand=author, comments`
-
-### C. Pagination (Limit & Offset)
-You can limit the number of related records returned to improve performance. This is applied per record found.
-
-**Syntax:** `field(limit, offset)`
-
-*   `limit`: Max records to return.
-*   `offset`: Number of records to skip.
-
-**Example:**
-Get posts and the **top 5 most recent comments**:
-
-`?expand=comments(5, 0)`
-
-**Example:**
-Get the *next* 5 comments (pagination):
-
-`?expand=comments(5, 5)`
-
----
-
-## 3. Types of Relations
-
-The system handles three types of expansion logic automatically based on your schema.
-
-### 1. Forward Relations
-*   **Definition:** Defined in `schema.relations` (e.g., `post` has `author_id`).
-*   **Result:** Returns an **Array** of records (usually length 1 for 1:1, or length 0 if broken).
-
-### 2. Owner Field (User System)
-*   **Definition:** Defined in `schema.fields` with type `owner`.
-*   **Behavior:** Links directly to the internal `users` authentication table.
-*   **Result:** Returns a **Single Object** (not an array).
-
-**Example:** `?expand=created_by`
-```json
-"expand": {
-  "created_by": {
-    "id": 1,
-    "email": "admin@apexkit.io",
-    "role": "admin"
-  }
-}
-```
-
-### 3. Reverse Relations (Back-References)
-*   **Definition:** Implicit. If you are querying `posts` and request `?expand=comments`, the system checks if the `comments` collection has a relation pointing back to `posts`.
-*   **Result:** Returns an **Array** of records.
-
-**How it works:**
-1.  You request `?expand=comments` on `posts`.
-2.  System looks for a collection named "comments".
-3.  System scans "comments" schema for a relation targeting "posts".
-4.  If found, it executes a reverse join query.
-
----
-
-## 4. Error Handling (Graceful Failures)
-
-If you request an invalid expansion (e.g., a typo in the field name, or a relation that doesn't exist), the API **will not crash** or fail the main request.
-
-Instead, it injects an error object into the specific expansion key.
-
-**Request:** `?expand=non_existent_field`
-
-**Response:**
-```json
-{
-  "id": 1,
-  "data": { "title": "My Post" },
-  "expand": {
-    "non_existent_field": {
-      "error": "Relation \"non_existent_field\" not defined in schema for \"posts\" or valid reverse lookup found"
-    }
-  }
-}
-```
-
----
-
-## 5. Performance Tips
-
-1.  **Use Limits:** Always use `(limit)` on reverse lookups (e.g., `comments(10)`) to prevent fetching thousands of child records accidentally.
-2.  **Indexing:** Ensure columns used in relations are indexed in the database for speed.
-3.  **Recursive Depth:** While technically unlimited, keep nesting depth reasonable (2-3 levels) to maintain response times. SQL Complexity grows with depth.
-
----
-
-## 8. Expansion on Single Records
-
-You can also expand relationships when fetching a specific record by ID. This is particularly powerful for "Detail Views" (e.g., fetching a Post and its top 5 Comments in one request).
-
-**Endpoint:**
-`GET /collections/{collection_id}/records/{record_id}?expand=relation_name`
-
-### Syntax
-The `expand` parameter supports the exact same syntax as the List endpoint:
-
-1.  **Forward Relation:** `?expand=author` (Expands the `author` field).
-2.  **Owner:** `?expand=created_by` (Expands the User object).
-3.  **Reverse Relation:** `?expand=comments` (Finds records in the `comments` collection that point to this record).
-4.  **Nested:** `?expand=comments.author` (Expands comments, then the author of those comments).
-5.  **Pagination:** `?expand=comments(5,0)` (Fetches only the first 5 related records).
-
-### Example: Fetch Post + Author + Top 5 Comments
-**Request:**
-`GET /api/v1/collections/posts/records/101?expand=author,comments(5)`
-
-**Response:**
 ```json
 {
   "id": 101,
   "data": {
-    "title": "My Viral Post",
-    "content": "...",
-    "author": 55
+    "title": "Hello ApexKit",
+    "author_id": "user_55" 
   },
   "expand": {
-    "author": [
-      { 
-        "id": 55, 
-        "data": { "name": "Jane Doe", "email": "jane@example.com" } 
-      }
-    ],
-    "comments": [
-      { "id": 901, "data": { "text": "First!", "post_id": 101 } },
-      { "id": 902, "data": { "text": "Great read.", "post_id": 101 } },
-      { "id": 903, "data": { "text": "Thanks!", "post_id": 101 } },
-      { "id": 904, "data": { "text": "Helpful.", "post_id": 101 } },
-      { "id": 905, "data": { "text": "More please.", "post_id": 101 } }
-    ]
+    "author_id": {
+      "id": "user_55",
+      "email": "john@app.io",
+      "role": "editor"
+    }
   }
 }
 ```
 
-> **Performance Note:** When using `expand` on a single record, the response is **not cached** server-side to ensure the related data (which changes independently of the parent record) is always fresh.
+---
+
+## 2. Expansion Types
+
+ApexKit automatically detects the type of relationship and handles the data formatting accordingly.
+
+### A. Forward Relations (Direct)
+Fields defined as type `relation` in the collection schema.
+*   **One-to-One**: Returns a single object.
+*   **One-to-Many**: Returns an array of objects.
+
+### B. Owner Fields (System Users)
+Fields defined as type `owner`. These link directly to the internal `users` table.
+*   **Result**: Always returns a **single object** containing the user's ID, email, role, and metadata.
+
+### C. Reverse Relations (Back-references)
+ApexKit scans other collections to find links pointing back to the current record.
+*   **Example**: If you query `posts` and request `?expand=comments`, ApexKit finds the `comments` collection has a relation field (e.g., `post_id`) pointing to `posts`.
+*   **Result**: Returns an **array** of matching records.
+
+---
+
+## 3. Advanced Expansion Features
+
+### Nested Expansion (Deep Joins)
+You can traverse the graph multiple levels deep using **dot notation**.
+
+**Syntax**: `?expand=field.sub_field`  
+**Example**: Get **Posts**, expand their **Comments**, and then expand the **Author** of each comment.  
+`?expand=comments.user_id`
+
+### Multiple Expansions
+Expand multiple unrelated fields by separating them with commas.
+
+**Syntax**: `?expand=field1,field2`  
+**Example**: `?expand=author_id,categories,tags`
+
+### Relational Pagination (Limits & Offsets)
+Avoid large payloads by limiting the number of related items returned per record.
+
+**Syntax**: `field_name(limit, offset)`  
+**Example**: Get posts and only the **top 5** most recent comments for each.  
+`?expand=comments(5,0)`
+
+---
+
+## 4. Single Record Expansion
+
+Relational expansion is equally powerful when fetching a single specific record.
+
+**Endpoint**: `GET /collections/{id}/records/{record_id}?expand=...`  
+**Example**:  
+`GET /api/v1/collections/projects/records/1?expand=members,tasks(10,0).assigned_to`
+
+---
+
+## 5. Error Handling
+
+If you request a relation that does not exist or has a typo, the API will not crash. Instead, it injects an error message into the specific key within the `expand` object.
+
+**Request**: `?expand=non_existent_field`  
+**Response**:
+```json
+{
+  "id": 1,
+  "expand": {
+    "non_existent_field": {
+      "error": "Relation 'non_existent_field' not defined in schema or no reverse lookup found."
+    }
+  }
+}
+```
+
+---
+
+## 6. Performance Best Practices
+
+1.  **Use Limits**: When expanding Many-to-Many or Reverse relations (like `comments`), always provide a limit (e.g., `comments(20)`) to prevent fetching thousands of rows.
+2.  **Depth Control**: While ApexKit supports deep nesting, aim for 2-3 levels maximum for optimal performance. Each level adds complexity to the underlying SQL query.
+3.  **Indexing**: Ensure that the fields used for relations (e.g., `author_id`) are marked as `sql_indexed: true` in your schema to speed up join operations.
+
+---
+
+## 7. JavaScript SDK Usage
+
+Expansion is natively supported in the `pb.collection().list()` and `get()` methods.
+
+```javascript
+import { pb } from './apiClient';
+
+const posts = await pb.collection('posts').list({
+    page: 1,
+    expand: 'author_id,comments(5).user_id'
+});
+
+posts.items.forEach(post => {
+    console.log("Author:", post.expand.author_id.email);
+    console.log("Latest Commenter:", post.expand.comments[0]?.expand.user_id.email);
+});
+```

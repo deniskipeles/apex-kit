@@ -1,17 +1,15 @@
-# ApexKit Files & Storage API Documentation
+# ☁️ Files & Storage API Documentation
 
 **Version:** 0.1.0
-**Base URL:** `http://localhost:5000/api/v1`
+**Base URL:** `https://api.your-app.com/api/v1`
 
-The Storage API abstracts file management. Whether you are running ApexKit locally (storing files on disk) or in the cloud (using AWS S3), the API endpoints remain exactly the same.
-
-ApexKit maintains a separate database table (`_storage_files`) to track file metadata (original name, size, uploader) while storing the actual binary data in the configured backend.
+ApexKit provides a unified Storage API that abstracts file management. Whether your instance is configured for **Local Storage** (disk) or **Cloud Storage** (AWS S3/R2), the API endpoints and script methods remain identical.
 
 ---
 
 ## 1. The File Object
 
-When listing or uploading files, the API returns a metadata object.
+When you upload or list files, ApexKit returns a metadata object. The `filename` is a generated UUID to prevent collisions and should be used as the reference in your database records.
 
 ```json
 {
@@ -20,158 +18,137 @@ When listing or uploading files, the API returns a metadata object.
   "original_name": "profile-pic.png",
   "mime_type": "image/png",
   "size": 204800,
-  "url": "http://localhost:5000/api/v1/storage/file/f47ac10b-58cc-4372-a567-0e02b2c3d479.png",
-  "created_at": "2023-10-27T10:00:00Z"
+  "url": "https://api.your-app.com/api/v1/storage/file/f47ac10b...png",
+  "created_at": "2024-02-14T10:00:00Z"
 }
 ```
 
-*   **id**: (Integer) Internal System ID. Used for management/deletion.
-*   **filename**: (UUID String) The sanitized, unique name of the file on disk/bucket. **This is what you store in your Record `file` fields.**
-*   **url**: The fully qualified public URL to access the file.
-
 ---
 
-## 2. API Endpoints
+## 2. Standard API Endpoints
 
 ### Upload File
-Upload a binary file. ApexKit automatically renames the file to a UUID to prevent collisions and sanitizes the extension.
-
+Upload a binary file using `multipart/form-data`.
 *   **POST** `/storage/upload`
-*   **Auth:** Required (Valid User Token).
-*   **Content-Type:** `multipart/form-data`
+*   **Auth**: Required (Valid JWT)
 
-**Form Fields:**
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `file` | Binary | **Required.** The file content to upload. |
-
-**Example (JavaScript):**
-```javascript
-const formData = new FormData();
-formData.append('file', fileInput.files[0]);
-
-const response = await fetch('http://localhost:5000/api/v1/storage/upload', {
-  method: 'POST',
-  headers: {
-    'Authorization': 'Bearer <TOKEN>'
-  },
-  body: formData
-});
-```
-
-**Response:** `201 Created`
-Returns the [File Object](#1-the-file-object).
-
----
-
-### Serve File (Public Access)
-Retrieve the raw file content. This endpoint is public and includes appropriate `Content-Type` headers based on the file extension.
-
+### Serve File (Public)
+Retrieve raw file content. This endpoint is public and supports range requests for streaming.
 *   **GET** `/storage/file/{filename}`
-*   **Auth:** Public.
 
-**Parameters:**
-*   `filename`: The UUID filename returned during upload (e.g., `f47ac...png`).
-
-**Headers Returned:**
-*   `Content-Type`: e.g., `image/png`, `application/pdf`.
-*   `Cache-Control`: `public, max-age=...` (Configurable caching).
-
----
+### Image Processing (Thumbnails)
+ApexKit can dynamically resize images on the fly and cache the results.
+*   **Query Param**: `thumb={Width}x{Height}`
+*   **Example**: `GET /storage/file/image.png?thumb=200x200`
 
 ### List Files
-Retrieve a paginated list of uploaded files and their metadata.
+Retrieve a paginated list of file metadata.
+*   **GET** `/storage/files?page=1&per_page=20`
 
-*   **GET** `/storage/files`
-*   **Auth:** Public (Metadata listing).
+---
 
-**Query Parameters:**
+## 3. Integration with Edge Functions (Scripts)
 
-| Parameter | Default | Description |
-| :--- | :--- | :--- |
-| `page` | `1` | Page number. |
-| `per_page` | `20` | Items per page. |
+Scripts have powerful, scope-aware access to the storage system. They can read, manipulate, and generate files without needing external libraries.
 
-**Response:**
-```json
-{
-  "items": [ ...FileObjects... ],
-  "total": 150
+### Reading Files
+Use `$fs` for text or `$zip` for binary-to-base64 conversion.
+
+```javascript
+export default async function(req) {
+    // 1. Read a text file (e.g. a config or log)
+    const logData = await $fs.readText("app_logs.txt");
+
+    // 2. Read a binary file as Base64 string
+    const imageBase64 = await $zip.readFile("avatar.png");
+    
+    return new Response({ size: imageBase64.length });
+}
+```
+
+### Saving Generated Files
+The `$zip.saveFile` method is the most robust way to save data. It writes the file to the current scope's storage (S3/Local) **and** registers it in the database metadata table automatically.
+
+```javascript
+export default async function(req) {
+    // Create a text file content
+    const content = "User report generated at " + new Date();
+    const b64 = $util.base64Encode(content);
+
+    // Save directly to scoped storage
+    const fileMeta = await $zip.saveFile("report.txt", b64, "text/plain");
+
+    return new Response({ 
+        msg: "File saved", 
+        downloadUrl: fileMeta.url 
+    });
+}
+```
+
+### In-Memory Archiving
+Use the `$zip` object to bundle multiple files or extract uploaded archives.
+
+```javascript
+export default async function(req) {
+    // 1. Bundle existing uploads into a ZIP
+    const fileA = await $zip.readFile("photo1.jpg");
+    const fileB = await $zip.readFile("document.pdf");
+
+    const zipB64 = await $zip.create({
+        "assets/image.jpg": fileA,
+        "docs/ref.pdf": fileB,
+        "info.txt": "Exported via ApexKit"
+    });
+
+    // 2. Save the new ZIP
+    const archive = await $zip.saveFile("bundle.zip", zipB64);
+    
+    return new Response({ archiveUrl: archive.url });
 }
 ```
 
 ---
 
-### Delete File
-Permanently remove a file from both the database metadata and the physical storage (Disk/S3).
+## 4. Multi-Tenancy & Sandboxes
 
-*   **DELETE** `/storage/files/{id}`
-*   **Auth:** **Admin Only.**
+Storage is strictly isolated based on the execution context:
 
-**Parameters:**
-*   `id`: The **Integer ID** of the file (not the filename).
+1.  **Root App**: Files reside in `storage/system/uploads`.
+2.  **Tenants**: Files reside in `storage/tenants/{tenant_id}/uploads`.
+3.  **Sandboxes**: Files reside in `storage/sandboxes/session_{uuid}/uploads`.
 
-**Response:** `204 No Content`
-
----
-
-## 3. Linking Files to Data Records
-
-To associate a file with a data record (e.g., a User Profile or a Blog Post cover image), use the **Record API**.
-
-1.  **Schema Definition:**
-    Ensure your collection has a field of type `file` or `string`.
-    ```json
-    "avatar": { "type": "file" }
-    ```
-
-2.  **Workflow:**
-    1.  **Upload:** Call `POST /storage/upload`. Get the `filename` from the response (e.g., `abc-123.jpg`).
-    2.  **Link:** Create or Update the Record, saving the filename string.
-
-**Example Request (Update User Profile):**
-`PATCH /collections/profiles/records/5`
-
-```json
-{
-  "data": {
-    "full_name": "Alice",
-    "avatar": "abc-123.jpg" 
-  }
-}
-```
-
-3.  **Retrieving:**
-    When you fetch the record, you get the filename string.
-    **Frontend Logic:**
-    ```javascript
-    const imageUrl = `http://localhost:5000/api/v1/storage/file/${record.data.avatar}`;
-    ```
+**Behavior**:
+*   A script running in **Tenant A** cannot use `$zip.readFile` to access files belonging to **Tenant B**.
+*   Public URLs are automatically prefixed: `/tenant/{id}/api/v1/storage/file/...`.
 
 ---
 
-## 4. Configuration (Server Side)
+## 5. JavaScript SDK Usage
 
-The storage backend is defined at the environment level (`.env`) when running the ApexKit binary.
+The `pb.files` namespace provides convenient methods for frontend integration.
 
-### Local Storage (Default)
-Files are stored in the `./uploads` directory relative to the binary.
-```bash
-STORAGE_TYPE="local"
+```javascript
+import { pb } from './apiClient';
+
+// 1. Upload from a file input
+const fileInput = document.querySelector('input[type="file"]');
+const uploaded = await pb.files.upload(fileInput.files[0]);
+
+// 2. List with pagination
+const { items, total } = await pb.files.list(1, 20);
+
+// 3. Delete
+await pb.files.delete(uploaded.id);
+
+// 4. Generate URL (Tenant-Aware)
+// Returns correct path regardless of whether you are in root or tenant context
+const url = pb.files.getFileUrl(uploaded.filename);
 ```
 
-### AWS S3 (or Compatible)
-Offload storage to the cloud (AWS, DigitalOcean Spaces, MinIO, Google Cloud Storage).
+---
 
-```bash
-STORAGE_TYPE="s3"
-S3_BUCKET="my-app-assets"
-S3_REGION="us-east-1"
-S3_PUBLIC_URL="https://my-app-assets.s3.amazonaws.com/" 
-# Credentials usually picked up from AWS_ACCESS_KEY_ID env vars or IAM roles
-```
+## 6. Limits & Configuration
 
-When `s3` is enabled:
-1.  **Uploads:** Stream directly to the bucket.
-2.  **Serving:** The `/storage/file/{filename}` endpoint effectively proxies the data (or you can construct the `S3_PUBLIC_URL` + `filename` on the client to bypass the server completely).
+*   **Default Limit**: 10MB per file (Adjustable via `ARCHIVE_LIMIT` env variable).
+*   **Image Formats**: Supports PNG, JPEG, WEBP, and SVG. (SVG is served raw without resizing).
+*   **S3 Proxies**: If S3 is enabled, the `/storage/file` endpoint acts as a secure proxy to hide your bucket's private credentials.

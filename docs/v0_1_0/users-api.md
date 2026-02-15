@@ -1,160 +1,145 @@
-# ApexKit Users API & Data Relationships
+# 👤 Users API & Identity Management
 
-**Version:** 2.1
-**Base URL:** `http://localhost:5000/api/v1`
+**Version:** 0.1.0  
+**Base URL:** `https://api.your-app.com/api/v1`
 
-In ApexKit, **Users** are a system-level entity distinct from standard Data Collections. The Users API handles authentication, identity management, and security roles.
-
-This document explains how to manage users and, crucially, **how to link Users to Data Records** to create personalized, secure applications.
+In ApexKit, **Users** are system-level entities managed within an isolated `core.db` for every tenant. Unlike standard Data Collections, the User schema is rigid and optimized for authentication, though it supports a flexible `metadata` object for lightweight extensions.
 
 ---
 
 ## 1. The User Object
 
-The system User object is rigid and optimized for authentication. It is **not** a schema-less JSON document like a standard Record.
+The User object represents a unique identity within a specific scope (Root, Tenant, or Sandbox).
 
 ```json
 {
   "id": 101,
-  "email": "developer@example.com",
-  "role": "user",  // "admin" or "user"
-  "last_active": "2023-10-27T10:00:00Z"
+  "email": "user@example.com",
+  "role": "admin",
+  "scope": "tenant:client-abc",
+  "is_verified": true,
+  "metadata": {
+    "avatar": "profile_123.jpg",
+    "theme_preference": "dark"
+  }
 }
 ```
 
 *   **id**: (Integer) Unique System ID.
-*   **role**: Defines high-level system access.
-    *   `admin`: Can modify Schemas, Settings, and delete any data.
-    *   `user`: Subject to Collection Policies (e.g., can only edit their own data).
+*   **role**: High-level permission tier (e.g., `admin`, `user`).
+*   **scope**: The environment the user belongs to. Tokens are strictly valid only for this scope.
+*   **metadata**: A JSON object for storing non-structural user data.
 
 ---
 
 ## 2. Authentication Endpoints
 
-These endpoints are public and used to establish a session.
+### Login
+Authenticate and receive a JWT token.
+*   **POST** `/auth/login`
+*   **Body**: `{ "email": "...", "password": "..." }`
+*   **Response**: `{ "token": "...", "user": { ... } }`
 
 ### Register
-Create a new account.
+Create a new account. Registration can be disabled via Root Settings.
 *   **POST** `/auth/register`
+*   **Body**: `{ "email": "...", "password": "...", "metadata": { ... } }`
 
-**Body:**
-```json
-{
-  "email": "alice@example.com",
-  "password": "securePassword123"
-}
-```
-**Response:** Returns the User object + JWT Token.
-
-### Login
-Authenticate and receive a session token.
-*   **POST** `/auth/login`
-
-**Body:** Same as Register.
-
-**Response:**
-```json
-{
-  "token": "eyJhbGciOiJIUzI1Ni...",
-  "user": { ... }
-}
-```
-
-> **Client Usage:** Store the `token` in LocalStorage/Cookies and send it in the header `Authorization: Bearer <token>` for all subsequent requests.
+### Identity (Me)
+Retrieve the profile of the currently logged-in user.
+*   **GET** `/auth/me`
+*   **Auth**: Required (Bearer Token)
 
 ---
 
-## 3. Relating Users to Data Records
+## 3. Scopes & Permission Levels
 
-This is the most critical concept for application development. Since the `users` table is fixed, how do you store a profile picture? How do you ensure a user only sees their own posts?
+ApexKit enforces a strict hierarchy to prevent cross-tenant data leakage.
 
-### A. The "Owner" Field Type
-When designing a Collection Schema, you can define a special field type called `owner`.
+| Role | Scope | Capabilities |
+| :--- | :--- | :--- |
+| **Root Admin** | `root` | Full access to the master system and **all** tenants/sandboxes. |
+| **Tenant Admin** | `tenant:{id}` | Full access to their specific tenant's settings and data. |
+| **Standard User** | Any | Access to data based on **Collection Policies** (RLS). |
 
-**Collection Schema Example (`posts`):**
+---
+
+## 4. Relating Users to Data (RLS)
+
+The primary way to personalize applications is by linking Data Records to Users using the `owner` field type.
+
+### The `owner` Field
+When a field is defined as type `owner` in a collection schema, it stores the User ID.
+
+**Schema Example:**
 ```json
-{
-  "fields": {
-    "title": { "type": "string", "required": true },
-    "author_id": { "type": "owner", "required": true }
-  }
+"author_id": { 
+  "type": "owner", 
+  "auto": true,   // Automatically injects current User ID on Create
+  "required": true 
 }
 ```
 
-When you create a record in this collection, the `author_id` field expects a User ID.
+### Row-Level Security (RLS)
+You enforce ownership using **Collection Policies**.
 
-### B. Row-Level Security (Ownership Policy)
-You enforce data ownership using **API Policies** in your collection definition.
+*   **Policy**: `auth.id == field:author_id`
+*   **Logic**: If User #10 tries to update a record where `author_id` is #10, access is granted. If the IDs mismatch, the API returns `403 Forbidden`.
 
-**The Policy:** `"update": "owner:author_id"`
+---
 
-**How it works:**
-1.  Alice (User ID `10`) tries to `PATCH /collections/posts/records/55`.
-2.  Record `55` has `{"author_id": 10, "title": "Alice's Post"}`.
-3.  ApexKit compares the Token ID (`10`) with the Record's `author_id` (`10`).
-4.  **Match:** Update allowed.
+## 5. User Profiles (The Sidecar Pattern)
 
-If Bob (User ID `20`) tries to update Record `55`, the IDs won't match, and he receives `403 Forbidden`.
-
-### C. Storing User Profiles (The "Sidecar" Pattern)
-Because the system `User` object cannot hold extra fields like `avatar` or `bio`, you should create a standard Collection named `profiles`.
+Because the system `User` object is not customizable, use a **Sidecar Collection** for complex profile data (e.g., bios, addresses, social links).
 
 1.  **Create Collection `profiles`**:
-    *   Fields:
-        *   `user_id`: `{ "type": "owner", "unique": true, "required": true }`
-        *   `full_name`: `{ "type": "string" }`
-        *   `avatar`: `{ "type": "file" }`
-    *   Policies:
-        *   `create`: `"auth"`
-        *   `update`: `"owner:user_id"`
-        *   `read`: `"public"` (If profiles are public)
-
-2.  **Usage**:
-    When a user registers, your frontend (or a server-side script trigger) creates a record in `profiles` linking to the new User ID.
+    *   `user_id`: `{ "type": "owner", "unique": true, "auto": true }`
+    *   `bio`: `{ "type": "text" }`
+    *   `location`: `{ "type": "string" }`
+2.  **Accessing**: 
+    In your frontend, fetch the profile using a filter:  
+    `GET /collections/profiles/records?filter={"user_id": current_user_id}`
 
 ---
 
-## 4. Admin Management
+## 6. Auth Hooks (Edge Functions)
 
-Endpoints for administrators to manage the user base. Requires `Authorization` header with an admin token.
+You can intercept user lifecycle events using scripts to add custom validation or logic.
 
-### List Users
-**GET** `/admin/users`
-
-Returns a list of all registered users.
-
-### Delete User
-**DELETE** `/admin/users/{id}`
-
-*   Deletes the user account.
-*   **Note on Cascading:** Currently, this does *not* automatically delete records in other collections linked via `owner` fields (to prevent accidental data loss). You should use a `before_delete` script or manual cleanup if that is required.
+*   **`before_user_create`**: Validate email domains or block specific registrations.
+*   **`after_user_create`**: Automatically create a record in the `profiles` sidecar collection.
+*   **`before_user_delete`**: Clean up associated data or block deletion of "Super Admins".
 
 ---
 
-## 5. Advanced Auth (OAuth & Verification)
+## 7. JavaScript SDK Usage
 
-### GitHub Login
-*   **GET** `/auth/github` -> Redirects browser to GitHub.
-*   **GET** `/auth/github/callback` -> Returns JWT + User after successful GitHub auth.
+The `ApexKit` client manages token persistence and scope automatically.
 
-*(Requires `github_client_id` and `github_client_secret` to be set in System Config)*
+```javascript
+import { pb } from './apiClient';
 
-### Email Verification
-*   **POST** `/auth/verify/resend`: `{ "email": "..." }` -> Sends email.
-*   **GET** `/auth/verify?token=...`: Verifies the account.
+// 1. Authenticate
+const { token, user } = await pb.auth.login('alice@app.com', 'password');
+
+// 2. Fetch current user (validates token/scope)
+const me = await pb.auth.getMe();
+console.log(`Loggend into: ${me.scope}`);
+
+// 3. Admin Management (Requires Admin role)
+const { items: users } = await pb.admins.listUsers({ page: 1 });
+
+// 4. Update Metadata
+await pb.admins.updateUser(user.id, {
+    metadata: { ...user.metadata, last_ip: '1.2.3.4' }
+});
+```
 
 ---
 
-## 6. Example: Fetching "My Data"
+## 8. Advanced: API Keys
 
-To fetch records belonging to the currently logged-in user, you typically filter by the owner field.
-
-**Scenario:** Get all orders for the current user.
-
-1.  **Frontend:** Get current User ID from the stored session (e.g., `user.id = 5`).
-2.  **Request:**
-    `GET /collections/orders/records?filter={"user_id": 5}`
-
-**Secure it:**
-Even though the filter is sent by the client, you ensure security by setting the collection's **Read Policy** to `"owner:user_id"`.
-If a user tries to change the filter to `?filter={"user_id": 6}`, the API Policy check will fail because the returned records do not belong to the token bearer, returning an empty list or `403`.
+For server-to-server communication, use **API Keys** instead of user credentials.
+*   **Root API Keys**: Can have scope `*` (Global) or `tenant:{id}`.
+*   **Bypass CORS**: Keys can be configured to ignore browser Origin checks, useful for native mobile integrations.
+*   **Header**: `x-api-key: ak_...`

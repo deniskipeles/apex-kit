@@ -1,78 +1,104 @@
+# ⚡ Database Performance & Environment Variables
 
-# Optimizing ApexKit Database Performance
+**Version:** 0.1.0
+**Context:** Infrastructure Tuning and System Configuration
 
-ApexKit uses a specialized **Write Manager** (`batching.rs`) to handle SQLite's single-writer concurrency model. Instead of locking the database for every single insert (which kills performance), ApexKit buffers writes into memory and commits them in bulk transactions.
-
-You can tune this behavior via environment variables to match your hardware infrastructure.
-
-## Configuration Variables
-
-### 1. `DB_BATCH_SIZE`
-**Description:** Determines the maximum number of SQL write operations (inserts/updates/deletes) to buffer in memory before forcing a database commit.
-*   **Default:** `1000`
-*   **Type:** Integer
-
-### 2. `DB_FLUSH_MS`
-**Description:** The maximum time (in milliseconds) the system waits for a batch to fill up. If this time passes and the buffer isn't full, it commits whatever data is currently pending.
-*   **Default:** `10`
-*   **Type:** Integer (Milliseconds)
+ApexKit is designed for high-performance data ingestion. It uses a specialized **Write Manager** to overcome the single-writer limitation of SQLite/LibSQL, grouping individual operations into atomic batches to minimize disk I/O overhead.
 
 ---
 
-## Performance Tuning Guide
+## 1. The Write Manager (Batching)
 
-The optimal settings depend entirely on your hardware constraints (CPU Cores and Disk IOPS).
+Unlike standard frameworks that lock the database for every single `INSERT` or `UPDATE`, ApexKit buffers writes in memory.
 
-### Scenario A: The "Beast" (Dedicated Bare Metal / NVMe)
-*   **Target:** Hetzner Dedicated (Ryzen/Threadripper), AWS i3en.metal.
-*   **Goal:** Maximum throughput. You have abundant CPU cycles and fast NVMe storage. You want to minimize disk `fsync` calls by grouping as many writes as possible, and you want near-zero latency.
+### How it Works:
+1.  **Draining**: Incoming write requests are pushed into a high-capacity async channel.
+2.  **Batching**: A background worker collects requests until a specific **Size** is reached OR a **Time** interval passes.
+3.  **Transaction**: All collected operations are executed within a single `BEGIN IMMEDIATE ... COMMIT` block.
 
+### Key Tuning Variables:
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| **`DB_BATCH_SIZE`** | `2000` | Maximum number of SQL operations to group in one transaction. |
+| **`DB_FLUSH_MS`** | `50` | Maximum time to wait for a batch to fill before committing anyway. |
+
+---
+
+## 2. Performance Tuning Scenarios
+
+### Scenario A: High Throughput (Dedicated Server / NVMe)
+If you are running bulk imports or a high-traffic app on fast storage.
 ```env
-# Allow large bursts of traffic (e.g., bulk imports) to sit in RAM
 DB_BATCH_SIZE=5000
-
-# Flush rapidly. Your CPU can handle waking up 500 times a second.
-DB_FLUSH_MS=2
-```
-**Result:** Capable of 10,000+ writes/second.
-
-### Scenario B: The "Budget" (Shared vCPU / DigitalOcean Basic)
-*   **Target:** AWS t3.micro, DigitalOcean $5 Droplet, Raspberry Pi.
-*   **Goal:** Stability and CPU efficiency.
-*   **Risk:** If `DB_FLUSH_MS` is too low on a shared CPU, the background thread wakes up constantly, consuming your "CPU Credits" or causing the OS to throttle your application, even if no data is being written.
-
-```env
-# Keep memory usage low
-DB_BATCH_SIZE=500
-
-# Relax the timer. Check for writes only 20 times a second.
-# This saves significant CPU cycles for your API logic.
-DB_FLUSH_MS=50
-```
-**Result:** Lower CPU usage, slightly higher latency (50ms) for data to appear in search results, preventing system freezes.
-
-### Scenario C: General Production (Default)
-*   **Target:** Standard VPS (2 vCPU, 4GB RAM).
-*   **Goal:** Balance between latency and throughput.
-
-```env
-DB_BATCH_SIZE=1000
 DB_FLUSH_MS=10
 ```
+*Result: Grouping more writes reduces `fsync` calls, maximizing disk throughput.*
+
+### Scenario B: Low Latency / Real-Time
+If you need data to appear in search results or lists almost instantly.
+```env
+DB_BATCH_SIZE=100
+DB_FLUSH_MS=5
+```
+*Result: Commits happen more frequently, reducing the time data spends in memory.*
 
 ---
 
-## The Technical "Why"
+## 3. System Environment Variables
 
-### Why Batch Size Matters (The `fsync` Bottleneck)
-SQLite in WAL (Write-Ahead Log) mode allows many readers but only **one writer**.
-Every time a transaction commits, the operating system must perform an `fsync` to physically write data to the disk platter/NAND to ensure durability.
-*   **Without Batching:** 1,000 requests = 1,000 `fsync` operations. This is slow (approx. 50-100 req/sec on HDD).
-*   **With Batching:** 1,000 requests = 1 transaction = 1 `fsync` operation. This is incredibly fast.
+ApexKit uses environment variables for core security and infrastructure settings.
 
-Increasing `DB_BATCH_SIZE` reduces the number of times we hit the disk, trading RAM usage for write speed.
+### 🔐 Security & Identity
+| Variable | Required | Description |
+| :--- | :--- | :--- |
+| **`APEXKIT_MASTER_KEY`** | **Yes** | 32-byte Base64 string used to encrypt secrets (S3 keys, AI keys) in the DB. |
+| **`APEX_ROOT_DOMAIN`** | No | The base domain for multi-tenant routing (e.g., `myapp.com`). |
 
-### Why Flush Time Matters (Context Switching)
-The Write Manager runs an infinite loop in a background thread.
-*   **High Frequency (2ms):** The thread wakes up, checks the channel, and sleeps. This ensures writes happen almost instantly but forces the CPU to "context switch" constantly. On a shared vCPU, this looks like high usage to the hypervisor.
-*   **Low Frequency (50ms):** The thread sleeps longer. Writes might sit in RAM for 50ms before being saved. This is imperceptible to humans but frees up the CPU to handle incoming HTTP requests (Axum/Tokio tasks).
+### 🤖 AI & Search
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| **`APEX_VECTOR_MODEL`** | `all-minilm-l6-v2` | The local model used for embeddings. Options: `bge-small`, `bge-base`, `gte-small`. |
+| **`ARCHIVE_LIMIT`** | `10` | Maximum size in MB for `$zip` operations and site deployments. |
+
+### ⚙️ Runtime & Cache
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| **`PORT`** | `5000` | The port the server listens on. |
+| **`CACHE_TTL`** | `300` | Default Time-To-Live (seconds) for `$cache` entries. |
+| **`APP_ENV`** | `development` | Setting to `production` disables GraphQL introspection and verbose error logs. |
+
+---
+
+## 4. Database Optimization (Pragmas)
+
+ApexKit automatically applies these SQLite pragmas on startup for every tenant database:
+
+*   **`journal_mode = WAL`**: Enables concurrent readers while one writer is active.
+*   **`synchronous = NORMAL`**: Significant performance boost; safe when using WAL mode.
+*   **`temp_store = MEMORY`**: Forces temporary tables and indices into RAM.
+*   **`mmap_size = 30000000000`**: Maps up to 30GB of the database file into memory for near-instant read access (on supported OSs).
+
+---
+
+## 5. Deployment Example (`.env`)
+
+```bash
+# Security
+APEXKIT_MASTER_KEY="your-generated-32-byte-base64-key"
+APEX_ROOT_DOMAIN="api.myapp.com"
+
+# Tuning
+DB_BATCH_SIZE=1000
+DB_FLUSH_MS=20
+CACHE_TTL=600
+
+# Features
+ARCHIVE_LIMIT=50
+APEX_VECTOR_MODEL="bge-small"
+
+# Environment
+PORT=8080
+APP_ENV="production"
+```
+
+> **Note**: If `APEXKIT_MASTER_KEY` is not provided at startup, ApexKit will generate a temporary one and print a warning. **Always** persist this key; losing it means you cannot recover encrypted configurations like S3 credentials.

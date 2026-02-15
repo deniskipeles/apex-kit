@@ -1,9 +1,9 @@
-# ApexKit Filtering API Documentation
+# 🔍 Filtering API Documentation
 
 **Version:** 0.1.0
-**Context:** REST API, GraphQL, and Real-time WebSockets.
+**Context:** REST API, GraphQL, Real-time WebSockets, and Scripting.
 
-ApexKit provides a unified, **MongoDB-style JSON filtering syntax**. This engine translates JSON logic into efficient SQL for database queries and performs high-speed in-memory evaluation for real-time WebSocket subscriptions.
+ApexKit provides a unified, **MongoDB-style JSON filtering syntax**. This engine translates JSON logic into efficient SQL for database queries and performs high-speed in-memory evaluation for real-time WebSocket subscriptions and script hooks.
 
 ---
 
@@ -12,14 +12,14 @@ ApexKit provides a unified, **MongoDB-style JSON filtering syntax**. This engine
 Filters are defined as JSON objects. They operate on the JSON data stored within your records.
 
 ### Basic Equality
-To filter by exact match, provide the field name and value.
+To filter by an exact match, provide the field name and value.
 ```json
 {
   "status": "published",
-  "author_id": 55
+  "category": "news"
 }
 ```
-*Implies: `status = 'published' AND author_id = 55`*
+*Implies: `status = 'published' AND category = 'news'`*
 
 ### Dot Notation (Nested Data)
 Since ApexKit stores data as JSON, you can filter deeply nested properties using dot notation.
@@ -30,17 +30,11 @@ Since ApexKit stores data as JSON, you can filter deeply nested properties using
 }
 ```
 
-### Operators
-To perform checks other than equality, use an operator object:
-```json
-{
-  "field_name": { "$operator": value }
-}
-```
-
 ---
 
 ## 2. Comparison Operators
+
+To perform checks other than equality, use an operator object: `{ "field": { "$operator": value } }`.
 
 | Operator | SQL Equivalent | Description | Example |
 | :--- | :--- | :--- | :--- |
@@ -50,10 +44,10 @@ To perform checks other than equality, use an operator object:
 | **`$gte`** | `>=` | Greater than or equal. | `{ "age": { "$gte": 18 } }` |
 | **`$lt`** | `<` | Less than. | `{ "stock": { "$lt": 5 } }` |
 | **`$lte`** | `<=` | Less than or equal. | `{ "rating": { "$lte": 3.5 } }` |
-| **`$in`** | `IN (...)` | Value exists in array. | `{ "category": { "$in": ["news", "tech"] } }` |
-| **`$nin`** | `NOT IN (...)` | Value not in array. | `{ "id": { "$nin": [1, 2, 3] } }` |
-| **`$like`** | `LIKE` | SQL Wildcard matching (`%`). | `{ "title": { "$like": "The %" } }` |
-| **`$contains`** | `LIKE %...%` | Substring match. | `{ "bio": { "$contains": "developer" } }` |
+| **`$in`** | `IN (...)` | Value exists in array. | `{ "tag": { "$in": ["A", "B"] } }` |
+| **`$nin`** | `NOT IN (...)` | Value not in array. | `{ "id": { "$nin": [1, 2] } }` |
+| **`$like`** | `LIKE` | SQL Wildcard matching. | `{ "title": { "$like": "The %" } }` |
+| **`$contains`** | `LIKE %...%` | Substring match. | `{ "bio": { "$contains": "dev" } }` |
 
 ---
 
@@ -90,7 +84,7 @@ You can nest logic arbitrarily deep.
   "$and": [
     { "status": "active" },
     { "$or": [
-        { "category": "A" },
+        { "category": "tech" },
         { "price": { "$lt": 50 } }
     ]}
   ]
@@ -99,96 +93,48 @@ You can nest logic arbitrarily deep.
 
 ---
 
-## 4. Usage in REST API
+## 4. Usage Contexts
 
-Pass the filter JSON as a URL-encoded string in the `filter` query parameter.
+### REST API
+Pass the filter as a URL-encoded JSON string in the `filter` query parameter.
+`GET /collections/posts/records?filter={"status":"active"}`
 
-**Endpoint:** `GET /api/v1/collections/{id}/records`
-
-**Example:**
-*Filter:* `{ "status": "active", "views": { "$gt": 100 } }`
-
-**Request:**
-```http
-GET /api/v1/collections/posts/records?filter=%7B%22status%22%3A%22active%22%2C%22views%22%3A%7B%22%24gt%22%3A100%7D%7D
-```
-
-**JavaScript Client Example:**
-```javascript
-const filter = {
-  status: "active",
-  $or: [{ category: "tech" }, { category: "news" }]
-};
-
-const params = new URLSearchParams({ 
-    filter: JSON.stringify(filter) 
-});
-
-fetch(`/api/v1/collections/posts/records?${params}`);
-```
-
----
-
-## 5. Usage in GraphQL
-
+### GraphQL
 The GraphQL API exposes a `where` argument on collection queries. This argument accepts the raw JSON scalar.
-
-**Query:**
 ```graphql
-query GetProducts {
-  products(
-    limit: 10,
-    where: {
-      category: "electronics",
-      price: { $lt: 500 },
-      $or: [
-        { stock: { $gt: 0 } },
-        { is_preorder: true }
-      ]
-    }
-  ) {
-    id
-    title
-    price
+query {
+  posts(where: { status: "published", views: { $gt: 100 } }) {
+    items { title }
   }
 }
 ```
 
----
-
-## 6. Usage in Real-Time (WebSockets)
-
-You can filter the stream of events sent to your client. This is performed **in-memory** on the server before the event is broadcast, saving bandwidth and client-side processing.
-
-**Scenario:** Only receive updates when a ticket marked "URGENT" is created or updated.
-
-**WebSocket Message:**
+### Real-Time (WebSockets)
+Filter the stream of events sent to your client. This happens in-memory on the server before broadcast.
 ```json
 {
   "type": "Subscribe",
   "payload": {
     "collection_id": 5,
-    "filter": {
-      "priority": "URGENT",
-      "status": { "$neq": "closed" }
-    }
+    "filter": { "priority": "URGENT" }
   }
 }
 ```
 
-If a record is inserted with `priority: "LOW"`, the server **will not** send that event to this socket.
+### Scripting Engine
+Pass filter objects directly to the `$db` helper.
+```javascript
+const activeUsers = await $db.find("users", {
+    "last_login": { "$gt": "2024-01-01" },
+    "status": "active"
+});
+```
 
 ---
 
-## 7. Data Types & Caveats
+## 5. Data Types & Caveats
 
-1.  **Type Sensitivity:**
-    *   `"100"` (String) is not equal to `100` (Number).
-    *   Ensure your filter values match the data types defined in your Schema.
-2.  **Date Comparison:**
-    *   Dates are stored as ISO 8601 Strings (`"2023-01-01T00:00:00Z"`).
-    *   Use `$gt` / `$lt` with string comparisons for dates:
-        `{ "created_at": { "$gt": "2023-01-01" } }`.
-3.  **Boolean:**
-    *   SQLite stores booleans as `0` or `1` internally, but the JSON extractor handles standard JSON `true`/`false`.
-    *   Filter using: `{ "is_published": true }`.
+1.  **Strict Typing**: Filters are type-sensitive. `{ "age": "18" }` (string) will not match a record where `age` is `18` (number).
+2.  **Dates**: Dates are stored as ISO 8601 strings. Use string comparisons: `{ "created_at": { "$gt": "2024-02-01T00:00:00Z" } }`.
+3.  **Booleans**: Use JSON booleans `true` / `false`.
+4.  **Nulls**: To check for missing or null fields, use `{ "field": null }`. To check for existence, use `{ "field": { "$neq": null } }`.

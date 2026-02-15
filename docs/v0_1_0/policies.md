@@ -1,23 +1,23 @@
-# ApexKit Security Policies & Access Control
+# 🛡️ Security Policies & Access Control
 
-**Version:** 0.1.0 (Updated for Expression Engine)
-**Context:** Policies define **who** can perform **what** action (`read`, `create`, `update`, `delete`) on a Collection.
+**Version:** 0.1.0
+**Context:** Multi-Tenant Row-Level Security (RLS) & RBAC
 
-ApexKit uses a robust **Expression Engine** allowing for complex logic, role-based access control (RBAC), and row-level security (RLS) by chaining conditions.
+ApexKit uses a high-performance **Expression Engine** to define who can access what data. Policies are defined directly in the Collection Schema and are evaluated in real-time for every API and GraphQL request.
 
 ---
 
 ## 1. Defining Policies
 
-Policies are defined in the `schema` object of a Collection.
+Policies are mapped to the four core CRUD operations in the `policies` object of a collection.
 
-**JSON Structure:**
+**Example Schema:**
 ```json
 {
   "name": "posts",
   "schema": {
     "fields": {
-      "title": { "type": "string", "required": true },
+      "title": { "type": "string" },
       "status": { "type": "select", "options": ["draft", "published"] },
       "owner_id": { "type": "owner" }
     },
@@ -35,127 +35,112 @@ Policies are defined in the `schema` object of a Collection.
 
 ## 2. Syntax Reference
 
-The policy engine parses logical expressions.
+The engine parses logical expressions. Spaces are ignored, but strings must be quoted.
 
 ### Operators
 | Operator | Description | Example |
 | :--- | :--- | :--- |
-| `&&` | Logical AND | `auth && field:published == 'true'` |
-| `||` | Logical OR | `admin || auth.id == field:owner_id` |
+| `&&` | Logical AND | `auth && field:active == 'true'` |
+| `||` | Logical OR | `admin || auth.id == field:user_id` |
 | `==` | Equality | `auth.role == 'editor'` |
 | `!=` | Inequality | `field:status != 'locked'` |
 | `( )` | Grouping | `(A || B) && C` |
 
 ### Literals
-*   **Strings**: Must be quoted using `'` or `"`. (e.g., `'published'`, `"admin"`).
-*   **Booleans**: Represented as string comparisons usually, or implicit existence (e.g., `field:is_active == 'true'`).
+*   **Strings**: `'published'`, `"admin"` (must be quoted).
+*   **Booleans**: `true`, `false`.
+*   **Numbers**: `101`, `5.5`.
 
 ---
 
 ## 3. Context Variables
 
-You have access to the **User** (Requester) and the **Record** (Data).
+You have access to the **Requester** (Auth) and the **Record** (Field).
 
 ### Authentication Context (`auth.*`)
-These variables are populated from the JWT token passed in the `Authorization` header.
+These variables are extracted from the JWT token.
 
 | Variable | Description |
 | :--- | :--- |
-| `auth` | Boolean. Returns `true` if the user is logged in. |
-| `admin` | Boolean. Returns `true` if the user has the `admin` role. |
-| `auth.id` | The User ID (integer) of the requester. |
-| `auth.role` | The Role string (e.g., `'user'`, `'manager'`, `'student'`). |
-| `auth.email` | The Email address of the requester. |
+| `auth` | Returns `true` if the user is logged in. |
+| `admin` | Returns `true` if the user has the `admin` role. |
+| `auth.id` | The unique ID of the logged-in user. |
+| `auth.role` | The role string (e.g., `'manager'`, `'student'`). |
+| `auth.email`| The email address of the user. |
 
 ### Record Context (`field:*`)
-These variables access the JSON data of the record being acted upon.
+These variables access the JSON data of the record in the database.
 
 | Variable | Description |
 | :--- | :--- |
 | `field:{name}` | The value of a specific field in the record. |
 
-> **Note on Updates:** During an `update` or `delete` operation, `field:*` refers to the **existing** data in the database, not the new incoming data. This allows for "Locking" logic (e.g., "You cannot delete if status is 'archived'").
+> **Crucial for Updates**: During `update` or `delete` operations, `field:*` refers to the **existing** data in the database *before* the changes are applied. This allows for logic like "you cannot edit a post if its current status is 'archived'".
 
 ---
 
-## 4. Common Use Cases & Examples
+## 4. Common Use Cases
 
-### A. Public Read, Authenticated Write
-Standard for blogs or forums.
+### A. Ownership (Row-Level Security)
+Only allow users to see or edit their own data.
 ```json
 {
-  "read": "public",
-  "create": "auth",
-  "update": "admin",
-  "delete": "admin"
+  "read": "auth.id == field:user_id",
+  "update": "auth.id == field:user_id"
 }
 ```
 
-### B. Ownership (Row-Level Security)
-Only the user who created the record can modify it.
+### B. Role-Based Access (RBAC)
+Allow access based on specific custom roles.
 ```json
 {
-  "read": "public",
-  "create": "auth",
-  "update": "auth.id == field:owner_id",
-  "delete": "auth.id == field:owner_id"
-}
-```
-*Note: Legacy syntax `owner:owner_id` is still supported and equivalent to the update rule above.*
-
-### C. Role-Based Access (RBAC)
-Allow multiple specific roles to access data.
-```json
-{
-  "read": "auth.role == 'manager' || auth.role == 'auditor' || admin"
+  "read": "auth.role == 'editor' || auth.role == 'viewer' || admin"
 }
 ```
 
-### D. Workflow Locking
-Users can edit their own records, **but only if** the record is in 'draft' mode. Once published, only admins can touch it.
+### C. Workflow Locking
+Allow users to update their records, but only if the record is in a 'draft' state.
 ```json
 {
-  "update": "(auth.id == field:owner_id && field:status == 'draft') || admin"
+  "update": "auth.id == field:owner_id && field:status == 'draft'"
 }
 ```
 
-### E. Department Isolation
-Assuming you store a `department_id` on the User object (custom JWT claims support coming soon, currently assumes mapped via role or lookup scripts).
-*Currently, you would model this via roles:*
+### D. Public/Private Toggle
+Allow any user to read a record if it is marked as public.
 ```json
 {
-  "read": "auth.role == field:required_role"
+  "read": "field:is_public == 'true' || auth.id == field:owner_id"
 }
 ```
 
 ---
 
-## 5. Legacy Shorthands
+## 5. Multi-Tenancy & Admin Bypass
 
-ApexKit 2.4 maintains backward compatibility with v1.0 shorthands.
+ApexKit enforces a strict hierarchy for security:
+
+1.  **Root Admin Bypass**: Users with the `admin` role in the **Root App** context bypass all collection policies. They can see and edit any record in any tenant for support or maintenance.
+2.  **Tenant Admin**: Users with the `admin` role inside a **Tenant** context bypass policies *only within that tenant*. They cannot see data in other tenants.
+3.  **Physical Isolation**: Policies are evaluated *after* tenant resolution. A request to `tenant_A` can never leak data from `tenant_B`, regardless of how permissive the policy is.
+
+---
+
+## 6. Shorthands (Legacy Support)
+
+ApexKit maintains support for standard shorthands for quick configuration:
 
 | Shorthand | Equivalent Expression |
 | :--- | :--- |
-| `"public"` | `true` (Always allowed) |
-| `"auth"` | `auth` (Checks if JWT exists) |
-| `"admin"` | `admin` (Checks if role == 'admin') |
-| `"owner:X"` | `auth.id == field:X` |
+| `"public"` | Always returns `true`. |
+| `"auth"` | Equivalent to `auth` (logged in). |
+| `"admin"` | Equivalent to `auth.role == 'admin'`. |
+| `"owner:X"` | Equivalent to `auth.id == field:X`. |
 
 ---
 
-## 6. Testing Policies
+## 7. Performance Note
 
-You can test policies using the **Script Runner** before applying them to a schema.
+Policies are evaluated in a high-speed Rust-based virtual machine. However, for large `list` requests (e.g., thousands of records), complex expressions involving many `field:*` lookups may impact latency. 
 
-```javascript
-// Pseudo-code for testing logic manually in a script
-export default async function(req) {
-    const user = { role: "student", uid: 55 };
-    const record = { owner_id: 55, status: "active" };
-    
-    // Simulate logic
-    const can_update = (user.uid == record.owner_id) || (user.role == "admin");
-    
-    return new Response({ allowed: can_update });
-}
-```
+**Best Practice**: Whenever possible, combine policies with **Filters** in your API requests (`?filter={...}`) to reduce the number of records the policy engine needs to process.
