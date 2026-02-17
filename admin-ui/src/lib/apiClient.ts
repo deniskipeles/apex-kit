@@ -241,7 +241,7 @@ export const apiClient = {
   },
 
   system: {
-    reload: async () => await pb.admins.reloadSystem(),
+    reload: async (target = null) => await pb.admins.reloadSystem(target),
     testEmail: async (email: string) => await pb.admins.testEmail(email),
     createBackup: async () => await pb.admins.createBackup(),
     listBackups: async () => await pb.admins.listBackups(),
@@ -372,7 +372,7 @@ export const apiClient = {
     update: async (id: string, data: Partial<AuthUser>): Promise<AuthUser> => {
       const { email, role, password, metadata } = data;
       const res = await pb.admins.updateUser(id, email, password, role, metadata);
-      
+
       // FIX 2: Explicitly cast 'id' because backend 'User' type has 'id' as string in SDK but might be number from raw response
       const updatedUser: AuthUser = {
         id: res.id.toString(), // Ensure string
@@ -645,9 +645,9 @@ export const apiClient = {
       const res = await pb.scripts.list();
       // FIX 4: Map backend response to local Script type (ensure target_collection)
       return res.map((s: any) => ({
-          ...s,
-          id: s.id.toString(),
-          target_collection: s.target_collection || '' // Default string if missing
+        ...s,
+        id: s.id.toString(),
+        target_collection: s.target_collection || '' // Default string if missing
       }));
     },
     create: async (data: Partial<Script>): Promise<Script> => {
@@ -707,10 +707,10 @@ export const apiClient = {
       const res = await pb.ai.getActions();
       // FIX 7: Map ID to string
       return res.map((a: any) => ({
-          ...a,
-          id: a.id.toString(),
-          system_prompt: a.system_prompt || '',
-          config: a.config || {}
+        ...a,
+        id: a.id.toString(),
+        system_prompt: a.system_prompt || '',
+        config: a.config || {}
       }));
     },
     createAction: async (data: Partial<AiAction>) => {

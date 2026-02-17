@@ -137,7 +137,7 @@ fn apply_projection_recursive(
                     if let Some(sub_val) = new_map.get_mut(key) {
                         let sub_param = sub_fields.join(",");
                         apply_projection(sub_val, &sub_param);
-                    } else if let Some(val) = map.remove(key) {
+                    } else if let Some(_val) = map.remove(key) {
                          // Case: "expand.author" might exist in the record but wasn't in roots?
                          // If "author.name" was requested, "author" IS in roots.
                          // But if we are processing the `expand` object separately, we need care.

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use crate::Db;
 use serde_json::{json, Value};
 use crate::filter::FilterNode;
@@ -207,7 +206,7 @@ impl QueryProcessor {
                         }
                     }
                 },
-                PipelineStep::Map { expression } => {
+                PipelineStep::Map { expression: _ } => {
                     // Simple evaluation (e.g. "a + b")
                     // In a real implementation, this would use the `ScriptEngine` (Boa).
                     // For now, let's implement basic field renaming as a placeholder or basic math if possible.

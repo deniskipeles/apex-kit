@@ -269,11 +269,13 @@ async fn main() {
     // Initialize EmbedderService (Wrapper for external APIs like OpenAI/Gemini if used in scripts)
     let embedder = Arc::new(apexkit_core::embeddings::EmbedderService::new());
 
-    let env_ttl = std::env::var("CACHE_TTL")
+    let env_ttl = std::env::var("ROOT_CACHE_TTL")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(300); // 5 mins default
+    let env_root_cache_size = std::env::var("ROOT_CACHE_SIZE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1000); // 1000 records defaults
 
-    let script_cache = Cache::builder()
-        .max_capacity(100_000)
+    let root_script_cache = Cache::builder()
+        .max_capacity(env_root_cache_size)
         .time_to_live(std::time::Duration::from_secs(env_ttl)) // Enforce ENV TTL
         .build();
 
@@ -295,7 +297,7 @@ async fn main() {
         embedder,
         vector_provider: vector_provider.clone(),
         port: cli.port,
-        script_cache,
+        root_script_cache,
     };
 
     // 11. Build Real Schema

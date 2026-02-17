@@ -23,10 +23,10 @@ export const Topbar = ({ onMenuClick }: TopbarProps) => {
   const handleSystemReload = async () => {
       setIsReloading(true);
       try {
-          await pb.admins.reloadSystem();
-          toast('System reloaded successfully (Schema & Cron)', 'success');
+          const res = await pb.admins.reloadSystem(null);
+          toast(res.message || 'System reloaded successfully (Schema & Cron)', 'success');
       } catch (e) {
-          toast('Failed to reload system', 'error');
+          toast('Failed to reload system \n'+(e.message || ''), 'error');
           console.error(e);
       } finally {
           setIsReloading(false);
@@ -51,7 +51,6 @@ export const Topbar = ({ onMenuClick }: TopbarProps) => {
             size="sm" 
             className="hidden sm:flex gap-2 text-xs h-9" 
             onClick={handleSystemReload}
-            isLoading={isReloading}
         >
             <RefreshCw className={`h-3.5 w-3.5 ${isReloading ? 'animate-spin' : ''}`} />
             <span className="hidden lg:inline">Restart App</span>

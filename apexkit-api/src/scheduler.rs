@@ -1,6 +1,6 @@
 use crate::{AppState};
 use tokio_cron_scheduler::{Job, JobScheduler};
-use apexkit_core::{models::CronJob, Db, VectorProvider, security::Vault, realtime::EventScope};
+use apexkit_core::{models::CronJob, Db, realtime::EventScope};
 use std::sync::Arc;
 use chrono::Utc;
 use cron::Schedule;
@@ -76,17 +76,20 @@ impl SchedulerService {
         let sandbox_ticker = Job::new_async("0 * * * * *", move |_uuid, _l| {
             let s = state_sandbox.clone();
             Box::pin(async move {
-                // Note: We need list_sandboxes on manager. Assuming it exists or we add it similar to tenants.
-                // If not, we can iterate fs::read_dir("storage/sandboxes") manually here.
                 if let Ok(entries) = std::fs::read_dir("storage/sandboxes") {
                     for entry in entries.flatten() {
                         if let Ok(fname) = entry.file_name().into_string() {
                             if fname.starts_with("session_") {
                                 let session_id = fname.strip_prefix("session_").unwrap().to_string();
-                                let s_inner = s.clone();
-                                tokio::spawn(async move {
-                                    process_context_crons(s_inner, session_id.clone(), EventScope::Sandbox(session_id)).await;
-                                });
+                                
+                                // [FIX] Only process if Active in Cache
+                                // This prevents waking up cold sandboxes every minute.
+                                if s.sandbox_manager.is_active(&session_id) {
+                                    let s_inner = s.clone();
+                                    tokio::spawn(async move {
+                                        process_context_crons(s_inner, session_id.clone(), EventScope::Sandbox(session_id)).await;
+                                    });
+                                }
                             }
                         }
                     }
@@ -158,7 +161,6 @@ async fn execute_job(state: &AppState, db: Arc<dyn Db>, _context_id: &str, job: 
     });
 
     if job.payload.starts_with("/") {
-        // ... (Webhook logic remains same) ...
         let base = format!("http://127.0.0.1:{}", state.port);
         let url = match &scope {
             EventScope::Root => format!("{}{}", base, job.payload),

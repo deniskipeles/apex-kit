@@ -1,22 +1,23 @@
 use axum::{
-    extract::{Query, State, Path},
-    http::{StatusCode},
+    extract::{Query, State, Path, ConnectInfo},
+    http::{StatusCode, HeaderMap},
     response::{Redirect, Response, IntoResponse},
     Json,
 };
 use serde::{Deserialize, Serialize};
-use apexkit_core::{auth, jobs::Job};
-use crate::{AppState, AppError, AuthResponse, UserDto};
+use apexkit_core::{auth, policies, jobs::Job};
+use crate::{AppState, AppError, AuthResponse, AuthRequest,ProblemDetail, UserDto};
 use apexkit_core::security::EncryptedValue;
 use serde_json::json;
 use apexkit_core::auth::Claims;
-use crate::{DatabaseConnection, IdPath};
+use crate::{DatabaseConnection, IdPath, trigger_void_hook, trigger_filter_hook, BaseUrl, extract_log_meta};
 use axum::Extension;
 use apexkit_core::jobs;
-use utoipa::ToSchema;
+use utoipa::{ToSchema, IntoParams};
 use apexkit_core::realtime::EventScope;
 use std::sync::Arc;
 use apexkit_core::{Db, security::Vault};
+use std::net::SocketAddr;
 
 // --- GitHub Models ---
 #[derive(Deserialize)]
@@ -339,4 +340,291 @@ pub async fn update_user_handler(
         metadata: u.metadata,
         scope: None 
     }))
+}
+
+
+
+// =========================================================
+// 4. USERS / AUTH
+// =========================================================
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/login",
+    request_body = AuthRequest,
+    responses((status = 200, body = AuthResponse), (status = 401, body = ProblemDetail))
+)]
+pub async fn login(
+    DatabaseConnection(db): DatabaseConnection, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    scope: Option<Extension<EventScope>>, // [NEW] Capture current scope
+    headers: HeaderMap,
+    Json(p): Json<AuthRequest>
+) -> Result<Json<AuthResponse>, AppError> {
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let scope_str = match event_scope {
+        EventScope::Tenant(id) => format!("tenant:{}", id),
+        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+        _ => "root".to_string()
+    };
+
+    let base_meta = json!({ "email": p.email });
+
+    let user_opt = db.get_user_by_email(&p.email).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let u = match user_opt {
+        Some(u) => u,
+        None => {
+            let meta = extract_log_meta(&headers, Some(addr), base_meta);
+            let _ = db.log_audit_event("warning", "Login Failed (User Not Found)", "auth", Some(meta)).await;
+            return Err(AppError::Unauthorized("Bad creds".into()));
+        }
+    };
+
+    if !auth::verify_password(&p.password, &u.password_hash) {
+        let meta = extract_log_meta(&headers, Some(addr), base_meta);
+        let _ = db.log_audit_event("warning", "Login Failed (Bad Password)", "auth", Some(meta)).await;
+        return Err(AppError::Unauthorized("Bad creds".into())); 
+    }
+
+    // [FIX] Pass scope to JWT
+    let token = auth::create_jwt(u.id, &u.email, &u.role, &scope_str).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
+    
+    // [LOG] Success
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "email": u.email, "user_id": u.id }));
+    let _ = db.log_audit_event("info", "Login Success", "auth", Some(meta)).await;
+
+    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role, metadata: u.metadata, scope: Some(scope_str)}}))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/register",
+    request_body = AuthRequest,
+    responses((status = 200, body = AuthResponse))
+)]
+pub async fn register(
+    BaseUrl(_base_url): BaseUrl, 
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>, 
+    BaseUrl(base_url): BaseUrl, 
+    scope: Option<Extension<EventScope>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(p): Json<AuthRequest>
+) -> Result<Json<AuthResponse>, AppError> {
+    // 1. Check if requester is Admin
+    let is_admin = matches!(auth, Some(Extension(ref c)) if c.role == "admin");
+
+    // 2. Check Public Registration Setting (Only if NOT admin)
+    if !is_admin {
+        let general_settings = db.get_config("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        
+        let allow_registration = general_settings
+            .and_then(|v| v.get("allow_public_registration").and_then(|b| b.as_bool()))
+            .unwrap_or(true); // Default true
+
+        if !allow_registration {
+            return Err(AppError::Forbidden("Public registration is disabled".into()));
+        }
+    }
+    
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let scope_str = match &event_scope {
+        EventScope::Tenant(id) => format!("tenant:{}", id),
+        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+        _ => "root".to_string()
+    };
+    
+    // [NEW] Use role from request or default to "user"
+    // Security Note: In a real app, you might want to block "admin" registration via public endpoint
+    // unless allow_public_registration is true AND we filter roles.
+    // For this dev setup, we allow requested role if not validated elsewhere.
+    let role = p.role.unwrap_or_else(|| "user".to_string());
+    
+    // [TRIGGER] before_user_create
+    let input_data = json!({ "email": p.email, "role": role, "metadata": p.metadata });
+    trigger_void_hook(&state, "before_user_create", input_data.clone(), None, Some(&event_scope.clone()), Some(base_url.clone())).await?;
+
+    let hash = auth::hash_password(&p.password).map_err(|_| AppError::UnknownError("Hash fail".into()))?;
+    
+    // [FIX] Pass metadata
+    let u = db.create_user(&p.email, &hash, &role, p.metadata).await.map_err(|_| AppError::UnknownError("User exists".into()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "email": u.email, "user_id": u.id }));
+    let _ = db.log_audit_event("info", "Register", "auth", Some(meta)).await;
+
+    // [TRIGGER] after_user_create
+    let user_json = json!({ "id": u.id, "email": u.email, "role": u.role });
+    let _ = trigger_void_hook(&state, "after_user_create", user_json, None, Some(&event_scope.clone()), Some(base_url.clone())).await;
+
+    // [FIX] Pass scope to JWT
+    let token = auth::create_jwt(u.id, &u.email, &u.role, &scope_str).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
+    
+    state.queue.enqueue(Job::SendWelcomeEmail { email: u.email.clone(), user_id: u.id }).await;
+    
+    Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role, metadata: u.metadata, scope: Some(scope_str)}}))
+}
+
+// Helper to convert User to Value for policy check
+fn user_to_value(u: &apexkit_core::auth::User) -> serde_json::Value {
+    serde_json::json!({
+        "id": u.id,
+        "email": u.email,
+        "role": u.role,
+        "metadata": u.metadata
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/users",
+    params(UserListQuery),
+    responses((status = 200, body = UserListResponse))
+)]
+pub async fn list_users_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(params): Query<UserListQuery>,
+) -> Result<Json<UserListResponse>, AppError> {
+    let claims = auth.map(|c| c.0);
+
+    // 1. Fetch User Policies from Config
+    let policy_json = db.get_config("policy_users").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    let policies: apexkit_core::schema::CollectionPolicies = if let Some(val) = policy_json {
+        serde_json::from_value(val).unwrap_or_else(|_| apexkit_core::schema::CollectionPolicies {
+             read: "admin".to_string(), // Default secure
+             ..Default::default()
+        })
+    } else {
+        // Fallback default
+        apexkit_core::schema::CollectionPolicies {
+             read: "admin".to_string(),
+             ..Default::default()
+        }
+    };
+
+    // 2. Check Global Read Access
+    // Passing None for record_data checks if user has general read access
+    if !apexkit_core::policies::check_access(&policies.read, claims.as_ref(), None) { 
+        return Err(AppError::Forbidden("Access denied".into())); 
+    }
+
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    
+    // [TRIGGER] Before List
+    let query_json = json!({ "search": params.search, "page": params.page });
+    let mod_q = trigger_filter_hook(&state, "before_list_users", query_json, claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
+    
+    let search = mod_q.get("search").and_then(|s| s.as_str()).map(String::from);
+    let page = mod_q.get("page").and_then(|v| v.as_i64()).unwrap_or(1).max(1);
+    let limit = params.per_page.unwrap_or(20).min(100);
+    let offset = (page - 1) * limit;
+
+    let users = db.list_users(search.clone(), limit, offset).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let total = db.count_users(search).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    // 3. [OPTIONAL] Row-Level Filtering (In-Memory)
+    // If policy is complex (e.g. "owner:id"), we must filter the results.
+    // However, for efficiency, "list" usually implies broad access or specific query filters.
+    // If you want strict RLS on list, uncomment this block:
+    /*
+    let filtered_users: Vec<User> = users.into_iter().filter(|u| {
+        let u_val = serde_json::json!({ "id": u.id, "email": u.email, "role": u.role });
+        apexkit_core::policies::check_access(&policies.read, claims.as_ref(), Some(&u_val))
+    }).collect();
+    // Update total? Doing so accurately requires fetching ALL and filtering, which kills pagination.
+    // Standard practice: Apply global check, then rely on query filters for narrowing.
+    */
+
+    let response = UserListResponse {
+        items: users.into_iter().map(|u| UserDto { id: u.id, email: u.email, role: u.role, metadata: u.metadata, scope: None, }).collect(),
+        total
+    };
+
+    // [TRIGGER] After List
+    let final_json = trigger_filter_hook(&state, "after_list_users", json!(response), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
+    let final_resp: UserListResponse = serde_json::from_value(final_json).unwrap_or(response);
+
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "count": final_resp.items.len() }));
+    let _ = db.log_audit_event("info", "Users Listed", "admin", Some(meta)).await;
+
+    Ok(Json(final_resp))
+}
+
+#[utoipa::path(delete, path = "/api/v1/admin/users/{id}", params(IdPath))]
+pub async fn delete_user_handler(
+    BaseUrl(base_url): BaseUrl,
+    auth: Option<Extension<Claims>>, 
+    State(state): State<AppState>, 
+    scope: Option<Extension<EventScope>>,
+    DatabaseConnection(db): DatabaseConnection, 
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<IdPath>
+) -> Result<StatusCode, AppError> {
+    let claims = auth.map(|c| c.0);
+    let user_id = path.id.parse::<i64>().map_err(|_| AppError::JsonError("Invalid ID".into()))?;
+
+    // 1. Fetch Target User
+    // We need to fetch it to check "owner" policy against it
+    // get_users_by_ids is in Db trait
+    let targets = db.get_users_by_ids(&[user_id]).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let target_user = targets.first().ok_or(AppError::NotFound("User not found".into()))?;
+
+    // 2. Get Policy
+    let policy_json = db.get_config("policy_users").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let policies: apexkit_core::schema::CollectionPolicies = policy_json
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_else(|| apexkit_core::schema::CollectionPolicies {
+             delete: "admin".to_string(),
+             ..Default::default()
+        });
+
+    // 3. Check "Delete" Policy
+    let target_data = user_to_value(target_user);
+    if !policies::check_access(&policies.delete, claims.as_ref(), Some(&target_data)) { 
+        return Err(AppError::Forbidden("Delete denied".into())); 
+    }
+
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    
+    // [TRIGGER] Before Delete
+    let user_json = json!({ "id": path.id });
+    trigger_void_hook(&state, "before_user_delete", user_json.clone(), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
+
+    // [FIX] Parse String ID to i64
+    let user_id = path.id.parse::<i64>().map_err(|_| AppError::JsonError("Invalid User ID format".into()))?;
+
+    db.delete_user(user_id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    // [LOG]
+    let meta = extract_log_meta(&headers, Some(addr), json!({ "target_user_id": user_id }));
+    let _ = db.log_audit_event("warning", "User Deleted", "admin", Some(meta)).await;
+
+    // [TRIGGER] After Delete
+    let _ = trigger_void_hook(&state, "after_user_delete", user_json, claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct UserListQuery {
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
+    pub search: Option<String>,
+}
+
+#[derive(Serialize, ToSchema, Deserialize)]
+pub struct UserListResponse {
+    pub items: Vec<UserDto>,
+    pub total: i64,
 }

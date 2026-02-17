@@ -4,7 +4,7 @@ use crate::{Db, query::QueryOptions, ScriptContext};
 use crate::realtime::{DbEvent, EventScope};
 use tokio::sync::broadcast;
 use regex::Regex;
-use std::path::Path;
+use std::path::{PathBuf};
 use std::cell::RefCell;
 use crate::query_engine::ApexQuery;
 
@@ -18,10 +18,8 @@ use std::io::{Cursor, Read, Write};
 use zip::{ZipArchive, ZipWriter};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use zip::write::FileOptions;
-use std::process::{Command, Stdio};
-use std::time::Duration;
-use tokio::time::timeout;
 use std::collections::HashMap;
+use std::time::UNIX_EPOCH;
 
 // --- PRELUDE ---
 const JS_PRELUDE: &str = r#"
@@ -169,7 +167,7 @@ const JS_PRELUDE: &str = r#"
 "#;
 
 thread_local! {
-    static ACTIVE_CONTEXT: RefCell<Option<(
+    pub static ACTIVE_CONTEXT: RefCell<Option<(
         Arc<dyn ScriptContext>,           
         tokio::runtime::Handle,           
         Option<String>,                   
@@ -246,7 +244,7 @@ impl ScriptEngine {
         base_url: Option<String>,
         scope: Option<EventScope>
     ) -> Result<Option<JsonValue>, String> {
-        let actual_scope = scope.unwrap_or(EventScope::Root);
+        let _actual_scope = scope.unwrap_or(EventScope::Root);
         let wrapped_code = format!(r#"
             (async () => {{
                 {}
@@ -326,9 +324,8 @@ impl ScriptEngine {
         register_fetch(ctx)?;
         register_fs(ctx)?;
         register_zip(ctx)?;
-        register_archive(ctx)?;
         register_db(ctx)?;
-        register_cmd(ctx)?;
+        crate::scripting_cmd::register_cmd(ctx)?;
         register_run(ctx)?;
         register_root(ctx)?;
         register_env(ctx)?;
@@ -353,7 +350,7 @@ impl ScriptEngine {
 }
 
 // --- JS Return Helper ---
-fn return_json_promise(ctx: &mut Context, result: Result<serde_json::Value, String>) -> JsResult<JsValue> {
+pub fn return_json_promise(ctx: &mut Context, result: Result<serde_json::Value, String>) -> JsResult<JsValue> {
     let (promise, resolvers) = boa_engine::object::builtins::JsPromise::new_pending(ctx);
     match result {
         Ok(json_val) => {
@@ -507,35 +504,207 @@ fn register_util(ctx: &mut Context) -> Result<(), String> {
     ctx.register_global_property(JsString::from("$util"), obj, Attribute::all()).map_err(|e| e.to_string())
 }
 
+// 1. Resolve READ Path (Scope Root)
+fn resolve_read_path(scope: &EventScope, requested_path: &str) -> Result<PathBuf, String> {
+    if requested_path.contains("..") { return Err("Path traversal forbidden".into()); }
+
+    let base_dir = match scope {
+        EventScope::Root => {
+            // Root Admin can read anywhere via prefix
+            if let Some(stripped) = requested_path.strip_prefix("tenant:") {
+                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                 if parts.len() < 2 { return Err("Invalid format".into()); }
+                 format!("storage/tenants/{}/{}", parts[0], parts[1])
+            } else if let Some(stripped) = requested_path.strip_prefix("sandbox:") {
+                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                 if parts.len() < 2 { return Err("Invalid format".into()); }
+                 format!("storage/sandboxes/session_{}/{}", parts[0], parts[1])
+            } else {
+                 format!("storage/system/{}", requested_path)
+            }
+        },
+        EventScope::Tenant(id) => format!("storage/tenants/{}/{}", id, requested_path),
+        EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/{}", id, requested_path),
+        _ => return Err("Invalid scope".into())
+    };
+    
+    Ok(PathBuf::from(base_dir))
+}
+
+// 2. Resolve WRITE Path (Scope TMP Only)
+fn resolve_write_path(scope: &EventScope, requested_path: &str) -> Result<PathBuf, String> {
+    if requested_path.contains("..") { return Err("Path traversal forbidden".into()); }
+
+    // Root Admin can write anywhere (Power User) - OR restrict to root/tmp? 
+    // Let's restrict Root to its own root/tmp for consistency, 
+    // unless they explicitly use a prefix to write to a tenant's tmp.
+    
+    let base_dir = match scope {
+        EventScope::Root => {
+            if let Some(stripped) = requested_path.strip_prefix("tenant:") {
+                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                 if parts.len() < 2 { return Err("Invalid format".into()); }
+                 format!("storage/tenants/{}/tmp/{}", parts[0], parts[1])
+            } else if let Some(stripped) = requested_path.strip_prefix("sandbox:") {
+                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                 if parts.len() < 2 { return Err("Invalid format".into()); }
+                 format!("storage/sandboxes/session_{}/tmp/{}", parts[0], parts[1])
+            } else {
+                 format!("storage/system/tmp/{}", requested_path)
+            }
+        },
+        EventScope::Tenant(id) => format!("storage/tenants/{}/tmp/{}", id, requested_path),
+        EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/tmp/{}", id, requested_path),
+        _ => return Err("Invalid scope".into())
+    };
+
+    Ok(PathBuf::from(base_dir))
+}
+
 fn register_fs(ctx: &mut Context) -> Result<(), String> {
+
+    // $fs.read(path) -> string
     let read_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
         let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
-                // Fixed type mismatch (String vs Result)
-                let base = match scope {
-                    EventScope::Root => "storage/system/uploads".to_string(),
-                    EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
-                    EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
-                    _ => "storage/tmp".to_string()
-                };
-                
-                if fname.contains("..") { return Err("Invalid path".to_string()); }
-                
+                let target = resolve_read_path(scope, &fname)?; // Read from Root
                 handle.block_on(async {
-                    tokio::fs::read_to_string(Path::new(&base).join(fname)).await.map_err(|e| e.to_string())
+                     if !target.exists() { return Err("File not found".into()); }
+                     if target.is_dir() { return Err("Cannot read directory".into()); }
+                     tokio::fs::read_to_string(target).await.map_err(|e| e.to_string())
                 })
-            } else { Err("Context lost".to_string()) }
+            } else { Err("Context lost".into()) }
         });
-        
         match result {
-            Ok(s) => Ok(JsValue::from(JsString::from(s))),
-            Err(e) => Err(JsError::from_opaque(JsString::from(e).into()))
+            Ok(s) => return_json_promise(ctx, Ok(serde_json::Value::String(s))),
+            Err(e) => return_json_promise(ctx, Err(e))
         }
     });
+
+    // $fs.write(path, content) -> void (Writes to TMP)
+    let write_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let content = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
+                let target = resolve_write_path(scope, &fname)?; // Write to TMP
+                handle.block_on(async {
+                     if let Some(parent) = target.parent() {
+                         tokio::fs::create_dir_all(parent).await.ok();
+                     }
+                     tokio::fs::write(target, content).await.map_err(|e| e.to_string())?;
+                     Ok(json!(true))
+                })
+            } else { Err("Context lost".into()) }
+        });
+        return_json_promise(ctx, result)
+    });
+
+    // $fs.delete(path) -> void (Deletes from TMP)
+    let delete_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
+                let target = resolve_write_path(scope, &fname)?; // Delete from TMP only
+                handle.block_on(async {
+                     if !target.exists() { return Err("File not found in tmp".into()); }
+                     if target.is_dir() {
+                         tokio::fs::remove_dir_all(target).await.map_err(|e| e.to_string())
+                     } else {
+                         tokio::fs::remove_file(target).await.map_err(|e| e.to_string())
+                     }
+                }).map(|_| json!(true))
+            } else { Err("Context lost".into()) }
+        });
+        return_json_promise(ctx, result)
+    });
     
+    // $fs.list(path) -> Array (Lists from Root)
+    let list_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
+                let target = resolve_read_path(scope, &fname)?; // List from Root
+                handle.block_on(async {
+                     if !target.exists() { return Err("Path not found".into()); }
+                     
+                     let mut entries = Vec::new();
+                     let mut dir = tokio::fs::read_dir(target).await.map_err(|e| e.to_string())?;
+                     
+                     while let Ok(Some(entry)) = dir.next_entry().await {
+                         let meta = entry.metadata().await.map_err(|e| e.to_string())?;
+                         entries.push(json!({
+                             "name": entry.file_name().to_string_lossy(),
+                             "isDir": meta.is_dir(),
+                             "size": meta.len()
+                         }));
+                     }
+                     Ok(json!(entries))
+                })
+            } else { Err("Context lost".into()) }
+        });
+        return_json_promise(ctx, result)
+    });
+
+    // $fs.exists(path) -> bool (Checks Root)
+    let exists_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((_, _, _, _, scope)) = &*c.borrow() {
+                let target = resolve_read_path(scope, &fname); // Check Root
+                match target {
+                    Ok(p) => Ok(json!(p.exists())),
+                    Err(_) => Ok(json!(false))
+                }
+            } else { Err("Context lost".into()) }
+        });
+        return_json_promise(ctx, result)
+    });
+
+    // $fs.mkdir(path) -> void (Creates in TMP)
+    let mkdir_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
+                let target = resolve_write_path(scope, &fname)?; // Mkdir in TMP
+                handle.block_on(async {
+                    tokio::fs::create_dir_all(target).await.map_err(|e| e.to_string())?;
+                    Ok(json!(true))
+                })
+            } else { Err("Context lost".into()) }
+        });
+        return_json_promise(ctx, result)
+    });
+
+    // $fs.stat(path) -> { size, created, modified, isDir } (Checks Root)
+    let stat_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
+                let target = resolve_read_path(scope, &fname)?;
+                handle.block_on(async {
+                     let meta = tokio::fs::metadata(target).await.map_err(|e| e.to_string())?;
+                     Ok(json!({
+                         "size": meta.len(),
+                         "isDir": meta.is_dir(),
+                         "created": meta.created().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs_f64()),
+                         "modified": meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs_f64())
+                     }))
+                })
+            } else { Err("Context lost".into()) }
+        });
+        return_json_promise(ctx, result)
+    });
+
     let obj = ObjectInitializer::new(ctx)
-        .function(read_fn, JsString::from("readText"), 1)
+        .function(read_fn, JsString::from("read"), 1)
+        .function(write_fn, JsString::from("write"), 2)
+        .function(delete_fn, JsString::from("delete"), 1)
+        .function(list_fn, JsString::from("list"), 1)
+        .function(exists_fn, JsString::from("exists"), 1)
+        .function(mkdir_fn, JsString::from("mkdir"), 1)
+        .function(stat_fn, JsString::from("stat"), 1)
         .build();
     ctx.register_global_property(JsString::from("$fs"), obj, Attribute::all()).map_err(|e| e.to_string())
 }
@@ -962,7 +1131,7 @@ fn register_http(ctx: &mut Context) -> Result<(), String> {
 
 fn register_zip(ctx: &mut Context) -> Result<(), String> {
     
-    fn resolve_storage_path(scope: &EventScope) -> String {
+    fn _resolve_storage_path(scope: &EventScope) -> String {
         match scope {
             EventScope::Root => "storage/system/uploads".to_string(),
             EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
@@ -1203,68 +1372,13 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
     ctx.register_global_property(JsString::from("$zip"), obj, Attribute::all()).map_err(|e| e.to_string())
 }
 
-fn register_archive(ctx: &mut Context) -> Result<(), String> {
-    let create_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let json_val = args.get_or_undefined(0).to_json(ctx).unwrap();
-        let fname = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
-        let safe_fname = if fname.ends_with(".tar.gz") { fname } else { format!("{}.tar.gz", fname) };
-
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
-                let (upload_dir, _base_url) = match scope {
-                    EventScope::Root => ("storage/system/uploads".to_string(), "/api/v1/storage/file/".to_string()),
-                    EventScope::Tenant(id) => (format!("storage/tenants/{}/uploads", id), format!("/tenant/{}/api/v1/storage/file/", id)),
-                    EventScope::Sandbox(id) => (format!("storage/sandboxes/session_{}/uploads", id), format!("/sandbox/{}/api/v1/storage/file/", id)),
-                    _ => return Err("Invalid scope".to_string())
-                };
-
-                let temp_id = uuid::Uuid::new_v4();
-                let staging = format!("storage/tmp/{}", temp_id);
-                let final_path = format!("{}/{}", upload_dir, safe_fname);
-
-                handle.block_on(async {
-                    tokio::task::spawn_blocking(move || {
-                        let root = Path::new(&staging);
-                        // [FIX] Handle Option
-                        if let Some(obj) = json_val.as_ref().and_then(|v| v.as_object()) {
-                            fn write_tree(base: &Path, tree: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
-                                std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
-                                for (k, v) in tree {
-                                    if k.contains("..") { return Err("Invalid path".into()); }
-                                    let target = base.join(k);
-                                    if let Some(s) = v.as_str() { std::fs::write(target, s).map_err(|e| e.to_string())?; }
-                                    else if let Some(o) = v.as_object() { write_tree(&target, o)?; }
-                                }
-                                Ok(())
-                            }
-                            write_tree(root, obj)?;
-                        }
-                        
-                        std::fs::create_dir_all(&upload_dir).ok();
-                        let out = Command::new("tar").arg("-czf").arg(&final_path).arg("-C").arg(&staging).arg(".").output().map_err(|e| e.to_string())?;
-                        if !out.status.success() { return Err("Tar failed".into()); }
-                        let _ = std::fs::remove_dir_all(root);
-                        Ok(safe_fname)
-                    }).await.unwrap()
-                })
-            } else { Err("Context lost".into()) }
-        });
-        return_json_promise(ctx, result.map(|s| serde_json::Value::String(s)))
-    });
-
-    let obj = ObjectInitializer::new(ctx)
-        .function(create_fn, JsString::from("create"), 2)
-        .build();
-    ctx.register_global_property(JsString::from("$archive"), obj, Attribute::all()).map_err(|e| e.to_string())
-}
-
 fn register_run(ctx: &mut Context) -> Result<(), String> { 
     let script_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
         let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
         let payload = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(json!({}));
 
         let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, base_url, _, current_scope)) = &*c.borrow() {
+            if let Some((app, handle, _base_url, _, current_scope)) = &*c.borrow() {
                 handle.block_on(async {
                     
                     // 1. Get the DB for the CURRENT scope (e.g. Tenant DB)
@@ -1314,152 +1428,6 @@ fn register_run(ctx: &mut Context) -> Result<(), String> {
         .build();
 
     ctx.register_global_property(JsString::from("$run"), obj, Attribute::all()).map_err(|e| e.to_string())
-}
-
-fn register_cmd(ctx: &mut Context) -> Result<(), String> {
-    // Shared helper for option parsing
-    let parse_options = |ctx: &mut Context, val: &boa_engine::JsValue| -> (Option<String>, Option<HashMap<String, String>>, Option<u64>) {
-        let mut cwd = None;
-        let mut envs = None;
-        let mut timeout_ms = None;
-        
-        // Correctly handle Result<Option<Value>>
-        if let Ok(Some(json)) = val.to_json(ctx) {
-            if let Some(obj) = json.as_object() {
-                // Explicitly type 'v' to help the compiler infer Value methods
-                cwd = obj.get("cwd").and_then(|v: &serde_json::Value| v.as_str().map(|s| s.to_string()));
-                timeout_ms = obj.get("timeout").and_then(|v: &serde_json::Value| v.as_u64());
-
-                if let Some(e) = obj.get("env").and_then(|v: &serde_json::Value| v.as_object()) {
-                    let mut map = HashMap::new();
-                    for (k, v) in e {
-                        let val_str = if let Some(s) = v.as_str() {
-                            s.to_string()
-                        } else {
-                            v.to_string()
-                        };
-                        map.insert(k.clone(), val_str);
-                    }
-                    envs = Some(map);
-                }
-            }
-        }
-        (cwd, envs, timeout_ms)
-    };
-
-    // $cmd.run(program, args, options)
-    let run_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let program = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let args_val = args.get_or_undefined(1);
-        let options_val = args.get_or_undefined(2);
-        
-        let (cwd, envs, timeout_ms) = parse_options(ctx, options_val);
-        let mut cmd_args: Vec<String> = Vec::new();
-
-        if let Ok(Some(json_val)) = args_val.to_json(ctx) {
-            if let Some(arr) = json_val.as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() { cmd_args.push(s.to_string()); }
-                    else { cmd_args.push(v.to_string()); }
-                }
-            }
-        }
-
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
-                if !matches!(scope, EventScope::Root) {
-                    return Err("Access Denied: $cmd is reserved for Root scripts.".into());
-                }
-
-                handle.block_on(async {
-                    let mut command = tokio::process::Command::new(&program);
-                    command.args(&cmd_args);
-                    command.stdout(Stdio::piped());
-                    command.stderr(Stdio::piped());
-                    
-                    if let Some(dir) = cwd { command.current_dir(dir); }
-                    if let Some(vars) = envs { command.envs(vars); }
-
-                    let future = command.output();
-                    let output_res = if let Some(ms) = timeout_ms {
-                        match timeout(std::time::Duration::from_millis(ms), future).await {
-                            Ok(res) => res,
-                            Err(_) => return Err(format!("Command timed out after {}ms", ms))
-                        }
-                    } else {
-                        future.await
-                    };
-
-                    match output_res {
-                        Ok(output) => Ok(json!({
-                            "stdout": String::from_utf8_lossy(&output.stdout),
-                            "stderr": String::from_utf8_lossy(&output.stderr),
-                            "status": output.status.code().unwrap_or(-1)
-                        })),
-                        Err(e) => Err(format!("Execution failed: {}", e))
-                    }
-                })
-            } else { Err("Context lost".into()) }
-        });
-        
-        return_json_promise(ctx, result)
-    });
-
-    // $cmd.spawn(program, args, options)
-    let spawn_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let program = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let args_val = args.get_or_undefined(1);
-        let options_val = args.get_or_undefined(2);
-        
-        let (cwd, envs, _) = parse_options(ctx, options_val);
-        let mut cmd_args: Vec<String> = Vec::new();
-
-        if let Ok(Some(json_val)) = args_val.to_json(ctx) {
-            if let Some(arr) = json_val.as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() { cmd_args.push(s.to_string()); }
-                    else { cmd_args.push(v.to_string()); }
-                }
-            }
-        }
-
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
-                if !matches!(scope, EventScope::Root) {
-                    return Err("Access Denied.".into());
-                }
-
-                handle.block_on(async {
-                     let mut command = tokio::process::Command::new(&program);
-                     command.args(&cmd_args);
-                     command.stdout(Stdio::null());
-                     command.stderr(Stdio::null());
-                     command.stdin(Stdio::null());
-                     
-                     if let Some(dir) = cwd { command.current_dir(dir); }
-                     if let Some(vars) = envs { command.envs(vars); }
-
-                     match command.spawn() {
-                         Ok(mut child) => {
-                             let id = child.id().unwrap_or(0);
-                             tokio::spawn(async move { let _ = child.wait().await; });
-                             Ok(json!({ "pid": id, "started": true }))
-                         },
-                         Err(e) => Err(format!("Spawn failed: {}", e))
-                     }
-                })
-            } else { Err("Context lost".into()) }
-        });
-
-        return_json_promise(ctx, result)
-    });
-
-    let obj = ObjectInitializer::new(ctx)
-        .function(run_fn, JsString::from("run"), 3)
-        .function(spawn_fn, JsString::from("spawn"), 3)
-        .build();
-
-    ctx.register_global_property(JsString::from("$cmd"), obj, Attribute::all()).map_err(|e| e.to_string())
 }
 
 fn register_root(ctx: &mut Context) -> Result<(), String> {

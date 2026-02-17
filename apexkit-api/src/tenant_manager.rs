@@ -44,6 +44,8 @@ pub struct TenantContext {
     pub db: Arc<dyn Db>,
     pub vector_provider: Arc<dyn VectorProvider>,
     pub status: String,
+    // Isolated Cache
+    pub script_cache: Cache<String, String>,
 }
 
 // --- 3. Tenant Manager ---
@@ -184,10 +186,21 @@ impl TenantManager {
             }
         });
 
+        // Configurable size per tenant? For now, global env default.
+        let cache_size = std::env::var("SCRIPT_CACHE_SIZE")
+            .ok().and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(100);
+            
+        let script_cache = Cache::builder()
+            .max_capacity(cache_size)
+            .time_to_live(Duration::from_secs(300)) // 5 mins default
+            .build();
+
         Ok(TenantContext {
             db: db_arc,
             vector_provider: tenant_vector_provider,
-            status, // [OPTIMIZATION] Stored in memory
+            status,
+            script_cache, // [NEW]
         })
     }
 

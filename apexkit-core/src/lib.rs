@@ -41,6 +41,7 @@ pub mod validation;
 pub mod ai_models; 
 pub mod script_models;
 pub mod scripting;
+pub mod scripting_cmd;
 pub mod filter;
 pub mod batching;
 pub mod embeddings;
@@ -1110,7 +1111,7 @@ impl Db for ApexKit {
 
         let sql = format!("UPDATE _api_keys SET {} WHERE id = ?", sets.join(", "));
         
-        let mut stmt = conn.prepare(&sql).await?;
+        let stmt = conn.prepare(&sql).await?;
         stmt.execute(params).await?;
         
         Ok(())
@@ -2227,7 +2228,7 @@ impl Db for ApexKit {
         params.push(id.to_string().into());
 
         let sql = format!("UPDATE _tenants SET {} WHERE id = ?", sets.join(", "));
-        let mut stmt = conn.prepare(&sql).await?;
+        let stmt = conn.prepare(&sql).await?;
         stmt.execute(params).await?;
         Ok(())
     }
@@ -2311,7 +2312,7 @@ impl Db for ApexKit {
 
         params.push(id.to_string().into());
         let sql = format!("UPDATE _sandboxes SET {} WHERE id = ?", sets.join(", "));
-        let mut stmt = conn.prepare(&sql).await?;
+        let stmt = conn.prepare(&sql).await?;
         stmt.execute(params).await?;
         Ok(())
     }
@@ -2654,7 +2655,7 @@ async fn setup_data(db: &Database) -> Result<()> {
     let conn = db.connect()?;
     conn.execute("CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, schema JSON, index_key TEXT UNIQUE)", ()).await?;
     // Ensure column exists for older DBs
-    conn.execute("ALTER TABLE collections ADD COLUMN index_key TEXT", ()).await;
+    let _ = conn.execute("ALTER TABLE collections ADD COLUMN index_key TEXT", ()).await;
 
     conn.execute("CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id INTEGER NOT NULL, data JSONB NOT NULL, created DATETIME DEFAULT CURRENT_TIMESTAMP, updated DATETIME DEFAULT CURRENT_TIMESTAMP)", ()).await?;
     

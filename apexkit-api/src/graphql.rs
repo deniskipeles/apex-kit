@@ -313,7 +313,7 @@ pub async fn build_schema(
     for col in &collections {
         let type_name = capitalize(&col.name);
         let col_id = col.id;
-        let col_name = col.name.clone();
+        let _col_name = col.name.clone();
         
         // --- 2A. QUERY TYPES ---
         let mut object = Object::new(&type_name);
@@ -706,7 +706,6 @@ pub async fn build_schema(
     builder.finish()
 }
 
-// ... [Keep helpers capitalize, map_json_to_gql, json_to_gql] ...
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {

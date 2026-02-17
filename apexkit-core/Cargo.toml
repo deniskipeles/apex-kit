@@ -61,6 +61,8 @@ boa_engine = { version = "0.21.0" }
 boa_gc = "0.21.0"
 # --- ARCHIVE MANAGER ---
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# Filesystem Traversal
+walkdir = "2.4"
 
 # Validation Extensions
 regex = "1.10"

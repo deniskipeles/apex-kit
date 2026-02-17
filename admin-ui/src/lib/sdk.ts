@@ -471,7 +471,7 @@ export class ApexKit {
             deleteApiKey: (id: string | number) => this._request(`/admin/keys/${id}`, { method: 'DELETE' }),
 
             // System
-            reloadSystem: () => this._request('/admin/system/reload', { method: 'POST', body: {} }),
+            reloadSystem: (target: string | null) => this._request('/admin/system/reload', { method: 'POST', body: {target} }),
             testEmail: (email: string) => this._request('/admin/smtp/test', { method: 'POST', body: { email } }),
             reIndex: (collectionId?: string | number) =>
                 this._request(`/admin/collections/${collectionId || ''}/reindex`, { method: 'POST', body: {} }),

@@ -30,6 +30,7 @@ pub enum CloneStrategy {
 pub struct SandboxContext {
     pub db: Arc<dyn Db>,
     pub vector_provider: Arc<dyn VectorProvider>,
+    pub script_cache: Cache<String, String>,
 }
 
 // --- 2. Sandbox Vector Provider ---
@@ -417,9 +418,19 @@ impl SandboxManager {
             }
         });
 
+        let cache_size = std::env::var("SCRIPT_CACHE_SIZE")
+            .ok().and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(100);
+
+        let script_cache = Cache::builder()
+            .max_capacity(cache_size)
+            .time_to_live(Duration::from_secs(300))
+            .build();
+
         Ok(SandboxContext {
             db: db_arc,
             vector_provider: vec_provider,
+            script_cache,
         })
     }
 
@@ -443,5 +454,20 @@ impl SandboxManager {
                 }
             }
         });
+    }
+    // Check if sandbox is currently loaded in memory
+    pub fn is_active(&self, session_id: &str) -> bool {
+        self.cache.contains_key(session_id)
+    }
+    pub async fn get_sandbox_context(&self, session_id: &str) -> Result<SandboxContext, String> {
+        if let Some(ctx) = self.cache.get(session_id).await {
+            return Ok(ctx);
+        }
+        let ctx = self.load_context_from_disk(session_id).await?;
+        self.cache.insert(session_id.to_string(), ctx.clone()).await;
+        Ok(ctx)
+    }
+    pub async fn invalidate(&self, session_id: &str) {
+        self.cache.invalidate(session_id).await;
     }
 }
