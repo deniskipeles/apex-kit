@@ -800,7 +800,6 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
         })
     }
     
-    // Implement cache_del and cache_incr similarly...
     // For incr, you need read-modify-write on the specific cache instance.
     fn cache_incr(&self, key: &str, delta: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = i64> + Send>> {
         let key = key.to_string();
@@ -840,6 +839,29 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
                 EventScope::Tenant(id) => { if let Ok(ctx) = tm.get_tenant_context(&id).await { ctx.script_cache.invalidate(&key).await; } },
                 EventScope::Sandbox(id) => { if let Ok(ctx) = sm.get_sandbox_context(&id).await { ctx.script_cache.invalidate(&key).await; } },
                 _ => { root_cache.invalidate(&key).await; }
+            }
+        })
+    }
+
+    // Implementation for listing keys
+    fn cache_list_keys(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>> {
+        let tm = self.state.tenant_manager.clone();
+        let sm = self.state.sandbox_manager.clone();
+        let root_cache = self.state.root_script_cache.clone();
+        let scope = self.scope.clone();
+
+        Box::pin(async move {
+            let cache = match scope {
+                EventScope::Tenant(id) => tm.get_tenant_context(&id).await.ok().map(|c| c.script_cache),
+                EventScope::Sandbox(id) => sm.get_sandbox_context(&id).await.ok().map(|c| c.script_cache),
+                _ => Some(root_cache),
+            };
+
+            if let Some(c) = cache {
+                // moka::future::Cache::iter() is synchronous and returns an iterator over the keys
+                c.iter().map(|(k, _)| k.as_ref().clone()).collect()
+            } else {
+                vec![]
             }
         })
     }
@@ -1601,7 +1623,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/collections/{id}/get-vector/{record_id}", get(vector_routes::get_record_vector)) 
         .route("/collections/{id}/records/{record_id}/relations", post(collections_and_records_routes::create_relation).delete(collections_and_records_routes::delete_relation))
         .route("/storage/upload", post(storage::upload_file))
-        .route("/storage/file/{filename}", get(storage::serve_file))
+        .route("/storage/file/{*filename}", get(storage::serve_file)) 
         .route("/storage/files", get(storage::list_files))
         .route("/storage/files/{id}", axum::routing::delete(storage::delete_file))
         .route("/admin/storage/test", post(storage::test_s3_connection))

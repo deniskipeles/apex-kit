@@ -42,6 +42,7 @@ pub mod ai_models;
 pub mod script_models;
 pub mod scripting;
 pub mod scripting_cmd;
+pub mod scripting_db;
 pub mod filter;
 pub mod batching;
 pub mod embeddings;
@@ -119,10 +120,11 @@ pub trait ScriptContext: Send + Sync {
     fn cache_get(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
     fn cache_set(&self, key: &str, val: &str, ttl_secs: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
     fn cache_del(&self, key: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
-    
     // Atomic Increment (Crucial for Quotas)
     // Returns the new value
     fn cache_incr(&self, key: &str, delta: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = i64> + Send>>;
+    // List all keys in current scope
+    fn cache_list_keys(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>;
 }
 
 #[async_trait]

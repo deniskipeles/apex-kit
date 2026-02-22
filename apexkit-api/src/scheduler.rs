@@ -5,6 +5,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use cron::Schedule;
 use std::str::FromStr;
+use std::time::UNIX_EPOCH;
+use std::time::SystemTime;
 
 pub struct SchedulerService {
     scheduler: JobScheduler,
@@ -124,28 +126,64 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
         if let Ok(jobs) = serde_json::from_value::<Vec<CronJob>>(val) {
             let now = Utc::now();
             
+            // --- RATE LIMIT CHECK (Tenants/Sandboxes Only) ---
+            if !matches!(scope, EventScope::Root) {
+                let max_crons = std::env::var("TENANT_MAX_CRONS")
+                    .ok().and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(2); // Default 2 jobs
+
+                let interval_mins = std::env::var("TENANT_CRON_INTERVAL")
+                    .ok().and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(5); // Default 5 minutes window
+
+                // Calculate current window key
+                let current_minute = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 60;
+                let window_key = current_minute / interval_mins;
+                let cache_key = format!("cron_limit:{}:{}", context_id, window_key);
+
+                // Check current count
+                // We use the root_script_cache for system-level rate limiting
+                let current_count = state.root_script_cache.get(&cache_key).await
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                if current_count >= max_crons {
+                    tracing::warn!("[Scheduler] Rate limit hit for {}. Skipping jobs.", context_id);
+                    return;
+                }
+            }
+
+            // 3. Iterate Jobs
+            let mut jobs_run = 0;
             for job in jobs {
                 if !job.active { continue; }
 
                 if let Ok(schedule) = Schedule::from_str(&job.schedule) {
-                    // Check if job should have run in the last minute (since we tick every minute)
-                    // We look for the most recent occurrence BEFORE now.
-                    // If it happened < 60 seconds ago, we run it.
-                    // (Note: This might double-run if ticker logic drifts, robust systems use a 'last_run' DB field)
-                    // For ApexKit v1, simple window check is okay.
-                    
-                    // Actually, 'upcoming' gives future. We need to check if 'now' matches.
-                    // Or check if the *previous* occurrence was recent.
-                    // Logic: Get upcoming from (Now - 1 minute). If that occurrence is <= Now, run it.
-                    
-                    let one_min_ago = now - chrono::Duration::seconds(60);
-                    // [FIX] Explicitly annotate type for next_run
-                    if let Some(next_run) = schedule.after(&one_min_ago).next() {
+                     let one_min_ago = now - chrono::Duration::seconds(60);
+                     if let Some(next_run) = schedule.after(&one_min_ago).next() {
                          if next_run <= now {
+                             // Execute
                              execute_job(&state, db.clone(), &context_id, &job, scope.clone()).await;
+                             jobs_run += 1;
                          }
-                    }
+                     }
                 }
+            }
+
+            // 4. Increment Counter if jobs ran
+            if jobs_run > 0 && !matches!(scope, EventScope::Root) {
+                let interval_mins = std::env::var("TENANT_CRON_INTERVAL")
+                    .ok().and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(5);
+                let current_minute = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 60;
+                let window_key = current_minute / interval_mins;
+                let cache_key = format!("cron_limit:{}:{}", context_id, window_key);
+
+                let current_count = state.root_script_cache.get(&cache_key).await
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                
+                state.root_script_cache.insert(cache_key, (current_count + jobs_run).to_string()).await;
             }
         }
     }

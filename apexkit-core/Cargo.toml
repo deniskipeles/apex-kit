@@ -32,14 +32,18 @@ utoipa = "5.4.0"
 aws-config = { version = "1.8.12", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
 aws-sdk-s3 = { version = "1.1", default-features = false, features = ["rt-tokio"] }
 aws-credential-types = "1.1"
+# Added to implement the HTTP adapter
+aws-smithy-runtime-api = { version = "1.1", features = ["client"] }
+# Added for SdkBody
+aws-smithy-types = "1.1"
+# Explicit http dependency for building responses
+http = "0.2.9" 
 
-# [FIXED] Use native-tls-vendored for Reqwest to avoid aws-lc/ring conflict
+# Use native-tls-vendored for Reqwest to avoid aws-lc/ring conflict
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "native-tls-vendored"] }
 
 # [Note] You can keep rustls for other things if needed, but AWS/Reqwest will now use native-tls
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-
-
 
 # Email
 lettre = { version = "0.11", features = ["tokio1", "smtp-transport", "builder", "tokio1-native-tls", "sendmail-transport"] }

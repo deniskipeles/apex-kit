@@ -12,7 +12,6 @@ env:
   OPENSSL_STATIC: 1
   PKG_CONFIG_ALL_STATIC: 1
 
-# [FIX] Added explicit permissions to allow creating releases
 permissions:
   contents: write
 
@@ -40,12 +39,15 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 musl-tools nasm perl
+          sudo apt-get install -y mingw-w64 musl-tools nasm perl cmake
 
+      # [OPTIMIZATION] Cache Node.js modules
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
+          cache: 'npm'
+          cache-dependency-path: 'admin-ui/package-lock.json'
 
       - name: Build Admin UI
         working-directory: admin-ui
@@ -63,10 +65,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # [OPTIMIZATION] Smart cache for Rust dependencies and build artifacts
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Create a separate cache for Linux vs Windows builds to avoid conflicts
+          shared-key: "v1-${{ matrix.target }}"
+
+      # [OPTIMIZATION] Install via pip (pre-compiled binary) instead of cargo install (source compile)
+      # This saves ~2-3 minutes per build.
       - name: Install cargo-zigbuild
         run: |
-          sudo pip install ziglang
-          cargo install cargo-zigbuild
+          sudo pip install ziglang cargo-zigbuild
 
       - name: Build (${{ matrix.target }})
         run: |
@@ -80,7 +90,6 @@ jobs:
           DEST_BIN="dist/${{ matrix.binary_name }}-${{ matrix.target }}${{ matrix.extension }}"
           cp "$SRC_BIN" "$DEST_BIN"
 
-      # [UPDATE] Upload to temporary storage for the next job
       - name: Upload to Actions
         uses: actions/upload-artifact@v4
         with:

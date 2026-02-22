@@ -74,7 +74,7 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
 
     useEffect(() => {
         collectionsService.list().then(setCollections);
-        // setIsRoot(apiClient.getScope().type === 'root');
+        setIsRoot(apiClient.getScope().type === 'root');
     }, []);
 
     useEffect(() => {

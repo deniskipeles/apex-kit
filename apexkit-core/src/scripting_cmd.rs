@@ -11,15 +11,17 @@ use boa_engine::{
     property::Attribute,
 };
 use serde_json::json;
-use crate::realtime::EventScope;
 use crate::scripting::{ACTIVE_CONTEXT, return_json_promise};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use crate::realtime::{DbEvent, EventScope};
+use regex::Regex;
 
 // --- GLOBAL PROCESS TRACKER ---
 struct ProcessInfo {
     pid: u32,
     program: String,
     start_time: Instant,
-    status: String, // "running", "completed", "failed", "timed_out"
+    status: String,
     exit_code: Option<i32>,
 }
 
@@ -40,23 +42,19 @@ fn get_semaphore_for_program(program: &str) -> Arc<Semaphore> {
         return sem.clone();
     }
     
-    // If not found in read-lock, check default
     if let Some(default_sem) = map.get("*") {
         return default_sem.clone();
     }
     
-    // Release read lock to acquire write lock
     drop(map);
     
     let mut write_map = get_semaphores().write().unwrap();
-    // Double check (race condition)
     if let Some(sem) = write_map.get(program) {
         return sem.clone();
     }
     
-    // Ensure default exists
     if !write_map.contains_key("*") {
-        write_map.insert("*".to_string(), Arc::new(Semaphore::new(2))); // Default limit 2
+        write_map.insert("*".to_string(), Arc::new(Semaphore::new(2)));
     }
     
     write_map.get("*").unwrap().clone()
@@ -64,7 +62,6 @@ fn get_semaphore_for_program(program: &str) -> Arc<Semaphore> {
 
 pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
     
-    // Shared helper for option parsing
     let parse_options = |ctx: &mut Context, val: &boa_engine::JsValue| -> (Option<String>, Option<HashMap<String, String>>, Option<u64>) {
         let mut cwd = None;
         let mut envs = None;
@@ -100,7 +97,7 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
                  let mut map = get_semaphores().write().unwrap();
                  map.insert(program.clone(), Arc::new(Semaphore::new(limit)));
                  
-                 Ok(json!(true))
+                 Ok(json!({ "program": program, "limit": limit, "set": true }))
              } else { Err("Context lost".into()) }
         });
         return_json_promise(ctx, result)
@@ -170,7 +167,7 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
         let options_val = args.get_or_undefined(2);
         
         let (cwd, envs, timeout_val) = parse_options(ctx, options_val);
-        let max_time = timeout_val.unwrap_or(60_000);
+        let max_time = timeout_val.unwrap_or(3_600_000); // Default 1 hour for media processing
 
         let mut cmd_args: Vec<String> = Vec::new();
         if let Ok(Some(json_val)) = args_val.to_json(ctx) {
@@ -182,11 +179,30 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
             }
         }
 
+        // Parse onProgress config
+        let mut progress_config = None;
+        if let Ok(Some(json)) = options_val.to_json(ctx) {
+            if let Some(obj) = json.as_object() {
+                if let Some(prog_obj) = obj.get("onProgress").and_then(|v| v.as_object()) {
+                    let regex_str = prog_obj.get("regex").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let channel = prog_obj.get("channel").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let event_name = prog_obj.get("event").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    
+                    if let (Some(r), Some(c), Some(e)) = (regex_str, channel, event_name) {
+                        progress_config = Some((r, c, e));
+                    }
+                }
+            }
+        }
+
         let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
+            if let Some((_, handle, _, tx_opt, scope)) = &*c.borrow() {
                 if !matches!(scope, EventScope::Root) {
                     return Err("Access Denied.".into());
                 }
+
+                let tx = tx_opt.clone();
+                let client_scope = scope.clone();
 
                 handle.block_on(async {
                      let sem = get_semaphore_for_program(&program);
@@ -194,6 +210,7 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
 
                      let mut command = tokio::process::Command::new(&program);
                      command.args(&cmd_args);
+                     
                      command.stdout(Stdio::piped());
                      command.stderr(Stdio::piped());
                      command.stdin(Stdio::null());
@@ -217,6 +234,41 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
                                  });
                              }
 
+                             // Progress Monitor (Stderr)
+                             if let Some((regex_pattern, channel_name, event_name)) = progress_config {
+                                 if let Some(stderr) = child.stderr.take() {
+                                     if let Some(broadcaster) = tx {
+                                          let reader = BufReader::new(stderr);
+                                          
+                                          let scoped_channel = match &client_scope {
+                                              EventScope::Root => format!("root::{}", channel_name),
+                                              EventScope::Tenant(id) => format!("tenant_{}::{}", id, channel_name),
+                                              EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, channel_name),
+                                              _ => channel_name.clone()
+                                          };
+                                          
+                                          tokio::spawn(async move {
+                                              if let Ok(re) = Regex::new(&regex_pattern) {
+                                                  let mut lines = reader.lines();
+                                                  while let Ok(Some(line)) = lines.next_line().await {
+                                                      if let Some(caps) = re.captures(&line) {
+                                                          let val = caps.get(1).map(|m| m.as_str()).unwrap_or(caps.get(0).map(|m| m.as_str()).unwrap_or(""));
+                                                          
+                                                          let event = DbEvent::Custom {
+                                                              event: event_name.clone(),
+                                                              data: json!({ "value": val, "raw": line }),
+                                                              scope: EventScope::Channel(scoped_channel.clone())
+                                                          };
+                                                          let _ = broadcaster.send(event);
+                                                      }
+                                                  }
+                                              }
+                                          });
+                                     }
+                                 }
+                             }
+
+                             // Lifecycle Monitor
                              tokio::spawn(async move {
                                  let _permit_guard = permit;
                                  let wait_future = child.wait();
@@ -230,7 +282,9 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
                                              info.exit_code = status.code();
                                          },
                                          Ok(Err(_)) => { info.status = "failed".to_string(); },
-                                         Err(_) => { info.status = "timed_out".to_string(); }
+                                         Err(_) => { 
+                                             info.status = "timed_out".to_string();
+                                         }
                                      }
                                  }
                              });
@@ -264,8 +318,38 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
                          "runtime_ms": info.start_time.elapsed().as_millis() as u64
                      }))
                  } else {
-                     Ok(json!({ "status": "unknown" }))
+                     Ok(json!({ "status": "unknown", "pid": pid }))
                  }
+             } else { Err("Context lost".into()) }
+        });
+        return_json_promise(ctx, result)
+    });
+
+    // $cmd.kill(pid) - NEW FUNCTION
+    let kill_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let pid = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as u32;
+
+        let result = ACTIVE_CONTEXT.with(|c| {
+             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
+                 if !matches!(scope, EventScope::Root) { return Err("Access Denied.".into()); }
+
+                 handle.block_on(async {
+                     // Use tokio::process to kill by PID
+                     // Note: This requires platform-specific implementation
+                     #[cfg(unix)]
+                     {
+                         use std::process::Command;
+                         let output = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+                         match output {
+                             Ok(o) if o.status.success() => Ok(json!({ "killed": true, "pid": pid })),
+                             _ => Ok(json!({ "killed": false, "pid": pid, "error": "Process not found or access denied" }))
+                         }
+                     }
+                     #[cfg(not(unix))]
+                     {
+                         Ok(json!({ "killed": false, "error": "Kill not implemented for this platform" }))
+                     }
+                 })
              } else { Err("Context lost".into()) }
         });
         return_json_promise(ctx, result)
@@ -276,6 +360,7 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
         .function(spawn_fn, JsString::from("spawn"), 3)
         .function(status_fn, JsString::from("status"), 1)
         .function(set_limit_fn, JsString::from("setLimit"), 2)
+        .function(kill_fn, JsString::from("kill"), 1)  // NEW
         .build();
 
     ctx.register_global_property(JsString::from("$cmd"), obj, Attribute::all()).map_err(|e| e.to_string())

@@ -297,10 +297,18 @@ pub async fn get_record(
     Ok(Json(final_resp))
 }
 
-// Helper to inject auto fileds
+// Helper to inject auto fileds AND SANITIZE THE STRING NUMBERS
 fn inject_auto_fields(data: &mut serde_json::Value, schema: &CollectionSchema, user_id: Option<i64>) {
     if let Some(obj) = data.as_object_mut() {
         for (name, def) in &schema.fields {
+            // Check the relation and owner field and turn to number
+            if def.r#type == FieldType::Relation || def.r#type == FieldType::Owner {
+                if let Some(val) = obj.get(name) {
+                    if let Some(num) = val.as_str().and_then(|s| s.parse::<i64>().ok()) {
+                        obj.insert(name.clone(), serde_json::json!(num));
+                    }
+                }
+            }
             // Check if field is effectively "missing" (not present, null, or empty string)
             // Empty string check fixes frontend forms sending "" for empty dates
             let is_missing = match obj.get(name) {
@@ -319,7 +327,7 @@ fn inject_auto_fields(data: &mut serde_json::Value, schema: &CollectionSchema, u
                     FieldType::Owner => {
                         if def.auto {
                             if let Some(uid) = user_id {
-                                obj.insert(name.clone(), serde_json::json!(uid.to_string()));
+                                obj.insert(name.clone(), serde_json::json!(uid));
                             }
                         } else if let Some(default_val) = &def.default {
                              obj.insert(name.clone(), default_val.clone());

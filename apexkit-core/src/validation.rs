@@ -60,8 +60,11 @@ pub fn validate_record(
 
 fn validate_field_type(val: &Value, def: &crate::schema::FieldDefinition) -> Result<(), String> {
     match def.r#type {
-        FieldType::String | FieldType::Text | FieldType::File | FieldType::Relation | FieldType::Owner => {
+        FieldType::String | FieldType::Text | FieldType::File => {
             if !val.is_string() { return Err("Expected String".into()); }
+        },
+        FieldType::Relation | FieldType::Owner => {
+            if !val.is_number() { return Err("Expected Number".into()); }
         },
         FieldType::Number => {
             if !val.is_number() { return Err("Expected Number".into()); }

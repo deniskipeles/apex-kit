@@ -226,6 +226,11 @@ impl StorageBackend for DynamicStorage {
     fn get_public_url_base(&self) -> String {
         self.public_url_prefix.clone().unwrap_or_else(|| "/api/v1/storage/file/".to_string())
     }
+
+    async fn get_signed_url(&self, filename: &str, expires_in_secs: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let backend = self.resolve_backend().await?;
+        backend.get_signed_url(filename, expires_in_secs).await
+    }
 }
 
 pub struct ScopedDynamicStorage {
@@ -305,11 +310,17 @@ impl StorageBackend for ScopedDynamicStorage {
             _ => "/api/v1/storage/file/".to_string(),
         }
     }
+
+    async fn get_signed_url(&self, filename: &str, expires_in_secs: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let backend = self.resolve().await?;
+        backend.get_signed_url(filename, expires_in_secs).await
+    }
 }
 
 // --- HANDLERS ---
 // --- HANDLER: Test S3 Connection ---
 // Uses payload if present, otherwise falls back to DB settings
+// --- HANDLER: Test S3 Connection ---
 #[utoipa::path(
     post,
     path = "/api/v1/admin/storage/test",
@@ -322,8 +333,8 @@ impl StorageBackend for ScopedDynamicStorage {
 )]
 pub async fn test_s3_connection(
     auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection, // <--- Need DB to fetch saved config
-    State(state): State<AppState>,              // <--- Need Vault to decrypt saved secret
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>,              
     Json(payload): Json<TestS3ConfigReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
@@ -348,31 +359,34 @@ pub async fn test_s3_connection(
     let access_key = payload.access_key.filter(|s| !s.is_empty()).unwrap_or(s3_saved.access_key);
     
     // 3. Resolve Secret Key (Handle Masking & Encryption)
-    // If payload has a value and it's NOT "******", use it (Raw)
-    // If payload is empty or "******", try to load from DB (Encrypted)
     let raw_secret_key = if let Some(pk) = payload.secret_key.filter(|s| !s.is_empty() && s != "******") {
         pk
     } else if let Some(encrypted_str) = s3_saved.secret_key {
          if !encrypted_str.is_empty() {
              let enc: EncryptedValue = serde_json::from_str(&encrypted_str)
-                .map_err(|_| AppError::UnknownError("Saved secret key is corrupted".into()))?;
+                .map_err(|_| AppError::JsonError("Saved secret key format is invalid".into()))?;
              state.vault.decrypt(&enc)
-                .map_err(|_| AppError::UnknownError("Failed to decrypt saved secret key".into()))?
+                .map_err(|_| AppError::UnknownError("Failed to decrypt saved secret key. Master Key mismatch?".into()))?
          } else {
-             return Err(AppError::UnknownError("Secret key is empty".into()));
+             return Err(AppError::JsonError("Secret key is empty in database. Please enter it.".into()));
          }
     } else {
-        return Err(AppError::UnknownError("Secret key missing in request and database".into()));
+        return Err(AppError::JsonError("Secret key is missing. Please enter it explicitly.".into()));
     };
 
-    if bucket.is_empty() { return Err(AppError::UnknownError("Bucket is required".into())); }
+    if bucket.is_empty() { return Err(AppError::JsonError("Bucket is required".into())); }
 
     // 4. Initialize Backend
+    // [FIX] Ensure region defaults to auto if empty (R2 requirement)
+    let final_region = if region.is_empty() { "auto".to_string() } else { region };
+    
+    tracing::info!("Testing S3 Connection: Bucket={}, Region={}, Endpoint={}", bucket, final_region, endpoint);
+
     let s3 = S3Storage::new_with_creds(
         &bucket,
-        &region,
+        &final_region,
         &endpoint,
-        "", // public_url_base irrelevant for connection test
+        "", 
         &access_key,
         &raw_secret_key
     ).await;
@@ -381,11 +395,18 @@ pub async fn test_s3_connection(
 
     // 5. Try Upload
     s3.save(filename, b"connection_verified", "text/plain").await
-        .map_err(|e| AppError::UnknownError(format!("Write failed: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!("S3 Test Upload Failed: {}", e);
+            // Return 400 (Bad Request) instead of 500 for config errors
+            AppError::JsonError(format!("Connection failed: {}", e))
+        })?;
 
     // 6. Try Delete (Cleanup)
     s3.delete(filename).await
-        .map_err(|e| AppError::UnknownError(format!("Delete failed: {}", e)))?;
+        .map_err(|e| {
+            tracing::warn!("S3 Test Delete Failed: {}", e);
+            AppError::JsonError(format!("Write succeeded but Delete failed: {}. Check permissions.", e))
+        })?;
 
     Ok(Json(serde_json::json!({ 
         "success": true, 
@@ -580,6 +601,7 @@ pub async fn upload_file(
 
 
 // --- HANDLER: Serve Generic File ---
+// --- HANDLER: Serve Generic File ---
 #[utoipa::path(
     get,
     path = "/api/v1/storage/file/{filename}",
@@ -589,20 +611,39 @@ pub async fn upload_file(
 pub async fn serve_file(
     StorageConnection(storage): StorageConnection,
     State(state): State<AppState>, 
-    Path(path): Path<FilenamePath>, // <--- FIXED: Use Struct for Path
+    Path(path): Path<FilenamePath>, 
     Query(params): Query<FileParams>,
 ) -> Result<Response, AppError> {
     
-    let original_bytes = storage.get(&path.filename).await
+    // [PATCH] Security: Prevent Directory Traversal via ".."
+    if path.filename.contains("..") {
+        return Err(AppError::Forbidden("Invalid path".into()));
+    }
+
+    // [PATCH] Strip leading slash if present to ensure relative path join works
+    let clean_filename = path.filename.trim_start_matches('/');
+
+    let original_bytes = storage.get(clean_filename).await
         .map_err(|_| AppError::NotFound("File not found".into()))?;
 
-    let mime_type = mime_guess::from_path(&path.filename).first_or_octet_stream();
+    // [PATCH] Better MIME detection for HLS/DASH
+    let mime_type = if clean_filename.ends_with(".m4s") {
+        "video/iso.segment".to_string()
+    } else if clean_filename.ends_with(".mpd") {
+        "application/dash+xml".to_string()
+    } else if clean_filename.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl".to_string()
+    } else if clean_filename.ends_with(".ts") {
+        "video/mp2t".to_string()
+    } else {
+        mime_guess::from_path(clean_filename).first_or_octet_stream().to_string()
+    };
 
     process_image(
         &state, 
         original_bytes, 
-        mime_type.as_ref(), 
-        path.filename, 
+        &mime_type, 
+        clean_filename.to_string(), 
         params.thumb
     ).await
 }
