@@ -566,7 +566,6 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
     
     // $files.read(filename) -> Base64
     let read_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        // ... (Same logic as zip.readFile) ...
         // See implementation below
         let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
         
@@ -586,7 +585,6 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
 
     // $files.save(filename, base64, mime) -> Metadata
     let save_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        // ... (Same logic as zip.saveFile) ...
         let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
         let b64_data = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
         let mime_type = args.get(2).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or("application/octet-stream".to_string());
@@ -648,10 +646,50 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
         return_json_promise(ctx, result)
     });
 
+    // $files.registerMetadata(filename, options) -> Metadata
+    // options: { originalName?, mimeType?, size? }
+    let register_metadata_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
+        let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let opts = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(serde_json::json!({}));
+
+        let original_name = opts.get("originalName").and_then(|v| v.as_str()).unwrap_or(&filename).to_string();
+        let mime_type = opts.get("mimeType").and_then(|v| v.as_str()).unwrap_or("application/octet-stream").to_string();
+        let size = opts.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        let result = ACTIVE_CONTEXT.with(|c| {
+            if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                handle.block_on(async {
+                    let db = resolve_db(None, app.clone()).await?;
+
+                    // 1. Check for existing filename to ensure consistency
+                    if let Ok(Some(_)) = db.get_file_by_filename(&filename).await {
+                        return Err(format!("File '{}' is already registered in metadata.", filename));
+                    }
+
+                    // 2. Register in Metadata DB (Does NOT generate UUID, uses provided filename)
+                    let id = db.create_file_metadata(&filename, &original_name, &mime_type, size, None).await
+                        .map_err(|e| e.to_string())?;
+                        
+                    let storage = app.get_storage();
+                    let public_url = format!("{}{}", storage.get_public_url_base(), filename);
+
+                    Ok(serde_json::json!({
+                        "id": id,
+                        "filename": filename, 
+                        "url": public_url,
+                        "size": size
+                    }))
+                })
+            } else { Err("Context lost".into()) }
+        });
+        return_json_promise(ctx, result)
+    });
+
     let obj = ObjectInitializer::new(ctx)
         .function(read_fn, JsString::from("read"), 1)
         .function(save_fn, JsString::from("save"), 3)
-        .function(signed_url_fn, JsString::from("getSignedUrl"), 2) // [NEW]
+        .function(register_metadata_fn, JsString::from("registerMetadata"), 2)
+        .function(signed_url_fn, JsString::from("getSignedUrl"), 2)
         .build();
 
     ctx.register_global_property(JsString::from("$files"), obj, Attribute::all()).map_err(|e| e.to_string())
@@ -811,7 +849,7 @@ fn execute_http_request(
     method: String,
     headers_val: Option<serde_json::Map<String, serde_json::Value>>,
     body_val: Option<serde_json::Value>,
-    redirect_mode: Option<String>, // [NEW] Argument
+    redirect_mode: Option<String>, // Argument
 ) -> Result<serde_json::Value, String> {
     
     ACTIVE_CONTEXT.with(|c| {
@@ -1298,11 +1336,11 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        // 1. Create Physical Resources
-                        app.admin_create_tenant(id.clone()).await.map_err(|e| e.to_string())?;
-                        
-                        // 2. Register Metadata with injected values
+                        // [CRITICAL FIX]: Register Metadata FIRST so the manager can find it
                         app.get_db().register_tenant(&id, owner_id, name, tier).await.map_err(|e| e.to_string())?;
+                        
+                        // Create Physical Resources SECOND
+                        app.admin_create_tenant(id.clone()).await.map_err(|e| e.to_string())?;
                         
                         Ok(true)
                     })
@@ -1517,6 +1555,20 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
             }
         });
 
+        // 11. listTenants() -> Array
+        let list_tenants = NativeFunction::from_copy_closure(move |_, _, ctx| {
+            let res = ACTIVE_CONTEXT.with(|c| {
+               if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                   handle.block_on(async {
+                       // list_tenants returns Vec<Tenant>
+                       let tenants = app.get_db().list_tenants().await.map_err(|e| e.to_string())?;
+                       Ok(serde_json::to_value(tenants).unwrap())
+                   })
+               } else { Err("Context lost".into()) }
+           });
+           return_json_promise(ctx, res)
+       });
+
         // Create DB Object for $root.db
         let db_obj = crate::scripting_db::create_db_object(ctx, crate::scripting_db::DbMode::Root)?;
 
@@ -1531,6 +1583,7 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
             .function(update_tenant, JsString::from("updateTenant"), 2)
             .function(delete_tenant, JsString::from("deleteTenant"), 1)
             .function(get_tenant_usage, JsString::from("getTenantDiskUsage"), 1)
+            .function(list_tenants, JsString::from("listTenants"), 0)
             // Sandbox Management
             .function(create_sandbox, JsString::from("createSandbox"), 2)
             .function(update_sandbox, JsString::from("updateSandbox"), 2)

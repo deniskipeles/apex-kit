@@ -71,6 +71,7 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
     const [collections, setCollections] = useState<Collection[]>([]);
     const [isSaving, setIsSaving] = useState(false);
     const [isRoot, setIsRoot] = useState(false);
+    const isShared = (initialData as any)?.isShared;
 
     useEffect(() => {
         collectionsService.list().then(setCollections);
@@ -264,10 +265,12 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
 
                 {/* Modal Footer */}
                 <div className="flex justify-end gap-3 pt-4 border-t border-border mt-auto">
-                    <Button variant="ghost" onClick={onClose}>Cancel</Button>
-                    <Button onClick={handleSave} isLoading={isSaving} disabled={!formData.name}>
-                        <Save className="mr-2 h-4 w-4" /> Save Script
-                    </Button>
+                    <Button variant="ghost" onClick={onClose}>{isShared ? 'Close' : 'Cancel'}</Button>
+                    {!isShared && (
+                        <Button onClick={handleSave} isLoading={isSaving} disabled={!formData.name}>
+                            <Save className="mr-2 h-4 w-4" /> Save Script
+                        </Button>
+                    )}
                 </div>
             </div>
         </Dialog>

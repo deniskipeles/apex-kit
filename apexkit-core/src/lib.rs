@@ -187,6 +187,7 @@ pub trait Db: Send + Sync {
     async fn list_files(&self, limit: i64, offset: i64) -> std::result::Result<Vec<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>>;
     async fn count_files(&self) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>>; 
     async fn get_file_metadata(&self, id: i64) -> std::result::Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_file_by_filename(&self, filename: &str) -> std::result::Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>>;
     async fn delete_file_metadata(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     // --- Advanced Auth ---
@@ -1913,6 +1914,11 @@ impl Db for ApexKit {
         let mut rows = conn.query("SELECT id, filename, original_name, mime_type, size, created_at FROM _storage_files WHERE id = ?1", params![id]).await?;
         if let Some(row) = rows.next().await? { Ok(Some(models::StoredFile { id: row.get(0)?, filename: row.get(1)?, original_name: row.get(2)?, mime_type: row.get(3)?, size: row.get(4)?, created_at: row.get(5)? })) } else { Ok(None) }
     }
+    async fn get_file_by_filename(&self, filename: &str) -> std::result::Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_data_read().await;
+        let mut rows = conn.query("SELECT id, filename, original_name, mime_type, size, created_at FROM _storage_files WHERE filename = ?1", params![filename]).await?;
+        if let Some(row) = rows.next().await? { Ok(Some(models::StoredFile { id: row.get(0)?, filename: row.get(1)?, original_name: row.get(2)?, mime_type: row.get(3)?, size: row.get(4)?, created_at: row.get(5)? })) } else { Ok(None) }
+    }
     async fn delete_file_metadata(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let map_err = |e: String| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
@@ -2083,9 +2089,9 @@ impl Db for ApexKit {
         let conn = self.get_sys_read().await;
         // Added visibility
         let mut rows = conn.query(
-            "INSERT INTO _scripts (name, trigger_type, code, target_collection, visibility) VALUES (?1, ?2, ?3, ?4, ?5) 
-             ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, target_collection=excluded.target_collection, visibility=excluded.visibility, created_at=CURRENT_TIMESTAMP RETURNING id", 
-            params![req.name, req.trigger_type, req.code, req.target_collection, req.visibility]
+            "INSERT INTO _scripts (name, trigger_type, code, target_collection, visibility, active) VALUES (?1, ?2, ?3, ?4, ?5, ?6) 
+             ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, target_collection=excluded.target_collection, visibility=excluded.visibility, active=excluded.active, created_at=CURRENT_TIMESTAMP RETURNING id", 
+            params![req.name, req.trigger_type, req.code, req.target_collection, req.visibility, req.active]
         ).await?;
         if let Some(row) = rows.next().await? { Ok(row.get(0)?) } else { Err("Failed".into()) }
     }

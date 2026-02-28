@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use apexkit_core::{auth::Claims, script_models::{Script, CreateScriptReq}, Db};
+use apexkit_core::{auth::Claims, script_models::{CreateScriptReq}, Db};
 use crate::{AppState, AppError, DatabaseConnection};
 use std::sync::Arc;
 use tracing::info;
@@ -29,15 +29,52 @@ pub struct ScriptNamePath {
 
 // --- CRUD HANDLERS ---
 
-#[utoipa::path(get, path = "/api/v1/admin/scripts", responses((status = 200, body = Vec<Script>)))]
+#[utoipa::path(get, path = "/api/v1/admin/scripts", responses((status = 200, body = Value)))]
 pub async fn list_scripts(
     Extension(claims): Extension<Claims>, 
     DatabaseConnection(db): DatabaseConnection, 
-    State(_state): State<AppState>
-) -> Result<Json<Vec<Script>>, AppError> {
+    State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>
+) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    let scripts = db.list_scripts().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(scripts))
+    
+    // 1. Fetch Local Scripts (For this Tenant/Sandbox or Root)
+    let local_scripts = db.list_scripts().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    let mut shared = Vec::new();
+    let mut root_total = 0;
+    let mut transparency_enabled = false;
+
+    let current_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+
+    // 2. If we are inside a Tenant/Sandbox, inject Root Scripts
+    if !matches!(current_scope, EventScope::Root) {
+        let root_scripts = state.db.list_scripts().await.unwrap_or_default();
+        root_total = root_scripts.len();
+
+        let sec_config = state.db.get_config("security").await.unwrap_or_default();
+        if let Some(val) = sec_config {
+            transparency_enabled = val.get("tenant_transparency").and_then(|v| v.as_bool()).unwrap_or(false);
+        }
+
+        for s in root_scripts {
+            if s.visibility == "public" {
+                shared.push(s.clone()); // Public scripts share code freely
+            } else if transparency_enabled {
+                // Transparency Mode: Expose existence, redact the code
+                let mut redacted = s.clone();
+                redacted.code = "// [TRANSPARENCY MODE]\n// Code redacted by Host Provider to protect secrets.\n// Script is active and running in the Root context.".to_string();
+                shared.push(redacted);
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "local": local_scripts,
+        "shared": shared,
+        "root_total": root_total,
+        "transparency_enabled": transparency_enabled
+    })))
 }
 
 #[utoipa::path(post, path = "/api/v1/admin/scripts", request_body = CreateScriptReq, responses((status = 200, body = Value)))]

@@ -165,7 +165,7 @@ async fn deploy_metadata_item(db: &Arc<dyn Db>, label: &str, content: &[u8]) -> 
             let items: Vec<apexkit_core::script_models::Script> = serde_json::from_slice(content).map_err(|e| e.to_string())?;
             for s in items {
                 db.create_script(CreateScriptReq {
-                    name: s.name, trigger_type: s.trigger_type, target_collection: s.target_collection, code: s.code, visibility: s.visibility
+                    name: s.name, trigger_type: s.trigger_type, target_collection: s.target_collection, code: s.code, active: s.active, visibility: s.visibility
                 }).await.map_err(|e| e.to_string())?;
             }
         },

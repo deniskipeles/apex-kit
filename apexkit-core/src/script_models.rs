@@ -22,6 +22,7 @@ pub struct CreateScriptReq {
     pub trigger_type: String,
     pub target_collection: Option<String>, // Added
     pub code: String,
+    pub active: bool,
     #[serde(default = "default_visibility")]
     pub visibility: String,
 }

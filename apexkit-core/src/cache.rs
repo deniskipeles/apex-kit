@@ -88,7 +88,7 @@ impl Db for CachedDb {
         Ok(res)
     }
 
-    // FIX: Updated return type to match trait
+    // Updated return type to match trait
     async fn delete_collection(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_collection(id).await?;
         self.collection_cache.invalidate(&id).await;
@@ -160,7 +160,7 @@ impl Db for CachedDb {
         Ok(res)
     }
 
-    // FIX: Updated return type to match trait
+    // Updated return type to match trait
     async fn delete_record(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_record(collection_id, record_id).await?;
         self.record_cache.invalidate(&(collection_id, record_id)).await;
@@ -317,7 +317,7 @@ impl Db for CachedDb {
         self.inner.get_users_by_ids(ids).await
     }
 
-    // FIX: Updated return type
+    // Updated return type
     async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_user(id).await
     }
@@ -351,7 +351,11 @@ impl Db for CachedDb {
         self.inner.get_file_metadata(id).await
     }
 
-    // FIX: Updated return type
+    async fn get_file_by_filename(&self, filename: &str) -> std::result::Result<Option<models::StoredFile>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_file_by_filename(filename).await
+    }
+
+    // Updated return type
     async fn delete_file_metadata(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_file_metadata(id).await
     }
@@ -445,7 +449,7 @@ impl Db for CachedDb {
         self.inner.create_ai_action(action).await
     }
 
-    // FIX: Updated return type
+    // Updated return type
     async fn delete_ai_action(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_ai_action(id).await
     }
@@ -487,7 +491,7 @@ impl Db for CachedDb {
     async fn create_relation(&self, oc: i64, oi: i64, tc: i64, ti: i64, rn: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.create_relation(oc, oi, tc, ti, rn).await
     }
-    // FIX: Updated return type
+    // Updated return type
     async fn delete_relation(&self, oc: i64, oi: i64, tc: i64, ti: i64, rn: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_relation(oc, oi, tc, ti, rn).await
     }
@@ -505,7 +509,7 @@ impl Db for CachedDb {
     async fn create_script(&self, req: crate::script_models::CreateScriptReq) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.create_script(req).await
     }
-    // FIX: Updated return type
+    // Updated return type
     async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_script(id).await
     }
@@ -552,7 +556,7 @@ impl Db for CachedDb {
         Ok(())
     }
 
-    // FIX: Updated return type
+    // Updated return type
     async fn delete_template(&self, id: i64) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner.delete_template(id).await?;
         self.template_cache.invalidate_all();

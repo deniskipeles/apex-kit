@@ -21,6 +21,7 @@ export interface Script {
     code: string;
     target_collection: string;
     active: boolean;
+    visibility: 'public' | 'private';
 }
 
 // Templates

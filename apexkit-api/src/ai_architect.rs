@@ -536,6 +536,7 @@ async fn deploy_manifest(db: Arc<dyn Db>, manifest: &AppManifest) -> Result<(), 
             trigger_type: script.trigger_type.clone(),
             target_collection: None, // Explicitly set target_collection (required by struct)
             code: script.code.clone(),
+            active: true,
             visibility: "private".to_string()
         }).await.map_err(|e| AppError::UnknownError(format!("Script Error {}: {}", script.name, e)))?;
     }

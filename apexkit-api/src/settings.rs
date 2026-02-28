@@ -65,6 +65,7 @@ pub struct S3ConfigDto {
 pub struct SecurityConfigDto {
     pub cors_allow_all: bool, 
     pub cors_origins: String, 
+    pub tenant_transparency: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Default)]
@@ -191,7 +192,7 @@ pub async fn get_settings(
     if let Some(sec_val) = security {
         response.security = serde_json::from_value(sec_val).ok();
     } else {
-        response.security = Some(SecurityConfigDto { cors_allow_all: true, cors_origins: "".into() });
+        response.security = Some(SecurityConfigDto { cors_allow_all: true, cors_origins: "".into(), tenant_transparency: false });
     }
 
     // Cron Jobs

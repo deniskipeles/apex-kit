@@ -641,15 +641,40 @@ export const apiClient = {
   },
 
   scripts: {
-    list: async (): Promise<Script[]> => {
+    list: async (): Promise<any> => {
       const res = await pb.scripts.list();
-      // FIX 4: Map backend response to local Script type (ensure target_collection)
-      return res.map((s: any) => ({
-        ...s,
-        id: s.id.toString(),
-        target_collection: s.target_collection || '' // Default string if missing
+      
+      // Fallback for older server versions returning array directly
+      if (Array.isArray(res)) {
+          return {
+              local: res.map((s: any) => ({ ...s, id: s.id.toString(), target_collection: s.target_collection || '' })),
+              shared: [],
+              root_total: 0,
+              transparency_enabled: false
+          };
+      }
+
+      // Map new compound response
+      const local = (res.local || []).map((s: any) => ({
+          ...s,
+          id: s.id.toString(),
+          target_collection: s.target_collection || ''
       }));
-    },
+
+      const shared = (res.shared || []).map((s: any) => ({
+          ...s,
+          id: s.id.toString(),
+          target_collection: s.target_collection || '',
+          isShared: true // Flag to disable editing in UI
+      }));
+
+      return {
+          local,
+          shared,
+          root_total: res.root_total || 0,
+          transparency_enabled: res.transparency_enabled || false
+      };
+  },
     create: async (data: Partial<Script>): Promise<Script> => {
       // FIX 5: Cast Partial<Script> to any to satisfy Omit type in SDK
       const res = await pb.scripts.create(data as any);

@@ -1,3 +1,4 @@
+// =========================== /teamspace/studios/this_studio/apex/apex-kit/apexkit-api/src/storage.rs ===========================
 use axum::{
     extract::{Multipart, State, Path, Query},
     response::{Response},
@@ -28,6 +29,7 @@ use crate::BaseUrl;
 
 use async_trait::async_trait;
 
+// --- DTOs ---
 #[derive(Serialize, ToSchema)]
 pub struct FileResponse {
     id: i64,
@@ -70,10 +72,8 @@ pub struct TestS3ConfigReq {
 
 #[derive(Deserialize, ToSchema)]
 pub struct MigrateStorageReq {
-    #[schema(example = "local")]
-    pub source: String, // "local" or "s3"
-    #[schema(example = "s3")]
-    pub destination: String, // "local" or "s3"
+    pub source: String, 
+    pub destination: String, 
 }
 
 #[derive(Serialize, ToSchema)]
@@ -84,7 +84,6 @@ pub struct MigrationResult {
     pub message: String,
 }
 
-// --- PATH STRUCTS FOR NESTED ROUTING ---
 #[derive(Deserialize, IntoParams)]
 pub struct FilenamePath {
     pub filename: String,
@@ -95,8 +94,7 @@ pub struct FileIdPath {
     pub id: i64,
 }
 
-// --- DYNAMIC STORAGE PROXY ---
-
+// --- DYNAMIC STORAGE PROXY (Root Only) ---
 pub struct DynamicStorage {
     db: Arc<dyn Db>,
     vault: Arc<Vault>,
@@ -107,20 +105,8 @@ pub struct DynamicStorage {
 }
 
 impl DynamicStorage {
-    pub fn new(
-        db: Arc<dyn Db>, 
-        vault: Arc<Vault>,
-        fs_root_override: Option<String>,
-        public_url_prefix: String
-    ) -> Self {
-        Self { 
-            db, 
-            vault,
-            backend_cache: RwLock::new(None),
-            last_update: RwLock::new(std::time::Instant::now()),
-            fs_root_override,
-            public_url_prefix: Some(public_url_prefix)
-        }
+    pub fn new(db: Arc<dyn Db>, vault: Arc<Vault>, fs_root_override: Option<String>, public_url_prefix: String) -> Self {
+        Self { db, vault, backend_cache: RwLock::new(None), last_update: RwLock::new(std::time::Instant::now()), fs_root_override, public_url_prefix: Some(public_url_prefix) }
     }
 
     async fn resolve_backend(&self) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error + Send + Sync>> {
@@ -128,111 +114,46 @@ impl DynamicStorage {
             let cache = self.backend_cache.read().await;
             let time = self.last_update.read().await;
             if let Some(backend) = cache.as_ref() {
-                if time.elapsed() < std::time::Duration::from_secs(60) {
-                    return Ok(backend.clone());
-                }
+                if time.elapsed() < std::time::Duration::from_secs(60) { return Ok(backend.clone()); }
             }
         }
 
         let mut cache_write = self.backend_cache.write().await;
         let mut time_write = self.last_update.write().await;
-        
-        if let Some(backend) = cache_write.as_ref() {
-             if time_write.elapsed() < std::time::Duration::from_secs(60) {
-                 return Ok(backend.clone());
-             }
-        }
 
         let settings_json = self.db.get_config("storage").await?;
-        
-        let config: StorageConfigDto = if let Some(val) = settings_json {
-            serde_json::from_value(val).unwrap_or_else(|_| StorageConfigDto {
-                active_driver: "local".to_string(),
-                s3: Default::default(),
-            })
-        } else {
-            StorageConfigDto {
-                active_driver: "local".to_string(),
-                s3: Default::default(),
-            }
-        };
+        let config: StorageConfigDto = if let Some(val) = settings_json { serde_json::from_value(val).unwrap_or_default() } else { StorageConfigDto::default() };
 
         let backend: Arc<dyn StorageBackend> = if config.active_driver == "s3" && config.s3.enabled {
             let secret_key = if let Some(encrypted_str) = config.s3.secret_key {
-                if !encrypted_str.is_empty() {
-                    let enc: EncryptedValue = serde_json::from_str(&encrypted_str)
-                        .map_err(|_| "Invalid encrypted secret key format")?;
-                    self.vault.decrypt(&enc).map_err(|_| "Failed to decrypt secret key")?
-                } else {
-                    return Err("S3 Secret Key is empty".into());
-                }
-            } else {
-                return Err("S3 Secret Key missing".into());
-            };
+                let enc: EncryptedValue = serde_json::from_str(&encrypted_str)?;
+                self.vault.decrypt(&enc)?
+            } else { String::new() };
 
-            let s3 = S3Storage::new_with_creds(
-                &config.s3.bucket,
-                &config.s3.region,
-                &config.s3.endpoint, // <--- Added this argument
-                &self.get_public_url_base(), // Pass base URL or use config public URL if you have it
-                &config.s3.access_key,
-                &secret_key
-            ).await;
-            
-            Arc::new(s3)
+            Arc::new(S3Storage::new_with_creds(&config.s3.bucket, &config.s3.region, &config.s3.endpoint, &self.get_public_url_base(), &config.s3.access_key, &secret_key, "").await)
         } else {
             let path = self.fs_root_override.clone().unwrap_or_else(|| "./storage/system/uploads".to_string());
-            let url_base = self.public_url_prefix.clone().unwrap_or_else(|| "/api/v1/storage/file/".to_string());
-            
-            Arc::new(LocalStorage::new(&path, &url_base).await)
+            Arc::new(LocalStorage::new(&path, &self.get_public_url_base()).await)
         };
 
         *cache_write = Some(backend.clone());
         *time_write = std::time::Instant::now();
-
         Ok(backend)
     }
 }
 
 #[async_trait]
 impl StorageBackend for DynamicStorage {
-    async fn save(&self, filename: &str, data: &[u8], content_type: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.resolve_backend().await?;
-        backend.save(filename, data, content_type).await
-    }
-
-    async fn get(&self, filename: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        match self.resolve_backend().await {
-            Ok(backend) => {
-                match backend.get(filename).await {
-                    Ok(data) => Ok(data),
-                    Err(_) => Err("File not found".into())
-                }
-            }
-            Err(e) => Err(e)
-        }
-    }
-
-    async fn delete(&self, filename: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.resolve_backend().await?;
-        backend.delete(filename).await
-    }
-
-    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.resolve_backend().await?;
-        backend.list_prefix(prefix).await
-    }
-
-    fn get_public_url_base(&self) -> String {
-        self.public_url_prefix.clone().unwrap_or_else(|| "/api/v1/storage/file/".to_string())
-    }
-
-    async fn get_signed_url(&self, filename: &str, expires_in_secs: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.resolve_backend().await?;
-        backend.get_signed_url(filename, expires_in_secs).await
-    }
+    async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.save(name, data, mime).await }
+    async fn get(&self, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.get(name).await }
+    async fn delete(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.delete(name).await }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.list_prefix(prefix).await }
+    async fn get_signed_url(&self, name: &str, ttl: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.get_signed_url(name, ttl).await }
+    fn get_public_url_base(&self) -> String { self.public_url_prefix.clone().unwrap_or_else(|| "/api/v1/storage/file/".to_string()) }
 }
 
+// --- SCOPED DYNAMIC STORAGE (The Reseller Logic) ---
+// --- SCOPED DYNAMIC STORAGE ---
 pub struct ScopedDynamicStorage {
     state: AppState,
     scope: EventScope,
@@ -243,66 +164,142 @@ impl ScopedDynamicStorage {
         Self { state, scope }
     }
 
-    // Async helper to get the real backend
-    async fn resolve(&self) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error + Send + Sync>> {
-        // 1. Resolve DB based on Scope
+    // Helper to increment usage counters
+    async fn track_op(&self, op_type: &str) {
+        if let EventScope::Tenant(tenant_id) = &self.scope {
+            // Key format: "usage:tenant_id:s3_get" or "usage:tenant_id:s3_put"
+            let key = format!("usage:{}:{}", tenant_id, op_type);
+            
+            // We use the root script cache as a high-performance in-memory counter
+            // This avoids hitting the database on every single file download
+            let current = self.state.root_script_cache.get(&key).await
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+                
+            self.state.root_script_cache.insert(key, (current + 1).to_string()).await;
+        }
+    }
+
+    async fn resolve(&self) -> Result<(Arc<dyn StorageBackend>, bool), Box<dyn std::error::Error + Send + Sync>> {
+        // Returns (Backend, IsResellerMode)
+        
         let db = match &self.scope {
-            EventScope::Root => self.state.db.clone(),
+            EventScope::Root => return Ok((Arc::new(DynamicStorage::new(self.state.db.clone(), self.state.vault.clone(), None, "/api/v1/storage/file/".to_string())), false)),
             EventScope::Tenant(id) => self.state.tenant_manager.get_tenant(id.clone()).await.map_err(|e| e.to_string())?,
             EventScope::Sandbox(id) => self.state.sandbox_manager.get_sandbox(id).await.map_err(|e| e.to_string())?,
-            _ => self.state.db.clone(),
+            _ => return Err("Invalid scope".into()),
         };
 
-        // 2. Resolve Paths
-        let (fs_root, url_prefix) = match &self.scope {
-             EventScope::Root => (None, None), // Use defaults
-             EventScope::Tenant(id) => (
-                 Some(format!("storage/tenants/{}/uploads", id)),
-                 Some(format!("/tenant/{}/api/v1/storage/file/", id))
-             ),
-             EventScope::Sandbox(id) => (
-                 Some(format!("storage/sandboxes/session_{}/uploads", id)),
-                 Some(format!("/sandbox/{}/api/v1/storage/file/", id))
-             ),
-             _ => (None, None),
+        let url_prefix = match &self.scope {
+             EventScope::Tenant(id) => format!("/tenant/{}/api/v1/storage/file/", id),
+             EventScope::Sandbox(id) => format!("/sandbox/{}/api/v1/storage/file/", id),
+             _ => "/api/v1/storage/file/".to_string(),
         };
 
-        // 3. Create DynamicStorage (which handles S3/Local switching based on DB settings)
-        let ds = DynamicStorage::new(
-            db, 
-            self.state.vault.clone(), 
-            fs_root, 
-            url_prefix.unwrap_or("/api/v1/storage/file/".to_string())
-        );
-        
-        // We can't return DynamicStorage directly because it implements the trait, 
-        // but we need to return Arc<dyn StorageBackend>.
-        // Since DynamicStorage itself implements it, we can wrap it.
-        Ok(Arc::new(ds))
+        // 1. Check Tenant Config
+        let tenant_settings = db.get_config("storage").await?;
+        if let Some(val) = tenant_settings {
+            let tenant_config: StorageConfigDto = serde_json::from_value(val).unwrap_or_default();
+            if tenant_config.active_driver == "s3" && tenant_config.s3.enabled {
+                 // Tenant BYOS (Bring Your Own Storage) - NOT Reseller
+                 let secret_key = if let Some(enc_str) = tenant_config.s3.secret_key {
+                     let enc: EncryptedValue = serde_json::from_str(&enc_str)?;
+                     self.state.vault.decrypt(&enc)?
+                 } else { String::new() };
+                 
+                 let s3 = S3Storage::new_with_creds(&tenant_config.s3.bucket, &tenant_config.s3.region, &tenant_config.s3.endpoint, &url_prefix, &tenant_config.s3.access_key, &secret_key, "").await;
+                 return Ok((Arc::new(s3), false));
+            }
+        }
+
+        // 2. Check Root Config (Reseller)
+        let root_settings = self.state.db.get_config("storage").await?;
+        if let Some(val) = root_settings {
+            let root_config: StorageConfigDto = serde_json::from_value(val).unwrap_or_default();
+            if root_config.active_driver == "s3" && root_config.s3.enabled {
+                 // Reseller Mode Active!
+                 let secret_key = if let Some(enc_str) = root_config.s3.secret_key {
+                     let enc: EncryptedValue = serde_json::from_str(&enc_str)?;
+                     self.state.vault.decrypt(&enc)?
+                 } else { String::new() };
+
+                 let isolation_prefix = match &self.scope {
+                     EventScope::Tenant(id) => format!("tenants/{}/uploads/", id),
+                     EventScope::Sandbox(id) => format!("sandboxes/session_{}/uploads/", id),
+                     _ => "".to_string(),
+                 };
+
+                 let s3 = S3Storage::new_with_creds(&root_config.s3.bucket, &root_config.s3.region, &root_config.s3.endpoint, &url_prefix, &root_config.s3.access_key, &secret_key, &isolation_prefix).await;
+                 return Ok((Arc::new(s3), true)); // TRUE = Is Reseller
+            }
+        }
+
+        let fs_root = match &self.scope {
+             EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
+             EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
+             _ => "./storage/tmp".to_string(),
+        };
+        Ok((Arc::new(LocalStorage::new(&fs_root, &url_prefix).await), false))
     }
 }
 
 #[async_trait]
 impl StorageBackend for ScopedDynamicStorage {
-    async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.resolve().await?;
-        backend.save(name, data, mime).await
+    async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
+        let (backend, is_reseller) = self.resolve().await?;
+        if is_reseller { self.track_op("s3_put").await; } // Count Upload
+        backend.save(name, data, mime).await 
     }
-    async fn get(&self, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.resolve().await?;
-        backend.get(name).await
+
+    async fn get(&self, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { 
+        let (active, is_reseller) = self.resolve().await?;
+        
+        match active.get(name).await {
+            Ok(data) => {
+                if is_reseller { self.track_op("s3_get").await; } // Count Download
+                Ok(data)
+            },
+            Err(_) => {
+                // Fallback Logic
+                let fs_root = match &self.scope {
+                     EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
+                     EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
+                     _ => "./storage/system/uploads".to_string(),
+                };
+                let local = LocalStorage::new(&fs_root, "/").await;
+                local.get(name).await
+            }
+        }
     }
-    async fn delete(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.resolve().await?;
-        backend.delete(name).await
+
+    async fn delete(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { 
+        let (active, is_reseller) = self.resolve().await?;
+        if is_reseller { self.track_op("s3_del").await; }
+        
+        let _ = active.delete(name).await;
+        
+        let fs_root = match &self.scope {
+             EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
+             EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
+             _ => "./storage/system/uploads".to_string(),
+        };
+        let local = LocalStorage::new(&fs_root, "/").await;
+        let _ = local.delete(name).await;
+        Ok(())
     }
-    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.resolve().await?;
-        backend.list_prefix(prefix).await
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> { 
+        self.resolve().await?.0.list_prefix(prefix).await 
     }
+    
+    async fn get_signed_url(&self, name: &str, ttl: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
+        let (backend, is_reseller) = self.resolve().await?;
+        // Signed URL generation effectively grants access to download, so we count it as a GET
+        if is_reseller { self.track_op("s3_get").await; } 
+        backend.get_signed_url(name, ttl).await 
+    }
+
     fn get_public_url_base(&self) -> String {
-        // This is synchronous, so we can't async resolve DB config here easily.
-        // We must rely on static path generation logic.
         match &self.scope {
             EventScope::Root => "/api/v1/storage/file/".to_string(),
             EventScope::Tenant(id) => format!("/tenant/{}/api/v1/storage/file/", id),
@@ -310,175 +307,82 @@ impl StorageBackend for ScopedDynamicStorage {
             _ => "/api/v1/storage/file/".to_string(),
         }
     }
-
-    async fn get_signed_url(&self, filename: &str, expires_in_secs: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = self.resolve().await?;
-        backend.get_signed_url(filename, expires_in_secs).await
-    }
 }
 
-// --- HANDLERS ---
-// --- HANDLER: Test S3 Connection ---
-// Uses payload if present, otherwise falls back to DB settings
 // --- HANDLER: Test S3 Connection ---
 #[utoipa::path(
     post,
     path = "/api/v1/admin/storage/test",
     request_body = TestS3ConfigReq,
-    responses(
-        (status = 200, description = "Connection successful"),
-        (status = 400, description = "Connection failed"),
-        (status = 403, description = "Admin only")
-    )
+    responses((status = 200, description = "Connection successful"), (status = 400, description = "Connection failed"), (status = 403, description = "Admin only"))
 )]
-pub async fn test_s3_connection(
-    auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection, 
-    State(state): State<AppState>,              
-    Json(payload): Json<TestS3ConfigReq>,
-) -> Result<Json<serde_json::Value>, AppError> {
+pub async fn test_s3_connection(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, State(state): State<AppState>, Json(payload): Json<TestS3ConfigReq>) -> Result<Json<serde_json::Value>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
-    // 1. Retrieve Saved Settings
-    let saved_json = db.get_config("storage").await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    let saved_config: Option<StorageConfigDto> = if let Some(val) = saved_json {
-        serde_json::from_value(val).ok()
-    } else {
-        None
-    };
-    
+    let saved_json = db.get_config("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let saved_config: Option<StorageConfigDto> = if let Some(val) = saved_json { serde_json::from_value(val).ok() } else { None };
     let s3_saved = saved_config.map(|c| c.s3).unwrap_or_default();
 
-    // 2. Resolve Values (Payload > Saved > Error)
     let bucket = payload.bucket.filter(|s| !s.is_empty()).unwrap_or(s3_saved.bucket);
     let region = payload.region.filter(|s| !s.is_empty()).unwrap_or(s3_saved.region);
     let endpoint = payload.endpoint.filter(|s| !s.is_empty()).unwrap_or(s3_saved.endpoint);
     let access_key = payload.access_key.filter(|s| !s.is_empty()).unwrap_or(s3_saved.access_key);
     
-    // 3. Resolve Secret Key (Handle Masking & Encryption)
     let raw_secret_key = if let Some(pk) = payload.secret_key.filter(|s| !s.is_empty() && s != "******") {
         pk
     } else if let Some(encrypted_str) = s3_saved.secret_key {
          if !encrypted_str.is_empty() {
-             let enc: EncryptedValue = serde_json::from_str(&encrypted_str)
-                .map_err(|_| AppError::JsonError("Saved secret key format is invalid".into()))?;
-             state.vault.decrypt(&enc)
-                .map_err(|_| AppError::UnknownError("Failed to decrypt saved secret key. Master Key mismatch?".into()))?
-         } else {
-             return Err(AppError::JsonError("Secret key is empty in database. Please enter it.".into()));
-         }
-    } else {
-        return Err(AppError::JsonError("Secret key is missing. Please enter it explicitly.".into()));
-    };
+             let enc: EncryptedValue = serde_json::from_str(&encrypted_str).map_err(|_| AppError::JsonError("Saved secret key format is invalid".into()))?;
+             state.vault.decrypt(&enc).map_err(|_| AppError::UnknownError("Failed to decrypt saved secret key. Master Key mismatch?".into()))?
+         } else { return Err(AppError::JsonError("Secret key is empty in database. Please enter it.".into())); }
+    } else { return Err(AppError::JsonError("Secret key is missing. Please enter it explicitly.".into())); };
 
     if bucket.is_empty() { return Err(AppError::JsonError("Bucket is required".into())); }
 
-    // 4. Initialize Backend
-    // [FIX] Ensure region defaults to auto if empty (R2 requirement)
     let final_region = if region.is_empty() { "auto".to_string() } else { region };
     
-    tracing::info!("Testing S3 Connection: Bucket={}, Region={}, Endpoint={}", bucket, final_region, endpoint);
-
-    let s3 = S3Storage::new_with_creds(
-        &bucket,
-        &final_region,
-        &endpoint,
-        "", 
-        &access_key,
-        &raw_secret_key
-    ).await;
+    // Test uses NO prefix
+    let s3 = S3Storage::new_with_creds(&bucket, &final_region, &endpoint, "", &access_key, &raw_secret_key, "").await;
 
     let filename = ".apexkit_test_connectivity";
 
-    // 5. Try Upload
-    s3.save(filename, b"connection_verified", "text/plain").await
-        .map_err(|e| {
-            tracing::error!("S3 Test Upload Failed: {}", e);
-            // Return 400 (Bad Request) instead of 500 for config errors
-            AppError::JsonError(format!("Connection failed: {}", e))
-        })?;
+    s3.save(filename, b"connection_verified", "text/plain").await.map_err(|e| AppError::JsonError(format!("Connection failed: {}", e)))?;
+    s3.delete(filename).await.map_err(|e| AppError::JsonError(format!("Write succeeded but Delete failed: {}. Check permissions.", e)))?;
 
-    // 6. Try Delete (Cleanup)
-    s3.delete(filename).await
-        .map_err(|e| {
-            tracing::warn!("S3 Test Delete Failed: {}", e);
-            AppError::JsonError(format!("Write succeeded but Delete failed: {}. Check permissions.", e))
-        })?;
-
-    Ok(Json(serde_json::json!({ 
-        "success": true, 
-        "message": "Successfully connected, uploaded, and deleted test file." 
-    })))
+    Ok(Json(serde_json::json!({ "success": true, "message": "Successfully connected, uploaded, and deleted test file." })))
 }
 
-// --- NEW HANDLER: Migrate Storage ---
+// --- HANDLER: Migrate Storage ---
 #[utoipa::path(
     post,
     path = "/api/v1/admin/storage/migrate",
     request_body = MigrateStorageReq,
-    responses(
-        (status = 200, body = MigrationResult),
-        (status = 403, description = "Admin only")
-    )
+    responses((status = 200, body = MigrationResult), (status = 403, description = "Admin only"))
 )]
-pub async fn migrate_storage(
-    auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection,
-    State(state): State<AppState>,
-    Json(payload): Json<MigrateStorageReq>,
-) -> Result<Json<MigrationResult>, AppError> {
-    // 1. Auth Check
+pub async fn migrate_storage(auth: Option<Extension<Claims>>, DatabaseConnection(db): DatabaseConnection, State(state): State<AppState>, Json(payload): Json<MigrateStorageReq>) -> Result<Json<MigrationResult>, AppError> {
     let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
-    if payload.source == payload.destination {
-        return Err(AppError::UnknownError("Source and Destination cannot be the same".into()));
-    }
+    if payload.source == payload.destination { return Err(AppError::UnknownError("Source and Destination cannot be the same".into())); }
 
-    // 2. Load Settings to configure backends
-    let settings_json = db.get_config("storage").await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    let config: StorageConfigDto = if let Some(val) = settings_json {
-        serde_json::from_value(val).unwrap_or_default()
-    } else {
-        return Err(AppError::UnknownError("Storage not configured".into()));
-    };
+    let settings_json = db.get_config("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let config: StorageConfigDto = if let Some(val) = settings_json { serde_json::from_value(val).unwrap_or_default() } else { return Err(AppError::UnknownError("Storage not configured".into())); };
 
-    // 3. Helper to build a backend instance dynamically
     let build_backend = |req_type: &str| -> Result<Arc<dyn StorageBackend>, AppError> {
         match req_type {
-            "local" => {
-                // Use default paths
-                let path = "./storage/system/uploads"; 
-                let url_base = "/api/v1/storage/file/";
-                // We have to call async new, so we wrap in async block if needed, but here we await immediately
-                // However, LocalStorage::new is async.
-                Ok(Arc::new(futures::executor::block_on(LocalStorage::new(path, url_base))))
-            },
+            "local" => Ok(Arc::new(futures::executor::block_on(LocalStorage::new("./storage/system/uploads", "/api/v1/storage/file/")))),
             "s3" => {
                 if !config.s3.enabled { return Err(AppError::UnknownError("S3 is disabled in settings".into())); }
-                
                 let raw_secret = config.s3.secret_key.as_ref().ok_or(AppError::UnknownError("S3 Secret missing".into()))?;
                 let secret_key = if raw_secret.starts_with('{') {
-                     // Decrypt
                      let enc: EncryptedValue = serde_json::from_str(raw_secret).map_err(|_| AppError::UnknownError("Bad key format".into()))?;
                      state.vault.decrypt(&enc).map_err(|_| AppError::UnknownError("Decrypt fail".into()))?
-                } else {
-                    raw_secret.clone()
-                };
-
-                let s3 = futures::executor::block_on(S3Storage::new_with_creds(
-                    &config.s3.bucket,
-                    &config.s3.region,
-                    &config.s3.endpoint,
-                    "", // public_url irrelevant for migration
-                    &config.s3.access_key,
-                    &secret_key
-                ));
+                } else { raw_secret.clone() };
+                
+                // Migrate uses NO prefix (usually for root, or we might need to handle tenant loop later)
+                // For now, this migrates ROOT storage.
+                let s3 = futures::executor::block_on(S3Storage::new_with_creds(&config.s3.bucket, &config.s3.region, &config.s3.endpoint, "", &config.s3.access_key, &secret_key, ""));
                 Ok(Arc::new(s3))
             },
             _ => Err(AppError::UnknownError("Invalid storage type".into()))
@@ -488,49 +392,28 @@ pub async fn migrate_storage(
     let source_backend = build_backend(&payload.source)?;
     let dest_backend = build_backend(&payload.destination)?;
 
-    // 4. Batch Process Files
     let mut offset = 0;
-    let limit = 50; // Process in chunks to avoid memory spikes
+    let limit = 50; 
     let mut processed_count = 0;
     let mut error_count = 0;
 
     loop {
-        // Fetch metadata from DB
-        let files = db.list_files(limit, offset).await
-            .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
+        let files = db.list_files(limit, offset).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         if files.is_empty() { break; }
 
         for file in files {
-            // A. Read from Source
             match source_backend.get(&file.filename).await {
                 Ok(data) => {
-                    // B. Write to Destination
-                    // We rely on DB mime_type
-                    if let Err(e) = dest_backend.save(&file.filename, &data, &file.mime_type).await {
-                        tracing::error!("Migration Write Error {}: {}", file.filename, e);
-                        error_count += 1;
-                    } else {
-                        processed_count += 1;
-                    }
+                    if let Err(_) = dest_backend.save(&file.filename, &data, &file.mime_type).await { error_count += 1; } 
+                    else { processed_count += 1; }
                 },
-                Err(e) => {
-                    // If file missing in source, log and skip
-                    tracing::warn!("Migration Read Error (Missing in Source) {}: {}", file.filename, e);
-                    error_count += 1;
-                }
+                Err(_) => { error_count += 1; }
             }
         }
-
         offset += limit;
     }
 
-    Ok(Json(MigrationResult {
-        success: true,
-        processed: processed_count,
-        errors: error_count,
-        message: format!("Processed {} files. {} errors.", processed_count, error_count)
-    }))
+    Ok(Json(MigrationResult { success: true, processed: processed_count, errors: error_count, message: format!("Processed {} files. {} errors.", processed_count, error_count) }))
 }
 
 // --- HANDLER: Upload File ---
@@ -547,20 +430,16 @@ pub async fn upload_file(
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,
     scope: Option<Extension<EventScope>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>, // Capture IP
-    headers: axum::http::HeaderMap, // Capture Headers
+    ConnectInfo(addr): ConnectInfo<SocketAddr>, 
+    headers: axum::http::HeaderMap, 
     mut multipart: Multipart,
 ) -> Result<Json<FileResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
     let user_id = claims.as_ref().map(|c| c.uid);
-    // if not user_id return an error
-    if user_id.is_none() {
-        return Err(AppError::Unauthorized("Login required".into()));
-    }
+    if user_id.is_none() { return Err(AppError::Unauthorized("Login required".into())); }
 
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
 
-    // [TRIGGER] Before Upload
     trigger_void_hook(&state, "before_file_upload", serde_json::json!({}), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     while let Some(field) = multipart.next_field().await.map_err(|_| AppError::InputValidation(validator::ValidationErrors::new()))? {
@@ -569,29 +448,18 @@ pub async fn upload_file(
         let data = field.bytes().await.map_err(|_| AppError::UnknownError("Failed bytes".into()))?;
         let size = data.len() as i64;
         
-        // 1. Extract extension from original name
-        // Use fully qualified 'std::path::Path' to avoid conflict with Axum's Path
-        let extension = std::path::Path::new(&original_name)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("bin");
-        // 2. Create filename with correct extension
+        let extension = std::path::Path::new(&original_name).extension().and_then(|ext| ext.to_str()).unwrap_or("bin");
         let filename = format!("{}.{}", uuid::Uuid::new_v4(), extension);
 
         storage.save(&filename, &data, &content_type).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-        let id = db.create_file_metadata(&filename, &original_name, &content_type, size, user_id).await
-            .map_err(|e| AppError::UnknownError(e.to_string()))?;
+        let id = db.create_file_metadata(&filename, &original_name, &content_type, size, user_id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-        // [LOG]
-        let meta = extract_log_meta(&headers, Some(addr), serde_json::json!({ 
-            "filename": filename, "original": original_name, "size": size 
-        }));
+        let meta = extract_log_meta(&headers, Some(addr), serde_json::json!({ "filename": filename, "original": original_name, "size": size }));
         let _ = db.log_audit_event("info", "File Uploaded", "storage", Some(meta)).await;
 
         let url = format!("{}{}", storage.get_public_url_base(), filename);
 
-        // [TRIGGER] After Upload
         let _ = trigger_void_hook(&state, "after_file_upload", serde_json::json!({ "id": id, "filename": filename }), claims.as_ref(),  Some(&event_scope.clone()), Some(base_url.clone())).await;
 
         return Ok(Json(FileResponse { id, url, filename }));
@@ -599,8 +467,6 @@ pub async fn upload_file(
     Err(AppError::InputValidation(validator::ValidationErrors::new()))
 }
 
-
-// --- HANDLER: Serve Generic File ---
 // --- HANDLER: Serve Generic File ---
 #[utoipa::path(
     get,
@@ -615,71 +481,33 @@ pub async fn serve_file(
     Query(params): Query<FileParams>,
 ) -> Result<Response, AppError> {
     
-    // [PATCH] Security: Prevent Directory Traversal via ".."
-    if path.filename.contains("..") {
-        return Err(AppError::Forbidden("Invalid path".into()));
-    }
-
-    // [PATCH] Strip leading slash if present to ensure relative path join works
+    if path.filename.contains("..") { return Err(AppError::Forbidden("Invalid path".into())); }
     let clean_filename = path.filename.trim_start_matches('/');
 
-    let original_bytes = storage.get(clean_filename).await
-        .map_err(|_| AppError::NotFound("File not found".into()))?;
+    let original_bytes = storage.get(clean_filename).await.map_err(|_| AppError::NotFound("File not found".into()))?;
+    
+    let mime_type = if clean_filename.ends_with(".m4s") { "video/iso.segment".to_string() } 
+    else if clean_filename.ends_with(".mpd") { "application/dash+xml".to_string() } 
+    else if clean_filename.ends_with(".m3u8") { "application/vnd.apple.mpegurl".to_string() } 
+    else if clean_filename.ends_with(".ts") { "video/mp2t".to_string() } 
+    else { mime_guess::from_path(clean_filename).first_or_octet_stream().to_string() };
 
-    // [PATCH] Better MIME detection for HLS/DASH
-    let mime_type = if clean_filename.ends_with(".m4s") {
-        "video/iso.segment".to_string()
-    } else if clean_filename.ends_with(".mpd") {
-        "application/dash+xml".to_string()
-    } else if clean_filename.ends_with(".m3u8") {
-        "application/vnd.apple.mpegurl".to_string()
-    } else if clean_filename.ends_with(".ts") {
-        "video/mp2t".to_string()
-    } else {
-        mime_guess::from_path(clean_filename).first_or_octet_stream().to_string()
-    };
-
-    process_image(
-        &state, 
-        original_bytes, 
-        &mime_type, 
-        clean_filename.to_string(), 
-        params.thumb
-    ).await
+    process_image(&state, original_bytes, &mime_type, clean_filename.to_string(), params.thumb).await
 }
 
 // --- HANDLER: List Files ---
-#[utoipa::path(
-    get,
-    path = "/api/v1/storage/files",
-    params(FileListQuery),
-    responses((status = 200, body = FileListResponse))
-)]
-pub async fn list_files(
-    DatabaseConnection(db): DatabaseConnection, 
-    Query(params): Query<FileListQuery>,
-) -> Result<Json<FileListResponse>, AppError> {
+#[utoipa::path(get, path = "/api/v1/storage/files", params(FileListQuery), responses((status = 200, body = FileListResponse)))]
+pub async fn list_files(DatabaseConnection(db): DatabaseConnection, Query(params): Query<FileListQuery>) -> Result<Json<FileListResponse>, AppError> {
     let page = params.page.unwrap_or(1).max(1);
     let limit = params.per_page.unwrap_or(20).min(100);
     let offset = (page - 1) * limit;
-
-    // 1. Get items
-    let files = db.list_files(limit, offset).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    // 2. Get real total count
-    let total = db.count_files().await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
+    let files = db.list_files(limit, offset).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let total = db.count_files().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(FileListResponse { items: files, total }))
 }
 
 // --- HANDLER: Delete File ---
-#[utoipa::path(
-    delete,
-    path = "/api/v1/storage/files/{id}",
-    params(FileIdPath),
-    responses((status = 204, description = "File deleted"))
-)]
+#[utoipa::path(delete, path = "/api/v1/storage/files/{id}", params(FileIdPath), responses((status = 204, description = "File deleted")))]
 pub async fn delete_file(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
@@ -693,19 +521,15 @@ pub async fn delete_file(
 ) -> Result<StatusCode, AppError> {
     let claims = auth.map(|Extension(c)| c);
     let user_id = claims.as_ref().map(|c| c.uid);
-    // if not user_id return an error
-    if user_id.is_none() {
-        return Err(AppError::Unauthorized("Login required".into()));
-    }
+    if user_id.is_none() { return Err(AppError::Unauthorized("Login required".into())); }
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
-    // [TRIGGER] Before Delete
+    
     trigger_void_hook(&state, "before_file_delete", serde_json::json!({ "id": path.id }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     let file = db.get_file_metadata(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?.ok_or(AppError::NotFound("File".into()))?;
     storage.delete(&file.filename).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     db.delete_file_metadata(path.id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), serde_json::json!({ "id": path.id, "filename": file.filename }));
     let _ = db.log_audit_event("warning", "File Deleted", "storage", Some(meta)).await;
 
@@ -713,158 +537,65 @@ pub async fn delete_file(
 }
 
 // --- HELPER: Centralized Image Resizing Logic ---
-async fn process_image(
-    state: &AppState,
-    original_bytes: Vec<u8>,
-    mime_type: &str,
-    cache_key: String,
-    dim_str: Option<String>
-) -> Result<Response, AppError> {
-
-    // Define aggressive cache strategy
-    // Cloudflare-CDN-Cache-Control allows us to tell Cloudflare to cache it for a year
-    // while telling the browser (Cache-Control) to cache it for maybe less if we wanted logic separation.
-    // Here we set both to 1 year.
+async fn process_image(state: &AppState, original_bytes: Vec<u8>, mime_type: &str, cache_key: String, dim_str: Option<String>) -> Result<Response, AppError> {
     let cache_header_val = "public, max-age=31536000, immutable";
-    
-    // Generate ETag based on the content being served
-    // This allows 304 Not Modified responses
-    let etag = format!("\"{:x}\"", md5::compute(&original_bytes)); // Requires md5 crate
+    let etag = format!("\"{:x}\"", md5::compute(&original_bytes)); 
 
     if dim_str.is_none() || mime_type.contains("svg") {
-         return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, mime_type)
-            .header(header::CACHE_CONTROL, cache_header_val) // <--- ADDED
-            .header(header::ETAG, etag) // <--- ADDED
-            .body(Body::from(original_bytes))
-            .unwrap());
+         return Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, cache_header_val).header(header::ETAG, etag).body(Body::from(original_bytes)).unwrap());
     }
 
     let dim = dim_str.unwrap();
     let full_cache_key = format!("{}_{}", cache_key, dim);
 
     if let Some(cached_bytes) = state.thumb_cache.get(&full_cache_key).await {
-        // Calculate ETag for the thumbnail
         let thumb_etag = format!("\"{:x}\"", md5::compute(cached_bytes.as_ref()));
-        
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, mime_type)
-            .header(header::CACHE_CONTROL, cache_header_val) // <--- ADDED
-            .header(header::ETAG, thumb_etag) // <--- ADDED
-            .body(Body::from(cached_bytes.as_ref().clone()))
-            .unwrap());
+        return Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, cache_header_val).header(header::ETAG, thumb_etag).body(Body::from(cached_bytes.as_ref().clone())).unwrap());
     }
 
     let (w, h) = parse_dimensions(&dim).unwrap_or((0, 0));
-    
-    if w == 0 && h == 0 {
-         return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, mime_type)
-            .header(header::CACHE_CONTROL, "public, max-age=3600")
-            .body(Body::from(original_bytes))
-            .unwrap());
-    }
+    if w == 0 && h == 0 { return Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, "public, max-age=3600").body(Body::from(original_bytes)).unwrap()); }
 
-    let format = image::ImageFormat::from_mime_type(mime_type)
-        .unwrap_or(image::ImageFormat::Png);
-
+    let format = image::ImageFormat::from_mime_type(mime_type).unwrap_or(image::ImageFormat::Png);
     let bytes_for_processing = original_bytes.clone();
 
-    let img_result = tokio::task::spawn_blocking(move || {
-        image::load_from_memory(&bytes_for_processing)
-    }).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let img_result = tokio::task::spawn_blocking(move || { image::load_from_memory(&bytes_for_processing) }).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     match img_result {
         Ok(img) => {
             let target_w = if w == 0 { u32::MAX } else { w };
             let target_h = if h == 0 { u32::MAX } else { h };
-
             let scaled = img.resize(target_w, target_h, FilterType::Lanczos3);
-            
             let mut buffer = Cursor::new(Vec::new());
-            if let Err(_) = scaled.write_to(&mut buffer, format) {
-                return Err(AppError::UnknownError("Image encoding failed".into()));
-            }
-
+            if let Err(_) = scaled.write_to(&mut buffer, format) { return Err(AppError::UnknownError("Image encoding failed".into())); }
             let thumb_bytes = buffer.into_inner();
             state.thumb_cache.insert(full_cache_key, Arc::new(thumb_bytes.clone())).await;
-
             let thumb_etag = format!("\"{:x}\"", md5::compute(&thumb_bytes));
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime_type)
-                .header(header::CACHE_CONTROL, cache_header_val) // <--- ADDED
-                .header(header::ETAG, thumb_etag) // <--- ADDED
-                .body(Body::from(thumb_bytes))
-                .unwrap())
+            Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, cache_header_val).header(header::ETAG, thumb_etag).body(Body::from(thumb_bytes)).unwrap())
         },
-        Err(_) => {
-             Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime_type)
-                .header(header::CACHE_CONTROL, cache_header_val)
-                .header(header::ETAG, etag)
-                .body(Body::from(original_bytes)) 
-                .unwrap())
-        }
+        Err(_) => { Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, cache_header_val).header(header::ETAG, etag).body(Body::from(original_bytes)).unwrap()) }
     }
 }
 
 // --- HANDLER: Serve App Logo ---
-#[utoipa::path(
-    get,
-    path = "/logo",
-    params(FileParams),
-    responses((status = 200, description = "App Logo"))
-)]
-pub async fn serve_app_logo(
-    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Tenant-aware metadata
-    StorageConnection(storage): StorageConnection, // <--- FIXED: Tenant-aware files
-    State(state): State<AppState>,
-    Query(params): Query<FileParams>,
-) -> Result<Response, AppError> {
-    
-    // 1. Get settings from Tenant DB
-    let settings = db.get_config("general").await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
+#[utoipa::path(get, path = "/logo", params(FileParams), responses((status = 200, description = "App Logo")))]
+pub async fn serve_app_logo(DatabaseConnection(db): DatabaseConnection, StorageConnection(storage): StorageConnection, State(state): State<AppState>, Query(params): Query<FileParams>) -> Result<Response, AppError> {
+    let settings = db.get_config("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     let (bytes, mime, cache_key_base) = if let Some(val) = settings {
         if let Some(logo_filename) = val.get("app_logo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-            // 2. Fetch file from Tenant Storage
             match storage.get(logo_filename).await {
-                Ok(b) => {
-                     let m = mime_guess::from_path(logo_filename).first_or_octet_stream();
-                     (b, m.to_string(), logo_filename.to_string())
-                },
+                Ok(b) => { let m = mime_guess::from_path(logo_filename).first_or_octet_stream(); (b, m.to_string(), logo_filename.to_string()) },
                 Err(_) => get_default_logo()?
             }
-        } else {
-            get_default_logo()?
-        }
-    } else {
-        get_default_logo()?
-    };
-
-    process_image(
-        &state,
-        bytes,
-        &mime,
-        format!("logo_{}", cache_key_base), 
-        params.thumb
-    ).await
+        } else { get_default_logo()? }
+    } else { get_default_logo()? };
+    process_image(&state, bytes, &mime, format!("logo_{}", cache_key_base), params.thumb).await
 }
 
 fn get_default_logo() -> Result<(Vec<u8>, String, String), AppError> {
     let default_path = "images/apexkit-logo.svg"; 
     match Assets::get(default_path) {
-        Some(content) => {
-            let mime = mime_guess::from_path(default_path).first_or_octet_stream();
-            Ok((content.data.to_vec(), mime.to_string(), "default".to_string()))
-        },
+        Some(content) => { let mime = mime_guess::from_path(default_path).first_or_octet_stream(); Ok((content.data.to_vec(), mime.to_string(), "default".to_string())) },
         None => Err(AppError::NotFound("Default logo asset missing".into()))
     }
 }

@@ -162,10 +162,6 @@ pub async fn list_backups_handler(
     let mut backups = Vec::new();
 
     if config.destination == "s3" {
-        // [FIX] S3 Listing Implementation
-        // We must reconstruct the S3 backend dynamically because `state.storage` points to `uploads/` logic, 
-        // but backups use different credentials/buckets potentially defined in `config`
-        
         let storage_settings = db.get_config("storage").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         if let Some(val) = storage_settings {
              let s_conf: crate::settings::StorageConfigDto = serde_json::from_value(val).unwrap_or_default();
@@ -181,10 +177,10 @@ pub async fn list_backups_handler(
                     &s_conf.s3.endpoint,
                     "",
                     &s_conf.s3.access_key,
-                    &secret
+                    &secret,
+                    "" // [FIX] Passed empty prefix (7th argument)
                  ).await;
                  
-                 // Determine Prefix based on scope
                  let prefix = match &event_scope {
                     EventScope::Root => "backups/".to_string(),
                     EventScope::Tenant(id) => format!("tenants/{}/backups/", id),
@@ -192,25 +188,17 @@ pub async fn list_backups_handler(
                     _ => return Ok(Json(vec![])),
                  };
                  
-                 // Call list_prefix on S3 impl directly (StorageBackend trait)
                  use apexkit_core::storage::StorageBackend;
                  let raw_files = s3.list_prefix(&prefix).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
                  
                  for (key, size, time) in raw_files {
-                     // Filter out "directories" or keys that ARE the prefix
                      if key == prefix || key.ends_with('/') { continue; }
-                     
                      let name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
-                     backups.push(BackupFile {
-                         name,
-                         size,
-                         created: time // S3 time string might need parsing if you want strict format, or pass as is
-                     });
+                     backups.push(BackupFile { name, size, created: time });
                  }
              }
         }
     } else {
-        // [FIX] Check Permission if not root
         if !matches!(event_scope, EventScope::Root) {
             let allow_val = state.db.get_config("ALLOW_NON_ROOT_BACKUP").await
                 .map_err(|e| AppError::UnknownError(e.to_string()))?;
@@ -219,7 +207,6 @@ pub async fn list_backups_handler(
             if !allowed { return Ok(Json(vec![])); }
         }
 
-        // Determine Path
         let backup_dir = match &event_scope {
             EventScope::Root => "storage/backups".to_string(),
             EventScope::Tenant(id) => format!("storage/tenants/{}/backups", id),
@@ -247,10 +234,7 @@ pub async fn list_backups_handler(
         }
     }
     
-    // Sort by creation date (desc)
-    // Basic string compare works for ISO dates, S3 dates might differ format so this is best effort
     backups.sort_by(|a, b| b.created.cmp(&a.created));
-
     Ok(Json(backups))
 }
 

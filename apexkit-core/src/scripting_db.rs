@@ -261,23 +261,38 @@ pub fn create_db_object(ctx: &mut Context, mode: DbMode) -> Result<boa_engine::o
     let query_fn = {
         let m = mode;
         NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let q_val = args.get_or_undefined(offset).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+            // Robust Argument Parsing Logic
+            let (ctx_id, q_val) = match m {
+                DbMode::Root => {
+                    // Root mode: explicit context required as first arg
+                    let id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+                    let query = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+                    (id, query)
+                },
+                DbMode::Scoped => {
+                    // Scoped mode: check if user is trying to switch context dynamically
+                    // If arg[0] is string and arg[1] is object -> It's a context switch
+                    // If arg[0] is object -> It's a standard query
+                    if args.len() >= 2 && args.get(0).map(|v| v.is_string()).unwrap_or(false) {
+                         let id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped());
+                         let query = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+                         (id, query)
+                    } else {
+                         let query = args.get_or_undefined(0).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+                         (None, query)
+                    }
+                }
+            };
             
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
+                        // Resolve the DB based on the optional context ID
                         let db = resolve_db(ctx_id, app.clone()).await?;
-                        // Note: Query Engine ApexQuery doesn't need ID resolution because it works by name internally.
-                        // But query_engine impl might need connection.
-                        let query: ApexQuery = serde_json::from_value(q_val).map_err(|e| e.to_string())?;
                         
-                        // IMPORTANT: For query_engine to work correctly on tenants, `resolve_db` MUST return the tenant DB connection.
-                        // Our `resolve_db` does exactly that.
-                        // However, `ApexQuery.from` is a string collection name. The `query_engine` implementation 
-                        // in `lib.rs` (ApexKit impl) calls `list_collections` on *itself* (the resolved db).
-                        // So this should work perfectly.
+                        let query: ApexQuery = serde_json::from_value(q_val).map_err(|e| format!("Query Parse Error: {}", e))?;
                         
+                        // Execute on the resolved DB
                         db.query_engine(query).await.map_err(|e| e.to_string())
                     })
                 } else { Err("Context lost".into()) }

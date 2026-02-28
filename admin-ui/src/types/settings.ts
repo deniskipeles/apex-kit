@@ -3,6 +3,7 @@ import { AiAction } from ".";
 export interface SecurityConfig {
   corsAllowAll: boolean;
   corsOrigins: string;
+  tenantTransparency: boolean;
 }
 
 export interface SystemLog {

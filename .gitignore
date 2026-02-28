@@ -33,6 +33,7 @@ indexes/
 sandboxes/
 tenants/
 uploads/
+tmp/
 
 # ============================
 # Build artifacts

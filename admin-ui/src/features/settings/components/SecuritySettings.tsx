@@ -5,6 +5,7 @@ import { AppSettings } from '../../../types';
 import { Users } from 'lucide-react';
 import { configService } from '@/src/features/settings/services/configService';
 import { useToast } from '@/src/components/feedback/Toast';
+import { apiClient } from '@/src/lib/apiClient';
 
 interface SecuritySettingsProps {
     settings: AppSettings;
@@ -163,6 +164,17 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
                             onCheckedChange={(c: boolean) => onChange({ allowPublicRegistration: c })}
                         />
                     </div>
+                    {apiClient.getScope().type === 'root' && (
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between rounded-lg border border-border p-4 gap-4 mt-4">
+                            <div className="space-y-0.5">
+                                <Label className="text-base flex items-center gap-2">Tenant Transparency Mode</Label>
+                                <p className="text-sm text-muted-foreground">If enabled, tenants can see the names of all root-level system scripts (code is securely redacted). Helps build trust in your platform.</p>
+                            </div>
+                            <Switch
+                                checked={settings.security.tenantTransparency}
+                                onCheckedChange={(c: boolean) => updateSecurity('tenantTransparency', c)}
+                            />
+                        </div>)}
                 </CardContent>
             </Card>
 

@@ -516,6 +516,7 @@ pub struct AdvancedQueryRequest {
     pub sort: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    pub system: Option<bool>,
     pub pipeline: Option<Vec<serde_json::Value>>, // Pipeline Steps
 }
 
@@ -558,6 +559,7 @@ pub async fn query_records_handler(
         sort: payload.sort,
         limit: payload.limit,
         offset: payload.offset,
+        system: payload.system.expect("REASON"),
         pipeline: payload.pipeline.map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default()).unwrap_or_default(),
     };
 

@@ -10,7 +10,7 @@ axum = { version = "=0.8.7", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1.37.0", features = ["full"] }
 futures = "0.3" 
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.5.2", features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace", "fs", "compression-gzip"] }
 async-stream = "0.3"
 
 # Data & Database

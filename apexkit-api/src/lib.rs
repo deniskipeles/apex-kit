@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Json, Router, Extension,
 };
+use axum::body::HttpBody;
 use axum_extra::headers::{Authorization, authorization::Bearer, HeaderMapExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -47,6 +48,7 @@ use serde_json::{json, Value};
 use apexkit_core::models::DashboardData;
 use axum::extract::DefaultBodyLimit;
 use tracing::{info, debug};
+use tower_http::compression::CompressionLayer;
 
 // --- Module Registrations ---
 pub mod websocket;
@@ -868,15 +870,15 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
 }
 
 // --- TENANT/SANDBOX MIDDLEWARES ---
-use axum::body::HttpBody;
+
 async fn sandbox_lifecycle_middleware(
     Path(params): Path<HashMap<String, String>>,
-    BaseUrl(base_url): BaseUrl, // [NEW] Needed for hooks
+    BaseUrl(base_url): BaseUrl, // Needed for hooks
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let session_id = params.get("session_id").ok_or(StatusCode::NOT_FOUND)?;
+    let session_id = params.get("session_id").ok_or(StatusCode::NOT_FOUND)?.clone();
 
     // 1. Capture Ingress
     let ingress = req.headers()
@@ -885,7 +887,7 @@ async fn sandbox_lifecycle_middleware(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
-    // [NEW] Before Request Hook
+    // Before Request Hook
     let hook_payload = serde_json::json!({
         "sandbox_id": session_id,
         "path": req.uri().path(),
@@ -907,17 +909,20 @@ async fn sandbox_lifecycle_middleware(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    match state.sandbox_manager.get_sandbox(session_id).await {
+    match state.sandbox_manager.get_sandbox(&session_id).await {
         Ok(sandbox_db) => {
             req.extensions_mut().insert(sandbox_db);
             
-            let storage_path = format!("storage/sandboxes/session_{}/uploads", session_id);
-            let public_url = format!("/sandbox/{}/api/v1/storage/file/", session_id);
-            let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, &public_url).await);
-            req.extensions_mut().insert(storage);
-            req.extensions_mut().insert(EventScope::Sandbox(session_id.to_string()));
+            // [FIX] Use ScopedDynamicStorage to support S3 Reselling
+            let scope = EventScope::Sandbox(session_id.clone());
+            let storage: Arc<dyn StorageBackend> = Arc::new(
+                crate::storage::ScopedDynamicStorage::new(state.clone(), scope.clone())
+            );
             
-            // [FIX] Capture path before consuming req
+            req.extensions_mut().insert(storage);
+            req.extensions_mut().insert(scope);
+            
+            // Capture path before consuming req
             let path_clone = req.uri().path().to_string();
 
             let mut response = next.run(req).await;
@@ -931,10 +936,10 @@ async fn sandbox_lifecycle_middleware(
                 .get(axum::http::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok())
-                .or_else(|| response.body().size_hint().exact()) // [ADDED]
+                .or_else(|| response.body().size_hint().exact())
                 .unwrap_or(0);
 
-            // [NEW] After Request Hook (Async)
+            // After Request Hook (Async)
             let status = response.status().as_u16();
             let state_clone = state.clone();
             let base_url_clone = base_url.clone();
@@ -977,6 +982,7 @@ async fn tenant_resolver_middleware(
     
     if let Some(key_header) = req.headers().get("x-api-key") {
          if let Ok(key) = key_header.to_str() {
+             // Verify against Root DB first for global keys
              if let Ok(Some(api_key)) = state.db.verify_api_key(key).await {
                  key_scope_override = Some(api_key.scope.clone());
                  req.extensions_mut().insert(api_key);
@@ -1030,14 +1036,14 @@ async fn tenant_resolver_middleware(
         }
     }
 
-    // 1. Capture Ingress (Request Size)
+    // Capture Ingress (Request Size)
     let ingress = req.headers()
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
-    // [NEW] Before Request Hook
+    // Before Request Hook
     if !tenant_id.is_empty() {
         let hook_payload = serde_json::json!({
             "tenant_id": tenant_id,
@@ -1048,8 +1054,6 @@ async fn tenant_resolver_middleware(
             "egress": 0
         });
 
-        // Run Hook. If it throws error, we BLOCK the request.
-        // We use Root scope for execution as this is a system-level check
         if let Err(e) = trigger_void_hook(
             &state, 
             "before_tenant_request", 
@@ -1059,18 +1063,8 @@ async fn tenant_resolver_middleware(
             Some(base_url.clone())
         ).await {
             tracing::warn!("Blocked request to tenant {}: {:?}", tenant_id, e);
-            
-            // [FIX] Extract the actual error message from the AppError enum
-            // The script engine wraps JS errors in "Script Rejected: ..."
             let msg = e.to_string(); 
-            
-            // Return JSON response with 429 Too Many Requests (or 403)
-            let body = Json(json!({
-                "error": "request_blocked",
-                "message": msg,
-                "status": 429 // Or 403
-            }));
-            
+            let body = Json(json!({ "error": "request_blocked", "message": msg, "status": 429 }));
             return Ok((StatusCode::TOO_MANY_REQUESTS, body).into_response());
         }
     }
@@ -1079,6 +1073,7 @@ async fn tenant_resolver_middleware(
     if tenant_id.is_empty() {
         // Root Context
         req.extensions_mut().insert(EventScope::Root);
+        // Ensure Root DynamicStorage is used if not overridden (usually defaults to AppState storage)
         let mut response = next.run(req).await;
         response.headers_mut().insert("X-Apex-Scope", HeaderValue::from_static("root"));
         return Ok(response);
@@ -1089,11 +1084,14 @@ async fn tenant_resolver_middleware(
         Ok(tenant_db) => {
             req.extensions_mut().insert(tenant_db.clone());
             
-            let storage_path = format!("storage/tenants/{}/uploads", tenant_id);
-            let public_url = format!("/tenant/{}/api/v1/storage/file/", tenant_id);
-            let storage: Arc<dyn StorageBackend> = Arc::new(apexkit_core::storage::LocalStorage::new(&storage_path, &public_url).await);
+            // [FIX] Use ScopedDynamicStorage to support S3 Reselling
+            let scope = EventScope::Tenant(tenant_id.clone());
+            let storage: Arc<dyn StorageBackend> = Arc::new(
+                crate::storage::ScopedDynamicStorage::new(state.clone(), scope.clone())
+            );
+            
             req.extensions_mut().insert(storage);
-            req.extensions_mut().insert(EventScope::Tenant(tenant_id.clone()));
+            req.extensions_mut().insert(scope);
 
             let path_clone = req.uri().path().to_string();
             
@@ -1104,16 +1102,15 @@ async fn tenant_resolver_middleware(
                 response.headers_mut().insert("X-Apex-Scope", val);
             }
 
-            // 3. CAPTURE EGRESS (Response Size)
+            // Capture Egress
             let egress = response.headers()
                 .get(axum::http::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok())
-                // FALLBACK: If header is missing (common in Axum), check the body size hint
                 .or_else(|| response.body().size_hint().exact()) 
                 .unwrap_or(0);
 
-            // [NEW] After Request Hook (Async)
+            // After Request Hook (Async)
             let status = response.status().as_u16();
             let state_clone = state.clone();
             let base_url_clone = base_url.clone();
@@ -1124,8 +1121,8 @@ async fn tenant_resolver_middleware(
                     "tenant_id": tid_clone,
                     "path": path_clone,
                     "status": status,
-                    "ingress": ingress, // How much they sent
-                    "egress": egress    // How much we sent back
+                    "ingress": ingress, 
+                    "egress": egress
                 });
                 let _ = trigger_void_hook(
                     &state_clone, 
@@ -1755,6 +1752,7 @@ pub fn app_router(state: AppState) -> Router {
         // Must be last
         .route("/{*path}", get(assets::serve_static_asset))
         .layer(middleware::from_fn(metrics_middleware))
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 

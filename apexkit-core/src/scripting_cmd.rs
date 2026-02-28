@@ -15,6 +15,7 @@ use crate::scripting::{ACTIVE_CONTEXT, return_json_promise};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::realtime::{DbEvent, EventScope};
 use regex::Regex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // --- GLOBAL PROCESS TRACKER ---
 struct ProcessInfo {
@@ -27,6 +28,8 @@ struct ProcessInfo {
 
 static PROCESS_TRACKER: OnceLock<Mutex<HashMap<u32, ProcessInfo>>> = OnceLock::new();
 static SEMAPHORE_MAP: OnceLock<RwLock<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
+// [NEW] Use a high starting number for internal job tracking
+static JOB_COUNTER: AtomicU32 = AtomicU32::new(100000); 
 
 fn get_tracker() -> &'static Mutex<HashMap<u32, ProcessInfo>> {
     PROCESS_TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
@@ -41,11 +44,6 @@ fn get_semaphore_for_program(program: &str) -> Arc<Semaphore> {
     if let Some(sem) = map.get(program) {
         return sem.clone();
     }
-    
-    if let Some(default_sem) = map.get("*") {
-        return default_sem.clone();
-    }
-    
     drop(map);
     
     let mut write_map = get_semaphores().write().unwrap();
@@ -167,7 +165,7 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
         let options_val = args.get_or_undefined(2);
         
         let (cwd, envs, timeout_val) = parse_options(ctx, options_val);
-        let max_time = timeout_val.unwrap_or(3_600_000); // Default 1 hour for media processing
+        let max_time = timeout_val.unwrap_or(3_600_000); // Default 1 hour
 
         let mut cmd_args: Vec<String> = Vec::new();
         if let Ok(Some(json_val)) = args_val.to_json(ctx) {
@@ -179,7 +177,6 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
             }
         }
 
-        // Parse onProgress config
         let mut progress_config = None;
         if let Ok(Some(json)) = options_val.to_json(ctx) {
             if let Some(obj) = json.as_object() {
@@ -195,6 +192,19 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
             }
         }
 
+        let internal_id = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        
+        {
+            let mut tracker = get_tracker().lock().unwrap();
+            tracker.insert(internal_id, ProcessInfo {
+                pid: 0, 
+                program: program.clone(),
+                start_time: Instant::now(),
+                status: "queued".to_string(), 
+                exit_code: None,
+            });
+        }
+
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, handle, _, tx_opt, scope)) = &*c.borrow() {
                 if !matches!(scope, EventScope::Root) {
@@ -203,14 +213,32 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
 
                 let tx = tx_opt.clone();
                 let client_scope = scope.clone();
+                let program_clone = program.clone();
 
-                handle.block_on(async {
-                     let sem = get_semaphore_for_program(&program);
-                     let permit = sem.clone().acquire_owned().await.map_err(|e| e.to_string())?;
-
-                     let mut command = tokio::process::Command::new(&program);
-                     command.args(&cmd_args);
+                // [CRITICAL FIX]: Acquire semaphore INSIDE the spawned task!
+                handle.spawn(async move {
+                     let sem = get_semaphore_for_program(&program_clone);
                      
+                     // The task pauses here if limit is reached, but the API request already returned!
+                     let permit = match sem.clone().acquire_owned().await {
+                         Ok(p) => p,
+                         Err(e) => {
+                             let mut tracker = get_tracker().lock().unwrap();
+                             if let Some(info) = tracker.get_mut(&internal_id) { info.status = format!("failed_sem: {}", e); }
+                             return;
+                         }
+                     };
+                     
+                     {
+                         let mut tracker = get_tracker().lock().unwrap();
+                         if let Some(info) = tracker.get_mut(&internal_id) {
+                             info.status = "running".to_string();
+                             info.start_time = Instant::now();
+                         }
+                     }
+
+                     let mut command = tokio::process::Command::new(&program_clone);
+                     command.args(&cmd_args);
                      command.stdout(Stdio::piped());
                      command.stderr(Stdio::piped());
                      command.stdin(Stdio::null());
@@ -221,30 +249,27 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
 
                      match command.spawn() {
                          Ok(mut child) => {
-                             let id = child.id().unwrap_or(0);
-                             
+                             let os_pid = child.id().unwrap_or(0);
                              {
                                  let mut tracker = get_tracker().lock().unwrap();
-                                 tracker.insert(id, ProcessInfo {
-                                     pid: id,
-                                     program: program.clone(),
-                                     start_time: Instant::now(),
-                                     status: "running".to_string(),
-                                     exit_code: None,
-                                 });
+                                 if let Some(info) = tracker.get_mut(&internal_id) {
+                                     info.pid = os_pid; 
+                                 }
                              }
 
-                             // Progress Monitor (Stderr)
                              if let Some((regex_pattern, channel_name, event_name)) = progress_config {
                                  if let Some(stderr) = child.stderr.take() {
                                      if let Some(broadcaster) = tx {
                                           let reader = BufReader::new(stderr);
-                                          
-                                          let scoped_channel = match &client_scope {
-                                              EventScope::Root => format!("root::{}", channel_name),
-                                              EventScope::Tenant(id) => format!("tenant_{}::{}", id, channel_name),
-                                              EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, channel_name),
-                                              _ => channel_name.clone()
+                                          let scoped_channel = if channel_name.contains("::") {
+                                              channel_name.clone()
+                                          } else {
+                                              match &client_scope {
+                                                  EventScope::Root => format!("root::{}", channel_name),
+                                                  EventScope::Tenant(id) => format!("tenant_{}::{}", id, channel_name),
+                                                  EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, channel_name),
+                                                  _ => channel_name.clone()
+                                              }
                                           };
                                           
                                           tokio::spawn(async move {
@@ -253,7 +278,6 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
                                                   while let Ok(Some(line)) = lines.next_line().await {
                                                       if let Some(caps) = re.captures(&line) {
                                                           let val = caps.get(1).map(|m| m.as_str()).unwrap_or(caps.get(0).map(|m| m.as_str()).unwrap_or(""));
-                                                          
                                                           let event = DbEvent::Custom {
                                                               event: event_name.clone(),
                                                               data: json!({ "value": val, "raw": line }),
@@ -268,32 +292,33 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
                                  }
                              }
 
-                             // Lifecycle Monitor
-                             tokio::spawn(async move {
-                                 let _permit_guard = permit;
-                                 let wait_future = child.wait();
-                                 let result = timeout(Duration::from_millis(max_time), wait_future).await;
-                                 
-                                 let mut tracker = get_tracker().lock().unwrap();
-                                 if let Some(info) = tracker.get_mut(&id) {
-                                     match result {
-                                         Ok(Ok(status)) => {
-                                             info.status = "completed".to_string();
-                                             info.exit_code = status.code();
-                                         },
-                                         Ok(Err(_)) => { info.status = "failed".to_string(); },
-                                         Err(_) => { 
-                                             info.status = "timed_out".to_string();
-                                         }
-                                     }
+                             let _permit_guard = permit;
+                             let wait_future = child.wait();
+                             let result = timeout(Duration::from_millis(max_time), wait_future).await;
+                             
+                             let mut tracker = get_tracker().lock().unwrap();
+                             if let Some(info) = tracker.get_mut(&internal_id) {
+                                 match result {
+                                     Ok(Ok(status)) => {
+                                         info.status = "completed".to_string();
+                                         info.exit_code = status.code();
+                                     },
+                                     Ok(Err(_)) => { info.status = "failed".to_string(); },
+                                     Err(_) => { info.status = "timed_out".to_string(); }
                                  }
-                             });
-
-                             Ok(json!({ "pid": id, "status": "running" }))
+                             }
                          },
-                         Err(e) => Err(format!("Spawn failed: {}", e))
+                         Err(e) => {
+                             let mut tracker = get_tracker().lock().unwrap();
+                             if let Some(info) = tracker.get_mut(&internal_id) {
+                                 info.status = format!("spawn_failed: {}", e);
+                             }
+                         }
                      }
-                })
+                });
+
+                // Return immediately
+                Ok(json!({ "pid": internal_id, "status": "queued" }))
             } else { Err("Context lost".into()) }
         });
 
@@ -311,38 +336,46 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
                  let tracker = get_tracker().lock().unwrap();
                  if let Some(info) = tracker.get(&pid) {
                      Ok(json!({
-                         "pid": info.pid,
+                         "pid": info.pid, // Real OS pid if running, 0 if queued
+                         "job_id": pid,   // The internal tracking ID
                          "program": info.program,
                          "status": info.status,
                          "exit_code": info.exit_code,
                          "runtime_ms": info.start_time.elapsed().as_millis() as u64
                      }))
                  } else {
-                     Ok(json!({ "status": "unknown", "pid": pid }))
+                     Ok(json!({ "status": "unknown", "job_id": pid }))
                  }
              } else { Err("Context lost".into()) }
         });
         return_json_promise(ctx, result)
     });
 
-    // $cmd.kill(pid) - NEW FUNCTION
+    // $cmd.kill(pid) 
     let kill_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let pid = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as u32;
+        let internal_pid = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as u32;
 
         let result = ACTIVE_CONTEXT.with(|c| {
              if let Some((_, handle, _, _, scope)) = &*c.borrow() {
                  if !matches!(scope, EventScope::Root) { return Err("Access Denied.".into()); }
 
+                 let os_pid = {
+                     let tracker = get_tracker().lock().unwrap();
+                     tracker.get(&internal_pid).map(|i| i.pid).unwrap_or(0)
+                 };
+
+                 if os_pid == 0 {
+                     return Ok(json!({ "killed": false, "error": "Process not running or unkillable" }));
+                 }
+
                  handle.block_on(async {
-                     // Use tokio::process to kill by PID
-                     // Note: This requires platform-specific implementation
                      #[cfg(unix)]
                      {
                          use std::process::Command;
-                         let output = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+                         let output = Command::new("kill").arg("-9").arg(os_pid.to_string()).output();
                          match output {
-                             Ok(o) if o.status.success() => Ok(json!({ "killed": true, "pid": pid })),
-                             _ => Ok(json!({ "killed": false, "pid": pid, "error": "Process not found or access denied" }))
+                             Ok(o) if o.status.success() => Ok(json!({ "killed": true, "job_id": internal_pid })),
+                             _ => Ok(json!({ "killed": false, "job_id": internal_pid, "error": "Process not found or access denied" }))
                          }
                      }
                      #[cfg(not(unix))]
@@ -360,7 +393,7 @@ pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
         .function(spawn_fn, JsString::from("spawn"), 3)
         .function(status_fn, JsString::from("status"), 1)
         .function(set_limit_fn, JsString::from("setLimit"), 2)
-        .function(kill_fn, JsString::from("kill"), 1)  // NEW
+        .function(kill_fn, JsString::from("kill"), 1)  
         .build();
 
     ctx.register_global_property(JsString::from("$cmd"), obj, Attribute::all()).map_err(|e| e.to_string())

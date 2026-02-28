@@ -495,6 +495,7 @@ pub async fn import_scripts_handler(
             trigger_type: item.trigger_type,
             target_collection: item.target_collection,
             code: item.code,
+            active: item.active,
             visibility: item.visibility
         };
         

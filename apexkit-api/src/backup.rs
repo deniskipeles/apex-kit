@@ -1,3 +1,4 @@
+// =========================== /teamspace/studios/this_studio/apex/apex-kit/apexkit-api/src/backup.rs ===========================
 use std::path::Path;
 use std::fs;
 use std::sync::Arc;
@@ -124,7 +125,8 @@ pub async fn perform_backup(
                         &storage_conf.s3.endpoint,
                         "",
                         &storage_conf.s3.access_key,
-                        &secret
+                        &secret,
+                        "" // [FIX] Passed empty prefix (7th argument)
                     ).await;
 
                     let bytes = fs::read(&archive_path).map_err(|e| e.to_string())?;
@@ -207,7 +209,8 @@ pub async fn restore_backup(
                     &storage_conf.s3.endpoint,
                     "",
                     &storage_conf.s3.access_key,
-                    &secret
+                    &secret,
+                    "" // [FIX] Passed empty prefix (7th argument)
                 ).await
             } else {
                 return Err("S3 not enabled".into());

@@ -48,7 +48,8 @@ const mapToFrontend = (apiData: any): AppSettings => {
         apiTokens: [],
         security: {
             corsAllowAll: apiData.security?.cors_allow_all ?? true, // Default to true if missing
-            corsOrigins: apiData.security?.cors_origins || ''
+            corsOrigins: apiData.security?.cors_origins || '',
+            tenantTransparency: apiData.security?.tenant_transparency ?? false,
         },
         ai: {
             enabled: apiData.ai?.enabled || false,
@@ -100,7 +101,8 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
     if (settings.security) {
         payload.security = {
             cors_allow_all: settings.security.corsAllowAll,
-            cors_origins: settings.security.corsOrigins
+            cors_origins: settings.security.corsOrigins,
+            tenant_transparency: settings.security.tenantTransparency
         };
     }
     if (settings.cronJobs) {

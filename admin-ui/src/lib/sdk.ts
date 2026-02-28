@@ -554,7 +554,7 @@ export class ApexKit {
 
     get scripts() {
         return {
-            list: () => this._request<Script[]>('/admin/scripts'),
+            list: () => this._request<{local: Script[], shared: Script[], root_total: Number, transparency_enabled: Boolean} | Script[]>('/admin/scripts'),
             create: (data: Partial<Script>) => this._request<Script>('/admin/scripts', { method: 'POST', body: data }),
             delete: (id: string | number) => this._request(`/admin/scripts/${id}`, { method: 'DELETE' }),
             run: (name: string, variables: any) => this._request<any>(`/run/${name}`, { method: 'POST', body: variables }),

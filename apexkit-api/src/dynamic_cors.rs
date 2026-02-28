@@ -31,7 +31,7 @@ pub async fn cors_middleware(
     let config: SecurityConfigDto = if let Some(val) = security_setting {
         serde_json::from_value(val).unwrap_or_default()
     } else {
-        SecurityConfigDto { cors_allow_all: true, cors_origins: "".to_string() }
+        SecurityConfigDto { cors_allow_all: true, cors_origins: "".to_string(), tenant_transparency: false }
     };
 
     let mut allow_origin_val: Option<HeaderValue> = None;
