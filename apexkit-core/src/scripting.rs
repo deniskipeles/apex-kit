@@ -289,7 +289,12 @@ impl ScriptEngine {
             let final_val = Self::resolve_promise(promise, ctx)?;
 
             if final_val.is_null() || final_val.is_undefined() { return Ok(None); }
-            if final_val.as_boolean().unwrap_or(false) == false { return Err("Hook blocked operation".to_string()); }
+
+            // [FIX] Only check boolean if the value is actually a boolean type.
+            // Objects/Strings/Numbers should NOT trigger this check.
+            if let Some(b) = final_val.as_boolean() {
+                 if !b { return Err("Hook blocked operation".to_string()); }
+            }
             
             if final_val.is_object() {
                 let json = final_val.to_json(ctx).unwrap().unwrap();
@@ -456,16 +461,23 @@ fn register_util(ctx: &mut Context) -> Result<(), String> {
         Ok(JsValue::from(JsString::from(STANDARD.encode(text))))
     });
 
-    // Base64 Decode
+    // Base64 Decode (Robust: Handles Standard, URL-Safe, Padded, and Unpadded)
     let b64_dec_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
         let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-        match STANDARD.decode(text) {
+        use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD, URL_SAFE, STANDARD_NO_PAD}};
+        
+        // Try multiple decoding engines gracefully
+        let decoded = STANDARD.decode(&text)
+            .or_else(|_| URL_SAFE_NO_PAD.decode(&text))
+            .or_else(|_| URL_SAFE.decode(&text))
+            .or_else(|_| STANDARD_NO_PAD.decode(&text));
+
+        match decoded {
             Ok(bytes) => {
                 let s = String::from_utf8(bytes).unwrap_or_default();
                 Ok(JsValue::from(JsString::from(s)))
             },
-            Err(_) => Err(JsError::from_opaque(JsString::from("Invalid Base64").into()))
+            Err(_) => Err(JsError::from_opaque(JsString::from("Invalid Base64 format").into()))
         }
     });
     

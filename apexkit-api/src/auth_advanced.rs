@@ -31,20 +31,28 @@ pub struct LoginQuery {
     redirect_to: Option<String>,
 }
 
+// --- Unified OAuth Token Model ---
 #[derive(Deserialize)]
-struct GithubToken {
+struct ProviderToken {
     access_token: String,
 }
 
+// --- Provider Specific DTOs (Mapped from their respective APIs) ---
 #[derive(Deserialize)]
 struct GithubUser {
-    id: i64,
+    id: i64, // GitHub uses integers for IDs
     email: Option<String>,
     login: String,
-    // [NEW] Metadata fields
-    avatar_url: Option<String>,
     name: Option<String>,
-    html_url: Option<String>,
+    avatar_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoogleUser {
+    id: String, // Google uses strings for IDs
+    email: Option<String>,
+    name: Option<String>,
+    picture: Option<String>,
 }
 
 // Helper to fetch and decrypt
@@ -63,14 +71,11 @@ async fn get_secret(db: Arc<dyn Db>, vault: Arc<Vault>, key: &str) -> Result<Str
 // --- GitHub Handlers ---
 
 pub async fn github_login(
-    DatabaseConnection(db): DatabaseConnection, // [FIX] Inject scoped DB
+    DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>,
     Query(query): Query<LoginQuery>,
 ) -> Result<Redirect, AppError> {
     let client_id = get_secret(db, state.vault.clone(), "github_client_id").await?;
-    
-    // Pass the redirect URL in the 'state' parameter (simple approach)
-    // For production, this should be signed/encrypted to prevent open redirect vulnerabilities
     let state_param = query.redirect_to.unwrap_or_default();
     
     let url = format!(
@@ -83,13 +88,12 @@ pub async fn github_login(
 pub async fn github_callback(
     DatabaseConnection(db): DatabaseConnection, 
     State(state): State<AppState>,
-    scope: Option<Extension<EventScope>>, // [FIX] Capture current scope (Root/Tenant)
+    scope: Option<Extension<EventScope>>,
     Query(params): Query<OauthCallback>,
 ) -> Result<Response, AppError> {
     let client_id = get_secret(db.clone(), state.vault.clone(), "github_client_id").await?;
     let client_secret = get_secret(db.clone(), state.vault.clone(), "github_client_secret").await?;
     
-    // [FIX] Determine Scope String from Context
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     let scope_str = match &event_scope {
         EventScope::Tenant(id) => format!("tenant:{}", id),
@@ -97,7 +101,6 @@ pub async fn github_callback(
         _ => "root".to_string()
     };
 
-    // 1. Exchange Code
     let client = reqwest::Client::new();
     let token_res = client.post("https://github.com/login/oauth/access_token")
         .header("Accept", "application/json")
@@ -106,58 +109,149 @@ pub async fn github_callback(
             ("client_secret", client_secret.as_str()),
             ("code", params.code.as_str()),
         ])
+        .send().await.map_err(|_| AppError::UnknownError("Failed to exchange code".into()))?
+        .json::<ProviderToken>().await.map_err(|_| AppError::UnknownError("Failed to parse token".into()))?;
+
+    let gh_user = client.get("https://api.github.com/user")
+        .header("User-Agent", "ApexKit")
+        .header("Authorization", format!("Bearer {}", token_res.access_token))
+        .send().await.map_err(|_| AppError::UnknownError("Failed to get user".into()))?
+        .json::<GithubUser>().await.map_err(|_| AppError::UnknownError("Failed to parse user".into()))?;
+
+    // NORMALIZATION
+    let provider_id = gh_user.id.to_string();
+    let email = gh_user.email.unwrap_or_else(|| format!("{}@github.oauth", gh_user.login));
+    let name = gh_user.name.unwrap_or(gh_user.login);
+    let avatar = gh_user.avatar_url;
+
+    process_oauth_user(db, provider_id, "github".to_string(), email, name, avatar, scope_str, params.state).await
+}
+
+// --- Google Handlers ---
+
+pub async fn google_login(
+    DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    uri: axum::http::Uri, // [FIX]: Use Uri extractor instead of Request
+    Query(query): Query<LoginQuery>,
+) -> Result<Redirect, AppError> {
+    let client_id = get_secret(db, state.vault.clone(), "google_client_id").await?;
+    let state_param = query.redirect_to.unwrap_or_default();
+    
+    // Construct exact callback URL based on current context
+    let path = uri.path(); 
+    let callback_path = format!("{}/callback", path); 
+    let redirect_uri = format!("{}{}", base_url, callback_path); // base_url.0 accesses the inner String
+
+    let url = reqwest::Url::parse_with_params("https://accounts.google.com/o/oauth2/v2/auth", &[
+        ("client_id", client_id.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("response_type", "code"),
+        ("scope", "email profile"),
+        ("state", state_param.as_str()),
+    ]).map_err(|e| AppError::UnknownError(e.to_string()))?.to_string();
+
+    Ok(Redirect::to(&url))
+}
+
+pub async fn google_callback(
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<EventScope>>,
+    uri: axum::http::Uri, // [FIX]: Use Uri extractor instead of Request
+    Query(params): Query<OauthCallback>,
+) -> Result<Response, AppError> {
+    let client_id = get_secret(db.clone(), state.vault.clone(), "google_client_id").await?;
+    let client_secret = get_secret(db.clone(), state.vault.clone(), "google_client_secret").await?;
+    
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let scope_str = match &event_scope {
+        EventScope::Tenant(id) => format!("tenant:{}", id),
+        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+        _ => "root".to_string()
+    };
+
+    let redirect_uri = format!("{}{}", base_url, uri.path());
+
+    // 1. Exchange Code
+    let client = reqwest::Client::new();
+    let token_res = client.post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("code", params.code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("grant_type", "authorization_code"),
+        ])
         .send()
         .await
         .map_err(|_| AppError::UnknownError("Failed to exchange code".into()))?
-        .json::<GithubToken>()
+        .json::<ProviderToken>()
         .await
         .map_err(|_| AppError::UnknownError("Failed to parse token".into()))?;
 
     // 2. Get User Info
-    let gh_user = client.get("https://api.github.com/user")
-        .header("User-Agent", "ApexKit")
+    let g_user = client.get("https://www.googleapis.com/oauth2/v2/userinfo")
         .header("Authorization", format!("Bearer {}", token_res.access_token))
         .send()
         .await
         .map_err(|_| AppError::UnknownError("Failed to get user".into()))?
-        .json::<GithubUser>()
+        .json::<GoogleUser>()
         .await
         .map_err(|_| AppError::UnknownError("Failed to parse user".into()))?;
 
-    // 3. Find or Create User (In the scoped DB)
-    let provider_id = gh_user.id.to_string();
-    let existing = db.get_user_by_oauth("github", &provider_id).await
+    // 3. Find or Create User
+    let provider_id = g_user.id.clone();
+    let email = g_user.email.clone().unwrap_or_else(|| format!("{}@google.oauth", g_user.id));
+    let name = g_user.name.unwrap_or_else(|| email.split('@').next().unwrap_or("User").to_string());
+    let avatar = g_user.picture;
+
+    process_oauth_user(db, provider_id, "google".to_string(), email, name, avatar, scope_str, params.state).await
+}
+
+// --- Shared Internal Logic for OAuth Convergence ---
+async fn process_oauth_user(
+    db: Arc<dyn apexkit_core::Db>,
+    provider_id: String,
+    provider_name: String,
+    email: String,
+    name: String,
+    avatar: Option<String>,
+    scope_str: String,
+    redirect_target: Option<String>
+) -> Result<Response, AppError> {
+
+    let existing = db.get_user_by_oauth(&provider_name, &provider_id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     let user = match existing {
         Some(u) => u,
         None => {
-            let metadata = json!({
-                "avatar": gh_user.avatar_url,
-                "name": gh_user.name.unwrap_or(gh_user.login.clone()),
-                "github_url": gh_user.html_url,
-                "source": "github"
+            // Unified Metadata Object
+            let metadata = serde_json::json!({
+                "avatar": avatar,
+                "name": name,
+                "provider": provider_name
             });
 
-            let email = gh_user.email.unwrap_or_else(|| format!("{}@github.oauth", gh_user.login));
             let pwd = uuid::Uuid::new_v4().to_string(); 
             let hash = auth::hash_password(&pwd).unwrap();
             
             let u = db.create_user(&email, &hash, "user", Some(metadata)).await
-                .map_err(|_| AppError::UnknownError("Email already taken".into()))?;
+                .map_err(|_| AppError::UnknownError("Email already taken by another account".into()))?;
             
-            db.link_oauth(u.id, "github", &provider_id).await
+            db.link_oauth(u.id, &provider_name, &provider_id).await
                 .map_err(|e| AppError::UnknownError(e.to_string()))?;
             u
         }
     };
 
-    // 4. Issue JWT with CORRECT SCOPE
     let token = auth::create_jwt(user.id, &user.email, &user.role, &scope_str)
         .map_err(|_| AppError::UnknownError("Token failed".into()))?;
 
-    // 5. Handle Response
-    if let Some(target) = params.state.filter(|s| !s.is_empty()) {
+    if let Some(target) = redirect_target.filter(|s| !s.is_empty()) {
         let separator = if target.contains('?') { '&' } else { '?' };
         let redirect_url = format!("{}{}{}={}", target, separator, "token", token);
         return Ok(Redirect::to(&redirect_url).into_response());
@@ -165,7 +259,13 @@ pub async fn github_callback(
 
     Ok(Json(AuthResponse {
         token,
-        user: UserDto { id: user.id, email: user.email, role: user.role, metadata: user.metadata, scope: Some(scope_str), },
+        user: UserDto { 
+            id: user.id, 
+            email: user.email, 
+            role: user.role, 
+            metadata: user.metadata, 
+            scope: Some(scope_str), 
+        },
     }).into_response())
 }
 

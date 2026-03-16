@@ -246,6 +246,33 @@ pub fn create_db_object(ctx: &mut Context, mode: DbMode) -> Result<boa_engine::o
         })
     };
 
+    // instantSearch(col, query, limit) OR instantSearch(ctx, col, query, limit)
+    let instant_search = {
+        let m = mode;
+        NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let (ctx_id, offset) = get_args(args, ctx, &m);
+            let col = args.get_or_undefined(offset).to_string(ctx)?.to_std_string_escaped();
+            let query = args.get_or_undefined(offset + 1).to_string(ctx)?.to_std_string_escaped();
+            let limit = args.get_or_undefined(offset + 2).to_number(ctx).unwrap_or(10.0) as usize;
+
+            let res = ACTIVE_CONTEXT.with(|c| {
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        let db = resolve_db(ctx_id, app.clone()).await?;
+                        let col_id = resolve_collection_local(db.clone(), &col).await?;
+                        
+                        // Call the Tantivy instant search engine
+                        let results = db.instant_search(col_id, &query, limit)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            
+                        Ok(serde_json::to_value(results).unwrap())
+                    })
+                } else { Err("Context lost".into()) }
+            });
+            return_json_promise(ctx, res)
+        })
+    };
 
     let records_obj = ObjectInitializer::new(ctx)
         .function(list_records, JsString::from("list"), 2)
@@ -255,6 +282,7 @@ pub fn create_db_object(ctx: &mut Context, mode: DbMode) -> Result<boa_engine::o
         .function(delete_record, JsString::from("delete"), 2)
         .function(search_vector, JsString::from("searchVector"), 4)
         .function(get_vector, JsString::from("getVector"), 2)
+        .function(instant_search, JsString::from("instantSearch"), 3)
         .build();
 
     // --- 2. QUERY ---

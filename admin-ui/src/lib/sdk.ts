@@ -408,6 +408,14 @@ export class ApexKit {
                 }
                 window.location.href = url.toString();
             },
+            // Google Auth Trigger
+            loginWithGoogle: (redirectTo?: string) => {
+                let path = '/auth/google';
+                if (!path.startsWith('/api/v1')) path = `/api/v1${path}`;
+                const url = new URL(`${this.baseUrl}${path}`);
+                if (redirectTo) url.searchParams.append('redirect_to', redirectTo);
+                window.location.href = url.toString();
+            },
         };
     }
 

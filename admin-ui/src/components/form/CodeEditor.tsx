@@ -169,6 +169,7 @@ export const CodeEditor = ({
                         search(query: string): Promise<any[]>;
                         searchVector(field: string, vector: number[], limit?: number): Promise<any[]>;
                         getVector(id: number | string): Promise<any[]>;
+                        instantSearch(query: string, limit?: number): Promise<Array<{id: number, score: number, snippet: any}>>;
                     }
 
                     interface UsersAPI {
@@ -208,7 +209,11 @@ export const CodeEditor = ({
                     declare const $db: {
                         records: {
                             list(ctx: string | null, col: string, opts: any): Promise<any>;
-                            // ... other low level methods
+                            create(ctx: string | null, col: string, data: any): Promise<any>;
+                            update(ctx: string | null, col: string, id: number, data: any): Promise<any>;
+                            delete(ctx: string | null, col: string, id: number): Promise<any>;
+                            get(ctx: string | null, col: string, id: number): Promise<any>;
+                            search(ctx: string | null, col: string, query: string): Promise<any>;
                         };
                         query(ctx: string | null, q: any): Promise<any>;
                     };

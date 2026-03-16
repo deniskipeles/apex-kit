@@ -1594,7 +1594,7 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
 // ROUTER
 // =========================================================
 fn make_api_router() -> Router<AppState> {
-    let upload_limit_mb = std::env::var("UPLOAD_LIMIT")
+    let upload_limit_mb = std::env::var("FILE_UPLOAD_LIMIT")
         .ok().and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(10);
 
@@ -1603,8 +1603,12 @@ fn make_api_router() -> Router<AppState> {
         .route("/auth/register", post(auth_advanced::register))
         .route("/auth/roles", get(auth_advanced::list_roles_handler))
         .route("/auth/me", get(auth_advanced::get_me)) 
+        // Github Auth Routes
         .route("/auth/github", get(auth_advanced::github_login))
         .route("/auth/github/callback", get(auth_advanced::github_callback))
+        // Google Auth Routes
+        .route("/auth/google", get(auth_advanced::google_login))
+        .route("/auth/google/callback", get(auth_advanced::google_callback))
         .route("/auth/verify", get(auth_advanced::verify_email))
         .route("/auth/verify/resend", post(auth_advanced::resend_verification))
         .route("/collections", post(collections_and_records_routes::create_collection).get(collections_and_records_routes::list_collections))

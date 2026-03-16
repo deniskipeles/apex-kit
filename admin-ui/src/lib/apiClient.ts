@@ -641,7 +641,7 @@ export const apiClient = {
   },
 
   scripts: {
-    list: async (): Promise<any> => {
+    list: async (): Promise<{ local: Script[], shared: Script[], root_total: Number, transparency_enabled: Boolean }> => {
       const res = await pb.scripts.list();
       
       // Fallback for older server versions returning array directly

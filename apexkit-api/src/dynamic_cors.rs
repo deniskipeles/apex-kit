@@ -40,8 +40,11 @@ pub async fn cors_middleware(
 
     if let Some(origin) = origin_header {
         if let Ok(origin_str) = origin.to_str() {
+            // if config.cors_allow_all {
+            //     allow_origin_val = Some(HeaderValue::from_static("*"));
             if config.cors_allow_all {
-                allow_origin_val = Some(HeaderValue::from_static("*"));
+                allow_origin_val = Some(origin.clone());
+                allow_credentials = true;
             } else {
                 let allowed_list: Vec<&str> = config.cors_origins.split(',').map(|s| s.trim()).collect();
                 

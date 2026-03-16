@@ -5,13 +5,25 @@ use axum::{
 use serde::{Deserialize};
 use serde_json::{json, Value};
 use apexkit_core::{auth::Claims, models::{Template, CreateTemplateReq}};
-use crate::{AppState, AppError, DatabaseConnection}; // [FIX] Added DatabaseConnection
+use crate::{AppState, AppError, DatabaseConnection};
+use utoipa::IntoParams;
 
 // DTO for Updates
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateTemplateReq {
     pub content: String,
     pub script_id: Option<i64>,
+}
+
+// --- Path Structs for Nested Routes ---
+#[derive(Deserialize, IntoParams)]
+pub struct IdPath {
+    pub id: i64,
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct NamePath {
+    pub name: String, // Can be "1" (ID) or "posts" (Name)
 }
 
 // --- CRUD HANDLERS ---
@@ -71,13 +83,13 @@ pub async fn update_template(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection, // [FIX] Use contextual DB
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(path): Path<IdPath>,
     Json(payload): Json<UpdateTemplateReq>
 ) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
     
     // [FIX] Use db
-    db.update_template(id, payload.content, payload.script_id).await
+    db.update_template(path.id, payload.content, payload.script_id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
     
     {

@@ -26,7 +26,9 @@ export const TemplateEditor = ({ isOpen, onClose, onSave, initialData }: Templat
   useEffect(() => {
     if (initialData) setFormData(initialData);
     // Load scripts for dropdown
-    scriptsService.list().then(setScripts);
+    scriptsService.list().then((res)=>{
+        setScripts(res.local);
+    });
   }, [initialData, isOpen]);
 
   const handleSave = async () => {
@@ -67,7 +69,7 @@ export const TemplateEditor = ({ isOpen, onClose, onSave, initialData }: Templat
                         onChange={(e: any) => setFormData({...formData, script_id: e.target.value || null})}
                     >
                         <option value="">-- None --</option>
-                        {scripts.map(s => (
+                        {scripts?.map(s => (
                             <option key={s.id} value={s.id}>{s.name}</option>
                         ))}
                     </Select>
