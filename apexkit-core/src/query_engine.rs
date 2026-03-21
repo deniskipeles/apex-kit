@@ -27,6 +27,9 @@ pub struct ApexQuery {
     // Rust Layer (Post-Processing)
     #[serde(default)]
     pub pipeline: Vec<PipelineStep>,
+    // [NEW] Internal RLS
+    #[serde(skip)]
+    pub rls_sql: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -133,65 +136,24 @@ impl QueryBuilder {
 
         // 3. Build WHERE
         let mut where_sql = where_prefix;
+        
+        // --- INJECT ROW LEVEL SECURITY ---
+        if !is_system {
+             if let Some(rls) = &query.rls_sql {
+                 where_sql.push_str(&format!(" AND ({})", rls));
+             }
+        }
+        
         if let Some(filter_json) = &query.r#where {
             let node = FilterNode::parse(filter_json);
             
             if let Some((sql, p)) = node.to_sql() {
-                // HACK: FilterNode generates JSON accessors ("data ->>").
-                // If this is a system table, we need to strip those out to refer to raw columns.
-                // e.g. "data ->> 'status' = 'active'" becomes "status = 'active'"
-                // This is a rough heuristic but works for standard system tables.
-                let final_sql = if is_system {
-                    sql.replace("data ->> ", "")
-                       .replace("data -> ", "")
-                       .replace("'", "") // Remove quotes around column names if FilterNode added them (it usually doesn't for field names)
-                       // FilterNode might produce: data ->> 'status'
-                       // We want: status
+                // Ensure we append properly
+                if where_sql.is_empty() || where_sql == "WHERE 1=1" {
+                     where_sql = format!("WHERE {}", sql); // Edge case overwrite
                 } else {
-                    sql.clone()
-                };
-                
-                // Better System Table Handling:
-                // We should really update FilterNode to accept a "mode" but for now, 
-                // string replacement is the safest non-invasive patch.
-                // We handle the specific case of: data ->> 'col_name' -> col_name
-                
-                let _cleaned_sql = if is_system {
-                     // Regex replacement would be better, but simple replace covers 90%
-                     final_sql.replace("data ->> '", "").replace("'", "") 
-                     // Wait, this might break string values. 
-                     // Let's rely on the user passing simple filters for system tables
-                     // or fix FilterNode later. The above string replace is risky for values.
-                     // SAFEST FIX: Only strip the prefix, assume field name matches column.
-                     // FilterNode output: data ->> 'field' op ?
-                     // We want: field op ?
-                     
-                     // NOTE: FilterNode uses `format_json_column` internally. We can't change that easily without editing filter.rs
-                     // So we do a targeted replace.
-                } else {
-                    final_sql
-                };
-
-                // Actually, let's just push the raw SQL if it's a user collection. 
-                // For system tables, the `FilterNode` logic is fundamentally JSON-oriented.
-                // If you need robust system filtering, use `filter.rs` updates.
-                // For this snippet, I will apply the raw SQL and hope the user knows 
-                // _tenants doesn't have a `data` column, so standard filters might fail 
-                // unless we implement the `is_system` logic inside `filter.rs`.
-                
-                // TEMPORARY FIX: Just append. Real fix requires filter.rs update.
-                where_sql.push_str(" AND ");
-                
-                if is_system {
-                     // Attempt to clean up the JSON accessors for system columns
-                     // Matches: data ->> 'any_word'
-                     let re = regex::Regex::new(r"data ->> '(\w+)'").unwrap();
-                     let cleaned = re.replace_all(&sql, "$1");
-                     where_sql.push_str(&cleaned);
-                } else {
-                     where_sql.push_str(&sql);
+                     where_sql.push_str(&format!(" AND ({})", sql));
                 }
-                
                 params.extend(p);
             }
         }

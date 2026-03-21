@@ -122,7 +122,8 @@ pub async fn export_data_handler(
         sort: params.sort,
         filter: params.filter,
         expand: None,
-        fields: None
+        fields: None,
+        rls_sql: None,
     };
     
     // 2. Fetch All Records from Tenant DB

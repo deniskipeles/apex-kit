@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/apex/apex-kit/apexkit-api/src/storage.rs ===========================
 use axum::{
     extract::{Multipart, State, Path, Query},
     response::{Response},
@@ -10,6 +9,9 @@ use serde::{Serialize, Deserialize};
 use utoipa::{ToSchema, IntoParams};
 use std::io::Cursor;
 use image::imageops::FilterType;
+use image::codecs::jpeg::JpegEncoder;
+use image::codecs::avif::AvifEncoder;
+use image::ImageEncoder;
 use std::sync::Arc;
 use tokio::sync::RwLock; 
 use crate::{trigger_void_hook, extract_log_meta};
@@ -46,6 +48,8 @@ pub struct FileListQuery {
 #[derive(Deserialize, IntoParams)]
 pub struct FileParams {
     pub thumb: Option<String>,
+    pub format: Option<String>,
+    pub quality: Option<u8>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -114,7 +118,9 @@ impl DynamicStorage {
             let cache = self.backend_cache.read().await;
             let time = self.last_update.read().await;
             if let Some(backend) = cache.as_ref() {
-                if time.elapsed() < std::time::Duration::from_secs(60) { return Ok(backend.clone()); }
+                if time.elapsed() < std::time::Duration::from_secs(60) { 
+                    return Ok(backend.clone()); 
+                }
             }
         }
 
@@ -122,15 +128,29 @@ impl DynamicStorage {
         let mut time_write = self.last_update.write().await;
 
         let settings_json = self.db.get_config("storage").await?;
-        let config: StorageConfigDto = if let Some(val) = settings_json { serde_json::from_value(val).unwrap_or_default() } else { StorageConfigDto::default() };
+        let config: StorageConfigDto = if let Some(val) = settings_json { 
+            serde_json::from_value(val).unwrap_or_default() 
+        } else { 
+            StorageConfigDto::default() 
+        };
 
         let backend: Arc<dyn StorageBackend> = if config.active_driver == "s3" && config.s3.enabled {
             let secret_key = if let Some(encrypted_str) = config.s3.secret_key {
                 let enc: EncryptedValue = serde_json::from_str(&encrypted_str)?;
                 self.vault.decrypt(&enc)?
-            } else { String::new() };
+            } else { 
+                String::new() 
+            };
 
-            Arc::new(S3Storage::new_with_creds(&config.s3.bucket, &config.s3.region, &config.s3.endpoint, &self.get_public_url_base(), &config.s3.access_key, &secret_key, "").await)
+            Arc::new(S3Storage::new_with_creds(
+                &config.s3.bucket, 
+                &config.s3.region, 
+                &config.s3.endpoint, 
+                &self.get_public_url_base(), 
+                &config.s3.access_key, 
+                &secret_key, 
+                ""
+            ).await)
         } else {
             let path = self.fs_root_override.clone().unwrap_or_else(|| "./storage/system/uploads".to_string());
             Arc::new(LocalStorage::new(&path, &self.get_public_url_base()).await)
@@ -138,6 +158,7 @@ impl DynamicStorage {
 
         *cache_write = Some(backend.clone());
         *time_write = std::time::Instant::now();
+        
         Ok(backend)
     }
 }
@@ -152,7 +173,6 @@ impl StorageBackend for DynamicStorage {
     fn get_public_url_base(&self) -> String { self.public_url_prefix.clone().unwrap_or_else(|| "/api/v1/storage/file/".to_string()) }
 }
 
-// --- SCOPED DYNAMIC STORAGE (The Reseller Logic) ---
 // --- SCOPED DYNAMIC STORAGE ---
 pub struct ScopedDynamicStorage {
     state: AppState,
@@ -164,14 +184,9 @@ impl ScopedDynamicStorage {
         Self { state, scope }
     }
 
-    // Helper to increment usage counters
     async fn track_op(&self, op_type: &str) {
         if let EventScope::Tenant(tenant_id) = &self.scope {
-            // Key format: "usage:tenant_id:s3_get" or "usage:tenant_id:s3_put"
             let key = format!("usage:{}:{}", tenant_id, op_type);
-            
-            // We use the root script cache as a high-performance in-memory counter
-            // This avoids hitting the database on every single file download
             let current = self.state.root_script_cache.get(&key).await
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(0);
@@ -181,8 +196,6 @@ impl ScopedDynamicStorage {
     }
 
     async fn resolve(&self) -> Result<(Arc<dyn StorageBackend>, bool), Box<dyn std::error::Error + Send + Sync>> {
-        // Returns (Backend, IsResellerMode)
-        
         let db = match &self.scope {
             EventScope::Root => return Ok((Arc::new(DynamicStorage::new(self.state.db.clone(), self.state.vault.clone(), None, "/api/v1/storage/file/".to_string())), false)),
             EventScope::Tenant(id) => self.state.tenant_manager.get_tenant(id.clone()).await.map_err(|e| e.to_string())?,
@@ -196,12 +209,10 @@ impl ScopedDynamicStorage {
              _ => "/api/v1/storage/file/".to_string(),
         };
 
-        // 1. Check Tenant Config
         let tenant_settings = db.get_config("storage").await?;
         if let Some(val) = tenant_settings {
             let tenant_config: StorageConfigDto = serde_json::from_value(val).unwrap_or_default();
             if tenant_config.active_driver == "s3" && tenant_config.s3.enabled {
-                 // Tenant BYOS (Bring Your Own Storage) - NOT Reseller
                  let secret_key = if let Some(enc_str) = tenant_config.s3.secret_key {
                      let enc: EncryptedValue = serde_json::from_str(&enc_str)?;
                      self.state.vault.decrypt(&enc)?
@@ -212,12 +223,10 @@ impl ScopedDynamicStorage {
             }
         }
 
-        // 2. Check Root Config (Reseller)
         let root_settings = self.state.db.get_config("storage").await?;
         if let Some(val) = root_settings {
             let root_config: StorageConfigDto = serde_json::from_value(val).unwrap_or_default();
             if root_config.active_driver == "s3" && root_config.s3.enabled {
-                 // Reseller Mode Active!
                  let secret_key = if let Some(enc_str) = root_config.s3.secret_key {
                      let enc: EncryptedValue = serde_json::from_str(&enc_str)?;
                      self.state.vault.decrypt(&enc)?
@@ -230,7 +239,7 @@ impl ScopedDynamicStorage {
                  };
 
                  let s3 = S3Storage::new_with_creds(&root_config.s3.bucket, &root_config.s3.region, &root_config.s3.endpoint, &url_prefix, &root_config.s3.access_key, &secret_key, &isolation_prefix).await;
-                 return Ok((Arc::new(s3), true)); // TRUE = Is Reseller
+                 return Ok((Arc::new(s3), true));
             }
         }
 
@@ -247,27 +256,37 @@ impl ScopedDynamicStorage {
 impl StorageBackend for ScopedDynamicStorage {
     async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
         let (backend, is_reseller) = self.resolve().await?;
-        if is_reseller { self.track_op("s3_put").await; } // Count Upload
+        if is_reseller { self.track_op("s3_put").await; } 
         backend.save(name, data, mime).await 
     }
 
     async fn get(&self, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { 
-        let (active, is_reseller) = self.resolve().await?;
+        let (backend, is_reseller) = self.resolve().await?;
         
-        match active.get(name).await {
+        match backend.get(name).await {
             Ok(data) => {
-                if is_reseller { self.track_op("s3_get").await; } // Count Download
+                if is_reseller { self.track_op("s3_get").await; }
                 Ok(data)
             },
-            Err(_) => {
-                // Fallback Logic
-                let fs_root = match &self.scope {
-                     EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
-                     EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
-                     _ => "./storage/system/uploads".to_string(),
-                };
-                let local = LocalStorage::new(&fs_root, "/").await;
-                local.get(name).await
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                let is_not_found = err_str.contains("NoSuchKey") || err_str.contains("404");
+
+                if is_not_found {
+                    tracing::warn!("File '{}' not found on S3. Attempting Local Fallback...", name);
+                    
+                    let fs_root = match &self.scope {
+                        EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
+                        EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
+                        _ => "./storage/system/uploads".to_string(),
+                    };
+                    
+                    let local = LocalStorage::new(&fs_root, "/").await;
+                    return local.get(name).await;
+                }
+                
+                tracing::error!("S3 Storage CRITICAL ERROR for {}: {}", name, e);
+                Err(e)
             }
         }
     }
@@ -294,7 +313,6 @@ impl StorageBackend for ScopedDynamicStorage {
     
     async fn get_signed_url(&self, name: &str, ttl: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
         let (backend, is_reseller) = self.resolve().await?;
-        // Signed URL generation effectively grants access to download, so we count it as a GET
         if is_reseller { self.track_op("s3_get").await; } 
         backend.get_signed_url(name, ttl).await 
     }
@@ -342,7 +360,6 @@ pub async fn test_s3_connection(auth: Option<Extension<Claims>>, DatabaseConnect
 
     let final_region = if region.is_empty() { "auto".to_string() } else { region };
     
-    // Test uses NO prefix
     let s3 = S3Storage::new_with_creds(&bucket, &final_region, &endpoint, "", &access_key, &raw_secret_key, "").await;
 
     let filename = ".apexkit_test_connectivity";
@@ -380,8 +397,6 @@ pub async fn migrate_storage(auth: Option<Extension<Claims>>, DatabaseConnection
                      state.vault.decrypt(&enc).map_err(|_| AppError::UnknownError("Decrypt fail".into()))?
                 } else { raw_secret.clone() };
                 
-                // Migrate uses NO prefix (usually for root, or we might need to handle tenant loop later)
-                // For now, this migrates ROOT storage.
                 let s3 = futures::executor::block_on(S3Storage::new_with_creds(&config.s3.bucket, &config.s3.region, &config.s3.endpoint, "", &config.s3.access_key, &secret_key, ""));
                 Ok(Arc::new(s3))
             },
@@ -484,7 +499,18 @@ pub async fn serve_file(
     if path.filename.contains("..") { return Err(AppError::Forbidden("Invalid path".into())); }
     let clean_filename = path.filename.trim_start_matches('/');
 
-    let original_bytes = storage.get(clean_filename).await.map_err(|_| AppError::NotFound("File not found".into()))?;
+    let mut original_bytes = storage.get(clean_filename).await;
+
+    if original_bytes.is_err() {
+        tracing::warn!("Primary storage failed for '{}'. Attempting Root Local Fallback...", clean_filename);
+        let root_local = LocalStorage::new("./storage/system/uploads", "/").await;
+        original_bytes = root_local.get(clean_filename).await;
+    }
+
+    let data = original_bytes.map_err(|e| {
+        tracing::error!("Storage failure for {}: {}", clean_filename, e);
+        AppError::NotFound("File not found".into())
+    })?;
     
     let mime_type = if clean_filename.ends_with(".m4s") { "video/iso.segment".to_string() } 
     else if clean_filename.ends_with(".mpd") { "application/dash+xml".to_string() } 
@@ -492,7 +518,7 @@ pub async fn serve_file(
     else if clean_filename.ends_with(".ts") { "video/mp2t".to_string() } 
     else { mime_guess::from_path(clean_filename).first_or_octet_stream().to_string() };
 
-    process_image(&state, original_bytes, &mime_type, clean_filename.to_string(), params.thumb).await
+    process_image(&state, data, &mime_type, clean_filename.to_string(), params.thumb, params.format, params.quality).await
 }
 
 // --- HANDLER: List Files ---
@@ -536,44 +562,115 @@ pub async fn delete_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// --- HELPER: Centralized Image Resizing Logic ---
-async fn process_image(state: &AppState, original_bytes: Vec<u8>, mime_type: &str, cache_key: String, dim_str: Option<String>) -> Result<Response, AppError> {
+// --- HELPER: Centralized Image Processing ---
+// --- HELPER: Centralized Image Processing ---
+async fn process_image(
+    state: &AppState, 
+    original_bytes: Vec<u8>, 
+    original_mime: &str, 
+    cache_key: String, 
+    dim_str: Option<String>,
+    req_format: Option<String>,
+    req_quality: Option<u8>
+) -> Result<Response, AppError> {
     let cache_header_val = "public, max-age=31536000, immutable";
     let etag = format!("\"{:x}\"", md5::compute(&original_bytes)); 
 
-    if dim_str.is_none() || mime_type.contains("svg") {
-         return Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, cache_header_val).header(header::ETAG, etag).body(Body::from(original_bytes)).unwrap());
+    if (dim_str.is_none() && req_format.is_none() && req_quality.is_none()) || original_mime.contains("svg") {
+         return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, original_mime)
+            .header(header::CACHE_CONTROL, cache_header_val)
+            .header(header::ETAG, etag)
+            .body(Body::from(original_bytes))
+            .unwrap());
     }
 
-    let dim = dim_str.unwrap();
-    let full_cache_key = format!("{}_{}", cache_key, dim);
+    // Default to 80 quality for good web balance
+    let quality = req_quality.unwrap_or(80).clamp(1, 100);
+
+    let (target_format, target_mime) = match req_format.as_deref().unwrap_or("").to_lowercase().as_str() {
+        "webp" => (image::ImageFormat::WebP, "image/webp"),
+        "jpg" | "jpeg" => (image::ImageFormat::Jpeg, "image/jpeg"),
+        "png" => (image::ImageFormat::Png, "image/png"),
+        "avif" => (image::ImageFormat::Avif, "image/avif"),
+        "gif" => (image::ImageFormat::Gif, "image/gif"),
+        _ => (image::ImageFormat::from_mime_type(original_mime).unwrap_or(image::ImageFormat::Png), original_mime)
+    };
+
+    let dim_part = dim_str.as_deref().unwrap_or("orig");
+    let fmt_part = target_mime.split('/').last().unwrap_or("bin");
+    let full_cache_key = format!("{}_{}_{}_q{}", cache_key, dim_part, fmt_part, quality);
 
     if let Some(cached_bytes) = state.thumb_cache.get(&full_cache_key).await {
         let thumb_etag = format!("\"{:x}\"", md5::compute(cached_bytes.as_ref()));
-        return Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, cache_header_val).header(header::ETAG, thumb_etag).body(Body::from(cached_bytes.as_ref().clone())).unwrap());
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, target_mime)
+            .header(header::CACHE_CONTROL, cache_header_val)
+            .header(header::ETAG, thumb_etag)
+            .body(Body::from(cached_bytes.as_ref().clone()))
+            .unwrap());
     }
 
-    let (w, h) = parse_dimensions(&dim).unwrap_or((0, 0));
-    if w == 0 && h == 0 { return Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, "public, max-age=3600").body(Body::from(original_bytes)).unwrap()); }
-
-    let format = image::ImageFormat::from_mime_type(mime_type).unwrap_or(image::ImageFormat::Png);
+    let (w, h) = if let Some(d) = &dim_str { parse_dimensions(d).unwrap_or((0, 0)) } else { (0, 0) };
     let bytes_for_processing = original_bytes.clone();
-
-    let img_result = tokio::task::spawn_blocking(move || { image::load_from_memory(&bytes_for_processing) }).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    
+    let img_result = tokio::task::spawn_blocking(move || { 
+        image::load_from_memory(&bytes_for_processing) 
+    }).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     match img_result {
         Ok(img) => {
-            let target_w = if w == 0 { u32::MAX } else { w };
-            let target_h = if h == 0 { u32::MAX } else { h };
-            let scaled = img.resize(target_w, target_h, FilterType::Lanczos3);
+            let processed_img = if w > 0 || h > 0 {
+                let target_w = if w == 0 { u32::MAX } else { w };
+                let target_h = if h == 0 { u32::MAX } else { h };
+                // Triangle filter is much faster than Lanczos3 and perfectly fine for downscaling on the web
+                img.resize(target_w, target_h, FilterType::Triangle)
+            } else {
+                img
+            };
+
             let mut buffer = Cursor::new(Vec::new());
-            if let Err(_) = scaled.write_to(&mut buffer, format) { return Err(AppError::UnknownError("Image encoding failed".into())); }
+            let encoding_success = match target_format {
+                image::ImageFormat::Jpeg => JpegEncoder::new_with_quality(&mut buffer, quality).encode_image(&processed_img).is_ok(),
+                image::ImageFormat::Avif => AvifEncoder::new_with_speed_quality(&mut buffer, 8, quality).write_image(processed_img.as_bytes(), processed_img.width(), processed_img.height(), processed_img.color()).is_ok(),
+                _ => processed_img.write_to(&mut buffer, target_format).is_ok(),
+            };
+
+            if !encoding_success {
+                tracing::warn!("Image encoding to {} failed. Serving original.", target_mime);
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, original_mime)
+                    .header(header::CACHE_CONTROL, cache_header_val)
+                    .header(header::ETAG, etag)
+                    .body(Body::from(original_bytes))
+                    .unwrap());
+            }
+            
             let thumb_bytes = buffer.into_inner();
             state.thumb_cache.insert(full_cache_key, Arc::new(thumb_bytes.clone())).await;
+            
             let thumb_etag = format!("\"{:x}\"", md5::compute(&thumb_bytes));
-            Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, cache_header_val).header(header::ETAG, thumb_etag).body(Body::from(thumb_bytes)).unwrap())
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, target_mime)
+                .header(header::CACHE_CONTROL, cache_header_val)
+                .header(header::ETAG, thumb_etag)
+                .body(Body::from(thumb_bytes))
+                .unwrap())
         },
-        Err(_) => { Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime_type).header(header::CACHE_CONTROL, cache_header_val).header(header::ETAG, etag).body(Body::from(original_bytes)).unwrap()) }
+        Err(e) => { 
+            tracing::warn!("Failed to load image for processing: {}. Serving original.", e);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, original_mime)
+                .header(header::CACHE_CONTROL, cache_header_val)
+                .header(header::ETAG, etag)
+                .body(Body::from(original_bytes))
+                .unwrap()) 
+        }
     }
 }
 
@@ -585,11 +682,18 @@ pub async fn serve_app_logo(DatabaseConnection(db): DatabaseConnection, StorageC
         if let Some(logo_filename) = val.get("app_logo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             match storage.get(logo_filename).await {
                 Ok(b) => { let m = mime_guess::from_path(logo_filename).first_or_octet_stream(); (b, m.to_string(), logo_filename.to_string()) },
-                Err(_) => get_default_logo()?
+                Err(_) => {
+                    let root_local = LocalStorage::new("./storage/system/uploads", "/").await;
+                    match root_local.get(logo_filename).await {
+                         Ok(b) => { let m = mime_guess::from_path(logo_filename).first_or_octet_stream(); (b, m.to_string(), logo_filename.to_string()) },
+                         Err(_) => get_default_logo()?
+                    }
+                }
             }
         } else { get_default_logo()? }
     } else { get_default_logo()? };
-    process_image(&state, bytes, &mime, format!("logo_{}", cache_key_base), params.thumb).await
+    
+    process_image(&state, bytes, &mime, format!("logo_{}", cache_key_base), params.thumb, params.format, params.quality).await
 }
 
 fn get_default_logo() -> Result<(Vec<u8>, String, String), AppError> {

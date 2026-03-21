@@ -38,6 +38,13 @@ pub struct RecordVectorPath {
     pub record_id: i64,    // Record ID
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct ImageVectorSearchReq {
+    /// Base64 encoded image (data:image/png;base64,...)
+    pub image_data: String,
+    pub limit: Option<usize>,
+}
+
 //  Handler: Get Vector
 #[utoipa::path(
     get,
@@ -232,7 +239,7 @@ pub async fn revectorize_collection_handler(
     trigger_void_hook(&state, "on_vectorization_start", serde_json::json!({ "collection_id": collection.id }), Some(&claims),  Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     let current_tenant = crate::get_tenant_id_from_scope(scope.as_ref().map(|e| &e.0));
-    let current_model = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+    let current_model = crate::get_current_model();
 
     let schema = collection.schema.clone().unwrap_or_default();
     
@@ -281,10 +288,11 @@ pub async fn revectorize_collection_handler(
 
                 let job = Job::GenerateEmbedding {
                     tenant_id: current_tenant.clone(),
-                    collection_id: collection.id, // [FIX] Use collection.id
+                    collection_id: collection.id, 
                     record_id,
                     field_name: field_name.clone(),
-                    text_content: text_content.to_string(),
+                    content: text_content.to_string(), 
+                    content_type: "text".to_string(),
                     model: current_model.clone()
                 };
                 state.queue.enqueue(job).await;
@@ -299,4 +307,74 @@ pub async fn revectorize_collection_handler(
         "skipped": skipped,
         "mode": if options.force { "hard (overwrite)" } else { "soft (skip existing)" }
     })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/collections/{id}/search-image-vector",
+    request_body = ImageVectorSearchReq,
+    params(IdPath),
+    responses((status = 200, body = Vec<RecordResponse>))
+)]
+pub async fn query_image_vector_search(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection, 
+    State(state): State<AppState>,
+    Path(path): Path<IdPath>, 
+    Json(payload): Json<ImageVectorSearchReq>,
+) -> Result<Json<Vec<RecordResponse>>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    
+    let collection = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    
+    let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+    if !apexkit_core::policies::check_access(policy, claims.as_ref(), None) {
+        return Err(AppError::Forbidden("Search denied".into()));
+    }
+
+    // 1. Generate Vector from Uploaded Image
+    let query_vector = state.vector_provider.embed_image(&payload.image_data).await
+        .map_err(|e| AppError::UnknownError(format!("Image Embedding failed: {}", e)))?;
+        
+    let limit = payload.limit.unwrap_or(10).min(100);
+
+    // 2. Identify all vectorizable FILE fields
+    // We only want to search against fields that are actually images/files to compare apples to apples
+    let vectorizable_fields: Vec<String> = collection.schema.as_ref().unwrap_or(&Default::default()).fields.iter()
+        .filter(|(_, def)| def.vectorize && def.r#type == apexkit_core::schema::FieldType::File)
+        .map(|(name, _)| name.clone())
+        .collect();
+        
+    if vectorizable_fields.is_empty() {
+         return Err(AppError::NotFound("No vectorizable File fields found for this collection.".into()));
+    }
+    
+    // 3. Perform Search for each field and aggregate scores
+    let mut record_scores: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
+
+    for field_name in vectorizable_fields {
+        let records = db.search_vector(collection.id, &field_name, query_vector.clone(), limit).await
+            .map_err(|e| AppError::UnknownError(format!("Vector search failed for {}: {}", field_name, e)))?;
+
+        for rec in records {
+             *record_scores.entry(rec.id).or_insert(0.0) += 1.0; 
+        }
+    }
+    
+    // 4. Sort and Fetch (Same logic as text search)
+    let mut sorted_records_tuples: Vec<(i64, f32)> = record_scores.iter().map(|(&k, &v)| (k, v)).collect();
+    sorted_records_tuples.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    
+    let top_ids: Vec<i64> = sorted_records_tuples.iter().take(limit).map(|(id, _)| *id).collect();
+
+    let mut records = db.get_records_by_ids(collection.id, &top_ids).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    records.sort_by(|a, b| {
+        let score_a = record_scores.get(&a.id).unwrap_or(&0.0);
+        let score_b = record_scores.get(&b.id).unwrap_or(&0.0);
+        score_b.partial_cmp(score_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(Json(records.into_iter().map(|r| RecordResponse { id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated }).collect()))
 }

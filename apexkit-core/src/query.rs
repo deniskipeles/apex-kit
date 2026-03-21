@@ -16,6 +16,8 @@ pub struct QueryOptions {
     // Comma-separated list of fields to include/exclude
     // e.g. "title,created,author.name" or "-internal_meta"
     pub fields: Option<String>,
+    #[serde(skip)]
+    pub rls_sql: Option<String>,
 }
 
 impl Default for QueryOptions {
@@ -29,6 +31,7 @@ impl Default for QueryOptions {
             limit: None,
             offset: None,
             fields: None,
+            rls_sql: None,
         }
     }
 }
@@ -72,6 +75,12 @@ impl SqlBuilder {
 
         let mut where_clause = "WHERE collection_id = ?".to_string();
 
+        // --- ROW-LEVEL SECURITY PUSHDOWN ---
+        if let Some(rls) = options.rls_sql {
+             where_clause.push_str(&format!(" AND ({})", rls));
+        }
+
+        // --- FILTER ---
         if let Some(filter_str) = options.filter {
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&filter_str) {
                 let filter_node = FilterNode::parse(&json_val);

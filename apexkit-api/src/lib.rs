@@ -1485,7 +1485,12 @@ pub async fn get_versions_handler() -> Json<AppVersions> {
 
 // Helpers for helpers
 pub fn get_current_model() -> String {
-    std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string())
+    let model = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+    if model == "custom" {
+        std::env::var("APEX_VECTOR_CUSTOM_REPO").unwrap_or("custom".to_string())
+    } else {
+        model
+    }
 }
 pub fn get_tenant_id_from_scope(scope: Option<&EventScope>) -> Option<String> {
     match scope {
@@ -1621,6 +1626,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/collections/{id}/instant-search", get(collections_and_records_routes::instant_search_handler))
         .route("/collections/{id}/search-vector", post(vector_routes::search_vector))
         .route("/collections/{id}/search-text-vector", post(vector_routes::query_vector_search))
+        .route("/collections/{id}/search-image-vector", post(vector_routes::query_image_vector_search))
         .route("/collections/{id}/get-vector/{record_id}", get(vector_routes::get_record_vector)) 
         .route("/collections/{id}/records/{record_id}/relations", post(collections_and_records_routes::create_relation).delete(collections_and_records_routes::delete_relation))
         .route("/storage/upload", post(storage::upload_file))

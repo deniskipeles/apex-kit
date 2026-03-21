@@ -80,6 +80,7 @@ pub struct ListResult {
 #[async_trait]
 pub trait VectorProvider: Send + Sync {
     async fn embed(&self, text: &str) -> std::result::Result<Vec<f32>, String>;
+    async fn embed_image(&self, base64_image: &str) -> std::result::Result<Vec<f32>, String>;
     async fn search(&self, col_id: i64, field: &str, vec: &[f32], limit: usize) -> std::result::Result<Vec<(i64, f32)>, String>;
     async fn index(&self, col_id: i64, rec_id: i64, field: &str, vec: &[f32]) -> std::result::Result<(), String>;
 }
@@ -1239,7 +1240,6 @@ impl Db for ApexKit {
 
     // [OPTIMIZED] Bypass Mutex. Use fresh connection for READ checks. Writes go to batcher.
     async fn create_record(&self, collection_id: i64, data: &Value) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        // Transient connection for Reads (Schema check, Uniqueness check)
         let conn = self.data_db.connect()?; 
         
         let col = {
@@ -1250,10 +1250,18 @@ impl Db for ApexKit {
         }.ok_or("Collection not found")?;
 
         let schema = col.schema.unwrap_or_default();
-        let json_str = serde_json::to_string(data)?;
+        
+        // --- CORE SANITIZATION & VALIDATION ---
+        let mut sanitized_data = data.clone();
+        if let Err(errors) = crate::validation::sanitize_and_validate(&schema, &mut sanitized_data) {
+            let err_json = serde_json::to_string(&errors).unwrap();
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Schema Validation Failed: {}", err_json))));
+        }
+
+        let json_str = serde_json::to_string(&sanitized_data)?;
 
         // READ Check
-        enforce_uniqueness(&conn, collection_id, None, data, &schema).await?;
+        enforce_uniqueness(&conn, collection_id, None, &sanitized_data, &schema).await?;
 
         // WRITE (Async Batcher)
         let record_id = self.data_batcher.insert(
@@ -1261,11 +1269,8 @@ impl Db for ApexKit {
             vec![collection_id.into(), json_str.into()]
         ).await?;
         
-        // Writes
-        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, data, &schema);
-        
-        // READ + Write (using transient conn for reads)
-        let relation_future = self.sync_relations(&conn, collection_id, record_id, data);
+        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, &sanitized_data, &schema);
+        let relation_future = self.sync_relations(&conn, collection_id, record_id, &sanitized_data);
 
         tokio::try_join!(unique_future, relation_future)?;
         
@@ -1293,6 +1298,12 @@ impl Db for ApexKit {
             if let Some(new_obj) = data.as_object() {
                 for (k, v) in new_obj { obj.insert(k.clone(), v.clone()); }
             }
+        }
+        
+        // --- CORE SANITIZATION & VALIDATION ---
+        if let Err(errors) = crate::validation::sanitize_and_validate(&schema, &mut merged_data) {
+            let err_json = serde_json::to_string(&errors).unwrap();
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Schema Validation Failed: {}", err_json))));
         }
         
         let json_str = serde_json::to_string(&merged_data)?;

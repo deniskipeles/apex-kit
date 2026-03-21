@@ -4,39 +4,30 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Candle (Pure Rust ML)
-candle-core = "0.5.1"
-candle-nn = "0.5.1"
-candle-transformers = "0.5.1"
-tokenizers = "0.19.1"
-# Disable default features for hf-hub to control TLS
-hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq"] }
-# Note: hf-hub might not allow granular control of ureq features easily. 
-# If this fails, we might need to rely on the global rustls override or use "native-tls" if supported.
-# Let's try switching hf-hub to "native-tls" if possible? 
-# hf-hub 0.3 supports "native-tls" via ureq? No, ureq is rustls only usually.
-# Let's stick to the plan: Disable aws-lc.
+candle-core = "0.9.2"
+candle-nn = "0.9.2"
+candle-transformers = "0.9.2"
 
-# Force ring
+safetensors = "0.4"
+memmap2 = "0.9"
+
+tokenizers = "0.21.0"
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
-# Vector Search
 hnsw_rs = "0.3"
-
-# Utils
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.117"
 anyhow = "1.0"
 tokio = { version = "1.37.0", features = ["full"] }
 tracing = "0.1"
 
-
-# Explicitly pin rand to match candle-core
-rand = "0.8.5"
-
-# [NEW] For smart HTML -> Text conversion (preserves Code blocks)
+rand = "0.8"
 html2text = "0.6"
+image = "0.24"
+base64 = "0.21"
 
-# FIX: Force half to 2.3.1 to prevent it from pulling rand 0.9
-# We enable the "rand" feature so it implements traits for rand 0.8
-half = { version = "=2.3.1", features = ["rand_distr", "std"] }
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]

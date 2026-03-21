@@ -17,6 +17,39 @@ pub enum ValidationError {
     ConstraintViolation(String, String),
 }
 
+/// Sanitizes data (type coercion) AND validates it against the schema
+pub fn sanitize_and_validate(
+    schema: &CollectionSchema,
+    data: &mut Value,
+) -> Result<(), Vec<ValidationError>> {
+    
+    // 1. Sanitize / Coerce Types
+    if let Some(map) = data.as_object_mut() {
+        for (field_name, field_def) in &schema.fields {
+            if let Some(val) = map.get_mut(field_name) {
+                // If the field is Owner or Relation, force it to be an Integer
+                if field_def.r#type == FieldType::Owner || field_def.r#type == FieldType::Relation {
+                    if let Some(str_val) = val.as_str() {
+                        if let Ok(num) = str_val.parse::<i64>() {
+                            *val = serde_json::json!(num);
+                        }
+                    }
+                }
+                
+                // Remove empty strings for nullable numbers/relations to avoid type errors
+                if val.as_str().map(|s| s.trim().is_empty()).unwrap_or(false) {
+                    if field_def.r#type == FieldType::Number || field_def.r#type == FieldType::Relation || field_def.r#type == FieldType::Owner || field_def.r#type == FieldType::Date {
+                        *val = Value::Null;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Validate
+    validate_record(schema, data)
+}
+
 pub fn validate_record(
     schema: &CollectionSchema,
     data: &Value,
@@ -33,17 +66,15 @@ pub fn validate_record(
     for (field_name, field_def) in &schema.fields {
         let value = data_map.get(field_name);
 
-        // 1. Required Check
         if value.is_none() || value.unwrap().is_null() {
             if field_def.required {
                 errors.push(ValidationError::MissingRequiredField(field_name.clone()));
             }
-            continue; // Skip further checks if null (unless required)
+            continue; 
         }
 
         let val = value.unwrap();
 
-        // 2. Type & Constraint Check
         if let Err(msg) = validate_field_type(val, field_def) {
             errors.push(ValidationError::InvalidType(field_name.clone(), format!("{:?} ({})", field_def.r#type, msg)));
         } else if let Err(msg) = validate_constraints(val, field_def) {
@@ -51,11 +82,7 @@ pub fn validate_record(
         }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
 fn validate_field_type(val: &Value, def: &crate::schema::FieldDefinition) -> Result<(), String> {
@@ -63,10 +90,7 @@ fn validate_field_type(val: &Value, def: &crate::schema::FieldDefinition) -> Res
         FieldType::String | FieldType::Text | FieldType::File => {
             if !val.is_string() { return Err("Expected String".into()); }
         },
-        FieldType::Relation | FieldType::Owner => {
-            if !val.is_number() { return Err("Expected Number".into()); }
-        },
-        FieldType::Number => {
+        FieldType::Relation | FieldType::Owner | FieldType::Number => {
             if !val.is_number() { return Err("Expected Number".into()); }
         },
         FieldType::Boolean => {
@@ -77,7 +101,6 @@ fn validate_field_type(val: &Value, def: &crate::schema::FieldDefinition) -> Res
         },
         FieldType::Email => {
             let s = val.as_str().ok_or("Expected String")?;
-            // Basic regex for email
             let re = Regex::new(r"^[\w\-\.]+@([\w-]+\.)+[\w-]{2,4}$").unwrap();
             if !re.is_match(s) { return Err("Invalid Email Format".into()); }
         },
@@ -97,70 +120,44 @@ fn validate_field_type(val: &Value, def: &crate::schema::FieldDefinition) -> Res
         },
         FieldType::Vector => {
             let arr = val.as_array().ok_or("Expected Array of Numbers")?;
-            // Check elements are numbers
-            for item in arr {
-                if !item.is_number() { return Err("Vector must contain numbers".into()); }
-            }
-            // Check Dimension
+            for item in arr { if !item.is_number() { return Err("Vector must contain numbers".into()); } }
             if let Some(dim) = def.dimension {
                 if arr.len() != dim { return Err(format!("Vector dimension mismatch. Expected {}, got {}", dim, arr.len())); }
             }
         },
         FieldType::Blob => {
             let s = val.as_str().ok_or("Expected Base64 String")?;
-            // FIX: Use engine to decode
             if STANDARD.decode(s).is_err() { return Err("Invalid Base64 Data".into()); }
         },
         FieldType::GeoPoint => {
-            // Expect object: { "lat": f64, "lng": f64 }
             if let Some(obj) = val.as_object() {
                 let lat = obj.get("lat").and_then(|v| v.as_f64());
                 let lng = obj.get("lng").or_else(|| obj.get("lon")).and_then(|v| v.as_f64());
-                
-                if lat.is_none() || lng.is_none() {
-                    return Err("GeoPoint must have 'lat' and 'lng' (or 'lon') numbers".into());
-                }
-                
-                let lat_val = lat.unwrap();
-                let lng_val = lng.unwrap();
-                
+                if lat.is_none() || lng.is_none() { return Err("GeoPoint must have 'lat' and 'lng' numbers".into()); }
+                let (lat_val, lng_val) = (lat.unwrap(), lng.unwrap());
                 if lat_val < -90.0 || lat_val > 90.0 { return Err("Latitude must be between -90 and 90".into()); }
                 if lng_val < -180.0 || lng_val > 180.0 { return Err("Longitude must be between -180 and 180".into()); }
-            } else {
-                return Err("GeoPoint must be a JSON object".into());
-            }
+            } else { return Err("GeoPoint must be a JSON object".into()); }
         },
-        // _ => {} // Fallback for types not explicitly checked above if needed
     }
     Ok(())
 }
 
 fn validate_constraints(val: &Value, def: &crate::schema::FieldDefinition) -> Result<(), String> {
-    // Number Constraints
     if let Some(n) = val.as_f64() {
-        if let Some(min) = def.min {
-            if n < min { return Err(format!("Value {} is less than min {}", n, min)); }
-        }
-        if let Some(max) = def.max {
-            if n > max { return Err(format!("Value {} is greater than max {}", n, max)); }
-        }
+        if let Some(min) = def.min { if n < min { return Err(format!("Value {} is less than min {}", n, min)); } }
+        if let Some(max) = def.max { if n > max { return Err(format!("Value {} is greater than max {}", n, max)); } }
     }
 
-    // String/Array Length Constraints
     let len = if let Some(s) = val.as_str() { Some(s.len()) }
               else if let Some(a) = val.as_array() { Some(a.len()) }
               else { None };
 
     if let Some(l) = len {
-        if let Some(min) = def.min_length {
-            if l < min { return Err(format!("Length {} is less than min {}", l, min)); }
-        }
-        if let Some(max) = def.max_length {
-            if l > max { return Err(format!("Length {} is greater than max {}", l, max)); }
-        }
+        if let Some(min) = def.min_length { if l < min { return Err(format!("Length {} is less than min {}", l, min)); } }
+        if let Some(max) = def.max_length { if l > max { return Err(format!("Length {} is greater than max {}", l, max)); } }
     }
 
-    // Regex Pattern (String only)
     if let Some(s) = val.as_str() {
         if let Some(pat) = &def.pattern {
             if let Ok(re) = Regex::new(pat) {
@@ -168,6 +165,5 @@ fn validate_constraints(val: &Value, def: &crate::schema::FieldDefinition) -> Re
             }
         }
     }
-
     Ok(())
 }

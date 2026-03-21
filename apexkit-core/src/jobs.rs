@@ -20,7 +20,8 @@ pub enum Job {
         collection_id: i64, 
         record_id: i64, 
         field_name: String, 
-        text_content: String,
+        content: String,       // Either text, Base64 image (data:image/...), or a filename
+        content_type: String,  // "text" or "file"
         model: String,
     },
 
@@ -105,9 +106,37 @@ pub fn start_background_worker(
                     }
 
                     // --- Vector Generation ---
-                    Job::GenerateEmbedding { tenant_id, collection_id, record_id, field_name, text_content, model } => {
+                    Job::GenerateEmbedding { tenant_id, collection_id, record_id, field_name, content, content_type, model } => {
                         if let Some((db, vector_provider)) = resolver.resolve(tenant_id.as_deref()).await {
-                            match vector_provider.embed(&text_content).await {
+                            let vec_res = if content_type == "file" {
+                                // Resolve path based on tenant
+                                let fs_root = match tenant_id.as_deref() {
+                                    Some(id) if id.starts_with("session_") => format!("storage/sandboxes/{}/uploads", id),
+                                    Some(id) => format!("storage/tenants/{}/uploads", id),
+                                    None => "./storage/system/uploads".to_string(),
+                                };
+                                
+                                let file_path = std::path::Path::new(&fs_root).join(&content);
+                                
+                                if let Ok(bytes) = tokio::fs::read(&file_path).await {
+                                    let ext = file_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                    if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
+                                        use base64::{Engine as _, engine::general_purpose::STANDARD};
+                                        let b64 = STANDARD.encode(&bytes);
+                                        vector_provider.embed_image(&b64).await
+                                    } else {
+                                        Err("Only image files are currently supported for vectorization.".into())
+                                    }
+                                } else {
+                                    Err(format!("File {} not found on disk for vectorization.", content))
+                                }
+                            } else if content.starts_with("data:image/") {
+                                vector_provider.embed_image(&content).await
+                            } else {
+                                vector_provider.embed(&content).await
+                            };
+
+                            match vec_res {
                                 Ok(vec) => {
                                     if let Err(e) = vector_provider.index(collection_id, record_id, &field_name, &vec).await {
                                         eprintln!("[Job] Failed to index vector: {}", e);
@@ -115,6 +144,7 @@ pub fn start_background_worker(
                                     if let Err(e) = db.save_vector(collection_id, record_id, &field_name, vec, &model).await {
                                         eprintln!("[Job] Failed to persist vector: {}", e);
                                     }
+                                    println!("[Job] Successfully vectorized {} for record {}", field_name, record_id);
                                 },
                                 Err(e) => {
                                     eprintln!("[Job] Failed to generate embedding: {}", e);

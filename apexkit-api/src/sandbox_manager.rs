@@ -47,9 +47,20 @@ impl VectorProvider for SandboxVectorProvider {
         if let Some(embedder) = &self.embedder {
             let embedder = embedder.clone();
             let t = text.to_string();
-            // Offload heavy compute to blocking thread
             tokio::task::spawn_blocking(move || {
                 embedder.embed(&t).map_err(|e| e.to_string())
+            }).await.map_err(|e| e.to_string())?
+        } else {
+            Err("Vector AI is disabled (Embedder not initialized)".to_string())
+        }
+    }
+
+    async fn embed_image(&self, base64_image: &str) -> Result<Vec<f32>, String> {
+        if let Some(embedder) = &self.embedder {
+            let embedder = embedder.clone();
+            let img = base64_image.to_string();
+            tokio::task::spawn_blocking(move || {
+                embedder.embed_image(&img).map_err(|e| e.to_string())
             }).await.map_err(|e| e.to_string())?
         } else {
             Err("Vector AI is disabled (Embedder not initialized)".to_string())
@@ -397,7 +408,7 @@ impl SandboxManager {
         // E. Hydrate Vector Index from Disk
         let db_clone = db_arc.clone();
         let vec_prov_clone = vec_provider.clone();
-        let active_model = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+        let active_model = crate::get_current_model();
         
         // FIX: Create an owned String to move into the 'static background task
         let session_id_str = session_id.to_string();

@@ -41,9 +41,16 @@ impl VectorProvider for ApexBridge {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
         let engine = self.engine.clone();
         let text = text.to_string();
-        // Offload blocking Candle task to a blocking thread to avoid freezing the Async runtime
         tokio::task::spawn_blocking(move || {
             engine.embedder.embed(&text).map_err(|e| e.to_string())
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    async fn embed_image(&self, base64_image: &str) -> Result<Vec<f32>, String> {
+        let engine = self.engine.clone();
+        let image = base64_image.to_string();
+        tokio::task::spawn_blocking(move || {
+            engine.embedder.embed_image(&image).map_err(|e| e.to_string())
         }).await.map_err(|e| e.to_string())?
     }
 
@@ -57,13 +64,14 @@ impl VectorProvider for ApexBridge {
     }
 }
 
-// --- 2. Define Fallback (No AI) ---
-// Used if Candle/Models fail to load (e.g. missing files)
 struct FallbackVectorProvider;
 
 #[async_trait::async_trait]
 impl VectorProvider for FallbackVectorProvider {
     async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+        Err("Vector Engine failed to initialize. Check server logs.".to_string())
+    }
+    async fn embed_image(&self, _image: &str) -> Result<Vec<f32>, String> {
         Err("Vector Engine failed to initialize. Check server logs.".to_string())
     }
     async fn search(&self, _c: i64, _f: &str, _v: &[f32], _l: usize) -> Result<Vec<(i64, f32)>, String> {
@@ -119,16 +127,32 @@ async fn main() {
     tracing::info!("Initializing Apex Vector Engine...");
     
     // Configurable Model via Env Var
-    let active_model_name = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+    let active_model_name = apexkit_api::get_current_model();
     
     let model_config = match active_model_name.as_str() {
         "bge-small" => EmbeddingModelConfig::bge_small_en_v1_5(),
         "bge-base" => EmbeddingModelConfig::bge_base_en_v1_5(),
         "gte-small" => EmbeddingModelConfig::gte_small(),
-        _ => EmbeddingModelConfig::default(), // Default: all-MiniLM-L6-v2
+        // "qwen3-0.6b" => EmbeddingModelConfig::qwen3_embedding_0_6b(),
+        // "gemma-300m" => EmbeddingModelConfig::embedding_gemma_300m(),
+        
+        "custom" => EmbeddingModelConfig::custom(
+            std::env::var("APEX_VECTOR_CUSTOM_REPO").unwrap_or("sentence-transformers/all-MiniLM-L6-v2".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_REV").unwrap_or("main".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_CONFIG").unwrap_or("config.json".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_TOKENIZER").unwrap_or("tokenizer.json".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_WEIGHTS").unwrap_or("model.safetensors".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
+            std::env::var("APEX_VECTOR_CUSTOM_OVERLAP").ok().and_then(|v| v.parse().ok()).unwrap_or(128),
+        ),
+        _ => EmbeddingModelConfig::default(),
     };
 
-    tracing::info!("Active Vector Model: {}", active_model_name);
+    tracing::info!("Active Vector Model: {} (Context: {}, Overlap: {})", 
+        active_model_name, 
+        model_config.window_size, 
+        model_config.overlap
+    );
 
     // We split this so we can pass the specific `CandleEmbedder` struct to TenantManager
     // but pass the generic `dyn VectorProvider` trait to the AppState/DB.
@@ -218,7 +242,7 @@ async fn main() {
         root_db: cached_db.clone(),
         root_vector_provider: vector_provider.clone(),
         tenant_manager: tenant_manager.clone(),
-        sandbox_manager: sandbox_manager.clone(), // <--- PASS IT
+        sandbox_manager: sandbox_manager.clone(),
     });
 
     // Start Worker

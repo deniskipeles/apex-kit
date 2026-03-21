@@ -28,6 +28,18 @@ impl VectorProvider for TenantVectorProvider {
         }
     }
 
+    async fn embed_image(&self, base64_image: &str) -> Result<Vec<f32>, String> {
+        if let Some(embedder) = &self.embedder {
+            let embedder = embedder.clone();
+            let img = base64_image.to_string();
+            tokio::task::spawn_blocking(move || {
+                embedder.embed_image(&img).map_err(|e| e.to_string())
+            }).await.map_err(|e| e.to_string())?
+        } else {
+            Err("Vector AI is disabled (Embedder not initialized)".to_string())
+        }
+    }
+
     async fn search(&self, col: i64, f: &str, v: &[f32], l: usize) -> Result<Vec<(i64, f32)>, String> {
         Ok(self.index.search(col, f, v, l))
     }
@@ -172,7 +184,7 @@ impl TenantManager {
         // 3. Hydrate Vectors (Background)
         let db_clone = db_arc.clone();
         let vec_provider_clone = tenant_vector_provider.clone();
-        let active_model = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+        let active_model = crate::get_current_model();
         
         tokio::spawn(async move {
             if let Ok(cols) = db_clone.list_collections().await {

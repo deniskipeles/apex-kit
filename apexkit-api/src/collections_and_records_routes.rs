@@ -228,18 +228,27 @@ pub async fn list_records(
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     
     let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) { return Err(AppError::Forbidden("Read denied".into())); }
+    
+    // Compile Policy to SQL
+    let rls_sql = policies::compile_to_sql(policy, claims.as_ref())
+        .map_err(|e| AppError::UnknownError(format!("Policy Compilation Failed: {}", e)))?;
 
-    // [FIX 1] Use trigger_hooks for BEFORE hook
-    // It takes a `data` reference, so we pass a reference to our query options JSON
+    // Block table-level rejections early
+    if rls_sql == "1=0" {
+        return Err(AppError::Forbidden("Read denied".into())); 
+    }
+
     let query_json = json!(q);
-    let modified_q = match trigger_hooks(&state, "before_list_records", &col, None, &query_json, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? {
-        Some(modified_json) => serde_json::from_value(modified_json).unwrap_or(q),
-        None => q,
+    let mut modified_q: QueryOptions = match trigger_hooks(&state, "before_list_records", &col, None, &query_json, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? {
+        Some(modified_json) => serde_json::from_value(modified_json).unwrap_or(q.clone()),
+        None => q.clone(),
     };
 
+    // Inject RLS SQL into the final query
+    modified_q.rls_sql = Some(rls_sql);
+
     let res = db.list_records(col.id, modified_q.clone()).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
+
     let mut response_data = RecordListResponse{ items: res.items.into_iter().map(|r| RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}).collect(), total: res.total };
 
     // [FIX 2] Use trigger_hooks for AFTER hook
@@ -413,10 +422,23 @@ pub async fn create_record(
     if let Some(schema) = col.schema {
         let current_tenant = get_tenant_id_from_scope(Some(&event_scope)); 
         let model_name = get_current_model();
+        
         for (field_name, def) in &schema.fields {
             if def.vectorize {
-                if let Some(text_val) = data_to_save.get(field_name).and_then(|v| v.as_str()) {
-                    let job = Job::GenerateEmbedding { collection_id: col.id, record_id: rid, tenant_id: current_tenant.clone(), field_name: field_name.clone(), text_content: text_val.to_string(), model: model_name.clone() };
+                if let Some(content_val) = data_to_save.get(field_name).and_then(|v| v.as_str()) {
+                    
+                    // Determine if this field is a File reference or raw Text
+                    let c_type = if def.r#type == FieldType::File { "file" } else { "text" };
+
+                    let job = Job::GenerateEmbedding { 
+                        tenant_id: current_tenant.clone(),
+                        collection_id: col.id, 
+                        record_id: rid, 
+                        field_name: field_name.clone(), 
+                        content: content_val.to_string(), 
+                        content_type: c_type.to_string(),
+                        model: model_name.clone() 
+                    };
                     state.queue.enqueue(job).await;
                 }
             }
@@ -454,7 +476,13 @@ pub async fn update_record(
     
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
 
-    let data_updates = match trigger_hooks(&state, "before_update_record", &col, Some(path.record_id), &p.data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { Some(d) => d, None => p.data };
+    // Create a clone for the hook so we don't move the original p.data
+    let hook_data = p.data.clone();
+    
+    let data_updates = match trigger_hooks(&state, "before_update_record", &col, Some(path.record_id), &hook_data, claims.as_ref(), Some(base_url.clone()), Some(&event_scope.clone())).await? { 
+        Some(d) => d, 
+        None => p.data 
+    };
     
     let r = db.update_record(col.id, path.record_id, &data_updates).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
@@ -465,6 +493,32 @@ pub async fn update_record(
     let _ = state.tx.send(DbEvent::Update { collection_id: col.id, record_id: path.record_id, data: r.data.clone(), scope: event_scope.clone() });
     let _ = trigger_hooks(&state, "after_update_record", &col, Some(path.record_id), &r.data, claims.as_ref(), Some(base_url), Some(&event_scope.clone())).await;
     
+    if let Some(schema) = col.schema {
+        let current_tenant = get_tenant_id_from_scope(Some(&event_scope)); 
+        let model_name = get_current_model();
+        
+        for (field_name, def) in &schema.fields {
+            if def.vectorize {
+                // Use data_updates which is the final payload being sent to DB
+                if let Some(content_val) = data_updates.get(field_name).and_then(|v| v.as_str()) {
+                    
+                    let c_type = if def.r#type == FieldType::File { "file" } else { "text" };
+
+                    let job = Job::GenerateEmbedding { 
+                        tenant_id: current_tenant.clone(),
+                        collection_id: col.id, 
+                        record_id: path.record_id, 
+                        field_name: field_name.clone(), 
+                        content: content_val.to_string(), 
+                        content_type: c_type.to_string(),
+                        model: model_name.clone() 
+                    };
+                    state.queue.enqueue(job).await;
+                }
+            }
+        }
+    }
+
     Ok(Json(RecordResponse{id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated}))
 }
 
@@ -540,31 +594,31 @@ pub async fn query_records_handler(
     Json(payload): Json<AdvancedQueryRequest>
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = auth.map(|Extension(c)| c);
-    
-    // 1. Resolve Collection
     let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
 
-    // 2. Check Permissions
     let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) { 
+    
+    // Compile Policy to SQL
+    let rls_sql = policies::compile_to_sql(policy, claims.as_ref())
+        .map_err(|e| AppError::UnknownError(format!("Policy Compilation Failed: {}", e)))?;
+
+    if rls_sql == "1=0" {
         return Err(AppError::Forbidden("Read denied".into())); 
     }
 
-    // 3. Construct ApexQuery
     let query = ApexQuery {
-        from: col.name.clone(), // Force 'from' to match URL path ID
+        from: col.name.clone(),
         select: payload.select.map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default()).unwrap_or_default(),
         r#where: payload.filter,
         group_by: payload.group_by.unwrap_or_default(),
         sort: payload.sort,
         limit: payload.limit,
         offset: payload.offset,
-        system: payload.system.expect("REASON"),
+        system: payload.system.unwrap_or(false),
         pipeline: payload.pipeline.map(|v| serde_json::from_value(serde_json::Value::Array(v)).unwrap_or_default()).unwrap_or_default(),
+        rls_sql: Some(rls_sql), // INJECT RLS
     };
 
-    // 4. Execute Engine
-    // Note: Hooks are skipped for raw engine queries currently to avoid type mismatch complexity
     let result = db.query_engine(query).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 

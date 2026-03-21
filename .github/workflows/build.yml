@@ -1,4 +1,4 @@
-name: Build ApexKit
+name: Build and Publish ApexKit
 
 on:
   push:
@@ -41,7 +41,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mingw-w64 musl-tools nasm perl cmake
 
-      # [OPTIMIZATION] Cache Node.js modules
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -65,15 +64,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # [OPTIMIZATION] Smart cache for Rust dependencies and build artifacts
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          # Create a separate cache for Linux vs Windows builds to avoid conflicts
           shared-key: "v1-${{ matrix.target }}"
 
-      # [OPTIMIZATION] Install via pip (pre-compiled binary) instead of cargo install (source compile)
-      # This saves ~2-3 minutes per build.
       - name: Install cargo-zigbuild
         run: |
           sudo pip install ziglang cargo-zigbuild
@@ -97,27 +92,72 @@ jobs:
           path: dist/*
           retention-days: 1
 
-  publish:
-    name: Create GitHub Release
+  publish_to_public:
+    name: Publish to Public Repo
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      # 1. Checkout the PRIVATE repo to grab Dockerfile and README
+      - name: Checkout Private Repo
+        uses: actions/checkout@v4
+        with:
+          path: private-repo
+
+      # 2. Checkout the PUBLIC repo to push files
+      # CHANGE 'deniskipeles/apex-kit' to your exact public repository name
+      - name: Checkout Public Repo
+        uses: actions/checkout@v4
+        with:
+          repository: deniskipeles/apex-kit
+          token: ${{ secrets.PUBLIC_REPO_PAT }}
+          path: public-repo
+
+      # 3. Download binaries from the build job
       - name: Download all binaries
         uses: actions/download-artifact@v4
         with:
           path: all-binaries
           merge-multiple: true
 
+      # 4. Generate Checksums
       - name: Generate Checksums
         run: |
           cd all-binaries
           sha256sum * > checksums.txt
           cat checksums.txt
 
-      - name: Create Release
+      # 5. Sync Dockerfile and README to Public Repo
+      - name: Update Public Repo Files
+        run: |
+          # Copy files from private to public workspace
+          cp private-repo/Dockerfile public-repo/ 2>/dev/null || :
+          cp private-repo/README.md public-repo/ 2>/dev/null || :
+          
+          cd public-repo
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          
+          # Add copied files
+          git add Dockerfile README.md
+          
+          # Commit only if there are changes
+          git diff --quiet && git diff --staged --quiet || git commit -m "Sync Dockerfile and README for release ${{ github.ref_name }}"
+          git push origin main
+          
+          # Create the tag on the public repo so the release attaches correctly
+          git tag ${{ github.ref_name }} || true
+          git push origin ${{ github.ref_name }} || true
+
+      # 6. Create the Release on the PUBLIC Repo using the PAT
+      # CHANGE 'deniskipeles/apex-kit' to your exact public repository name
+      - name: Create Release on Public Repo
         uses: softprops/action-gh-release@v1
         with:
+          repository: deniskipeles/apex-kit
+          token: ${{ secrets.PUBLIC_REPO_PAT }}
           files: all-binaries/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false

@@ -76,7 +76,7 @@ serde_qs = "0.13" # To parse query strings/form data for scripts
 
 chrono = { version = "0.4", features = ["serde"] }
 # Image processing and Caching
-image = "0.24" # For image resizing
+image = { version = "0.24", features = ["avif-encoder", "webp-encoder", "jpeg", "png", "gif"] }
 moka = { version = "0.12", features = ["future"] } # High performance cache
 md5 = "0.7"
 
@@ -92,6 +92,11 @@ walkdir = "2.4"
 [dev-dependencies]
 assert-json-diff = "2.0.2"
 hyper = "1.8.1"
+
+[features]
+default = []
+cuda = ["apex-vector/cuda"]
+metal = ["apex-vector/metal"]
 
 # Profile optimizations for release
 [profile.release]
