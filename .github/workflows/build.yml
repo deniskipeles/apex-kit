@@ -105,11 +105,11 @@ jobs:
           path: private-repo
 
       # 2. Checkout the PUBLIC repo to push files
-      # CHANGE 'deniskipeles/apex-kit' to your exact public repository name
+      # CHANGE 'deniskipeles/apexkit' to your exact public repository name
       - name: Checkout Public Repo
         uses: actions/checkout@v4
         with:
-          repository: deniskipeles/apex-kit
+          repository: deniskipeles/apexkit
           token: ${{ secrets.PUBLIC_REPO_PAT }}
           path: public-repo
 
@@ -150,11 +150,11 @@ jobs:
           git push origin ${{ github.ref_name }} || true
 
       # 6. Create the Release on the PUBLIC Repo using the PAT
-      # CHANGE 'deniskipeles/apex-kit' to your exact public repository name
+      # CHANGE 'deniskipeles/apexkit' to your exact public repository name
       - name: Create Release on Public Repo
         uses: softprops/action-gh-release@v1
         with:
-          repository: deniskipeles/apex-kit
+          repository: deniskipeles/apexkit
           token: ${{ secrets.PUBLIC_REPO_PAT }}
           files: all-binaries/*
           tag_name: ${{ github.ref_name }}

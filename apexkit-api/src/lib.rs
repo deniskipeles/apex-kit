@@ -79,6 +79,7 @@ pub mod backup_routes;
 pub mod key_routes;
 pub mod site_routes;
 pub mod collections_and_records_routes;
+pub mod replication;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -147,7 +148,7 @@ pub struct UserDto {
 
 #[derive(Debug)]
 pub enum AppError {
-    LibsqlError(libsql::Error),
+    RusqliteError(rusqlite::Error),
     JsonError(String),
     UnknownError(String),
     NotFound(String),
@@ -159,6 +160,7 @@ pub enum AppError {
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{:?}", self) }
 }
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, msg, details) = match self {
@@ -168,7 +170,7 @@ impl IntoResponse for AppError {
             AppError::Validation(v) => (StatusCode::UNPROCESSABLE_ENTITY, "Schema Validation Failed".into(), Some(serde_json::json!(v))),
             AppError::InputValidation(v) => (StatusCode::BAD_REQUEST, "Input Validation Failed".into(), Some(serde_json::json!(v))),
             AppError::JsonError(m) => (StatusCode::BAD_REQUEST, m, None),
-            AppError::LibsqlError(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Database Error: {}", e), None),
+            AppError::RusqliteError(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Database Error: {}", e), None),
             AppError::UnknownError(m) => (StatusCode::INTERNAL_SERVER_ERROR, m, None),
         };
         

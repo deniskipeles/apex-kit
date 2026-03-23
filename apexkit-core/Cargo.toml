@@ -6,7 +6,8 @@ license = "MIT"
 
 [dependencies]
 # Database
-libsql = { version = "0.9.29", features = ["replication"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "hooks", "serde_json", "blob"] }
+# serde_sqlite_jsonb = "0.2.1" # Zero-copy JSONB wrapper
 
 # Async & Runtime
 tokio = { version = "1.37.0", features = ["full"] }

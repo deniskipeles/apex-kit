@@ -155,24 +155,27 @@ impl TenantManager {
     }
 
     async fn load_tenant(&self, tenant_id: &str) -> Result<TenantContext, String> {
+        let base_path = format!("storage/tenants/{}", tenant_id);
+        
+        // [NEW] Check and sync with Master if running as Replica
+        crate::replication::ensure_replica_env(&base_path).await;
+
         // 1. Fetch Status from Root DB (The "One Hit")
         let status = self.root_db.get_tenant_status(tenant_id).await
             .map_err(|e| format!("Failed to fetch status: {}", e))?;
 
-        // If explicitly deleted/not_found in DB, deny load even if files exist
         if status == "not_found" {
              return Err("Tenant not found in registry".into());
         }
 
         // 2. Initialize DB (Standard Logic)
-        let base_path = format!("storage/tenants/{}", tenant_id);
         let vector_index = Arc::new(VectorIndex::new());
         let tenant_vector_provider = Arc::new(TenantVectorProvider {
             embedder: self.shared_embedder.clone(),
             index: vector_index.clone(),
         });
 
-        let mut apexkit = ApexKit::init_filesystem(&base_path, tenant_vector_provider.clone())
+        let mut apexkit = ApexKit::init_filesystem(&base_path, tenant_vector_provider.clone(), None)
             .await.map_err(|e| e.to_string())?;
 
         let search_path = format!("{}/indexes", base_path);

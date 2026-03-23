@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/apex/apex-kit/apexkit-core/src/query_engine.rs ===========================
 use serde::{Deserialize, Serialize};
 use crate::Db;
 use serde_json::{json, Value};
@@ -60,8 +59,8 @@ pub enum PipelineStep {
 pub struct QueryBuilder;
 
 impl QueryBuilder {
-    pub async fn build(query: &ApexQuery, db: &impl Db) -> Result<(String, Vec<libsql::Value>, Vec<PipelineStep>), String> {
-        let mut params: Vec<libsql::Value> = vec![];
+    pub async fn build(query: &ApexQuery, db: &impl Db) -> Result<(String, Vec<rusqlite::types::Value>, Vec<PipelineStep>), String> {
+        let mut params: Vec<rusqlite::types::Value> = vec![];
         let mut select_clauses = Vec::new();
         let mut group_clauses = Vec::new();
 

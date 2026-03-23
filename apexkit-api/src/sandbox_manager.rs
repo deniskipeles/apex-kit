@@ -5,7 +5,6 @@ use std::time::Duration;
 use apexkit_core::{Db, ApexKit, VectorProvider, query::QueryOptions, schema::FieldType};
 use apexkit_core::search::SearchManager;
 use apexkit_core::cache::CachedDb;
-use libsql::Builder;
 use tracing::{info, warn};
 use apex_vector::{CandleEmbedder, VectorIndex};
 use moka::future::Cache;
@@ -149,7 +148,7 @@ impl SandboxManager {
             index: Arc::new(VectorIndex::new()),
         });
         
-        let apexkit = ApexKit::init_filesystem(&base_path, vector_provider).await
+        let apexkit = ApexKit::init_filesystem(&base_path, vector_provider, None).await
             .map_err(|e| format!("Failed to init sandbox filesystem: {}", e))?;
 
         Ok(Arc::new(CachedDb::new(Arc::new(apexkit))))
@@ -364,10 +363,13 @@ impl SandboxManager {
         }
     }
 
-    /// Internal logic to initialize DB connections and Vector Index
     // Internal logic to initialize DB connections and Vector Index
     async fn load_context_from_disk(&self, session_id: &str) -> Result<SandboxContext, String> {
         let sandbox_dir = format!("storage/sandboxes/session_{}", session_id);
+        
+        // [NEW] Check and sync with Master if running as Replica
+        crate::replication::ensure_replica_env(&sandbox_dir).await;
+        
         if !Path::new(&sandbox_dir).exists() {
             return Err("Sandbox expired or not found".into());
         }
@@ -381,20 +383,23 @@ impl SandboxManager {
             index: vector_index.clone(),
         });
 
-        // B. Connect to SQLite Files
-        let core = Builder::new_local(&format!("{}/core.db", sandbox_dir)).build().await.map_err(|e| e.to_string())?;
-        let data = Builder::new_local(&format!("{}/data.db", sandbox_dir)).build().await.map_err(|e| e.to_string())?;
-        let log = Builder::new_local(&format!("{}/logs.db", sandbox_dir)).build().await.map_err(|e| e.to_string())?;
-        let sys = Builder::new_local(&format!("{}/system.db", sandbox_dir)).build().await.map_err(|e| e.to_string())?;
-        let vec = Builder::new_local(&format!("{}/vectors.db", sandbox_dir)).build().await.map_err(|e| e.to_string())?;
+        // B. Connect to SQLite Files (using rusqlite directly)
+        let core = rusqlite::Connection::open(&format!("{}/core.db", sandbox_dir)).map_err(|e| e.to_string())?;
+        let data = rusqlite::Connection::open(&format!("{}/data.db", sandbox_dir)).map_err(|e| e.to_string())?;
+        let log = rusqlite::Connection::open(&format!("{}/logs.db", sandbox_dir)).map_err(|e| e.to_string())?;
+        let sys = rusqlite::Connection::open(&format!("{}/system.db", sandbox_dir)).map_err(|e| e.to_string())?;
+        let vec = rusqlite::Connection::open(&format!("{}/vectors.db", sandbox_dir)).map_err(|e| e.to_string())?;
 
+        // Pass raw connections to ApexKit::new
         let mut apexkit = ApexKit::new(
-            Arc::new(core), 
-            Arc::new(data), 
-            Arc::new(log), 
-            Arc::new(sys), 
-            Arc::new(vec),
-            vec_provider.clone() 
+            &sandbox_dir,
+            core, 
+            data, 
+            log, 
+            sys, 
+            vec,
+            vec_provider.clone(),
+            None,
         );
 
         // C. Setup Tantivy Search
@@ -410,7 +415,6 @@ impl SandboxManager {
         let vec_prov_clone = vec_provider.clone();
         let active_model = crate::get_current_model();
         
-        // FIX: Create an owned String to move into the 'static background task
         let session_id_str = session_id.to_string();
 
         tokio::spawn(async move {

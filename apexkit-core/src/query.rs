@@ -40,7 +40,7 @@ impl Default for QueryOptions {
 pub struct SqlBuilder {
     pub base_sql: String,
     pub count_sql: String,
-    pub params: Vec<libsql::Value>,
+    pub params: Vec<rusqlite::types::Value>,
 }
 
 // Helper for parsing "a.b, c" -> Tree
@@ -70,8 +70,8 @@ impl SqlBuilder {
         schemas: &HashMap<String, CollectionSchema>,
         name_to_id: &HashMap<String, i64>
     ) -> Self {
-        let mut params: Vec<libsql::Value> = vec![];
-        params.push(collection_id.into());
+        let mut params: Vec<rusqlite::types::Value> = vec![];
+        params.push(rusqlite::types::Value::Integer(collection_id));
 
         let mut where_clause = "WHERE collection_id = ?".to_string();
 

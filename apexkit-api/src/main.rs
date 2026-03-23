@@ -29,6 +29,7 @@ use apex_vector::{VectorEngine, CandleEmbedder, EmbeddingModelConfig};
 
 use apexkit_api::tenant_manager::TenantManager;
 use apexkit_api::sandbox_manager::SandboxManager;
+use apexkit_api::replication::{pb::replication_server::ReplicationServer, MasterReplicationService, GrpcWriteForwarder, ensure_replica_env, start_wal_streamer};
 
 // --- 1. Define Bridge (Real AI) ---
 // Bridges the ApexVector engine to the ApexKit Core trait
@@ -123,6 +124,16 @@ async fn main() {
     let builder = PrometheusBuilder::new();
     let handle = builder.install_recorder().expect("failed to install Prometheus recorder");
 
+    // --- REPLICATION TOPOLOGY DETECTION ---
+    let master_url = env::var("APEX_MASTER_URL").ok().filter(|s| !s.is_empty());
+    let is_replica = master_url.is_some();
+
+    let forwarder: Option<Arc<dyn apexkit_core::batching::WriteForwarder>> = if let Some(url) = &master_url {
+        Some(Arc::new(GrpcWriteForwarder { master_url: url.clone() }))
+    } else {
+        None
+    };
+
     // --- 4. Initialize AI Engine (Split Result) ---
     tracing::info!("Initializing Apex Vector Engine...");
     
@@ -168,14 +179,36 @@ async fn main() {
         }
     };
 
+    // Sync Root Databases from Master before opening them!
+    ensure_replica_env("storage/system").await;
     // Pass the provider (Real or Fallback) to the DB
-    let raw_db = match a_new_database_connection(vector_provider.clone()).await {
+    let raw_db = match a_new_database_connection(vector_provider.clone(), forwarder).await {
         Ok(db) => db,
         Err(e) => {
             tracing::error!("Failed to connect to database: {}", e);
             return;
         }
     };
+
+    // --- START REPLICA WAL STREAMER ---
+    if let Some(url) = master_url {
+        // We need to stream the WAL for all DBs that exist in our replicated environment
+        let dbs = vec![
+            "storage/system/core.db", 
+            "storage/system/data.db", 
+            "storage/system/logs.db", 
+            "storage/system/system.db", 
+            "storage/system/vectors.db"
+        ];
+        
+        for db_path in dbs {
+            let u = url.clone();
+            let p = db_path.to_string();
+            tokio::spawn(async move {
+                start_wal_streamer(u, p).await;
+            });
+        }
+    }
 
     let cached_db = Arc::new(CachedDb::new(Arc::new(raw_db)));
 
@@ -353,37 +386,48 @@ async fn main() {
     }
     // --- END CLI EXECUTION ---
 
-    // --- 13. SERVER START ---
+    // --- 13. SERVER START & MULTIPLEXER ---
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(600) // Increased for dashboard usage
+            .per_second(600) 
             .burst_size(1000)
             .finish()
             .unwrap(),
     );
 
-    let app = app_router(state.clone())
-        // Middleware Stack
+    let axum_app = app_router(state.clone())
         .layer(TraceLayer::new_for_http())
-        // Dynamic CORS from DB
         .layer(middleware::from_fn_with_state(state.clone(), apexkit_api::dynamic_cors::cors_middleware)) 
-        // Rate Limiting
         .layer(GovernorLayer::new(governor_conf));
 
     let addr = format!("0.0.0.0:{}", cli.port); 
-
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            tracing::error!("Failed to bind to port {}: {}", cli.port, e);
-            return;
-        }
-    };
+    let listener = TcpListener::bind(&addr).await.unwrap();
     
     tracing::info!("ApexKit listening on {}", listener.local_addr().unwrap());
     
-    if let Err(e) = serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await {
-        tracing::error!("Server error: {}", e);
+    if is_replica {
+        tracing::info!("Running in REPLICA mode. Forwarding writes to Master via gRPC.");
+        // Only serve HTTP on Replicas
+        if let Err(e) = serve(listener, axum_app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await {
+            tracing::error!("Server error: {}", e);
+        }
+    } else {
+        tracing::info!("Running in MASTER mode. Multiplexing HTTP and gRPC.");
+        
+        let grpc_service = ReplicationServer::new(MasterReplicationService);
+        
+        // Use tower::ServiceBuilder to wrap the gRPC service
+        // This is more robust for Tonic + Axum co-existence
+        let grpc_router = axum::Router::new()
+            .route_service("/replication.Replication/SubscribeWal", grpc_service.clone())
+            .route_service("/replication.Replication/ExecuteWrite", grpc_service.clone())
+            .route_service("/replication.Replication/FetchDbSnapshot", grpc_service);
+
+        let app = axum_app.merge(grpc_router);
+        
+        if let Err(e) = axum::serve(listener, app.into_make_service()).await {
+            tracing::error!("Server error: {}", e);
+        }
     }
 }
 

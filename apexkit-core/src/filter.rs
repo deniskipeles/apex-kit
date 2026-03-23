@@ -115,13 +115,13 @@ impl FilterNode {
 
     // --- SQL GENERATION (For Database Queries) ---
     
-    pub fn to_sql(&self) -> Option<(String, Vec<libsql::Value>)> {
+    pub fn to_sql(&self) -> Option<(String, Vec<rusqlite::types::Value>)> {
         let mut params = Vec::new();
         let sql = self.build_sql(&mut params)?;
         Some((sql, params))
     }
 
-    fn build_sql(&self, params: &mut Vec<libsql::Value>) -> Option<String> {
+    fn build_sql(&self, params: &mut Vec<rusqlite::types::Value>) -> Option<String> {
         match self {
             FilterNode::Empty => None,
             FilterNode::Group { op, children } => {
@@ -135,19 +135,18 @@ impl FilterNode {
                 Some(format!("({})", parts.join(joiner)))
             },
             FilterNode::Condition { field, op, value } => {
-                // SQLite JSON Extraction: data ->> 'field' or data -> 'nested' ->> 'field'
                 let column = Self::format_json_column(field);
                 
                 match op {
                     FilterOp::In | FilterOp::Nin => {
                         if let Value::Array(arr) = value {
-                            if arr.is_empty() { return Some("1=0".to_string()); } // In empty list is always false
+                            if arr.is_empty() { return Some("1=0".to_string()); } 
                             let placeholders: Vec<String> = arr.iter().map(|_| "?".to_string()).collect();
                             for v in arr { params.push(json_to_sql_val(v)); }
                             let not = if matches!(op, FilterOp::Nin) { "NOT " } else { "" };
                             Some(format!("{} {}IN ({})", column, not, placeholders.join(",")))
                         } else {
-                            None // Invalid syntax
+                            None 
                         }
                     },
                     _ => {
@@ -159,7 +158,7 @@ impl FilterNode {
                             FilterOp::Lt => "<",
                             FilterOp::Lte => "<=",
                             FilterOp::Like => "LIKE",
-                            FilterOp::Contains => "LIKE", // Simple string contains for SQL
+                            FilterOp::Contains => "LIKE", 
                             _ => "=" 
                         };
                         
@@ -167,7 +166,7 @@ impl FilterNode {
                         
                         if matches!(op, FilterOp::Contains) {
                             if let Value::String(s) = value {
-                                final_val = libsql::Value::Text(format!("%{}%", s));
+                                final_val = rusqlite::types::Value::Text(format!("%{}%", s));
                             }
                         }
 
@@ -257,13 +256,13 @@ impl FilterNode {
 }
 
 // Helpers
-fn json_to_sql_val(v: &Value) -> libsql::Value {
+fn json_to_sql_val(v: &Value) -> rusqlite::types::Value {
     match v {
-        Value::String(s) => s.clone().into(),
-        Value::Number(n) => n.as_f64().unwrap_or(0.0).into(),
-        Value::Bool(b) => if *b { 1 } else { 0 }.into(),
-        Value::Null => libsql::Value::Null,
-        _ => v.to_string().into(),
+        Value::String(s) => rusqlite::types::Value::Text(s.clone()),
+        Value::Number(n) => rusqlite::types::Value::Real(n.as_f64().unwrap_or(0.0)),
+        Value::Bool(b) => rusqlite::types::Value::Integer(if *b { 1 } else { 0 }),
+        Value::Null => rusqlite::types::Value::Null,
+        _ => rusqlite::types::Value::Text(v.to_string()),
     }
 }
 

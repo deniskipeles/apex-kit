@@ -1,0 +1,39 @@
+syntax = "proto3";
+package replication;
+
+service Replication {
+    rpc SubscribeWal (WalRequest) returns (stream WalFrame);
+    rpc ExecuteWrite (WriteRequest) returns (WriteResponse);
+    rpc FetchDbSnapshot (SnapshotRequest) returns (stream FileChunk);
+}
+
+message WalRequest { 
+    string replica_id = 1; 
+    uint64 last_offset = 2; 
+    string db_path = 3; 
+}
+
+message WalFrame { 
+    bytes data = 1; 
+    uint64 new_offset = 2; 
+}
+
+message WriteRequest { 
+    string sql = 1; 
+    bytes params = 2; 
+    string db_path = 3; 
+}
+
+message WriteResponse { 
+    bool success = 1; 
+    int64 insert_id = 2; 
+    string error = 3; 
+}
+
+message SnapshotRequest { 
+    string db_path = 1; 
+}
+
+message FileChunk { 
+    bytes data = 1; 
+}
