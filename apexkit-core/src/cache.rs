@@ -21,20 +21,20 @@ pub struct CachedDb {
 
 impl CachedDb {
     pub fn new(inner: Arc<dyn Db>) -> Self {
+        // [FIX] Detect replica mode to significantly lower TTLs. Read replicas need 
+        // to be highly reactive to the WAL syncing to ensure eventual consistency instantly.
+        let is_replica = std::env::var("APEX_MASTER_URL").is_ok();
         Self {
             inner,
-            // Cache collections for 1 hour, they rarely change
             collection_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(3600))
+                .time_to_live(Duration::from_secs(if is_replica { 5 } else { 3600 }))
                 .build(),
-            // Cache records for 5 minutes (max 10k items)
             record_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(300))
+                .time_to_live(Duration::from_secs(if is_replica { 2 } else { 300 }))
                 .max_capacity(10_000) 
                 .build(),
-            
             template_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(300))
+                .time_to_live(Duration::from_secs(if is_replica { 5 } else { 300 }))
                 .build(),
         }
     }
@@ -572,5 +572,16 @@ impl Db for CachedDb {
         // We can cache analytics queries if desired using (query) as hash key.
         // For now, pass through to raw DB for real-time analytics.
         self.inner.query_engine(query).await
+    }
+
+    async fn reload_connections(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.reload_connections().await?;
+        
+        // Wipe in-memory caches so the API fetches the new SQLite data immediately
+        self.collection_cache.invalidate_all();
+        self.record_cache.invalidate_all();
+        self.template_cache.invalidate_all();
+        
+        Ok(())
     }
 }

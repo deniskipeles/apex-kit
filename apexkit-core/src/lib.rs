@@ -20,6 +20,7 @@ use crate::security::Vault;
 use query_engine::ApexQuery;
 use crate::realtime::EventScope; 
 use crate::storage::StorageBackend;
+use models::{Collection, Record, ListResult, ChangesetEvent};
 
 const COMPOSITE_SEPARATOR: &str = "__::__";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -58,30 +59,6 @@ impl IntoSqlVal for Option<i64> { fn into_val(self) -> rusqlite::types::Value { 
 impl IntoSqlVal for bool { fn into_val(self) -> rusqlite::types::Value { rusqlite::types::Value::Integer(if self { 1 } else { 0 }) } }
 impl IntoSqlVal for Option<bool> { fn into_val(self) -> rusqlite::types::Value { match self { Some(b) => rusqlite::types::Value::Integer(if b { 1 } else { 0 }), None => rusqlite::types::Value::Null } } }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)] 
-pub struct Collection {
-    pub id: i64,
-    pub name: String,
-    pub schema: Option<CollectionSchema>,
-    #[serde(default)] 
-    pub index: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)] 
-pub struct Record {
-    pub id: i64,
-    pub data: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expand: Option<Value>,
-    pub created: String,
-    pub updated: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ListResult {
-    pub items: Vec<Record>,
-    pub total: i64,
-}
 
 #[async_trait]
 pub trait VectorProvider: Send + Sync {
@@ -251,6 +228,9 @@ pub trait Db: Send + Sync {
 
     // QUERY ENGINE
     async fn query_engine(&self, query: ApexQuery) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>;
+
+    // [NEW] Forces SQLite to drop open connections and re-read the physical DB files
+    async fn reload_connections(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 fn row_to_collection(row: &Row) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
@@ -265,16 +245,38 @@ fn row_to_record(row: &Row) -> std::result::Result<Record, Box<dyn std::error::E
     let id = row.get(0)?;
     
     let val_data = row.get_ref(1).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    
+    // OPTIMIZED: If the data is stored in SQLite's native JSONB format (Blob), 
+    // deserialize it directly into a serde_json::Value without converting to a string first.
     let data: serde_json::Value = match val_data {
-        rusqlite::types::ValueRef::Text(s) => serde_json::from_str(std::str::from_utf8(s).unwrap_or("{}"))?,
-        rusqlite::types::ValueRef::Blob(b) => serde_json::from_slice(b).unwrap_or(serde_json::json!({})),
+        rusqlite::types::ValueRef::Blob(b) => {
+             // Directly deserialize from the SQLite JSONB binary slice
+             match serde_sqlite_jsonb::from_slice(b) {
+                 Ok(val) => val,
+                 Err(_) => {
+                     // Fallback: If it's a standard text blob masquerading as a blob, try standard parsing
+                     serde_json::from_slice(b).unwrap_or(serde_json::json!({}))
+                 }
+             }
+        },
+        rusqlite::types::ValueRef::Text(s) => {
+             // Fallback for legacy text data or if the query used `json(data)`
+             serde_json::from_str(std::str::from_utf8(s).unwrap_or("{}"))?
+        },
         _ => serde_json::json!({}),
     };
 
     let expand = if let Ok(val_expand) = row.get_ref(2) {
         match val_expand {
-            rusqlite::types::ValueRef::Text(s) => Some(serde_json::from_str(std::str::from_utf8(s).unwrap_or("{}"))?),
-            rusqlite::types::ValueRef::Blob(b) => Some(serde_json::from_slice(b).unwrap_or(serde_json::json!({}))),
+            rusqlite::types::ValueRef::Blob(b) => {
+                 match serde_sqlite_jsonb::from_slice(b) {
+                     Ok(val) => Some(val),
+                     Err(_) => Some(serde_json::from_slice(b).unwrap_or(serde_json::json!({})))
+                 }
+            },
+            rusqlite::types::ValueRef::Text(s) => {
+                 Some(serde_json::from_str(std::str::from_utf8(s).unwrap_or("{}"))?)
+            },
             _ => None,
         }
     } else {
@@ -290,6 +292,7 @@ fn row_to_record(row: &Row) -> std::result::Result<Record, Box<dyn std::error::E
 // --- The Orchestrator: ApexKit ---
 #[derive(Clone)] 
 pub struct ApexKit {
+    base_path: String,
     hot_conn_core: Arc<Mutex<Connection>>,
     hot_conn_data: Arc<Mutex<Connection>>,
     hot_conn_log: Arc<Mutex<Connection>>,
@@ -312,7 +315,8 @@ struct ExpandableItem<'a> {
 
 pub async fn a_new_database_connection(
     vector_provider: Arc<dyn VectorProvider>,
-    forwarder: Option<Arc<dyn crate::batching::WriteForwarder>>
+    forwarder: Option<Arc<dyn crate::batching::WriteForwarder>>,
+    event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>
 ) -> std::result::Result<ApexKit, Box<dyn std::error::Error + Send + Sync>> {
     
     let base_path = "storage/system";
@@ -347,7 +351,7 @@ pub async fn a_new_database_connection(
     setup_sys(&sys)?;
     setup_vectors(&vec)?;
 
-    let mut instance = ApexKit::new(base_path, core, data, log, sys, vec, vector_provider, forwarder);
+    let mut instance = ApexKit::new(base_path, core, data, log, sys, vec, vector_provider, forwarder, event_tx, "root".to_string());
     
     instance.get_core_read().await.execute_batch("PRAGMA busy_timeout = 5000;")?;
     instance.get_data_read().await.execute_batch("PRAGMA busy_timeout = 5000;")?;
@@ -387,25 +391,25 @@ impl ApexKit {
         sys: Connection, 
         vec: Connection, 
         vector_provider: Arc<dyn VectorProvider>,
-        forwarder: Option<Arc<dyn crate::batching::WriteForwarder>>
+        forwarder: Option<Arc<dyn crate::batching::WriteForwarder>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>, 
+        scope: String 
     ) -> Self {
-        
         let hot_conn_data = Arc::new(Mutex::new(data));
         let hot_conn_log = Arc::new(Mutex::new(log));
         let hot_conn_vec = Arc::new(Mutex::new(vec));
 
-        // Inject the exact db path into the batchers
-        let data_batcher = batching::WriteManager::new(format!("{}/data.db", base_path), hot_conn_data.clone(), forwarder.clone());
-        let log_batcher = batching::WriteManager::new(format!("{}/logs.db", base_path), hot_conn_log.clone(), forwarder.clone());
-        let vector_batcher = batching::WriteManager::new(format!("{}/vectors.db", base_path), hot_conn_vec.clone(), forwarder.clone());
+        let data_batcher = batching::WriteManager::new(format!("{}/data.db", base_path), hot_conn_data.clone(), forwarder.clone(), event_tx.clone(), scope.clone(), "data".to_string());
+        let log_batcher = batching::WriteManager::new(format!("{}/logs.db", base_path), hot_conn_log.clone(), forwarder.clone(), event_tx.clone(), scope.clone(), "logs".to_string());
+        let vector_batcher = batching::WriteManager::new(format!("{}/vectors.db", base_path), hot_conn_vec.clone(), forwarder.clone(), event_tx.clone(), scope.clone(), "vectors".to_string());
 
         Self {
+            base_path: base_path.to_string(),
             hot_conn_core: Arc::new(Mutex::new(core)),
             hot_conn_data,
             hot_conn_log,
             hot_conn_sys: Arc::new(Mutex::new(sys)),
             hot_conn_vec,
-
             vector_provider,
             data_batcher,
             log_batcher,
@@ -415,10 +419,39 @@ impl ApexKit {
         }
     }
 
+    // // Helper to attach the rusqlite update hook
+    // fn attach_hook(conn: &Connection, scope: &str, db_name: &str, tx: tokio::sync::broadcast::Sender<SqliteEvent>) {
+    //     let s = scope.to_string();
+    //     let db = db_name.to_string();
+        
+    //     let _ = conn.update_hook(Some(move |action: Action, _db: &str, table: &str, row_id: i64| {
+    //         // Ignore noisy internal SQLite tables
+    //         if table.starts_with("sqlite_") { return; }
+
+    //         let act_str = match action {
+    //             Action::SQLITE_INSERT => "INSERT",
+    //             Action::SQLITE_UPDATE => "UPDATE",
+    //             Action::SQLITE_DELETE => "DELETE",
+    //             _ => "UNKNOWN",
+    //         };
+            
+    //         let _ = tx.send(SqliteEvent {
+    //             scope: s.clone(),
+    //             db_name: db.clone(),
+    //             table_name: table.to_string(),
+    //             record_id: row_id,
+    //             action: act_str.to_string(),
+    //         });
+    //     }));
+    // }
+
+    // Update init_filesystem signature too
     pub async fn init_filesystem(
         base_path: &str, 
         vector_provider: Arc<dyn VectorProvider>,
-        forwarder: Option<Arc<dyn crate::batching::WriteForwarder>>
+        forwarder: Option<Arc<dyn crate::batching::WriteForwarder>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>, // <--- NEW
+        scope: String // <--- NEW
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         
         if !Path::new(base_path).exists() {
@@ -443,7 +476,7 @@ impl ApexKit {
         setup_sys(&sys)?;
         setup_vectors(&vec)?;
 
-        let instance = Self::new(base_path, core, data, log, sys, vec, vector_provider, forwarder);
+        let instance = Self::new(base_path, core, data, log, sys, vec, vector_provider, forwarder, event_tx, scope);
 
         instance.get_core_read().await.execute_batch("PRAGMA busy_timeout = 5000;")?;
         instance.get_data_read().await.execute_batch("PRAGMA busy_timeout = 5000;")?;
@@ -483,12 +516,27 @@ impl ApexKit {
                     vec![collection_id.into_val(), record_id.into_val(), rel_name.clone().into_val()]
                 ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
 
-                let target_rec_id = match val {
-                    Value::String(s) => s.parse::<i64>().unwrap_or(0),
-                    Value::Number(n) => n.as_i64().unwrap_or(0),
-                    _ => 0
-                };
-                if target_rec_id == 0 { continue; }
+                // [FIX] Support Arrays of IDs for Multi-Relations
+                let mut target_ids = Vec::new();
+                if let Value::Array(arr) = val {
+                    for v in arr {
+                        let tid = match v {
+                            Value::String(s) => s.parse::<i64>().unwrap_or(0),
+                            Value::Number(n) => n.as_i64().unwrap_or(0),
+                            _ => 0
+                        };
+                        if tid != 0 { target_ids.push(tid); }
+                    }
+                } else {
+                    let tid = match val {
+                        Value::String(s) => s.parse::<i64>().unwrap_or(0),
+                        Value::Number(n) => n.as_i64().unwrap_or(0),
+                        _ => 0
+                    };
+                    if tid != 0 { target_ids.push(tid); }
+                }
+
+                if target_ids.is_empty() { continue; }
 
                 let identifier = &rel_def.target_collection;
                 let mut target_col_id: Option<i64> = None;
@@ -506,10 +554,13 @@ impl ApexKit {
                 }
 
                 if let Some(tc_id) = target_col_id {
-                    self.data_batcher.execute(
-                        "INSERT INTO _relations (origin_col_id, origin_rec_id, target_col_id, target_rec_id, rel_name) VALUES (?1, ?2, ?3, ?4, ?5)".into(),
-                        vec![collection_id.into_val(), record_id.into_val(), tc_id.into_val(), target_rec_id.into_val(), rel_name.clone().into_val()]
-                    ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+                    for target_rec_id in target_ids {
+                        // [FIX] Use INSERT OR IGNORE to safely handle concurrent deduplication
+                        self.data_batcher.execute(
+                            "INSERT OR IGNORE INTO _relations (origin_col_id, origin_rec_id, target_col_id, target_rec_id, rel_name) VALUES (?1, ?2, ?3, ?4, ?5)".into(),
+                            vec![collection_id.into_val(), record_id.into_val(), tc_id.into_val(), target_rec_id.into_val(), rel_name.clone().into_val()]
+                        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+                    }
                 }
             }
         }
@@ -771,6 +822,75 @@ impl ApexKit {
 
             Ok(())
         })
+    }
+
+    // --- Unified Internal Write Logic ---
+    async fn _write_record_internal(
+        &self, 
+        collection_id: i64, 
+        record_id: Option<i64>, 
+        data: &Value, 
+        validate: bool
+    ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        
+        let col = {
+            let conn = self.get_data_read().await; 
+            let mut stmt = conn.prepare("SELECT id, name, schema FROM collections WHERE id = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![collection_id])?;
+            if let Some(row) = rows.next()? {
+                Some(row_to_collection(&row)?)
+            } else { None }
+        }.ok_or("Collection not found")?;
+
+        let schema = col.schema.unwrap_or_default();
+        
+        let mut final_data = data.clone();
+        
+        // [FIX] Strip reserved frontend/framework fields to prevent double nesting inside 'data'
+        if let Some(obj) = final_data.as_object_mut() {
+            obj.remove("id");
+            obj.remove("created");
+            obj.remove("updated");
+            obj.remove("expand");
+            obj.remove("collectionId");
+            obj.remove("collectionName");
+        }
+        
+        if validate {
+            if let Err(errors) = crate::validation::sanitize_and_validate(&schema, &mut final_data) {
+                let err_json = serde_json::to_string(&errors).unwrap();
+                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Schema Validation Failed: {}", err_json))));
+            }
+        }
+
+        // OPTIMIZATION: Zero-copy serialization into SQLite's native JSONB binary format
+        let jsonb_bytes = serde_sqlite_jsonb::to_vec(&final_data).map_err(|e| Box::new(e))?;
+
+        // Ensure Read Lock Dropped Before `await` on Batcher
+        {
+            let conn = self.get_data_read().await;
+            enforce_uniqueness(&conn, collection_id, record_id, &final_data, &schema)?;
+        }
+
+        let actual_record_id = if let Some(rid) = record_id {
+            self.data_batcher.execute(
+                "INSERT INTO records (id, collection_id, data) VALUES (?1, ?2, ?3)".into(),
+                vec![rid.into_val(), collection_id.into_val(), rusqlite::types::Value::Blob(jsonb_bytes)]
+            ).await?;
+            rid
+        } else {
+            self.data_batcher.insert(
+                "INSERT INTO records (collection_id, data) VALUES (?1, ?2)".into(),
+                vec![collection_id.into_val(), rusqlite::types::Value::Blob(jsonb_bytes)]
+            ).await?
+        };
+        
+        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, actual_record_id, &final_data, &schema);
+        let relation_future = self.sync_relations(collection_id, actual_record_id, &final_data, &schema);
+
+        tokio::try_join!(unique_future, relation_future)?;
+        
+        Ok(actual_record_id)
     }
 }
 
@@ -1168,42 +1288,14 @@ impl Db for ApexKit {
     }
 
     async fn create_record(&self, collection_id: i64, data: &Value) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let col = {
-            let conn = self.get_data_read().await; 
-            let mut stmt = conn.prepare("SELECT id, name, schema FROM collections WHERE id = ?1")?;
-            let mut rows = stmt.query(rusqlite::params![collection_id])?;
-            if let Some(row) = rows.next()? {
-                Some(row_to_collection(&row)?)
-            } else { None }
-        }.ok_or("Collection not found")?;
+        // Reuse unified logic with validation enabled
+        self._write_record_internal(collection_id, None, data, true).await
+    }
 
-        let schema = col.schema.unwrap_or_default();
-        
-        let mut sanitized_data = data.clone();
-        if let Err(errors) = crate::validation::sanitize_and_validate(&schema, &mut sanitized_data) {
-            let err_json = serde_json::to_string(&errors).unwrap();
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Schema Validation Failed: {}", err_json))));
-        }
-
-        let json_str = serde_json::to_string(&sanitized_data)?;
-
-        // Ensure Lock Dropped Before `await`
-        {
-            let conn = self.get_data_read().await;
-            enforce_uniqueness(&conn, collection_id, None, &sanitized_data, &schema)?;
-        }
-
-        let record_id = self.data_batcher.insert(
-            "INSERT INTO records (collection_id, data) VALUES (?1, jsonb(?2))".into(),
-            vec![collection_id.into_val(), json_str.into_val()]
-        ).await?;
-        
-        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, &sanitized_data, &schema);
-        let relation_future = self.sync_relations(collection_id, record_id, &sanitized_data, &schema);
-
-        tokio::try_join!(unique_future, relation_future)?;
-        
-        Ok(record_id)
+    async fn import_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Reuse unified logic with validation disabled (import assumes raw data is valid)
+        self._write_record_internal(collection_id, Some(record_id), data, false).await?;
+        Ok(())
     }
 
     async fn update_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<Record, Box<dyn std::error::Error + Send + Sync>> {
@@ -1217,7 +1309,8 @@ impl Db for ApexKit {
             }.ok_or("Col not found")?;
 
             let existing = {
-                let mut stmt = conn.prepare("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2")?;
+                // Keep json(data) on read to let SQLite's C-engine handle formatting
+                let mut stmt = conn.prepare("SELECT id, data, NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2")?;
                 let mut rows = stmt.query(rusqlite::params![collection_id, record_id])?;
                 if let Some(row) = rows.next()? { Some(row_to_record(&row)?) } else { None }
             }.ok_or("Rec not found")?;
@@ -1239,7 +1332,8 @@ impl Db for ApexKit {
             return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Schema Validation Failed: {}", err_json))));
         }
         
-        let json_str = serde_json::to_string(&merged_data)?;
+        // OPTIMIZATION: Zero-copy serialization into SQLite's native JSONB binary format
+        let jsonb_bytes = serde_sqlite_jsonb::to_vec(&merged_data).map_err(|e| Box::new(e))?;
 
         {
             let conn = self.get_data_read().await;
@@ -1247,8 +1341,8 @@ impl Db for ApexKit {
         }
 
         self.data_batcher.execute(
-            "UPDATE records SET data = jsonb(?1), updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND id = ?3".into(), 
-            vec![json_str.into_val(), collection_id.into_val(), record_id.into_val()]
+            "UPDATE records SET data = ?1, updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND id = ?3".into(), 
+            vec![rusqlite::types::Value::Blob(jsonb_bytes), collection_id.into_val(), record_id.into_val()]
         ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         
         let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, &merged_data, &schema);
@@ -1263,34 +1357,6 @@ impl Db for ApexKit {
             created: existing.created,
             updated: chrono::Utc::now().to_rfc3339()
         })
-    }
-
-    async fn import_record(&self, collection_id: i64, record_id: i64, data: &Value) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let col = {
-            let conn = self.get_data_read().await; 
-            let mut stmt = conn.prepare("SELECT id, name, schema FROM collections WHERE id = ?1")?;
-            let mut rows = stmt.query(rusqlite::params![collection_id])?;
-            if let Some(row) = rows.next()? { Some(row_to_collection(&row)?) } else { None }
-        }.ok_or("Collection not found")?;
-
-        let schema = col.schema.unwrap_or_default();
-        let json_str = serde_json::to_string(data)?;
-
-        {
-            let conn = self.get_data_read().await;
-            enforce_uniqueness(&conn, collection_id, Some(record_id), data, &schema)?;
-        }
-
-        self.data_batcher.execute(
-            "INSERT INTO records (id, collection_id, data) VALUES (?1, ?2, jsonb(?3))".into(),
-            vec![record_id.into_val(), collection_id.into_val(), json_str.into_val()] 
-        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
-        
-        let unique_future = commit_uniqueness(&self.data_batcher, collection_id, record_id, data, &schema);
-        let relation_future = self.sync_relations(collection_id, record_id, data, &schema);
-        tokio::try_join!(unique_future, relation_future)?;
-
-        Ok(())
     }
 
     async fn delete_record(&self, collection_id: i64, record_id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1393,7 +1459,7 @@ impl Db for ApexKit {
             let conn = self.get_data_read().await;
             
             if expand.is_none() || expand.as_ref().unwrap().trim().is_empty() {
-                let mut stmt = conn.prepare("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2")?;
+                let mut stmt = conn.prepare("SELECT id, data, NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2")?;
                 let mut rows = stmt.query(rusqlite::params![collection_id, record_id])?;
                 match rows.next()? { Some(row) => Some(row_to_record(&row)?), None => None }
             } else {
@@ -1429,7 +1495,7 @@ impl Db for ApexKit {
                 );
 
                 let sql = format!(
-                    "SELECT id, json(data), {}, created, updated FROM records WHERE collection_id = ?1 AND id = ?2", 
+                    "SELECT id, data, {}, created, updated FROM records WHERE collection_id = ?1 AND id = ?2", 
                     expand_json_sql
                 );
                 
@@ -1455,7 +1521,7 @@ impl Db for ApexKit {
         if ids.is_empty() { return Ok(vec![]); }
         
         let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id, json(data), NULL, created, updated FROM records WHERE id IN ({})", id_list);
+        let sql = format!("SELECT id, data, NULL, created, updated FROM records WHERE id IN ({})", id_list);
         let conn = self.get_data_read().await;
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
@@ -1555,7 +1621,7 @@ impl Db for ApexKit {
         self.search.load_index(id, &schema).map_err(|e| format!("Search Load Error: {}", e))?;
         
         let conn = self.get_data_read().await;
-        let mut stmt = conn.prepare("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1")
+        let mut stmt = conn.prepare("SELECT id, data, NULL, created, updated FROM records WHERE collection_id = ?1")
             .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
         let mut rows = stmt.query(params![id])
             .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
@@ -2120,7 +2186,7 @@ impl Db for ApexKit {
     async fn get_records_by_ids(&self, collection_id: i64, ids: &[i64]) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
         if ids.is_empty() { return Ok(vec![]); }
         let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ? AND id IN ({})", id_list);
+        let sql = format!("SELECT id, data, NULL, created, updated FROM records WHERE collection_id = ? AND id IN ({})", id_list);
         let conn = self.get_data_read().await;
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(params![collection_id])?;
@@ -2504,6 +2570,30 @@ impl Db for ApexKit {
 
         Ok(serde_json::Value::Array(results))
     }
+
+    async fn reload_connections(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut core = self.hot_conn_core.lock().await;
+        *core = Connection::open(format!("{}/core.db", self.base_path))?;
+        apply_pragmas(&core)?;
+
+        let mut data = self.hot_conn_data.lock().await;
+        *data = Connection::open(format!("{}/data.db", self.base_path))?;
+        apply_pragmas(&data)?;
+
+        let mut log = self.hot_conn_log.lock().await;
+        *log = Connection::open(format!("{}/logs.db", self.base_path))?;
+        apply_pragmas(&log)?;
+
+        let mut sys = self.hot_conn_sys.lock().await;
+        *sys = Connection::open(format!("{}/system.db", self.base_path))?;
+        apply_pragmas(&sys)?;
+
+        let mut vec = self.hot_conn_vec.lock().await;
+        *vec = Connection::open(format!("{}/vectors.db", self.base_path))?;
+        apply_pragmas(&vec)?;
+
+        Ok(())
+    }
 }
 
 fn apply_pragmas(conn: &Connection) -> Result<()> {
@@ -2583,6 +2673,10 @@ fn setup_data(conn: &Connection) -> Result<()> {
     conn.execute("CREATE TABLE IF NOT EXISTS _relations (id INTEGER PRIMARY KEY AUTOINCREMENT, origin_col_id INTEGER NOT NULL, origin_rec_id INTEGER NOT NULL, target_col_id INTEGER NOT NULL, target_rec_id INTEGER NOT NULL, rel_name TEXT NOT NULL, properties JSON)", [])?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_origin ON _relations(origin_col_id, origin_rec_id, rel_name)", [])?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_target ON _relations(target_col_id, target_rec_id)", [])?;
+    
+    // [FIX] Unique constraint to prevent duplicate relationship links
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique ON _relations(origin_col_id, origin_rec_id, target_col_id, target_rec_id, rel_name)", [])?;
+    
     conn.execute("CREATE TABLE IF NOT EXISTS _unique_values (index_key TEXT NOT NULL, value TEXT NOT NULL, record_id INTEGER NOT NULL, PRIMARY KEY (index_key, value))", [])?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_unique_lookup ON _unique_values(index_key, value)", [])?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_unique_record ON _unique_values(record_id)", [])?;

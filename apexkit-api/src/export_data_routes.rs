@@ -35,7 +35,7 @@ pub struct ExportQuery {
 
 // --- LOGIC ---
 
-fn flatten_record_data(record: &apexkit_core::Record) -> Vec<(String, String)> {
+fn flatten_record_data(record: &apexkit_core::models::Record) -> Vec<(String, String)> {
     let mut flat_data = vec![
         ("id".to_string(), record.id.to_string()),
         ("created".to_string(), record.data.get("created").map(|v| v.as_str().unwrap_or_default()).unwrap_or_default().to_string()),
@@ -57,7 +57,7 @@ fn flatten_record_data(record: &apexkit_core::Record) -> Vec<(String, String)> {
     flat_data
 }
 
-fn create_csv_data(records: &[apexkit_core::Record]) -> Result<Vec<u8>, String> {
+fn create_csv_data(records: &[apexkit_core::models::Record]) -> Result<Vec<u8>, String> {
     if records.is_empty() { return Ok(Vec::new()); }
     
     // Use the first record to generate the column headers

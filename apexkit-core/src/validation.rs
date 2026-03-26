@@ -17,14 +17,27 @@ pub enum ValidationError {
     ConstraintViolation(String, String),
 }
 
-/// Sanitizes data (type coercion) AND validates it against the schema
+// Sanitizes data (type coercion, strict schema filtering) AND validates it against the schema
 pub fn sanitize_and_validate(
     schema: &CollectionSchema,
     data: &mut Value,
 ) -> Result<(), Vec<ValidationError>> {
     
-    // 1. Sanitize / Coerce Types
+    // 1. Sanitize / Coerce Types & Strip Unknown Fields
     if let Some(map) = data.as_object_mut() {
+        
+        // A. Strict Schema Filtering: Remove any field NOT defined in schema.fields or schema.relations
+        let mut keys_to_remove = Vec::new();
+        for key in map.keys() {
+            if !schema.fields.contains_key(key) && !schema.relations.contains_key(key) {
+                keys_to_remove.push(key.clone());
+            }
+        }
+        for key in keys_to_remove {
+            map.remove(&key);
+        }
+
+        // B. Coerce Types for Standard Fields
         for (field_name, field_def) in &schema.fields {
             if let Some(val) = map.get_mut(field_name) {
                 // If the field is Owner or Relation, force it to be an Integer
@@ -36,7 +49,7 @@ pub fn sanitize_and_validate(
                     }
                 }
                 
-                // Remove empty strings for nullable numbers/relations to avoid type errors
+                // Remove empty strings for nullable numbers/relations/dates to avoid type errors
                 if val.as_str().map(|s| s.trim().is_empty()).unwrap_or(false) {
                     if field_def.r#type == FieldType::Number || field_def.r#type == FieldType::Relation || field_def.r#type == FieldType::Owner || field_def.r#type == FieldType::Date {
                         *val = Value::Null;
@@ -44,9 +57,28 @@ pub fn sanitize_and_validate(
                 }
             }
         }
+
+        // C. Coerce Types for Virtual Relation Arrays/IDs
+        for (rel_name, _) in &schema.relations {
+            if let Some(val) = map.get_mut(rel_name) {
+                if let Value::Array(arr) = val {
+                    for item in arr.iter_mut() {
+                        if let Some(s) = item.as_str() {
+                            if let Ok(num) = s.parse::<i64>() {
+                                *item = serde_json::json!(num);
+                            }
+                        }
+                    }
+                } else if let Some(s) = val.as_str() {
+                    if let Ok(num) = s.parse::<i64>() {
+                        *val = serde_json::json!(num);
+                    }
+                }
+            }
+        }
     }
 
-    // 2. Validate
+    // 2. Validate against schema rules
     validate_record(schema, data)
 }
 

@@ -49,6 +49,7 @@ use apexkit_core::models::DashboardData;
 use axum::extract::DefaultBodyLimit;
 use tracing::{info, debug};
 use tower_http::compression::CompressionLayer;
+use apexkit_core::models::{Collection};
 
 // --- Module Registrations ---
 pub mod websocket;
@@ -339,7 +340,7 @@ pub async fn trigger_hooks(
     state: &AppState,
     // [REVERTED] No 'db' parameter here. We resolve it from scope.
     trigger: &str,
-    collection: &apexkit_core::Collection, 
+    collection: &Collection, 
     record_id: Option<i64>,
     data: &serde_json::Value,
     auth: Option<&Claims>,
@@ -984,7 +985,6 @@ async fn tenant_resolver_middleware(
     
     if let Some(key_header) = req.headers().get("x-api-key") {
          if let Ok(key) = key_header.to_str() {
-             // Verify against Root DB first for global keys
              if let Ok(Some(api_key)) = state.db.verify_api_key(key).await {
                  key_scope_override = Some(api_key.scope.clone());
                  req.extensions_mut().insert(api_key);
@@ -1014,16 +1014,26 @@ async fn tenant_resolver_middleware(
             .split(':').next().unwrap_or("");
 
         // PRIORITY 1: Explicit Path (/tenant/app-1/...)
-        if let Some(Path(params)) = path_params {
+        if let Some(Path(params)) = &path_params {
             if let Some(id) = params.get("tenant_id") { 
                 tenant_id = id.clone(); 
+            }
+        }
+
+        // [CRITICAL FIX] Axum nested router path extraction fallback
+        if tenant_id.is_empty() {
+            let path = req.uri().path();
+            if path.starts_with("/tenant/") {
+                let parts: Vec<&str> = path.split('/').collect();
+                if parts.len() >= 3 {
+                    tenant_id = parts[2].to_string();
+                }
             }
         }
 
         // PRIORITY 2: Check against ROOT_DOMAIN
         if tenant_id.is_empty() {
             if !root_domain.is_empty() && host == root_domain {
-                // Host is exactly the Root Domain (e.g. my-app.koyeb.app)
                 tenant_id = String::new(); 
             } else {
                 // PRIORITY 3: Subdomain Extraction
@@ -1038,14 +1048,12 @@ async fn tenant_resolver_middleware(
         }
     }
 
-    // Capture Ingress (Request Size)
     let ingress = req.headers()
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
-    // Before Request Hook
     if !tenant_id.is_empty() {
         let hook_payload = serde_json::json!({
             "tenant_id": tenant_id,
@@ -1071,22 +1079,18 @@ async fn tenant_resolver_middleware(
         }
     }
 
-    // 4. Resolve Context
     if tenant_id.is_empty() {
-        // Root Context
         req.extensions_mut().insert(EventScope::Root);
-        // Ensure Root DynamicStorage is used if not overridden (usually defaults to AppState storage)
         let mut response = next.run(req).await;
         response.headers_mut().insert("X-Apex-Scope", HeaderValue::from_static("root"));
         return Ok(response);
     }
 
-    // Tenant Context
+    // 4. Resolve Context
     match state.tenant_manager.get_tenant(tenant_id.clone()).await {
         Ok(tenant_db) => {
             req.extensions_mut().insert(tenant_db.clone());
             
-            // [FIX] Use ScopedDynamicStorage to support S3 Reselling
             let scope = EventScope::Tenant(tenant_id.clone());
             let storage: Arc<dyn StorageBackend> = Arc::new(
                 crate::storage::ScopedDynamicStorage::new(state.clone(), scope.clone())
@@ -1097,14 +1101,12 @@ async fn tenant_resolver_middleware(
 
             let path_clone = req.uri().path().to_string();
             
-            // Execute Handler
             let mut response = next.run(req).await;
             
             if let Ok(val) = HeaderValue::from_str(&format!("tenant:{}", tenant_id)) {
                 response.headers_mut().insert("X-Apex-Scope", val);
             }
 
-            // Capture Egress
             let egress = response.headers()
                 .get(axum::http::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
@@ -1112,7 +1114,6 @@ async fn tenant_resolver_middleware(
                 .or_else(|| response.body().size_hint().exact()) 
                 .unwrap_or(0);
 
-            // After Request Hook (Async)
             let status = response.status().as_u16();
             let state_clone = state.clone();
             let base_url_clone = base_url.clone();
@@ -1126,19 +1127,15 @@ async fn tenant_resolver_middleware(
                     "ingress": ingress, 
                     "egress": egress
                 });
-                let _ = trigger_void_hook(
-                    &state_clone, 
-                    "after_tenant_request", 
-                    payload, 
-                    None, 
-                    Some(&EventScope::Root), 
-                    Some(base_url_clone)
-                ).await;
+                let _ = trigger_void_hook(&state_clone, "after_tenant_request", payload, None, Some(&EventScope::Root), Some(base_url_clone)).await;
             });
 
             Ok(response)
         }
-        Err(_) => {
+        Err(e) => {
+            // [CRITICAL FIX] Log the error so we know WHY it failed instead of silently failing back to root!
+            tracing::error!("❌ [TenantResolver] Failed to load tenant '{}': {}", tenant_id, e);
+            
             req.extensions_mut().insert(EventScope::Root);
             let mut response = next.run(req).await;
             response.headers_mut().insert("X-Apex-Scope", HeaderValue::from_static("root"));
@@ -1187,7 +1184,7 @@ pub struct RecordPath {
 pub async fn resolve_collection_by_id_or_name(
     db: &Arc<dyn Db>, 
     identifier: &str
-) -> Result<apexkit_core::Collection, AppError> {
+) -> Result<Collection, AppError> {
     // 1. Try to parse as numeric ID first
     if let Ok(id_num) = identifier.parse::<i64>() {
         if let Ok(Some(col)) = db.get_collection(id_num).await {

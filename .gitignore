@@ -34,6 +34,7 @@ sandboxes/
 tenants/
 uploads/
 tmp/
+swalang
 
 # ============================
 # Build artifacts

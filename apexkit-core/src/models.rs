@@ -32,7 +32,7 @@ pub struct DashboardData {
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct Record {
     #[serde(skip_deserializing)] // ID is handled by DB on create
-    pub id: Option<i64>, 
+    pub id: i64, 
     #[schema(value_type = Object)]
     pub data: Value,
     // Skip deserializing timestamps (Client doesn't send them)
@@ -43,18 +43,33 @@ pub struct Record {
     #[serde(skip_deserializing)]
     #[serde(default)]
     pub updated: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expand: Option<Value>,
 }
 
 /// Represents a Collection definition
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct Collection {
     #[serde(skip_deserializing)]
-    pub id: Option<i64>,
+    pub id: i64,
     pub name: String,
     pub schema: Option<CollectionSchema>,
     // Stable unique identifier for schema portability
     #[serde(default)] 
     pub index: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListResult {
+    pub items: Vec<Record>,
+    pub total: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChangesetEvent {
+    pub scope: String,
+    pub db_name: String,
+    pub changeset: Vec<u8>,
 }
 
 /// Represents a File uploaded to Storage

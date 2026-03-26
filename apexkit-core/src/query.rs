@@ -320,71 +320,74 @@ pub fn build_expand_json_object(
 
         // Construct Subquery based on cardinality and direction
         let subquery = if !reverse_lookup && forward_relation_type == RelationType::One {
-             // Case A: Forward One-to-One -> Return Single Object
-             format!(
-                "(SELECT {} FROM _relations {} \
-                  JOIN records {} ON {}.target_rec_id = {}.id \
-                  WHERE {}.origin_rec_id = {}.id \
-                  AND {}.rel_name = '{}' \
-                  LIMIT 1)",
-                target_record_json,
-                rel_alias, target_alias,
-                rel_alias, target_alias,
-                rel_alias, parent_alias,
-                rel_alias, relation_name
-            )
-        } else {
-             // Case B: One-to-Many (Forward List or Reverse List) -> Return Array
-             let join_condition = if reverse_lookup {
-                 // Reverse: We are the 'Target' of the link in _relations
-                 // The 'Origin' is the child record we want to fetch
-                 // Link: Comment (Origin) -> Post (Target)
-                 format!(
-                    "WHERE {}.target_rec_id = {}.id \
-                     AND {}.origin_col_id = {} \
-                     AND {}.target_col_id = {} \
-                     AND {}.rel_name = '{}'",
-                    rel_alias, parent_alias,
-                    rel_alias, target_col_id,   // Origin Col = Child (Comment)
-                    rel_alias, current_col_id,  // Target Col = Parent (Post)
-                    rel_alias, actual_rel_name_in_db // Relation Name (post_id)
-                 )
-             } else {
-                 // Forward Many: We are 'Origin'
-                 format!(
-                    "WHERE {}.origin_rec_id = {}.id \
-                     AND {}.rel_name = '{}'",
-                    rel_alias, parent_alias,
-                    rel_alias, relation_name
-                 )
-             };
+            // Case A: Forward One-to-One -> Return Single Object
+            format!(
+               "(SELECT {} FROM _relations {} \
+                 JOIN records {} ON {}.target_rec_id = {}.id \
+                 WHERE {}.origin_rec_id = {}.id \
+                 AND {}.rel_name = '{}' \
+                 LIMIT 1)",
+               target_record_json,
+               rel_alias, target_alias,
+               rel_alias, target_alias,
+               rel_alias, parent_alias,
+               rel_alias, relation_name
+           )
+       } else {
+            // Case B: One-to-Many (Forward List or Reverse List) -> Return Array
+            let join_condition = if reverse_lookup {
+                // Reverse: We are the 'Target' of the link in _relations
+                // The 'Origin' is the child record we want to fetch
+                // Link: Comment (Origin) -> Post (Target)
+                format!(
+                   "WHERE {}.target_rec_id = {}.id \
+                    AND {}.origin_col_id = {} \
+                    AND {}.target_col_id = {} \
+                    AND {}.rel_name = '{}'",
+                   rel_alias, parent_alias,
+                   rel_alias, target_col_id,   // Origin Col = Child (Comment)
+                   rel_alias, current_col_id,  // Target Col = Parent (Post)
+                   rel_alias, actual_rel_name_in_db // Relation Name (post_id)
+                )
+            } else {
+                // Forward Many: We are 'Origin'
+                format!(
+                   "WHERE {}.origin_rec_id = {}.id \
+                    AND {}.rel_name = '{}'",
+                   rel_alias, parent_alias,
+                   rel_alias, relation_name
+                )
+            };
 
-             // Join logic
-             let join_target = if reverse_lookup {
-                 // We want the Origin Record (the child)
-                 format!("JOIN records {} ON {}.origin_rec_id = {}.id", target_alias, rel_alias, target_alias)
-             } else {
-                 // We want the Target Record
-                 format!("JOIN records {} ON {}.target_rec_id = {}.id", target_alias, rel_alias, target_alias)
-             };
+            // Join logic
+            let join_target = if reverse_lookup {
+                // We want the Origin Record (the child)
+                format!("JOIN records {} ON {}.origin_rec_id = {}.id", target_alias, rel_alias, target_alias)
+            } else {
+                // We want the Target Record
+                format!("JOIN records {} ON {}.target_rec_id = {}.id", target_alias, rel_alias, target_alias)
+            };
 
-             format!(
-                "(SELECT json_group_array(json(sub)) FROM ( \
-                    SELECT {} as sub \
-                    FROM _relations {} \
-                    {} \
-                    {} \
-                    {} {} {} \
-                ))",
-                target_record_json,
-                rel_alias,
-                join_target,
-                join_condition,
-                order_clause, limit_clause, offset_clause
-            )
-        };
+            // [FIX] Added GROUP BY {target_alias}.id to eliminate duplicate relations securely at the SQL level
+            format!(
+               "(SELECT json_group_array(json(sub)) FROM ( \
+                   SELECT {} as sub \
+                   FROM _relations {} \
+                   {} \
+                   {} \
+                   GROUP BY {}.id \
+                   {} {} {} \
+               ))",
+               target_record_json,
+               rel_alias,
+               join_target,
+               join_condition,
+               target_alias, 
+               order_clause, limit_clause, offset_clause
+           )
+       };
 
-        expand_fields.push(format!("'{}', {}", relation_name, subquery));
+       expand_fields.push(format!("'{}', {}", relation_name, subquery));
     }
 
     if expand_fields.is_empty() {

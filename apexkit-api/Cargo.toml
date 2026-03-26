@@ -78,6 +78,7 @@ chrono = { version = "0.4", features = ["serde"] }
 image = { version = "0.24", features = ["avif-encoder", "webp-encoder", "jpeg", "png", "gif"] }
 moka = { version = "0.12", features = ["future"] } # High performance cache
 md5 = "0.7"
+base64 = "0.21"
 
 # --- CLI ENGINE ---
 clap = { version = "4.5", features = ["derive"] }
@@ -88,7 +89,7 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 # Filesystem Traversal
 walkdir = "2.4"
 
-tonic = "0.14.5"
+tonic = { version = "0.14.5", features = ["transport", "tls-ring", "tls-native-roots"] }
 prost = "0.14.3"
 tonic-prost = "0.14.5"
 tokio-stream = "0.1"

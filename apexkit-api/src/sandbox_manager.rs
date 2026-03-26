@@ -5,6 +5,8 @@ use std::time::Duration;
 use apexkit_core::{Db, ApexKit, VectorProvider, query::QueryOptions, schema::FieldType};
 use apexkit_core::search::SearchManager;
 use apexkit_core::cache::CachedDb;
+use apexkit_core::batching::WriteForwarder;
+use apexkit_core::models::ChangesetEvent;
 use tracing::{info, warn};
 use apex_vector::{CandleEmbedder, VectorIndex};
 use moka::future::Cache;
@@ -83,17 +85,21 @@ pub struct SandboxManager {
     pub shared_embedder: Option<Arc<CandleEmbedder>>,
     // Cache stores active contexts. Key: session_id
     cache: Cache<String, SandboxContext>,
+    forwarder: Option<Arc<dyn WriteForwarder>>, 
+    // Add the event transmitter
+    event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>,
 }
 
 impl SandboxManager {
-    pub fn new(shared_embedder: Option<Arc<CandleEmbedder>>) -> Self {
+    pub fn new(
+        shared_embedder: Option<Arc<CandleEmbedder>>, 
+        forwarder: Option<Arc<dyn WriteForwarder>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>
+    ) -> Self {
         let _ = fs::create_dir_all("storage/sandboxes");
         
-        // STRICT CACHE POLICY:
-        // Evict sandbox from memory 3 minutes after the last access.
-        // This drops the HNSW index and closes DB connections.
         let cache = Cache::builder()
-            .max_capacity(100) // Limit total active sandboxes
+            .max_capacity(100) 
             .time_to_idle(Duration::from_secs(3 * 60)) 
             .eviction_listener(|key, _val, cause| {
                 info!("Sandbox '{}' evicted from memory. Reason: {:?}", key, cause);
@@ -102,7 +108,9 @@ impl SandboxManager {
 
         Self { 
             shared_embedder,
-            cache
+            cache,
+            forwarder, 
+            event_tx, 
         }
     }
 
@@ -148,8 +156,14 @@ impl SandboxManager {
             index: Arc::new(VectorIndex::new()),
         });
         
-        let apexkit = ApexKit::init_filesystem(&base_path, vector_provider, None).await
-            .map_err(|e| format!("Failed to init sandbox filesystem: {}", e))?;
+        // Pass the forwarder here
+        let apexkit = ApexKit::init_filesystem(
+            &base_path, 
+            vector_provider, 
+            self.forwarder.clone(), // <--- Forward writes to master
+            self.event_tx.clone(), // <--- Forward changesets to gRPC 
+            format!("sandbox:{}", session_id)
+        ).await.map_err(|e| format!("Failed to init sandbox filesystem: {}", e))?;
 
         Ok(Arc::new(CachedDb::new(Arc::new(apexkit))))
     }
@@ -391,15 +405,19 @@ impl SandboxManager {
         let vec = rusqlite::Connection::open(&format!("{}/vectors.db", sandbox_dir)).map_err(|e| e.to_string())?;
 
         // Pass raw connections to ApexKit::new
+        // 1: path, 2: core, 3: data, 4: log, 5: sys, 6: vec, 
+        // 7: vector_provider, 8: forwarder, 9: event_tx, 10: scope
         let mut apexkit = ApexKit::new(
             &sandbox_dir,
             core, 
             data, 
             log, 
             sys, 
-            vec,
+            vec, 
             vec_provider.clone(),
-            None,
+            self.forwarder.clone(), // <--- Forward writes to master
+            self.event_tx.clone(), // <--- Forward changesets to gRPC
+            format!("sandbox:{}", session_id) 
         );
 
         // C. Setup Tantivy Search

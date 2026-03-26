@@ -38,7 +38,14 @@ pub struct WriteManager {
 }
 
 impl WriteManager {
-    pub fn new(db_path: String, db: Arc<tokio::sync::Mutex<Connection>>, forwarder: Option<Arc<dyn WriteForwarder>>) -> Self {
+    pub fn new(
+        db_path: String, 
+        db: Arc<tokio::sync::Mutex<Connection>>, 
+        forwarder: Option<Arc<dyn WriteForwarder>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<crate::ChangesetEvent>>,
+        scope: String,
+        db_name: String
+    ) -> Self {
         let batch_size = std::env::var("DB_BATCH_SIZE")
             .unwrap_or("2000".to_string())
             .parse::<usize>()
@@ -52,7 +59,7 @@ impl WriteManager {
         let (tx, rx) = mpsc::channel(100_000); 
         
         tokio::spawn(async move {
-            Self::background_task(db_path, db, rx, batch_size, flush_ms, forwarder).await;
+            Self::background_task(db_path, db, rx, batch_size, flush_ms, forwarder, event_tx, scope, db_name).await;
         });
 
         Self { sender: tx }
@@ -64,7 +71,10 @@ impl WriteManager {
         mut rx: mpsc::Receiver<WriteRequest>,
         max_batch_size: usize,
         flush_ms: u64,
-        forwarder: Option<Arc<dyn WriteForwarder>>
+        forwarder: Option<Arc<dyn WriteForwarder>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<crate::ChangesetEvent>>,
+        scope: String,
+        db_name: String
     ) {
         let mut buffer = Vec::with_capacity(max_batch_size);
         let flush_interval = Duration::from_millis(flush_ms);
@@ -129,6 +139,12 @@ impl WriteManager {
 
             // MASTER MODE: Execute locally via SQLite
             let conn = db.lock().await;
+
+            // [FIX] Attach a SQLite Session to track all binary changes in memory
+            let mut session = rusqlite::session::Session::new(&conn).unwrap();
+            
+            // Specify the generic type <&str> for None so the compiler knows the expected type
+            session.attach::<&str>(None).unwrap(); 
 
             let tx_result = conn.execute_batch("BEGIN IMMEDIATE");
             if tx_result.is_err() {
@@ -195,6 +211,23 @@ impl WriteManager {
                     }
                 }
             } else {
+                // Commit succeeded!
+                // Stream the binary changeset directly into a vector
+                let mut changeset_bytes = Vec::new();
+                session.changeset_strm(&mut changeset_bytes)
+                    .map_err(|e| eprintln!("Changeset stream error: {}", e))
+                    .ok();
+
+                if !changeset_bytes.is_empty() {
+                    if let Some(tx) = &event_tx {
+                        let _ = tx.send(crate::ChangesetEvent {
+                            scope: scope.clone(),
+                            db_name: db_name.clone(),
+                            changeset: changeset_bytes,
+                        });
+                    }
+                }
+
                 for pr in pending_replies {
                     match pr {
                         PendingReply::Execute(tx, res) => { let _ = tx.send(Ok(res)); },

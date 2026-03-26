@@ -6,8 +6,8 @@ license = "MIT"
 
 [dependencies]
 # Database
-rusqlite = { version = "0.39.0", features = ["bundled", "hooks", "serde_json", "blob"] }
-# serde_sqlite_jsonb = "0.2.1" # Zero-copy JSONB wrapper
+rusqlite = { version = "0.39.0", features = ["bundled", "hooks", "serde_json", "blob", "session"] }
+serde_sqlite_jsonb = "0.2.1" # Zero-copy JSONB wrapper
 
 # Async & Runtime
 tokio = { version = "1.37.0", features = ["full"] }
@@ -43,7 +43,7 @@ http = "0.2.9"
 # Use native-tls-vendored for Reqwest to avoid aws-lc/ring conflict
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "native-tls-vendored"] }
 
-# [Note] You can keep rustls for other things if needed, but AWS/Reqwest will now use native-tls
+# [Note] We can keep rustls for other things if needed, but AWS/Reqwest will now use native-tls
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
 # Email

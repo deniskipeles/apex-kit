@@ -5,6 +5,9 @@ service Replication {
     rpc SubscribeWal (WalRequest) returns (stream WalFrame);
     rpc ExecuteWrite (WriteRequest) returns (WriteResponse);
     rpc FetchDbSnapshot (SnapshotRequest) returns (stream FileChunk);
+    
+    // Bi-Directional Stream: Replica sends subscriptions, Master streams CUD events
+    rpc StreamEvents (stream EventSubscription) returns (stream DbChangeEvent);
 }
 
 message WalRequest { 
@@ -16,6 +19,7 @@ message WalRequest {
 message WalFrame { 
     bytes data = 1; 
     uint64 new_offset = 2; 
+    bool is_reset = 3; 
 }
 
 message WriteRequest { 
@@ -36,4 +40,15 @@ message SnapshotRequest {
 
 message FileChunk { 
     bytes data = 1; 
+}
+
+message EventSubscription {
+    string replica_id = 1;
+    repeated string add_scopes = 2; // e.g., ["root", "tenant:123"]
+}
+
+message DbChangeEvent {
+    string scope = 1;      // "root", "tenant:123"
+    string db_name = 2;    // "data", "core", "system"
+    bytes changeset = 3;   // The raw SQLite binary changeset
 }

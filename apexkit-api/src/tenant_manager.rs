@@ -5,6 +5,8 @@ use apexkit_core::search::SearchManager;
 use apex_vector::{CandleEmbedder, VectorIndex}; 
 use std::time::Duration;
 use apexkit_core::cache::CachedDb;
+use apexkit_core::batching::WriteForwarder;
+use apexkit_core::models::ChangesetEvent;
 use std::path::Path;
 use tracing::info;
 
@@ -68,10 +70,19 @@ pub struct TenantManager {
     shared_embedder: Option<Arc<CandleEmbedder>>,
     // We need access to Root DB to fetch status during load
     root_db: Arc<dyn Db>, 
+    forwarder: Option<Arc<dyn WriteForwarder>>,
+    // Add the event transmitter
+    event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>,
 }
 
 impl TenantManager {
-    pub fn new(shared_embedder: Option<Arc<CandleEmbedder>>, root_db: Arc<dyn Db>, capacity: u64) -> Self {
+    pub fn new(
+        shared_embedder: Option<Arc<CandleEmbedder>>, 
+        root_db: Arc<dyn Db>, 
+        capacity: u64,
+        forwarder: Option<Arc<dyn WriteForwarder>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>
+    ) -> Self {
         let _ = std::fs::create_dir_all("storage/tenants");
         Self {
             cache: Cache::builder()
@@ -80,6 +91,8 @@ impl TenantManager {
                 .build(),
             shared_embedder,
             root_db,
+            forwarder,
+            event_tx,
         }
     }
 
@@ -94,10 +107,9 @@ impl TenantManager {
             return Ok(ctx);
         }
 
-        let base_path = format!("storage/tenants/{}", tenant_id);
-        if !Path::new(&base_path).exists() {
-            return Err(format!("Tenant '{}' does not exist", tenant_id));
-        }
+        // We removed the `!Path::new(&base_path).exists()` check here.
+        // `load_tenant` handles checking the Root DB and triggers the replica snapshot sync 
+        // if the files are missing locally.
 
         let ctx = self.load_tenant(tenant_id).await?;
         self.cache.insert(tenant_id.to_string(), ctx.clone()).await;
@@ -157,26 +169,56 @@ impl TenantManager {
     async fn load_tenant(&self, tenant_id: &str) -> Result<TenantContext, String> {
         let base_path = format!("storage/tenants/{}", tenant_id);
         
-        // [NEW] Check and sync with Master if running as Replica
+        tracing::info!("[TenantManager] Attempting to load tenant: {}", tenant_id);
+
+        // 1. Sync Files from Master FIRST (Wait for it to complete)
         crate::replication::ensure_replica_env(&base_path).await;
+        
+        // 2. TELL REPLICA EVENT STREAMER TO LISTEN TO THIS TENANT
+        crate::replication::add_replica_subscription(&format!("tenant:{}", tenant_id));
 
-        // 1. Fetch Status from Root DB (The "One Hit")
+        // 3. Fetch Status from Root DB (Safely fallback if replica lags)
         let status = self.root_db.get_tenant_status(tenant_id).await
-            .map_err(|e| format!("Failed to fetch status: {}", e))?;
+            .unwrap_or_else(|_| "not_found".to_string());
 
+        // 4. Verify Files Exist
+        let expected_db = format!("{}/data.db", base_path);
+        let files_exist = std::path::Path::new(&expected_db).exists();
+
+        // If the status says the tenant doesn't exist but the files are physically here, 
+        // it means the replica's Root DB is slightly lagging behind the Master. We bypass this to allow initiation.
         if status == "not_found" {
-             return Err("Tenant not found in registry".into());
+             if files_exist {
+                 tracing::warn!("[TenantManager] Tenant '{}' not found in Root DB registry, BUT files exist (likely replica lag). Proceeding...", tenant_id);
+             } else {
+                 tracing::warn!("[TenantManager] Tenant '{}' not found in Root DB registry.", tenant_id);
+                 return Err("Tenant not found in registry".into());
+             }
+        } else if !files_exist {
+             tracing::error!("[TenantManager] Snapshot fetch failed for {}. Database file {} does not exist.", tenant_id, expected_db);
+             return Err("Failed to sync tenant database from master".into());
         }
 
-        // 2. Initialize DB (Standard Logic)
+        tracing::info!("[TenantManager] Successfully verified files and status for tenant: {}", tenant_id);
+
+        // 5. Initialize DB (Standard Logic)
         let vector_index = Arc::new(VectorIndex::new());
         let tenant_vector_provider = Arc::new(TenantVectorProvider {
             embedder: self.shared_embedder.clone(),
             index: vector_index.clone(),
         });
 
-        let mut apexkit = ApexKit::init_filesystem(&base_path, tenant_vector_provider.clone(), None)
-            .await.map_err(|e| e.to_string())?;
+        // Pass None for forwarder and event_tx
+        let mut apexkit = ApexKit::init_filesystem(
+            &base_path, 
+            tenant_vector_provider.clone(), 
+            self.forwarder.clone(), // <--- Forward writes to Master
+            self.event_tx.clone(), // <--- Forward changesets to gRPC
+            format!("tenant:{}", tenant_id)
+        ).await.map_err(|e| {
+             tracing::error!("[TenantManager] Failed to init filesystem for {}: {}", tenant_id, e);
+             e.to_string()
+        })?;
 
         let search_path = format!("{}/indexes", base_path);
         let search_manager = Arc::new(SearchManager::new(&search_path));
@@ -201,7 +243,6 @@ impl TenantManager {
             }
         });
 
-        // Configurable size per tenant? For now, global env default.
         let cache_size = std::env::var("SCRIPT_CACHE_SIZE")
             .ok().and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(100);
@@ -214,8 +255,8 @@ impl TenantManager {
         Ok(TenantContext {
             db: db_arc,
             vector_provider: tenant_vector_provider,
-            status,
-            script_cache, // [NEW]
+            status: if status == "not_found" { "active".to_string() } else { status },
+            script_cache,
         })
     }
 
