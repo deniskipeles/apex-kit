@@ -130,6 +130,8 @@ async fn main() {
         "bge-small" => EmbeddingModelConfig::bge_small_en_v1_5(),
         "bge-base" => EmbeddingModelConfig::bge_base_en_v1_5(),
         "gte-small" => EmbeddingModelConfig::gte_small(),
+        "gemma-300m" => EmbeddingModelConfig::gemma_300m(),
+        
         "custom" => EmbeddingModelConfig::custom(
             std::env::var("APEX_VECTOR_CUSTOM_REPO").unwrap_or("sentence-transformers/all-MiniLM-L6-v2".to_string()),
             std::env::var("APEX_VECTOR_CUSTOM_REV").unwrap_or("main".to_string()),

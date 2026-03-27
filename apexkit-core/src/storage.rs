@@ -108,45 +108,7 @@ impl StorageBackend for LocalStorage {
         Ok(filename.to_string())
     }
     async fn get(&self, filename: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let file_path = self.base_path.join(filename);
-        
-        match fs::read(&file_path).await {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    // [NEW] Pull-Through Cache for Replicas
-                    if let Ok(master_url) = std::env::var("APEX_MASTER_URL") {
-                        if !master_url.is_empty() {
-                            println!("🔄 [Replica] File '{}' not found locally. Fetching from Master...", filename);
-                            
-                            let client = reqwest::Client::new();
-                            let url = format!("{}{}{}", master_url.trim_end_matches('/'), self.base_url, filename);
-                            let master_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
-                            
-                            let res = client.get(&url)
-                                .header("Authorization", format!("Bearer {}", master_key))
-                                .send()
-                                .await?;
-                                
-                            if res.status().is_success() {
-                                let bytes = res.bytes().await?.to_vec();
-                                
-                                // Cache it locally for next time
-                                if let Some(parent) = file_path.parent() {
-                                    fs::create_dir_all(parent).await?;
-                                }
-                                fs::write(&file_path, &bytes).await?;
-                                
-                                return Ok(bytes);
-                            } else {
-                                eprintln!("❌ [Replica] Master returned {} for file {}", res.status(), filename);
-                            }
-                        }
-                    }
-                }
-                Err(Box::new(e))
-            }
-        }
+        Ok(fs::read(self.base_path.join(filename)).await?)
     }
     async fn delete(&self, filename: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let file_path = self.base_path.join(filename);

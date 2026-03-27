@@ -4,7 +4,7 @@ FROM alpine:3.19
 # We install libc6-compat just in case our binary has any dynamic linking needs,
 # and install curl, jq, and msmtp (the Alpine alternative to sendmail)
 RUN apk add --no-cache curl jq msmtp ca-certificates && \
-    ln -s /usr/bin/msmtp /usr/sbin/sendmail
+    ln -sf /usr/bin/msmtp /usr/sbin/sendmail
 
 WORKDIR /app
 

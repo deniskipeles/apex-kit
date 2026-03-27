@@ -127,22 +127,23 @@ jobs:
           sha256sum * > checksums.txt
           cat checksums.txt
 
-      # 5. Sync Dockerfile and README to Public Repo
+      # 5. Sync Dockerfile, README, and docs to Public Repo
       - name: Update Public Repo Files
         run: |
           # Copy files from private to public workspace
           cp private-repo/Dockerfile public-repo/ 2>/dev/null || :
           cp private-repo/README.md public-repo/ 2>/dev/null || :
+          cp -r private-repo/docs public-repo/ 2>/dev/null || :
           
           cd public-repo
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           
-          # Add copied files
-          git add Dockerfile README.md
+          # Add copied files and directories
+          git add Dockerfile README.md docs
           
           # Commit only if there are changes
-          git diff --quiet && git diff --staged --quiet || git commit -m "Sync Dockerfile and README for release ${{ github.ref_name }}"
+          git diff --quiet && git diff --staged --quiet || git commit -m "Sync Dockerfile, README, and docs for release ${{ github.ref_name }}"
           git push origin main
           
           # Create the tag on the public repo so the release attaches correctly

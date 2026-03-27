@@ -221,7 +221,7 @@ pub trait Db: Send + Sync {
 
     // VECTORS
     async fn get_vectors_for_collection(&self, collection_id: i64, model: &str) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>>;
-    async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<(Record, f32)>, Box<dyn std::error::Error + Send + Sync>>;
     async fn save_vector(&self, collection_id: i64, record_id: i64, field_name: &str, vector: Vec<f32>, model: &str) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
     async fn has_vector(&self, collection_id: i64, record_id: i64, field_name: &str, model: &str) -> std::result::Result<bool, Box<dyn StdError + Send + Sync>>;
     async fn get_record_vectors(&self, collection_id: i64, record_id: i64) -> std::result::Result<Vec<models::VectorRecord>, Box<dyn StdError + Send + Sync>>;
@@ -2517,7 +2517,7 @@ impl Db for ApexKit {
         Ok(vectors)
     }
 
-    async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<(Record, f32)>, Box<dyn std::error::Error + Send + Sync>> {
         let results = self.vector_provider.search(collection_id, field, &vector, limit).await
             .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         
@@ -2526,7 +2526,19 @@ impl Db for ApexKit {
         }
 
         let ids: Vec<i64> = results.iter().map(|(id, _score)| *id).collect();
-        self.get_records_by_ids(collection_id, &ids).await
+        let records = self.get_records_by_ids(collection_id, &ids).await?;
+        
+        // Restore the correct AI sorting order by mapping the DB records back to the HNSW scores
+        let mut id_to_record: std::collections::HashMap<i64, Record> = records.into_iter().map(|r| (r.id, r)).collect();
+        
+        let mut final_results = Vec::new();
+        for (id, distance_score) in results {
+            if let Some(rec) = id_to_record.remove(&id) {
+                final_results.push((rec, distance_score));
+            }
+        }
+        
+        Ok(final_results)
     }
 
     async fn query_engine(&self, query: ApexQuery) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {

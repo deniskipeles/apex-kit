@@ -278,7 +278,7 @@ impl Db for CachedDb {
         self.inner.get_vectors_for_collection(collection_id, model).await
     }
     
-    async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<Record>, Box<dyn StdError + Send + Sync>> {
+    async fn search_vector(&self, collection_id: i64, field: &str, vector: Vec<f32>, limit: usize) -> std::result::Result<Vec<(Record, f32)>, Box<dyn StdError + Send + Sync>> {
         self.inner.search_vector(collection_id, field, vector, limit).await
     }
 

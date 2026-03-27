@@ -1,7 +1,3 @@
-// ============================================================================
-// FILE: apex-vector/src/embedder.rs
-// ============================================================================
-
 use anyhow::{Error as E, Result};
 use candle_core::{Device, Tensor, DType, Module};
 use candle_nn::VarBuilder;
@@ -9,10 +5,10 @@ use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer};
 use html2text::from_read;
 use std::sync::Mutex;
+use std::collections::HashMap; // Added for Gemma Tensor HashMap
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-// Import the Activation enum specifically from the clip models
 use candle_transformers::models::clip::text_model::Activation;
 use candle_transformers::models::clip::vision_model::{ClipVisionTransformer, ClipVisionConfig};
 
@@ -52,6 +48,16 @@ impl EmbeddingModelConfig {
         Self { repo_id: "thenlper/gte-small".to_string(), window_size: 512, overlap: 128, ..Default::default() } 
     }
     
+    // NEW: Preset for Gemma
+    pub fn gemma_300m() -> Self {
+        Self { 
+            repo_id: "google/embeddinggemma-300m".to_string(), // Adjust based on the actual Gemma model you want
+            window_size: 2048, 
+            overlap: 256, 
+            ..Default::default() 
+        }
+    }
+    
     pub fn custom(
         repo_id: String, revision: String, config_file: String, 
         tokenizer_file: String, weights_file: String, 
@@ -61,8 +67,10 @@ impl EmbeddingModelConfig {
     }
 }
 
+// UPDATED: Added RawTensors variant to support the EmbedGemma logic
 enum ModelBackend {
     Bert(BertModel),
+    RawTensors(HashMap<String, Tensor>), 
 }
 
 pub struct CandleEmbedder {
@@ -93,8 +101,9 @@ impl CandleEmbedder {
         let mut actual_config = config.clone();
         let lower_repo = actual_config.repo_id.to_lowercase();
         
-        if lower_repo.contains("qwen") || lower_repo.contains("gemma") {
-            tracing::warn!("Qwen and Gemma models are not implemented yet! Defaulting to all-MiniLM-L6-v2.");
+        // Allowed Gemma to bypass the unimplemented warning
+        if lower_repo.contains("qwen") {
+            tracing::warn!("Qwen models are not implemented yet! Defaulting to all-MiniLM-L6-v2.");
             actual_config = EmbeddingModelConfig::default();
         }
         
@@ -107,19 +116,27 @@ impl CandleEmbedder {
         
         let repo = api.repo(Repo::new(actual_config.repo_id.clone(), RepoType::Model));
 
-        let config_filename = repo.get(&actual_config.config_file)?;
         let tokenizer_filename = repo.get(&actual_config.tokenizer_file)?;
         let weights_filename = repo.get(&actual_config.weights_file)?;
+        
+        let is_gemma = lower_repo.contains("gemma");
 
-        let config_str = std::fs::read_to_string(config_filename)?;
-        let raw_config: serde_json::Value = serde_json::from_str(&config_str)?;
-
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_filename.clone()], DType::F32, &device)? };
-
-        tracing::info!("Apex Vector: Loading BERT-style text model");
-        let cfg: BertConfig = serde_json::from_value(raw_config)?;
-        let model = BertModel::load(vb, &cfg)?;
-        let backend = ModelBackend::Bert(model);
+        let backend = if is_gemma {
+            // LOGIC FROM ARTICLE STEP 5: Load raw Safetensors
+            tracing::info!("Apex Vector: Loading raw safetensors for Gemma Embeddings");
+            let tensors = candle_core::safetensors::load(&weights_filename, &device)?;
+            ModelBackend::RawTensors(tensors)
+        } else {
+            // Standard BERT Model Loading
+            tracing::info!("Apex Vector: Loading BERT-style text model");
+            let config_filename = repo.get(&actual_config.config_file)?;
+            let config_str = std::fs::read_to_string(config_filename)?;
+            let raw_config: serde_json::Value = serde_json::from_str(&config_str)?;
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_filename.clone()], DType::F32, &device)? };
+            let cfg: BertConfig = serde_json::from_value(raw_config)?;
+            let model = BertModel::load(vb, &cfg)?;
+            ModelBackend::Bert(model)
+        };
 
         let tokenizer_bytes = std::fs::read(&tokenizer_filename)?;
         let mut tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
@@ -173,6 +190,8 @@ impl CandleEmbedder {
         let mut final_vector = accum_vector.unwrap();
         let count_f32 = window_count as f32;
         for val in &mut final_vector { *val /= count_f32; }
+        
+        // Normalization
         let sum_squares: f32 = final_vector.iter().map(|v| v * v).sum();
         let magnitude = sum_squares.sqrt() + 1e-12; 
         for val in &mut final_vector { *val /= magnitude; }
@@ -180,23 +199,53 @@ impl CandleEmbedder {
     }
 
     fn run_model_pass(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        let token_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
         let mut backend_lock = self.backend.lock().unwrap();
 
-        let embeddings = match &mut *backend_lock {
+        match &mut *backend_lock {
             ModelBackend::Bert(m) => {
+                let token_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
                 let type_tensor = Tensor::zeros_like(&token_tensor)?;
-                m.forward(&token_tensor, &type_tensor, None)?
+                let embeddings = m.forward(&token_tensor, &type_tensor, None)?;
+                
+                let (_b, n_tokens, _h) = embeddings.dims3()?;
+                let divisor = Tensor::new(n_tokens as f32, embeddings.device())?;
+                let pooled = embeddings.sum(1)?.broadcast_div(&divisor)?;
+                
+                let normalized = normalize_l2(&pooled)?;
+                let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
+                Ok(vec)
+            },
+            ModelBackend::RawTensors(tensors) => {
+                // LOGIC FROM ARTICLE STEP 6: Gemma Embedding Generation
+                
+                // Gemma stores its embedding table under model.embed_tokens.weight
+                let embed_weights = tensors
+                    .get("model.embed_tokens.weight")
+                    .or_else(|| tensors.get("embed_tokens.weight"))
+                    .ok_or_else(|| anyhow::anyhow!("embed_tokens.weight not found in safetensors"))?;
+
+                let mut embeddings_vec = Vec::new();
+                for &token_id in token_ids {
+                    // Create tensor for specific token
+                    let token_tensor = Tensor::new(&[token_id], &self.device)?;
+                    
+                    // Lookup embedding matrix
+                    let token_embed = embed_weights.index_select(&token_tensor, 0)?;
+                    embeddings_vec.push(token_embed);
+                }
+
+                // Stack all tokens
+                let stacked = Tensor::stack(&embeddings_vec, 0)?;
+                
+                // Mean pooling across the token dimension (0)
+                let pooled = stacked.mean(0)?;
+                
+                // Squeeze to 1D array
+                let vec = pooled.squeeze(0)?.to_vec1::<f32>()?;
+                
+                Ok(vec)
             }
-        };
-        
-        let (_b, n_tokens, _h) = embeddings.dims3()?;
-        let divisor = Tensor::new(n_tokens as f32, embeddings.device())?;
-        let pooled = embeddings.sum(1)?.broadcast_div(&divisor)?;
-        
-        let normalized = normalize_l2(&pooled)?;
-        let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
-        Ok(vec)
+        }
     }
 
     pub fn embed_image(&self, base64_image: &str) -> Result<Vec<f32>> {
@@ -206,10 +255,8 @@ impl CandleEmbedder {
             tracing::info!("Apex Vector: Lazy-loading CLIP model for image vectorization...");
             let api = ApiBuilder::new().build()?;
             let repo = api.repo(Repo::new("openai/clip-vit-base-patch32".to_string(), RepoType::Model));
-            
             let weights = repo.get("model.safetensors")?;
             
-            // Standard ClipVisionConfig values for Vit-base-patch32
             let vision_config = ClipVisionConfig {
                 embed_dim: 768,
                 intermediate_size: 3072,
