@@ -102,7 +102,8 @@ pub struct FileIdPath {
 pub struct DynamicStorage {
     db: Arc<dyn Db>,
     vault: Arc<Vault>,
-    backend_cache: RwLock<Option<Arc<dyn StorageBackend>>>,
+    // Cached tuple: (Backend, is_local)
+    backend_cache: RwLock<Option<(Arc<dyn StorageBackend>, bool)>>,
     last_update: RwLock<std::time::Instant>,
     fs_root_override: Option<String>,
     public_url_prefix: Option<String>, 
@@ -113,13 +114,13 @@ impl DynamicStorage {
         Self { db, vault, backend_cache: RwLock::new(None), last_update: RwLock::new(std::time::Instant::now()), fs_root_override, public_url_prefix: Some(public_url_prefix) }
     }
 
-    async fn resolve_backend(&self) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn resolve_backend(&self) -> Result<(Arc<dyn StorageBackend>, bool), Box<dyn std::error::Error + Send + Sync>> {
         {
             let cache = self.backend_cache.read().await;
             let time = self.last_update.read().await;
-            if let Some(backend) = cache.as_ref() {
+            if let Some(cached) = cache.as_ref() {
                 if time.elapsed() < std::time::Duration::from_secs(60) { 
-                    return Ok(backend.clone()); 
+                    return Ok(cached.clone()); 
                 }
             }
         }
@@ -134,7 +135,7 @@ impl DynamicStorage {
             StorageConfigDto::default() 
         };
 
-        let backend: Arc<dyn StorageBackend> = if config.active_driver == "s3" && config.s3.enabled {
+        let (backend, is_local): (Arc<dyn StorageBackend>, bool) = if config.active_driver == "s3" && config.s3.enabled {
             let secret_key = if let Some(encrypted_str) = config.s3.secret_key {
                 let enc: EncryptedValue = serde_json::from_str(&encrypted_str)?;
                 self.vault.decrypt(&enc)?
@@ -142,7 +143,7 @@ impl DynamicStorage {
                 String::new() 
             };
 
-            Arc::new(S3Storage::new_with_creds(
+            let s3 = S3Storage::new_with_creds(
                 &config.s3.bucket, 
                 &config.s3.region, 
                 &config.s3.endpoint, 
@@ -150,26 +151,86 @@ impl DynamicStorage {
                 &config.s3.access_key, 
                 &secret_key, 
                 ""
-            ).await)
+            ).await;
+            (Arc::new(s3), false)
         } else {
             let path = self.fs_root_override.clone().unwrap_or_else(|| "./storage/system/uploads".to_string());
-            Arc::new(LocalStorage::new(&path, &self.get_public_url_base()).await)
+            let local = LocalStorage::new(&path, &self.get_public_url_base()).await;
+            (Arc::new(local), true)
         };
 
-        *cache_write = Some(backend.clone());
+        *cache_write = Some((backend.clone(), is_local));
         *time_write = std::time::Instant::now();
         
-        Ok(backend)
+        Ok((backend, is_local))
     }
 }
 
 #[async_trait]
 impl StorageBackend for DynamicStorage {
-    async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.save(name, data, mime).await }
-    async fn get(&self, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.get(name).await }
-    async fn delete(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.delete(name).await }
-    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.list_prefix(prefix).await }
-    async fn get_signed_url(&self, name: &str, ttl: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.get_signed_url(name, ttl).await }
+    async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
+        let (backend, is_local) = self.resolve_backend().await?;
+        let res = backend.save(name, data, mime).await?;
+        
+        // [REPLICA PUSH] Forward local file uploads to Master
+        if is_local {
+            if let Ok(master_url) = std::env::var("APEX_MASTER_URL") {
+                if !master_url.is_empty() {
+                    let master_url = master_url.trim_end_matches('/').to_string();
+                    let data_clone = data.to_vec();
+                    let name_clone = name.to_string();
+                    let mime_clone = mime.to_string();
+                    
+                    tokio::spawn(async move {
+                        let client = reqwest::Client::new();
+                        let url = format!("{}/api/v1/admin/storage/sync-file", master_url);
+                        let master_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
+                        
+                        let _ = client.post(&url)
+                            .header("Authorization", format!("Bearer {}", master_key))
+                            .header("X-Filename", name_clone)
+                            .header("X-Apex-Scope-Override", "root")
+                            .header("Content-Type", mime_clone)
+                            .body(data_clone)
+                            .send()
+                            .await;
+                    });
+                }
+            }
+        }
+        Ok(res)
+    }
+    
+    async fn get(&self, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { 
+        let (backend, _is_local) = self.resolve_backend().await?;
+        match backend.get(name).await {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                // [LAZY REPLICATION] Pull file from Master if missing on Replica
+                if let Ok(master_url) = std::env::var("APEX_MASTER_URL") {
+                    if !master_url.is_empty() {
+                        tracing::info!("☁️ File '{}' missing locally on Replica. Fetching from Master...", name);
+                        let url_path = self.get_public_url_base();
+                        let full_url = format!("{}{}{}", master_url.trim_end_matches('/'), url_path, name);
+                        
+                        let res = reqwest::Client::new().get(&full_url).send().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                        if res.status().is_success() {
+                            let bytes = res.bytes().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?.to_vec();
+                            let mime = mime_guess::from_path(name).first_or_octet_stream().to_string();
+                            // Cache locally for future requests
+                            let _ = backend.save(name, &bytes, &mime).await;
+                            return Ok(bytes);
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+    
+    async fn delete(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.0.delete(name).await }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.0.list_prefix(prefix).await }
+    async fn get_signed_url(&self, name: &str, ttl: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { self.resolve_backend().await?.0.get_signed_url(name, ttl).await }
     fn get_public_url_base(&self) -> String { self.public_url_prefix.clone().unwrap_or_else(|| "/api/v1/storage/file/".to_string()) }
 }
 
@@ -195,9 +256,10 @@ impl ScopedDynamicStorage {
         }
     }
 
-    async fn resolve(&self) -> Result<(Arc<dyn StorageBackend>, bool), Box<dyn std::error::Error + Send + Sync>> {
+    // Returns: (Backend, is_reseller, is_local)
+    async fn resolve(&self) -> Result<(Arc<dyn StorageBackend>, bool, bool), Box<dyn std::error::Error + Send + Sync>> {
         let db = match &self.scope {
-            EventScope::Root => return Ok((Arc::new(DynamicStorage::new(self.state.db.clone(), self.state.vault.clone(), None, "/api/v1/storage/file/".to_string())), false)),
+            EventScope::Root => return Ok((Arc::new(DynamicStorage::new(self.state.db.clone(), self.state.vault.clone(), None, "/api/v1/storage/file/".to_string())), false, true)),
             EventScope::Tenant(id) => self.state.tenant_manager.get_tenant(id.clone()).await.map_err(|e| e.to_string())?,
             EventScope::Sandbox(id) => self.state.sandbox_manager.get_sandbox(id).await.map_err(|e| e.to_string())?,
             _ => return Err("Invalid scope".into()),
@@ -219,7 +281,7 @@ impl ScopedDynamicStorage {
                  } else { String::new() };
                  
                  let s3 = S3Storage::new_with_creds(&tenant_config.s3.bucket, &tenant_config.s3.region, &tenant_config.s3.endpoint, &url_prefix, &tenant_config.s3.access_key, &secret_key, "").await;
-                 return Ok((Arc::new(s3), false));
+                 return Ok((Arc::new(s3), false, false));
             }
         }
 
@@ -239,7 +301,7 @@ impl ScopedDynamicStorage {
                  };
 
                  let s3 = S3Storage::new_with_creds(&root_config.s3.bucket, &root_config.s3.region, &root_config.s3.endpoint, &url_prefix, &root_config.s3.access_key, &secret_key, &isolation_prefix).await;
-                 return Ok((Arc::new(s3), true));
+                 return Ok((Arc::new(s3), true, false));
             }
         }
 
@@ -248,51 +310,105 @@ impl ScopedDynamicStorage {
              EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
              _ => "./storage/tmp".to_string(),
         };
-        Ok((Arc::new(LocalStorage::new(&fs_root, &url_prefix).await), false))
+        Ok((Arc::new(LocalStorage::new(&fs_root, &url_prefix).await), false, true))
     }
 }
 
 #[async_trait]
 impl StorageBackend for ScopedDynamicStorage {
     async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
-        let (backend, is_reseller) = self.resolve().await?;
+        let (backend, is_reseller, is_local) = self.resolve().await?;
         if is_reseller { self.track_op("s3_put").await; } 
-        backend.save(name, data, mime).await 
+        let res = backend.save(name, data, mime).await?;
+
+        // [REPLICA PUSH] Forward local file uploads to Master
+        if is_local {
+            if let Ok(master_url) = std::env::var("APEX_MASTER_URL") {
+                if !master_url.is_empty() {
+                    let master_url = master_url.trim_end_matches('/').to_string();
+                    let data_clone = data.to_vec();
+                    let name_clone = name.to_string();
+                    let mime_clone = mime.to_string();
+                    let scope_str = match &self.scope {
+                        EventScope::Root => "root".to_string(),
+                        EventScope::Tenant(id) => format!("tenant:{}", id),
+                        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+                        _ => "root".to_string(),
+                    };
+                    
+                    tokio::spawn(async move {
+                        let client = reqwest::Client::new();
+                        let url = format!("{}/api/v1/admin/storage/sync-file", master_url);
+                        let master_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
+                        
+                        let _ = client.post(&url)
+                            .header("Authorization", format!("Bearer {}", master_key))
+                            .header("X-Filename", name_clone)
+                            .header("X-Apex-Scope-Override", scope_str)
+                            .header("Content-Type", mime_clone)
+                            .body(data_clone)
+                            .send()
+                            .await;
+                    });
+                }
+            }
+        }
+        
+        Ok(res)
     }
 
     async fn get(&self, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { 
-        let (backend, is_reseller) = self.resolve().await?;
+        let (backend, is_reseller, _is_local) = self.resolve().await?;
         
-        match backend.get(name).await {
+        let mut result = backend.get(name).await;
+
+        // If S3 failed, try local fallback first
+        if result.is_err() && is_reseller {
+             let fs_root = match &self.scope {
+                  EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
+                  EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
+                  _ => "./storage/system/uploads".to_string(),
+             };
+             let local = LocalStorage::new(&fs_root, "/").await;
+             result = local.get(name).await;
+        }
+
+        // [LAZY REPLICATION] If still failed, and we are a replica, fetch from Master HTTP
+        if result.is_err() {
+            if let Ok(master_url) = std::env::var("APEX_MASTER_URL") {
+                if !master_url.is_empty() {
+                    tracing::info!("☁️ File '{}' missing locally on Replica (Scope: {:?}). Fetching from Master...", name, self.scope);
+                    let url_path = self.get_public_url_base();
+                    let full_url = format!("{}{}{}", master_url.trim_end_matches('/'), url_path, name);
+                    
+                    let res = reqwest::Client::new().get(&full_url).send().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    if res.status().is_success() {
+                        let bytes = res.bytes().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?.to_vec();
+                        let mime = mime_guess::from_path(name).first_or_octet_stream().to_string();
+                        
+                        // Cache locally for future requests
+                        let _ = backend.save(name, &bytes, &mime).await;
+                        
+                        if is_reseller { self.track_op("s3_get").await; }
+                        return Ok(bytes);
+                    } else {
+                        tracing::warn!("Failed to fetch file from Master: HTTP {}", res.status());
+                    }
+                }
+            }
+        }
+
+        match result {
             Ok(data) => {
                 if is_reseller { self.track_op("s3_get").await; }
                 Ok(data)
             },
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                let is_not_found = err_str.contains("NoSuchKey") || err_str.contains("404");
-
-                if is_not_found {
-                    tracing::warn!("File '{}' not found on S3. Attempting Local Fallback...", name);
-                    
-                    let fs_root = match &self.scope {
-                        EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
-                        EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
-                        _ => "./storage/system/uploads".to_string(),
-                    };
-                    
-                    let local = LocalStorage::new(&fs_root, "/").await;
-                    return local.get(name).await;
-                }
-                
-                tracing::error!("S3 Storage CRITICAL ERROR for {}: {}", name, e);
-                Err(e)
-            }
+            Err(e) => Err(e)
         }
     }
 
     async fn delete(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { 
-        let (active, is_reseller) = self.resolve().await?;
+        let (active, is_reseller, _is_local) = self.resolve().await?;
         if is_reseller { self.track_op("s3_del").await; }
         
         let _ = active.delete(name).await;
@@ -312,7 +428,7 @@ impl StorageBackend for ScopedDynamicStorage {
     }
     
     async fn get_signed_url(&self, name: &str, ttl: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
-        let (backend, is_reseller) = self.resolve().await?;
+        let (backend, is_reseller, _is_local) = self.resolve().await?;
         if is_reseller { self.track_op("s3_get").await; } 
         backend.get_signed_url(name, ttl).await 
     }
@@ -325,6 +441,58 @@ impl StorageBackend for ScopedDynamicStorage {
             _ => "/api/v1/storage/file/".to_string(),
         }
     }
+}
+
+// --- HANDLER: Sync File From Replica ---
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/storage/sync-file",
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    responses((status = 200, description = "File synced successfully"), (status = 401, description = "Invalid Master Key"))
+)]
+pub async fn sync_file_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, AppError> {
+    // 1. Auth using Master Key
+    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let master_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
+    if auth_header != format!("Bearer {}", master_key) {
+        return Err(AppError::Unauthorized("Invalid Master Key".into()));
+    }
+
+    // 2. Extract metadata
+    let filename = headers.get("X-Filename")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::JsonError("Missing X-Filename header".into()))?;
+        
+    let mime = headers.get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+        
+    let scope_str = headers.get("X-Apex-Scope-Override")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("root");
+
+    // 3. Resolve Scope
+    let scope = if scope_str == "root" {
+        EventScope::Root
+    } else if let Some(tid) = scope_str.strip_prefix("tenant:") {
+        EventScope::Tenant(tid.to_string())
+    } else if let Some(sid) = scope_str.strip_prefix("sandbox:") {
+        EventScope::Sandbox(sid.to_string())
+    } else {
+        EventScope::Root
+    };
+
+    tracing::info!("📥 Received file sync from replica for: {} (Scope: {:?})", filename, scope);
+
+    // 4. Save using ScopedDynamicStorage (Bypasses DB insert because we only call `.save()`)
+    let storage = ScopedDynamicStorage::new(state.clone(), scope);
+    storage.save(filename, &body, mime).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(StatusCode::OK)
 }
 
 // --- HANDLER: Test S3 Connection ---

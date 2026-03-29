@@ -31,7 +31,7 @@ use apex_vector::{VectorEngine, CandleEmbedder, EmbeddingModelConfig};
 
 use apexkit_api::tenant_manager::TenantManager;
 use apexkit_api::sandbox_manager::SandboxManager;
-use apexkit_api::replication::{pb::replication_server::ReplicationServer, MasterReplicationService, GrpcWriteForwarder, ensure_replica_env};
+use apexkit_api::replication::{pb::replication_server::ReplicationServer, MasterReplicationService, GrpcWriteForwarder, ensure_replica_env, init_master_replica_tracker};
 
 struct ApexBridge {
     engine: VectorEngine,
@@ -118,7 +118,7 @@ async fn main() {
     let is_replica = master_url.is_some();
 
     let forwarder: Option<Arc<dyn apexkit_core::batching::WriteForwarder>> = if let Some(url) = &master_url {
-        Some(Arc::new(GrpcWriteForwarder { master_url: url.clone() }))
+        Some(Arc::new(GrpcWriteForwarder::new(url.clone())))
     } else {
         None
     };
@@ -210,7 +210,7 @@ async fn main() {
         forwarder.clone(),
         if !is_replica { Some(sqlite_event_tx.clone()) } else { None }
     ));
-    
+
     let sandbox_manager = Arc::new(SandboxManager::new(
         shared_embedder.clone(), 
         forwarder.clone(),
@@ -248,12 +248,12 @@ async fn main() {
     };
 
     let script_engine = Arc::new(ScriptEngine::new().await);
-    
+
     let thumb_cache = Cache::builder()
         .max_capacity(1000)
         .time_to_live(std::time::Duration::from_secs(3600)) 
         .build();
-    
+
     let embedder = Arc::new(apexkit_core::embeddings::EmbedderService::new());
 
     let env_ttl = std::env::var("ROOT_CACHE_TTL").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
@@ -291,16 +291,17 @@ async fn main() {
             let mut rx = apexkit_api::replication::get_db_sync_tx().subscribe();
             
             tokio::spawn(async move {
-                apexkit_api::replication::start_event_streamer(master_url).await;
+                apexkit_api::replication::start_event_streamer(master_url, Some(state_clone.clone())).await;
             });
 
+            let state_for_apply = state.clone();
             tokio::spawn(async move {
                 loop {
                     if let Ok(event) = rx.recv().await {
                         let db_path = apexkit_api::replication::get_db_path_from_scope(&event.scope, &event.db_name);
                         if db_path.is_empty() || db_path.ends_with("logs.db") { continue; }
 
-                        let state_clone = state_clone.clone();
+                        let state_clone = state_for_apply.clone();
                         
                         tokio::task::spawn_blocking(move || {
                             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
@@ -371,9 +372,9 @@ async fn main() {
 
     let addr = format!("0.0.0.0:{}", cli.port); 
     let listener = TcpListener::bind(&addr).await.unwrap();
-    
+
     tracing::info!("ApexKit listening on {}", listener.local_addr().unwrap());
-    
+
     if is_replica {
         tracing::info!("Running in REPLICA mode. Forwarding writes to Master via gRPC.");
         if let Err(e) = axum::serve(listener, axum_app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await {
@@ -382,7 +383,8 @@ async fn main() {
     } else {
         tracing::info!("Running in MASTER mode. Multiplexing HTTP and gRPC.");
         
-        // [FIXED] Wrap the server with the auth interceptor
+        init_master_replica_tracker(sqlite_event_tx.subscribe()).await;
+
         let grpc_service = ReplicationServer::with_interceptor(
             MasterReplicationService {
                 event_tx: sqlite_event_tx.clone(), 
@@ -391,7 +393,6 @@ async fn main() {
         );
         
         let grpc_router = axum::Router::new()
-            .route_service("/replication.Replication/SubscribeWal", grpc_service.clone())
             .route_service("/replication.Replication/ExecuteWrite", grpc_service.clone())
             .route_service("/replication.Replication/FetchDbSnapshot", grpc_service.clone())
             .route_service("/replication.Replication/StreamEvents", grpc_service);
@@ -402,9 +403,9 @@ async fn main() {
             tracing::error!("Server error: {}", e);
         }
     }
-}
+    }
 
-async fn seed_admin(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn seed_admin(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let email = "admin@apexkit.io";
     if db.get_user_by_email(email).await?.is_none() {
         let hash = apexkit_core::auth::hash_password("password")?;
@@ -422,9 +423,9 @@ async fn seed_admin(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error
         tracing::info!("Seeded default user policies");
     }
     Ok(())
-}
+    }
 
-async fn seed_ai_actions(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn seed_ai_actions(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let actions = vec![
         CreateActionReq {
             name: "Generate Image".to_string(),
@@ -456,21 +457,21 @@ async fn seed_ai_actions(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::
         }
     }
     Ok(())
-}
+    }
 
-async fn seed_default_scripts(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn seed_default_scripts(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let script_name = "apex-auth-roles";
-    
+
     if db.get_script_by_name(script_name).await?.is_none() {
         tracing::info!("Seeding default script: {}", script_name);
         
         let code = r#"
-export default async function(req) {
+    export default async function(req) {
     return new Response({ 
         roles: ["user", "admin", "editor"] 
     });
-}
-"#.trim().to_string();
+    }
+    "#.trim().to_string();
 
         db.create_script(CreateScriptReq {
             name: script_name.to_string(),
@@ -482,4 +483,4 @@ export default async function(req) {
         }).await?;
     }
     Ok(())
-}
+    }

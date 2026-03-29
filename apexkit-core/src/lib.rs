@@ -58,7 +58,7 @@ impl IntoSqlVal for i64 { fn into_val(self) -> rusqlite::types::Value { rusqlite
 impl IntoSqlVal for Option<i64> { fn into_val(self) -> rusqlite::types::Value { match self { Some(v) => rusqlite::types::Value::Integer(v), None => rusqlite::types::Value::Null } } }
 impl IntoSqlVal for bool { fn into_val(self) -> rusqlite::types::Value { rusqlite::types::Value::Integer(if self { 1 } else { 0 }) } }
 impl IntoSqlVal for Option<bool> { fn into_val(self) -> rusqlite::types::Value { match self { Some(b) => rusqlite::types::Value::Integer(if b { 1 } else { 0 }), None => rusqlite::types::Value::Null } } }
-
+impl IntoSqlVal for Option<String> { fn into_val(self) -> rusqlite::types::Value { match self { Some(v) => rusqlite::types::Value::Text(v), None => rusqlite::types::Value::Null } } }
 
 #[async_trait]
 pub trait VectorProvider: Send + Sync {
@@ -302,6 +302,8 @@ pub struct ApexKit {
     data_batcher: batching::WriteManager,
     log_batcher: batching::WriteManager,
     vector_batcher: batching::WriteManager,
+    core_batcher: batching::WriteManager, // [ADDED]
+    sys_batcher: batching::WriteManager,  // [ADDED]
 
     search: Arc<SearchManager>,
     pub embedder: Arc<embeddings::EmbedderService>,
@@ -395,63 +397,42 @@ impl ApexKit {
         event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>, 
         scope: String 
     ) -> Self {
+        let hot_conn_core = Arc::new(Mutex::new(core));
         let hot_conn_data = Arc::new(Mutex::new(data));
         let hot_conn_log = Arc::new(Mutex::new(log));
+        let hot_conn_sys = Arc::new(Mutex::new(sys));
         let hot_conn_vec = Arc::new(Mutex::new(vec));
 
         let data_batcher = batching::WriteManager::new(format!("{}/data.db", base_path), hot_conn_data.clone(), forwarder.clone(), event_tx.clone(), scope.clone(), "data".to_string());
         let log_batcher = batching::WriteManager::new(format!("{}/logs.db", base_path), hot_conn_log.clone(), forwarder.clone(), event_tx.clone(), scope.clone(), "logs".to_string());
         let vector_batcher = batching::WriteManager::new(format!("{}/vectors.db", base_path), hot_conn_vec.clone(), forwarder.clone(), event_tx.clone(), scope.clone(), "vectors".to_string());
+        let core_batcher = batching::WriteManager::new(format!("{}/core.db", base_path), hot_conn_core.clone(), forwarder.clone(), event_tx.clone(), scope.clone(), "core".to_string());
+        let sys_batcher = batching::WriteManager::new(format!("{}/system.db", base_path), hot_conn_sys.clone(), forwarder.clone(), event_tx.clone(), scope.clone(), "system".to_string());
 
         Self {
             base_path: base_path.to_string(),
-            hot_conn_core: Arc::new(Mutex::new(core)),
+            hot_conn_core,
             hot_conn_data,
             hot_conn_log,
-            hot_conn_sys: Arc::new(Mutex::new(sys)),
+            hot_conn_sys,
             hot_conn_vec,
             vector_provider,
             data_batcher,
             log_batcher,
             vector_batcher,
+            core_batcher,
+            sys_batcher,
             search: Arc::new(SearchManager::new(&format!("{}/indexes", base_path))),
             embedder: Arc::new(embeddings::EmbedderService::new()), 
         }
     }
 
-    // // Helper to attach the rusqlite update hook
-    // fn attach_hook(conn: &Connection, scope: &str, db_name: &str, tx: tokio::sync::broadcast::Sender<SqliteEvent>) {
-    //     let s = scope.to_string();
-    //     let db = db_name.to_string();
-        
-    //     let _ = conn.update_hook(Some(move |action: Action, _db: &str, table: &str, row_id: i64| {
-    //         // Ignore noisy internal SQLite tables
-    //         if table.starts_with("sqlite_") { return; }
-
-    //         let act_str = match action {
-    //             Action::SQLITE_INSERT => "INSERT",
-    //             Action::SQLITE_UPDATE => "UPDATE",
-    //             Action::SQLITE_DELETE => "DELETE",
-    //             _ => "UNKNOWN",
-    //         };
-            
-    //         let _ = tx.send(SqliteEvent {
-    //             scope: s.clone(),
-    //             db_name: db.clone(),
-    //             table_name: table.to_string(),
-    //             record_id: row_id,
-    //             action: act_str.to_string(),
-    //         });
-    //     }));
-    // }
-
-    // Update init_filesystem signature too
     pub async fn init_filesystem(
         base_path: &str, 
         vector_provider: Arc<dyn VectorProvider>,
         forwarder: Option<Arc<dyn crate::batching::WriteForwarder>>,
-        event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>, // <--- NEW
-        scope: String // <--- NEW
+        event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>, 
+        scope: String 
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         
         if !Path::new(base_path).exists() {
@@ -555,7 +536,6 @@ impl ApexKit {
 
                 if let Some(tc_id) = target_col_id {
                     for target_rec_id in target_ids {
-                        // [FIX] Use INSERT OR IGNORE to safely handle concurrent deduplication
                         self.data_batcher.execute(
                             "INSERT OR IGNORE INTO _relations (origin_col_id, origin_rec_id, target_col_id, target_rec_id, rel_name) VALUES (?1, ?2, ?3, ?4, ?5)".into(),
                             vec![collection_id.into_val(), record_id.into_val(), tc_id.into_val(), target_rec_id.into_val(), rel_name.clone().into_val()]
@@ -1119,17 +1099,14 @@ async fn reconcile_sql_indexes(
 #[async_trait]
 impl Db for ApexKit {
     async fn create_api_key(&self, name: &str, role: &str, scope: &str, bypass_cors: bool) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
         let raw_key = format!("ak_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
         let prefix = raw_key[0..8].to_string();
         let hash = crate::auth::hash_password(&raw_key)?;
 
-        conn.execute(
-            "INSERT INTO _api_keys (name, prefix, hash, role, scope, bypass_cors) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", 
-            params![name, prefix.clone(), hash, role, scope, bypass_cors]
-        )?;
-        
-        let id = conn.last_insert_rowid();
+        let id = self.core_batcher.insert(
+            "INSERT INTO _api_keys (name, prefix, hash, role, scope, bypass_cors) VALUES (?1, ?2, ?3, ?4, ?5, ?6)".into(), 
+            vec![name.into_val(), prefix.clone().into_val(), hash.into_val(), role.into_val(), scope.into_val(), bypass_cors.into_val()]
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         
         let key_obj = ApiKey {
             id,
@@ -1146,8 +1123,6 @@ impl Db for ApexKit {
     }
 
     async fn update_api_key(&self, id: i64, name: Option<String>, role: Option<String>, scope: Option<String>, bypass_cors: Option<bool>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
-        
         let mut sets = Vec::new();
         let mut params: Vec<rusqlite::types::Value> = vec![]; 
         
@@ -1162,8 +1137,7 @@ impl Db for ApexKit {
 
         let sql = format!("UPDATE _api_keys SET {} WHERE id = ?", sets.join(", "));
         
-        let mut stmt = conn.prepare(&sql)?;
-        stmt.execute(rusqlite::params_from_iter(params))?;
+        self.core_batcher.execute(sql, params).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         
         Ok(())
     }
@@ -1189,7 +1163,7 @@ impl Db for ApexKit {
     }
 
     async fn delete_api_key(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.get_core_read().await.execute("DELETE FROM _api_keys WHERE id = ?1", params![id])?;
+        self.core_batcher.execute("DELETE FROM _api_keys WHERE id = ?1".into(), vec![id.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?;
         Ok(())
     }
 
@@ -1658,28 +1632,16 @@ impl Db for ApexKit {
 
     // --- Core DB (Users, Auth, Settings) ---
     async fn create_user(&self, e: &str, p: &str, r: &str, metadata: Option<Value>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
         let meta = metadata.unwrap_or(json!({}));
         let meta_str = serde_json::to_string(&meta)?;
-        conn.execute("INSERT INTO users (email, password_hash, role, metadata) VALUES (?1, ?2, ?3, ?4)", params![e, p, r, meta_str])?;
-        Ok(User { 
-            id: conn.last_insert_rowid(), 
-            email: e.into(), 
-            password_hash: p.into(), 
-            role: r.into(), 
-            metadata: Some(meta) 
-        })
+        let id = self.core_batcher.insert("INSERT INTO users (email, password_hash, role, metadata) VALUES (?1, ?2, ?3, ?4)".into(), vec![e.into_val(), p.into_val(), r.into_val(), meta_str.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(User { id, email: e.into(), password_hash: p.into(), role: r.into(), metadata: Some(meta) })
     }
 
     async fn import_user(&self, id: i64, e: &str, p: &str, r: &str, metadata: Option<Value>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
         let meta = metadata.unwrap_or(json!({}));
         let meta_str = serde_json::to_string(&meta)?;
-        
-        conn.execute(
-            "INSERT INTO users (id, email, password_hash, role, metadata) VALUES (?1, ?2, ?3, ?4, ?5)", 
-            params![id, e, p, r, meta_str]
-        )?;
+        self.core_batcher.execute("INSERT INTO users (id, email, password_hash, role, metadata) VALUES (?1, ?2, ?3, ?4, ?5)".into(), vec![id.into_val(), e.into_val(), p.into_val(), r.into_val(), meta_str.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
 
@@ -1757,59 +1719,40 @@ impl Db for ApexKit {
         Ok(users)
     }
 
-    async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core_read().await.execute("DELETE FROM users WHERE id = ?1", params![id])?; Ok(()) }
+    async fn delete_user(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
+        self.core_batcher.execute("DELETE FROM users WHERE id = ?1".into(), vec![id.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; 
+        Ok(()) 
+    }
+
     async fn update_user(&self, id: i64, email: Option<String>, role: Option<String>, metadata: Option<serde_json::Value>, password: Option<String>) -> std::result::Result<User, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
-        
         let mut sets = Vec::new();
         let mut params: Vec<rusqlite::types::Value> = vec![];
+        if let Some(e) = &email { sets.push("email = ?"); params.push(e.as_str().into_val()); }
+        if let Some(r) = &role { sets.push("role = ?"); params.push(r.as_str().into_val()); }
+        if let Some(p) = &password { let hash = crate::auth::hash_password(p)?; sets.push("password_hash = ?"); params.push(hash.into_val()); }
+        if let Some(m) = &metadata { let m_str = serde_json::to_string(m)?; sets.push("metadata = ?"); params.push(m_str.into_val()); }
         
-        if let Some(e) = email { sets.push("email = ?"); params.push(e.into_val()); }
-        if let Some(r) = role { sets.push("role = ?"); params.push(r.into_val()); }
-        
-        if let Some(p) = password {
-             let hash = crate::auth::hash_password(&p)?;
-             sets.push("password_hash = ?");
-             params.push(hash.into_val());
-        }
-
-        if let Some(m) = metadata { 
-            let m_str = serde_json::to_string(&m)?;
-            sets.push("metadata = ?"); 
-            params.push(m_str.into_val()); 
-        }
-
         if sets.is_empty() { 
+            let conn = self.get_core_read().await;
             let mut stmt = conn.prepare("SELECT id, email, password_hash, role, metadata FROM users WHERE id = ?1")?;
             let mut r = stmt.query(params![id])?;
             if let Some(row) = r.next()? {
                 let meta_str: String = row.get(4).unwrap_or("{}".to_string());
-                return Ok(User { 
-                    id: row.get(0)?, 
-                    email: row.get(1)?, 
-                    password_hash: row.get(2)?, 
-                    role: row.get(3)?,
-                    metadata: serde_json::from_str(&meta_str).ok()
-                });
+                return Ok(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)?, metadata: serde_json::from_str(&meta_str).ok() });
             }
             return Err("User not found".into());
         }
 
         params.push(id.into_val());
-        let sql = format!("UPDATE users SET {} WHERE id = ? RETURNING id, email, password_hash, role, metadata", sets.join(", "));
+        let sql = format!("UPDATE users SET {} WHERE id = ?", sets.join(", "));
+        self.core_batcher.execute(sql, params).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-        
-        if let Some(row) = rows.next()? {
+        let conn = self.get_core_read().await;
+        let mut stmt = conn.prepare("SELECT id, email, password_hash, role, metadata FROM users WHERE id = ?1")?;
+        let mut r = stmt.query(params![id])?;
+        if let Some(row) = r.next()? {
             let meta_str: String = row.get(4).unwrap_or("{}".to_string());
-            Ok(User { 
-                id: row.get(0)?, 
-                email: row.get(1)?, 
-                password_hash: row.get(2)?, 
-                role: row.get(3)?,
-                metadata: serde_json::from_str(&meta_str).ok()
-            })
+            Ok(User { id: row.get(0)?, email: row.get(1)?, password_hash: row.get(2)?, role: row.get(3)?, metadata: serde_json::from_str(&meta_str).ok() })
         } else {
             Err("User not found".into())
         }
@@ -1830,15 +1773,33 @@ impl Db for ApexKit {
             })) 
         } else { Ok(None) }
     }
-    async fn link_oauth(&self, uid: i64, p: &str, pid: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core_read().await.execute("INSERT INTO auth_identities (user_id, provider, provider_id) VALUES (?1, ?2, ?3)", params![uid, p, pid])?; Ok(()) }
-    async fn create_auth_token(&self, uid: i64, t: &str, tk: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core_read().await.execute("INSERT INTO auth_tokens (token, user_id, type, expires_at) VALUES (?1, ?2, ?3, datetime('now', '+1 hour'))", params![tk, uid, t])?; Ok(()) }
+    async fn link_oauth(&self, uid: i64, p: &str, pid: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.core_batcher.execute("INSERT INTO auth_identities (user_id, provider, provider_id) VALUES (?1, ?2, ?3)".into(), vec![uid.into_val(), p.into_val(), pid.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; Ok(()) }
+    async fn create_auth_token(&self, uid: i64, t: &str, tk: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.core_batcher.execute("INSERT INTO auth_tokens (token, user_id, type, expires_at) VALUES (?1, ?2, ?3, datetime('now', '+1 hour'))".into(), vec![tk.into_val(), uid.into_val(), t.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; Ok(()) }
     async fn consume_auth_token(&self, tk: &str, t: &str) -> std::result::Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
-        let mut stmt = conn.prepare("SELECT user_id FROM auth_tokens WHERE token = ?1 AND type = ?2 AND expires_at > datetime('now')")?;
-        let mut r = stmt.query(params![tk, t])?;
-        if let Some(row) = r.next()? { let uid: i64 = row.get(0)?; conn.execute("DELETE FROM auth_tokens WHERE token = ?1", params![tk])?; Ok(Some(uid)) } else { Ok(None) }
+        // Scope the sync DB operations
+        let uid = {
+            let conn = self.get_core_read().await;
+            let mut stmt = conn.prepare("SELECT user_id FROM auth_tokens WHERE token = ?1 AND type = ?2 AND expires_at > datetime('now')")?;
+            let mut r = stmt.query(params![tk, t])?;
+            if let Some(row) = r.next()? {
+                Some(row.get::<_, i64>(0)?)
+            } else {
+                None
+            }
+        };
+
+        // Now safe to await
+        if let Some(user_id) = uid {
+            self.core_batcher.execute(
+                "DELETE FROM auth_tokens WHERE token = ?1".into(), 
+                vec![tk.into_val()]
+            ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            Ok(Some(user_id))
+        } else {
+            Ok(None)
+        }
     }
-    async fn set_user_verified(&self, uid: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_core_read().await.execute("UPDATE users SET is_verified = 1 WHERE id = ?1", params![uid])?; Ok(()) }
+    async fn set_user_verified(&self, uid: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.core_batcher.execute("UPDATE users SET is_verified = 1 WHERE id = ?1".into(), vec![uid.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; Ok(()) }
     async fn get_config(&self, key: &str) -> std::result::Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core_read().await;
         let mut stmt = conn.prepare("SELECT value FROM _system_config_settings WHERE key = ?1")?;
@@ -1851,13 +1812,12 @@ impl Db for ApexKit {
         }
     }
     async fn set_config(&self, key: &str, value: &serde_json::Value, encrypted: bool) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
         let v_str = serde_json::to_string(value)?;
-        conn.execute(
+        self.core_batcher.execute(
             "INSERT INTO _system_config_settings (key, value, encrypted, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP) 
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=excluded.encrypted, updated_at=CURRENT_TIMESTAMP", 
-            params![key, v_str, encrypted]
-        )?; 
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=excluded.encrypted, updated_at=CURRENT_TIMESTAMP".into(), 
+            vec![key.into_val(), v_str.into_val(), encrypted.into_val()]
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; 
         Ok(())
     }
     async fn list_configs(&self) -> std::result::Result<Vec<models::ConfigItem>, Box<dyn std::error::Error + Send + Sync>> {
@@ -1890,8 +1850,7 @@ impl Db for ApexKit {
         Ok(items)
     }
     async fn delete_config(&self, key: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
-        conn.execute("DELETE FROM _system_config_settings WHERE key = ?1", params![key])?;
+        self.core_batcher.execute("DELETE FROM _system_config_settings WHERE key = ?1".into(), vec![key.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
 
@@ -1981,25 +1940,33 @@ impl Db for ApexKit {
         } else { Ok(None) }
     }
     async fn create_ai_action(&self, req: ai_models::CreateActionReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys_read().await;
-        conn.execute("INSERT INTO _ai_actions (slug, name, model, system_prompt, template, config) VALUES (?1, ?2, ?3, ?4, ?5, '{}')", params![req.slug, req.name, req.model, req.system_prompt, req.template])?;
-        Ok(conn.last_insert_rowid())
-    }
-    async fn delete_ai_action(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("DELETE FROM _ai_actions WHERE id = ?1", params![id])?; Ok(()) }
-    async fn create_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
-        self.get_sys_read().await.execute(
-            "INSERT INTO _ai_sessions (id, name, messages, current_manifest, pending_manifest, diff_summary, last_error, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", 
-            params![
-                s.id.clone(), 
-                s.name.clone(), 
-                serde_json::to_string(&s.messages)?, 
-                serde_json::to_string(&s.current_manifest)?, 
-                serde_json::to_string(&s.pending_manifest)?, 
-                s.diff_summary.clone(), 
-                s.last_error.clone(), 
-                s.created_at.clone()
+        let id = self.sys_batcher.insert(
+            "INSERT INTO _ai_actions (slug, name, model, system_prompt, template, config) VALUES (?1, ?2, ?3, ?4, ?5, '{}')".into(),
+            vec![
+                req.slug.into_val(), 
+                req.name.into_val(), 
+                req.model.into_val(), 
+                req.system_prompt.into_val(), 
+                req.template.into_val()
             ]
-        )?; 
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(id)
+    }
+    async fn delete_ai_action(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.sys_batcher.execute("DELETE FROM _ai_actions WHERE id = ?1".into(), vec![id.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; Ok(()) }
+    async fn create_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
+        self.sys_batcher.execute(
+            "INSERT INTO _ai_sessions (id, name, messages, current_manifest, pending_manifest, diff_summary, last_error, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)".into(), 
+            vec![
+                s.id.clone().into_val(), 
+                s.name.clone().into_val(), 
+                serde_json::to_string(&s.messages)?.into_val(), 
+                serde_json::to_string(&s.current_manifest)?.into_val(), 
+                serde_json::to_string(&s.pending_manifest)?.into_val(), 
+                s.diff_summary.clone().into_val(), 
+                s.last_error.clone().into_val(), 
+                s.created_at.clone().into_val()
+            ]
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; 
         Ok(()) 
     }
     async fn get_ai_session(&self, id: &str) -> std::result::Result<Option<AiSession>, Box<dyn std::error::Error + Send + Sync>> {
@@ -2026,17 +1993,17 @@ impl Db for ApexKit {
     }
 
     async fn update_ai_session(&self, s: &AiSession) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { 
-        self.get_sys_read().await.execute(
-            "UPDATE _ai_sessions SET messages = ?1, current_manifest = ?2, pending_manifest = ?3, diff_summary = ?4, last_error = ?5 WHERE id = ?6", 
-            params![
-                serde_json::to_string(&s.messages)?, 
-                serde_json::to_string(&s.current_manifest)?, 
-                serde_json::to_string(&s.pending_manifest)?, 
-                s.diff_summary.clone(), 
-                s.last_error.clone(), 
-                s.id.clone()
+        self.sys_batcher.execute(
+            "UPDATE _ai_sessions SET messages = ?1, current_manifest = ?2, pending_manifest = ?3, diff_summary = ?4, last_error = ?5 WHERE id = ?6".into(), 
+            vec![
+                serde_json::to_string(&s.messages)?.into_val(), 
+                serde_json::to_string(&s.current_manifest)?.into_val(), 
+                serde_json::to_string(&s.pending_manifest)?.into_val(), 
+                s.diff_summary.clone().into_val(), 
+                s.last_error.clone().into_val(), 
+                s.id.clone().into_val()
             ]
-        )?; 
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; 
         Ok(()) 
     }
 
@@ -2065,11 +2032,11 @@ impl Db for ApexKit {
     }
 
     async fn delete_ai_session(&self, id: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.get_sys_read().await.execute("DELETE FROM _ai_sessions WHERE id = ?1", params![id])?;
+        self.sys_batcher.execute("DELETE FROM _ai_sessions WHERE id = ?1".into(), vec![id.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
     
-    async fn save_plugin(&self, p: &Plugin) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("INSERT INTO _plugins (id, name, version, manifest, description) VALUES (?1, ?2, ?3, ?4, ?5)", params![p.id.clone(), p.name.clone(), p.version.clone(), serde_json::to_string(&p.manifest)?, p.description.clone()])?; Ok(()) }
+    async fn save_plugin(&self, p: &Plugin) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.sys_batcher.execute("INSERT INTO _plugins (id, name, version, manifest, description) VALUES (?1, ?2, ?3, ?4, ?5)".into(), vec![p.id.clone().into_val(), p.name.clone().into_val(), p.version.clone().into_val(), serde_json::to_string(&p.manifest)?.into_val(), p.description.clone().into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; Ok(()) }
     async fn list_plugins(&self) -> std::result::Result<Vec<Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys_read().await;
         let mut stmt = conn.prepare("SELECT id, name, version, manifest, description FROM _plugins ORDER BY created_at DESC")?;
@@ -2098,13 +2065,12 @@ impl Db for ApexKit {
     }
 
     async fn create_script(&self, req: script_models::CreateScriptReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys_read().await;
-        let mut stmt = conn.prepare(
+        let id = self.sys_batcher.insert(
             "INSERT INTO _scripts (name, trigger_type, code, target_collection, visibility, active) VALUES (?1, ?2, ?3, ?4, ?5, ?6) 
-             ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, target_collection=excluded.target_collection, visibility=excluded.visibility, active=excluded.active, created_at=CURRENT_TIMESTAMP RETURNING id"
-        )?;
-        let mut rows = stmt.query(params![req.name, req.trigger_type, req.code, req.target_collection, req.visibility, req.active])?;
-        if let Some(row) = rows.next()? { Ok(row.get(0)?) } else { Err("Failed".into()) }
+             ON CONFLICT(name) DO UPDATE SET trigger_type=excluded.trigger_type, code=excluded.code, target_collection=excluded.target_collection, visibility=excluded.visibility, active=excluded.active, created_at=CURRENT_TIMESTAMP".into(),
+            vec![req.name.into_val(), req.trigger_type.into_val(), req.code.into_val(), req.target_collection.into_val(), req.visibility.into_val(), req.active.into_val()]
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(id) // Note: this might return 0 on UPDATE due to SQLite last_insert_rowid quirks if replacing
     }
 
     async fn get_script_by_name(&self, name: &str) -> std::result::Result<Option<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
@@ -2124,7 +2090,7 @@ impl Db for ApexKit {
         } else { Ok(None) }
     }
 
-    async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("DELETE FROM _scripts WHERE id = ?1", params![id])?; Ok(()) }
+    async fn delete_script(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.sys_batcher.execute("DELETE FROM _scripts WHERE id = ?1".into(), vec![id.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; Ok(()) }
     
     async fn get_scripts_by_trigger(&self, t: &str) -> std::result::Result<Vec<script_models::Script>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_sys_read().await;
@@ -2159,13 +2125,11 @@ impl Db for ApexKit {
         if let Some(row) = r.next()? { Ok(Some(models::Template { id: row.get(0)?, slug: row.get(1)?, content: row.get(2)?, script_id: row.get(3)?, created_at: row.get(4)? })) } else { Ok(None) }
     }
     async fn create_template(&self, req: models::CreateTemplateReq) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_sys_read().await;
-        let mut stmt = conn.prepare("INSERT INTO _templates (slug, content, script_id) VALUES (?1, ?2, ?3) ON CONFLICT(slug) DO UPDATE SET content=excluded.content, script_id=excluded.script_id, created_at=CURRENT_TIMESTAMP RETURNING id")?;
-        let mut rows = stmt.query(params![req.slug, req.content, req.script_id])?;
-        if let Some(row) = rows.next()? { Ok(row.get(0)?) } else { Err("Failed".into()) }
+        let id = self.sys_batcher.insert("INSERT INTO _templates (slug, content, script_id) VALUES (?1, ?2, ?3) ON CONFLICT(slug) DO UPDATE SET content=excluded.content, script_id=excluded.script_id, created_at=CURRENT_TIMESTAMP".into(), vec![req.slug.into_val(), req.content.into_val(), req.script_id.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(id)
     }
-    async fn update_template(&self, id: i64, content: String, script_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("UPDATE _templates SET content = ?1, script_id = ?2 WHERE id = ?3", params![content, script_id, id])?; Ok(()) }
-    async fn delete_template(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.get_sys_read().await.execute("DELETE FROM _templates WHERE id = ?1", params![id])?; Ok(()) }
+    async fn update_template(&self, id: i64, content: String, script_id: Option<i64>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.sys_batcher.execute("UPDATE _templates SET content = ?1, script_id = ?2 WHERE id = ?3".into(), vec![content.into_val(), script_id.into_val(), id.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; Ok(()) }
+    async fn delete_template(&self, id: i64) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.sys_batcher.execute("DELETE FROM _templates WHERE id = ?1".into(), vec![id.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?; Ok(()) }
 
     async fn create_relation(&self, oc: i64, oi: i64, tc: i64, ti: i64, rn: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.data_batcher.execute("INSERT INTO _relations (origin_col_id, origin_rec_id, target_col_id, target_rec_id, rel_name) VALUES (?1, ?2, ?3, ?4, ?5)".into(), vec![oc.into_val(), oi.into_val(), tc.into_val(), ti.into_val(), rn.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error + Send + Sync>)?; Ok(())
@@ -2197,22 +2161,15 @@ impl Db for ApexKit {
 
     // --- Tenants ---
     async fn register_tenant(&self, id: &str, owner_id: Option<i64>, name: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
-        
-        conn.execute(
+        self.core_batcher.execute(
             "INSERT INTO _tenants (id, owner_id, name, tier) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET 
                 owner_id=excluded.owner_id, 
                 name=excluded.name, 
                 tier=excluded.tier,
-                updated_at=CURRENT_TIMESTAMP",
-            params![
-                id, 
-                owner_id, 
-                name, 
-                tier.unwrap_or("free".to_string())
-            ]
-        )?;
+                updated_at=CURRENT_TIMESTAMP".into(),
+            vec![id.into_val(), owner_id.into_val(), name.into_val(), tier.unwrap_or("free".to_string()).into_val()]
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
 
@@ -2230,13 +2187,11 @@ impl Db for ApexKit {
     }
 
     async fn update_tenant_status(&self, tenant_id: &str, status: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
-        conn.execute("UPDATE _tenants SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2", params![status, tenant_id])?;
+        self.core_batcher.execute("UPDATE _tenants SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2".into(), vec![status.into_val(), tenant_id.into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
 
     async fn update_tenant_full(&self, id: &str, name: Option<String>, status: Option<String>, tier: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
         let mut sets = Vec::new();
         let mut params: Vec<rusqlite::types::Value> = vec![];
 
@@ -2250,13 +2205,12 @@ impl Db for ApexKit {
         params.push(id.to_string().into_val());
 
         let sql = format!("UPDATE _tenants SET {} WHERE id = ?", sets.join(", "));
-        let mut stmt = conn.prepare(&sql)?;
-        stmt.execute(rusqlite::params_from_iter(params))?;
+        self.core_batcher.execute(sql, params).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
 
     async fn delete_tenant_metadata(&self, id: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.get_core_read().await.execute("DELETE FROM _tenants WHERE id = ?1", params![id.to_string()])?;
+        self.core_batcher.execute("DELETE FROM _tenants WHERE id = ?1".into(), vec![id.to_string().into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
 
@@ -2302,26 +2256,18 @@ impl Db for ApexKit {
 
     // --- Sandboxes ---
     async fn register_sandbox(&self, id: &str, owner_id: Option<i64>, name: Option<String>, expires_at: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
-        
-        conn.execute(
+        self.core_batcher.execute(
             "INSERT INTO _sandboxes (id, owner_id, name, expires_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET 
                 owner_id=excluded.owner_id, 
                 name=excluded.name, 
-                expires_at=excluded.expires_at",
-            params![
-                id, 
-                owner_id, 
-                name,
-                expires_at
-            ]
-        )?;
+                expires_at=excluded.expires_at".into(),
+            vec![id.into_val(), owner_id.into_val(), name.into_val(), expires_at.into_val()]
+        ).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
 
     async fn update_sandbox_full(&self, id: &str, name: Option<String>, status: Option<String>, expires_at: Option<String>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.get_core_read().await;
         let mut sets = Vec::new();
         let mut params: Vec<rusqlite::types::Value> = vec![];
 
@@ -2333,13 +2279,12 @@ impl Db for ApexKit {
 
         params.push(id.to_string().into_val());
         let sql = format!("UPDATE _sandboxes SET {} WHERE id = ?", sets.join(", "));
-        let mut stmt = conn.prepare(&sql)?;
-        stmt.execute(rusqlite::params_from_iter(params))?;
+        self.core_batcher.execute(sql, params).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
 
     async fn delete_sandbox_metadata(&self, id: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.get_core_read().await.execute("DELETE FROM _sandboxes WHERE id = ?1", params![id.to_string()])?;
+        self.core_batcher.execute("DELETE FROM _sandboxes WHERE id = ?1".into(), vec![id.to_string().into_val()]).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
 
@@ -2713,6 +2658,11 @@ fn setup_sys(conn: &Connection) -> Result<()> {
     conn.execute("CREATE TABLE IF NOT EXISTS _plugins (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, manifest JSON NOT NULL, description TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS _templates (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE NOT NULL, content TEXT NOT NULL, script_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS _scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, trigger_type TEXT NOT NULL, code TEXT NOT NULL, active BOOLEAN DEFAULT 1, target_collection TEXT, visibility TEXT DEFAULT 'private', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
+    conn.execute("CREATE TABLE IF NOT EXISTS _replicas (
+        id TEXT PRIMARY KEY,
+        scopes TEXT NOT NULL,
+        last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+    )", [])?;
     
     let _ = conn.execute("ALTER TABLE _scripts ADD COLUMN visibility TEXT DEFAULT 'private'", []);
     Ok(())

@@ -1634,6 +1634,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/storage/files/{id}", axum::routing::delete(storage::delete_file))
         .route("/admin/storage/test", post(storage::test_s3_connection))
         .route("/admin/storage/migrate", post(storage::migrate_storage))
+        .route("/admin/storage/sync-file", post(storage::sync_file_handler))
         .route("/admin/settings", get(settings::get_settings).patch(settings::update_settings).put(settings::update_settings))
         .route("/admin/smtp/test", post(auth_advanced::test_email_handler))
         .route("/admin/config", post(config_routes::set_config).get(config_routes::list_configs))

@@ -34,7 +34,12 @@ sandboxes/
 tenants/
 uploads/
 tmp/
+
+# ============================
+# Ignored Binaries & Assets
+# ============================
 swalang
+/static/tailwind-dark.full.css
 
 # ============================
 # Build artifacts

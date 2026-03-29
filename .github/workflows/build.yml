@@ -36,6 +36,19 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Cache Tailwind CSS
+        id: cache-tailwind
+        uses: actions/cache@v4
+        with:
+          path: static/tailwind-dark.full.css
+          key: tailwind-css-2.2.19
+
+      - name: Download Tailwind CSS
+        if: steps.cache-tailwind.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p static
+          curl -L -o static/tailwind-dark.full.css https://unpkg.com/tailwindcss@2.2.19/dist/tailwind-dark.css
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update
