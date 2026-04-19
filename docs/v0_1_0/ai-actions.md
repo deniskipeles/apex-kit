@@ -89,16 +89,16 @@ Content-Type: application/json
 The ApexKit SDK simplifies AI interaction with typed methods.
 
 ```javascript
-import { pb } from './apiClient';
+import { apex } from './apiClient';
 
 // 1. Text Generation
-const summary = await pb.ai.run('summarize', { 
+const summary = await apex.ai.run('summarize', {
     text: "Long article content..." 
 });
 console.log(summary.result);
 
 // 2. Vision (Image to Text)
-const description = await pb.ai.run('describe-image', {
+const description = await apex.ai.run('describe-image', {
     image: await getBase64(fileInput.files[0]),
     prompt: "What color is the car?"
 });

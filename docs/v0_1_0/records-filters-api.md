@@ -124,10 +124,10 @@ Filter the stream of events sent to your client. This happens in-memory on the s
 ### Scripting Engine
 Pass filter objects directly to the `$db` helper.
 ```javascript
-const activeUsers = await $db.find("users", {
+const activeUsers = await $db.records.list("users", { filter: {
     "last_login": { "$gt": "2024-01-01" },
     "status": "active"
-});
+} });
 ```
 
 ---

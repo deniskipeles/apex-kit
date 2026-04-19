@@ -95,19 +95,19 @@ Tenants are isolated, but they can consume logic shared by the Root App.
 The `ApexKit` client supports fluent context switching.
 
 ```javascript
-import { ApexKit } from 'apexkit-sdk';
+import { ApexKit } from '@apexkit/sdk';
 
-const pb = new ApexKit('https://api.myapp.com');
+const apex = new ApexKit('https://api.myapp.com');
 
 // 1. Root Context
-await pb.auth.login('admin@root.com', 'pass');
+await apex.auth.login('admin@root.com', 'pass');
 
 // 2. Switch to Tenant
-const tenant = pb.tenant('client-beta');
+const tenant = apex.tenant('client-beta');
 const orders = await tenant.collection('orders').list();
 
 // 3. Switch to Sandbox
-const sandbox = pb.sandbox('session-99-abc');
+const sandbox = apex.sandbox('session-99-abc');
 await sandbox.collection('todos').create({ title: "Try AI feature" });
 ```
 

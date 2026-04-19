@@ -24,7 +24,7 @@ These objects are available in every script context.
 
 | Object | Description | Example |
 | :--- | :--- | :--- |
-| **`$db`** | Scoped Database Access. | `await $db.records.find(null, "users", { active: true })` |
+| **`$db`** | Scoped Database Access. | `await $db.records.list(null, "users", { active: true })` |
 | **`$run`** | Execute other scripts. | `await $run.script("shared-logic", { id: 1 })` |
 | **`$cache`** | Scoped Key-Value store. | `await $cache.incr("hits", 1)` |
 | **`$http`** | Make external requests. | `await $http.get("https://api.com")` |

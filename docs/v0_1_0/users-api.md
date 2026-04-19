@@ -117,20 +117,20 @@ You can intercept user lifecycle events using scripts to add custom validation o
 The `ApexKit` client manages token persistence and scope automatically.
 
 ```javascript
-import { pb } from './apiClient';
+import { apex } from './apiClient';
 
 // 1. Authenticate
-const { token, user } = await pb.auth.login('alice@app.com', 'password');
+const { token, user } = await apex.auth.login('alice@app.com', 'password');
 
 // 2. Fetch current user (validates token/scope)
-const me = await pb.auth.getMe();
+const me = await apex.auth.getMe();
 console.log(`Loggend into: ${me.scope}`);
 
 // 3. Admin Management (Requires Admin role)
-const { items: users } = await pb.admins.listUsers({ page: 1 });
+const { items: users } = await apex.admins.listUsers({ page: 1 });
 
 // 4. Update Metadata
-await pb.admins.updateUser(user.id, {
+await apex.admins.updateUser(user.id, {
     metadata: { ...user.metadata, last_ip: '1.2.3.4' }
 });
 ```

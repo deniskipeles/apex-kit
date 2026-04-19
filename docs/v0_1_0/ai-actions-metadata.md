@@ -80,7 +80,7 @@ export default async function(req) {
     const tags = [...new Set(rawTags)].slice(0, 5); // Deduplicate and slice
 
     // 3. Save to Database
-    const newRecordId = await $db.insert("posts", {
+    const newRecordId = await $db.records.create("posts", {
         title: topic,
         content: content,
         tags: tags, // Stores: ["history of js", "js frameworks", ...]
