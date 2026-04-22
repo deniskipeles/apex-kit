@@ -168,32 +168,22 @@ impl DynamicStorage {
 
 #[async_trait]
 impl StorageBackend for DynamicStorage {
-    async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
+    async fn save(&self, name: &str, data: &[u8], content_type: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
         let (backend, is_local) = self.resolve_backend().await?;
-        let res = backend.save(name, data, mime).await?;
+        let res = backend.save(name, data, content_type).await?;
         
-        // [REPLICA PUSH] Forward local file uploads to Master
+        // [REPLICA PUSH] Forward local file uploads to Master via gRPC
         if is_local {
             if let Ok(master_url) = std::env::var("APEX_MASTER_URL") {
                 if !master_url.is_empty() {
-                    let master_url = master_url.trim_end_matches('/').to_string();
                     let data_clone = data.to_vec();
                     let name_clone = name.to_string();
-                    let mime_clone = mime.to_string();
+                    let mime_clone = content_type.to_string();
                     
                     tokio::spawn(async move {
-                        let client = reqwest::Client::new();
-                        let url = format!("{}/api/v1/admin/storage/sync-file", master_url);
-                        let master_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
-                        
-                        let _ = client.post(&url)
-                            .header("Authorization", format!("Bearer {}", master_key))
-                            .header("X-Filename", name_clone)
-                            .header("X-Apex-Scope-Override", "root")
-                            .header("Content-Type", mime_clone)
-                            .body(data_clone)
-                            .send()
-                            .await;
+                        if let Err(e) = crate::replication::forward_file_to_master(&master_url, "root", &name_clone, &mime_clone, &data_clone).await {
+                            tracing::error!("Failed to sync file to master via gRPC: {}", e);
+                        }
                     });
                 }
             }
@@ -316,19 +306,18 @@ impl ScopedDynamicStorage {
 
 #[async_trait]
 impl StorageBackend for ScopedDynamicStorage {
-    async fn save(&self, name: &str, data: &[u8], mime: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
+    async fn save(&self, name: &str, data: &[u8], content_type: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
         let (backend, is_reseller, is_local) = self.resolve().await?;
         if is_reseller { self.track_op("s3_put").await; } 
-        let res = backend.save(name, data, mime).await?;
+        let res = backend.save(name, data, content_type).await?;
 
-        // [REPLICA PUSH] Forward local file uploads to Master
+        // [REPLICA PUSH] Forward local file uploads to Master via gRPC
         if is_local {
             if let Ok(master_url) = std::env::var("APEX_MASTER_URL") {
                 if !master_url.is_empty() {
-                    let master_url = master_url.trim_end_matches('/').to_string();
                     let data_clone = data.to_vec();
                     let name_clone = name.to_string();
-                    let mime_clone = mime.to_string();
+                    let mime_clone = content_type.to_string();
                     let scope_str = match &self.scope {
                         EventScope::Root => "root".to_string(),
                         EventScope::Tenant(id) => format!("tenant:{}", id),
@@ -337,18 +326,9 @@ impl StorageBackend for ScopedDynamicStorage {
                     };
                     
                     tokio::spawn(async move {
-                        let client = reqwest::Client::new();
-                        let url = format!("{}/api/v1/admin/storage/sync-file", master_url);
-                        let master_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
-                        
-                        let _ = client.post(&url)
-                            .header("Authorization", format!("Bearer {}", master_key))
-                            .header("X-Filename", name_clone)
-                            .header("X-Apex-Scope-Override", scope_str)
-                            .header("Content-Type", mime_clone)
-                            .body(data_clone)
-                            .send()
-                            .await;
+                        if let Err(e) = crate::replication::forward_file_to_master(&master_url, &scope_str, &name_clone, &mime_clone, &data_clone).await {
+                            tracing::error!("Failed to sync file to master via gRPC: {}", e);
+                        }
                     });
                 }
             }
@@ -441,58 +421,6 @@ impl StorageBackend for ScopedDynamicStorage {
             _ => "/api/v1/storage/file/".to_string(),
         }
     }
-}
-
-// --- HANDLER: Sync File From Replica ---
-#[utoipa::path(
-    post,
-    path = "/api/v1/admin/storage/sync-file",
-    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
-    responses((status = 200, description = "File synced successfully"), (status = 401, description = "Invalid Master Key"))
-)]
-pub async fn sync_file_handler(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<StatusCode, AppError> {
-    // 1. Auth using Master Key
-    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let master_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
-    if auth_header != format!("Bearer {}", master_key) {
-        return Err(AppError::Unauthorized("Invalid Master Key".into()));
-    }
-
-    // 2. Extract metadata
-    let filename = headers.get("X-Filename")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::JsonError("Missing X-Filename header".into()))?;
-        
-    let mime = headers.get("Content-Type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
-        
-    let scope_str = headers.get("X-Apex-Scope-Override")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("root");
-
-    // 3. Resolve Scope
-    let scope = if scope_str == "root" {
-        EventScope::Root
-    } else if let Some(tid) = scope_str.strip_prefix("tenant:") {
-        EventScope::Tenant(tid.to_string())
-    } else if let Some(sid) = scope_str.strip_prefix("sandbox:") {
-        EventScope::Sandbox(sid.to_string())
-    } else {
-        EventScope::Root
-    };
-
-    tracing::info!("📥 Received file sync from replica for: {} (Scope: {:?})", filename, scope);
-
-    // 4. Save using ScopedDynamicStorage (Bypasses DB insert because we only call `.save()`)
-    let storage = ScopedDynamicStorage::new(state.clone(), scope);
-    storage.save(filename, &body, mime).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    Ok(StatusCode::OK)
 }
 
 // --- HANDLER: Test S3 Connection ---

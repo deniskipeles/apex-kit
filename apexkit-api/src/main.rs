@@ -263,6 +263,11 @@ async fn main() {
         .max_capacity(env_root_cache_size)
         .time_to_live(std::time::Duration::from_secs(env_ttl))
         .build();
+    // [NEW] Cache for OSE milestones (5 minutes TTL as requested)
+    let record_count_cache = Cache::builder()
+        .max_capacity(10_000)
+        .time_to_live(std::time::Duration::from_secs(300)) 
+        .build();
 
     let state = AppState {
         db: cached_db.clone(),
@@ -282,6 +287,7 @@ async fn main() {
         vector_provider: vector_provider.clone(),
         port: cli.port,
         root_script_cache,
+        record_count_cache,
     };
 
     // --- SNAPSHOT REPLICATION APPLIER ---
@@ -385,17 +391,25 @@ async fn main() {
         
         init_master_replica_tracker(sqlite_event_tx.subscribe()).await;
 
-        let grpc_service = ReplicationServer::with_interceptor(
-            MasterReplicationService {
-                event_tx: sqlite_event_tx.clone(), 
-            },
+        // 1. Initialize the server and set the limits FIRST
+        let master_service = ReplicationServer::new(MasterReplicationService {
+            event_tx: sqlite_event_tx.clone(),
+            state: state.clone(),
+        })
+        .max_decoding_message_size(100 * 1024 * 1024)
+        .max_encoding_message_size(100 * 1024 * 1024);
+
+        // 2. THEN wrap it in the interceptor
+        let grpc_service = tonic::service::interceptor::InterceptedService::new(
+            master_service,
             apexkit_api::replication::server_auth_interceptor
         );
         
         let grpc_router = axum::Router::new()
             .route_service("/replication.Replication/ExecuteWrite", grpc_service.clone())
             .route_service("/replication.Replication/FetchDbSnapshot", grpc_service.clone())
-            .route_service("/replication.Replication/StreamEvents", grpc_service);
+            .route_service("/replication.Replication/StreamEvents", grpc_service.clone())
+            .route_service("/replication.Replication/SyncFile", grpc_service); // [NEW] Bind SyncFile Route
 
         let multiplexed_app = grpc_router.merge(axum_app);
 
@@ -403,7 +417,7 @@ async fn main() {
             tracing::error!("Server error: {}", e);
         }
     }
-    }
+}
 
     async fn seed_admin(db: &impl apexkit_core::Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let email = "admin@apexkit.io";

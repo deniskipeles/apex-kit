@@ -1,4 +1,3 @@
-// =========================== /teamspace/studios/this_studio/apex/apex-kit/admin-ui/src/features/collections/components/SchemaEditor.tsx ===========================
 import React, { useState, useEffect, Suspense } from 'react';
 import { 
   Plus, Trash2, Settings, GripVertical, Check, X,
@@ -27,7 +26,6 @@ const generateHexId = () => Math.floor(Math.random() * 0xFFFFFFFF).toString(16);
 // --- Components ---
 
 const ValidationPreview = ({ field }: { field: SchemaField }) => {
-    // ... existing ValidationPreview code ...
     const [testValue, setTestValue] = useState('');
     const [status, setStatus] = useState<'idle' | 'valid' | 'invalid'>('idle');
     const [error, setError] = useState('');
@@ -77,19 +75,6 @@ const ValidationPreview = ({ field }: { field: SchemaField }) => {
                     isValid = false; errMsg = ` > Max (${field.max})`;
                 }
             }
-        }
-
-        // Vector Dimension (Check if vectorize is enabled)
-        if ((field.type === 'string' || field.type === 'text') && field.vectorize) {
-             try {
-                 const arr = JSON.parse(testValue);
-                 if (!Array.isArray(arr)) throw new Error();
-                 if (field.dimension && arr.length !== field.dimension) {
-                     isValid = false; errMsg = `Dim mismatch (exp ${field.dimension})`;
-                 }
-             } catch {
-                 isValid = false; errMsg = 'Invalid Vector Array';
-             }
         }
 
         setStatus(isValid ? 'valid' : 'invalid');
@@ -201,9 +186,10 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                                         ...data, 
                                         type: key as any, 
                                         // Default "Search Index (OSE)" for searchable types
-                                        ose_indexed: ['string', 'text', 'email'].includes(key) ? true : data.ose_indexed,
-                                        vectorize: ['string', 'text'].includes(key) ? data.vectorize : false,
-                                        dimension: ['string', 'text'].includes(key) && data.vectorize ? data.dimension : null
+                                        ose_indexed: ['string', 'text', 'email'].includes(key) ? true : false,
+                                        // Allow Vectorization on Text and Files
+                                        vectorize: ['string', 'text', 'file'].includes(key) ? data.vectorize : false,
+                                        dimension: ['string', 'text', 'file'].includes(key) && data.vectorize ? data.dimension : null
                                     })} 
                                     className={`flex flex-col items-start p-2.5 rounded-lg border transition-all text-left ${data.type === key ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-border hover:bg-secondary/50 hover:border-primary/30'}`}
                                 >
@@ -270,13 +256,13 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                         )}
 
                         {/* Vectorize */}
-                        {['string', 'text'].includes(data.type) && (
+                        {['string', 'text', 'file'].includes(data.type) && (
                             <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5 col-span-2">
                                 <div className="space-y-0.5">
                                     <Label className="text-xs cursor-pointer flex items-center gap-1" onClick={() => setData({...data, vectorize: !data.vectorize})}>
                                         <Zap className="h-3 w-3 text-purple-400" /> Vectorize (AI)
                                     </Label>
-                                    <p className="text-[10px] text-muted-foreground">Auto-generate embeddings for semantic search</p>
+                                    <p className="text-[10px] text-muted-foreground">Auto-generate embeddings for semantic search (Text or Images).</p>
                                 </div>
                                 <Switch 
                                     checked={data.vectorize || false} 
@@ -371,10 +357,10 @@ const FieldEditorDialog = ({ field, onSave, onCancel, isOpen, isNew, zIndex }: {
                         )}
 
                         {/* VECTOR DIMENSION */}
-                        {['string', 'text'].includes(data.type) && (data.vectorize) && (
+                        {['string', 'text', 'file'].includes(data.type) && (data.vectorize) && (
                             <div className="space-y-2 animate-in fade-in duration-300">
                                 <Label className="text-xs">Vector Dimensions</Label>
-                                <Input type="number" value={data.dimension ?? ''} onChange={(e: any) => setData({...data, dimension: e.target.value ? Number(e.target.value) : null})} className="h-8" placeholder="e.g. 1536 (OpenAI), 768" />
+                                <Input type="number" value={data.dimension ?? ''} onChange={(e: any) => setData({...data, dimension: e.target.value ? Number(e.target.value) : null})} className="h-8" placeholder="e.g. 512 (Gemma), 768 (CLIP)" />
                                 <p className="text-[10px] text-muted-foreground">Required for similarity search.</p>
                             </div>
                         )}
@@ -504,7 +490,7 @@ export const SchemaEditor = ({ value, onChange, zIndex = 60 }: SchemaEditorProps
                              <div className="text-xs text-muted-foreground font-medium uppercase tracking-wider flex items-center gap-1">
                                 {field.type}
                                 {(field.type === 'relation' || field.type === 'owner') && <span className="normal-case opacity-70">→ {field.relationTo}</span>}
-                                {(field.type === 'string' || field.type === 'text') && field.vectorize && <span className="normal-case opacity-70">[{field.dimension || '?'}]</span>}
+                                {['string', 'text', 'file'].includes(field.type) && field.vectorize && <span className="normal-case opacity-70">[{field.dimension || '?'}]</span>}
                              </div>
                              {field.uid && <span className="text-[9px] font-mono text-muted-foreground/40 select-all">#{field.uid.substring(0,4)}</span>}
                         </div>
@@ -535,4 +521,3 @@ export const SchemaEditor = ({ value, onChange, zIndex = 60 }: SchemaEditorProps
     </div>
   );
 };
-// =========================== /teamspace/studios/this_studio/apex/apex-kit/admin-ui/src/features/collections/components/SchemaEditor.tsx ends here ===========================

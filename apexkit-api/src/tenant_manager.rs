@@ -184,6 +184,7 @@ impl TenantManager {
         // 4. Verify Files Exist
         let expected_db = format!("{}/data.db", base_path);
         let files_exist = std::path::Path::new(&expected_db).exists();
+        let is_replica = std::env::var("APEX_MASTER_URL").map(|v| !v.trim().is_empty()).unwrap_or(false);
 
         // If the status says the tenant doesn't exist but the files are physically here, 
         // it means the replica's Root DB is slightly lagging behind the Master. We bypass this to allow initiation.
@@ -195,8 +196,13 @@ impl TenantManager {
                  return Err("Tenant not found in registry".into());
              }
         } else if !files_exist {
-             tracing::error!("[TenantManager] Snapshot fetch failed for {}. Database file {} does not exist.", tenant_id, expected_db);
-             return Err("Failed to sync tenant database from master".into());
+             if is_replica {
+                 tracing::error!("[TenantManager] Snapshot fetch failed for {}. Database file {} does not exist.", tenant_id, expected_db);
+                 return Err("Failed to sync tenant database from master".into());
+             } else {
+                 tracing::info!("[TenantManager] Master node creating new database files for tenant: {}", tenant_id);
+                 // We don't return an error here, we let `ApexKit::init_filesystem` proceed and create the DBs.
+             }
         }
 
         tracing::info!("[TenantManager] Successfully verified files and status for tenant: {}", tenant_id);

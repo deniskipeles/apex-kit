@@ -7,6 +7,9 @@ service Replication {
     
     // Bi-Directional Stream: Replica sends subscriptions, Master streams CUD events
     rpc StreamEvents (stream EventSubscription) returns (stream DbChangeEvent);
+
+    // [NEW] Sync files over gRPC
+    rpc SyncFile (SyncFileRequest) returns (SyncFileResponse);
 }
 
 message WriteRequest { 
@@ -31,11 +34,24 @@ message FileChunk {
 
 message EventSubscription {
     string replica_id = 1;
-    repeated string add_scopes = 2; // e.g., ["root", "tenant:123"]
+    repeated string add_scopes = 2; 
 }
 
 message DbChangeEvent {
-    string scope = 1;      // "root", "tenant:123"
-    string db_name = 2;    // "data", "core", "system"
-    bytes changeset = 3;   // The raw SQLite binary changeset
+    string scope = 1;      
+    string db_name = 2;    
+    bytes changeset = 3;   
+}
+
+// [NEW] Messages for File Sync
+message SyncFileRequest {
+    string scope = 1;
+    string filename = 2;
+    string mime_type = 3;
+    bytes data = 4;
+}
+
+message SyncFileResponse {
+    bool success = 1;
+    string error = 2;
 }

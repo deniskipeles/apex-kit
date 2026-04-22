@@ -409,6 +409,47 @@ pub async fn create_record(
 
     let rid = db.create_record(col.id, &data_to_save).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
     
+    // --- [NEW] AUTO RE-INDEX OSE ON MILESTONES ---
+    if let Some(schema) = &col.schema {
+        if schema.fields.values().any(|f| f.ose_indexed) {
+            let cache_key = format!("{:?}_{}", event_scope, col.id);
+            
+            // 1. Get count (from Cache, or fallback to DB if Cache expired)
+            let current_count = if let Some(cached_count) = state.record_count_cache.get(&cache_key).await {
+                cached_count + 1
+            } else {
+                let mut opts = QueryOptions::default();
+                opts.limit = Some(1); // We only need the 'total' metadata, limit 1 speeds it up
+                db.list_records(col.id, opts).await.map(|r| r.total).unwrap_or(1)
+            };
+            
+            // 2. Update Cache
+            state.record_count_cache.insert(cache_key, current_count).await;
+            
+            // 3. Calculate Milestone
+            // Power logic:
+            // count 1..9    -> power 10^0 = 1    (all trigger)
+            // count 10..99  -> power 10^1 = 10   (triggers on 10, 20, 30...)
+            // count 100..   -> power 10^2 = 100  (triggers on 100, 200, 300...)
+            let power = 10_i64.pow((current_count.to_string().len() as u32).saturating_sub(1));
+            let is_milestone = current_count > 0 && current_count % power == 0;
+            
+            if is_milestone {
+                tracing::info!("Milestone {} reached for collection {}. Triggering OSE auto-reindex.", current_count, col.name);
+                let db_clone = db.clone();
+                let col_id = col.id;
+                
+                // Spawn in background so it doesn't block the API response
+                tokio::spawn(async move {
+                    if let Err(e) = db_clone.reindex_collection(col_id).await {
+                        tracing::error!("Auto re-index failed for col {}: {}", col_id, e);
+                    }
+                });
+            }
+        }
+    }
+    // ---------------------------------------------
+
     // [LOG] Success
     let meta = extract_log_meta(&headers, Some(addr), json!({ "collection": col.name, "record_id": rid, "user_id": claims.as_ref().map(|c| c.uid) }));
     let _ = db.log_audit_event("info", "Record Created", "api", Some(meta)).await;

@@ -57,18 +57,10 @@ pub async fn get_record_vector(
     DatabaseConnection(db): DatabaseConnection, 
     Path(path): Path<RecordVectorPath>,
 ) -> Result<Json<Vec<VectorRecord>>, AppError> {
-    // 1. Auth Check
     let claims = auth.map(|Extension(c)| c);
-    
-    // 2. Resolve Collection
     let collection = resolve_collection_by_id_or_name(&db, &path.id).await?;
-    
-    // 3. Check Policy (Read access is required to see vectors)
     let policy = collection.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
     
-    // We need to fetch the record data first to verify 'owner' policy if needed
-    // However, for efficiency, if policy is public/admin/auth we can skip fetching data.
-    // If it's complex (owner-based), we fetch.
     let access_granted = if policy == "public" {
         true
     } else if policy == "admin" {
@@ -76,7 +68,6 @@ pub async fn get_record_vector(
     } else if policy == "auth" {
         claims.is_some()
     } else {
-        // Complex policy: fetch record to verify
         let rec = db.get_record(collection.id, path.record_id, None).await
             .map_err(|e| AppError::UnknownError(e.to_string()))?
             .ok_or(AppError::NotFound("Record not found".into()))?;
@@ -88,7 +79,6 @@ pub async fn get_record_vector(
         return Err(AppError::Forbidden("Read denied".into()));
     }
 
-    // 4. Fetch Vectors
     let vectors = db.get_record_vectors(collection.id, path.record_id).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
@@ -118,13 +108,19 @@ pub async fn search_vector(
     }
 
     let limit = payload.limit.unwrap_or(10).min(100);
-    let records_with_scores = db.search_vector(collection.id, &payload.field, payload.vector, limit)
+    let mut records_with_scores = db.search_vector(collection.id, &payload.field, payload.vector, limit)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // Map tuple (Record, f32) -> RecordResponse
-    Ok(Json(records_with_scores.into_iter().map(|(r, _score)| RecordResponse { 
-        id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated 
+    // [FIX]: Sort DESCENDING (Highest similarity score first)
+    records_with_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Map tuple (Record, f32) -> RecordResponse and inject _score
+    Ok(Json(records_with_scores.into_iter().map(|(mut r, score)| {
+        if let Some(obj) = r.data.as_object_mut() {
+            obj.insert("_score".to_string(), serde_json::json!(score));
+        }
+        RecordResponse { id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated } 
     }).collect()))
 }
 
@@ -173,20 +169,30 @@ pub async fn query_vector_search(
 
         for (rec, distance) in records_with_scores {
              id_to_record.insert(rec.id, rec.clone());
-             let entry = best_scores.entry(rec.id).or_insert(f32::MAX);
-             if distance < *entry {
+             
+             // [FIX]: Track the HIGHEST similarity score
+             let entry = best_scores.entry(rec.id).or_insert(f32::MIN);
+             if distance > *entry {
                  *entry = distance;
              }
         }
     }
     
     let mut sorted_ids: Vec<(i64, f32)> = best_scores.into_iter().collect();
-    sorted_ids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // [FIX]: Sort DESCENDING (Highest score at the top)
+    sorted_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     
     let final_records: Vec<RecordResponse> = sorted_ids.into_iter()
         .take(limit)
-        .filter_map(|(id, _)| id_to_record.remove(&id))
-        .map(|r| RecordResponse { id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated })
+        .filter_map(|(id, score)| {
+            if let Some(mut r) = id_to_record.remove(&id) {
+                // Inject the score so it's visible in the API/UI
+                if let Some(obj) = r.data.as_object_mut() {
+                    obj.insert("_score".to_string(), serde_json::json!(score));
+                }
+                Some(RecordResponse { id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated })
+            } else { None }
+        })
         .collect();
 
     Ok(Json(final_records))
@@ -237,20 +243,30 @@ pub async fn query_image_vector_search(
 
         for (rec, distance) in records_with_scores {
              id_to_record.insert(rec.id, rec.clone());
-             let entry = best_scores.entry(rec.id).or_insert(f32::MAX);
-             if distance < *entry {
+             
+             // [FIX]: Track the HIGHEST similarity score
+             let entry = best_scores.entry(rec.id).or_insert(f32::MIN);
+             if distance > *entry {
                  *entry = distance;
              }
         }
     }
     
     let mut sorted_ids: Vec<(i64, f32)> = best_scores.into_iter().collect();
-    sorted_ids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // [FIX]: Sort DESCENDING (Highest score at the top)
+    sorted_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     
     let final_records: Vec<RecordResponse> = sorted_ids.into_iter()
         .take(limit)
-        .filter_map(|(id, _)| id_to_record.remove(&id))
-        .map(|r| RecordResponse { id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated })
+        .filter_map(|(id, score)| {
+            if let Some(mut r) = id_to_record.remove(&id) {
+                // Inject the score so it's visible in the API/UI
+                if let Some(obj) = r.data.as_object_mut() {
+                    obj.insert("_score".to_string(), serde_json::json!(score));
+                }
+                Some(RecordResponse { id: r.id, data: r.data, expand: r.expand, created: r.created, updated: r.updated })
+            } else { None }
+        })
         .collect();
 
     Ok(Json(final_records))
@@ -279,11 +295,8 @@ pub async fn revectorize_collection_handler(
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
     let event_scope = scope.clone().map(|s| s.0).unwrap_or(EventScope::Root);
-    
-    // [FIX] Resolve ID
     let collection = resolve_collection_by_id_or_name(&db, &path.id).await?;
 
-    // [TRIGGER]
     trigger_void_hook(&state, "on_vectorization_start", serde_json::json!({ "collection_id": collection.id }), Some(&claims),  Some(&event_scope.clone()), Some(base_url.clone())).await?;
 
     let current_tenant = crate::get_tenant_id_from_scope(scope.as_ref().map(|e| &e.0));
@@ -303,7 +316,6 @@ pub async fn revectorize_collection_handler(
         })));
     }
 
-    // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), serde_json::json!({ "collection_id": collection.id, "force": options.force }));
     let _ = db.log_audit_event("info", "Revectorization Started", "ai", Some(meta)).await;
 
@@ -311,7 +323,6 @@ pub async fn revectorize_collection_handler(
     query_opts.limit = Some(100_000); 
     query_opts.per_page = None;
     
-    // [FIX] Use collection.id
     let all_records = db.list_records(collection.id, query_opts).await
         .map_err(|e| AppError::UnknownError(e.to_string()))?.items;
 
@@ -324,7 +335,6 @@ pub async fn revectorize_collection_handler(
         for field_name in &vectorizable_fields {
             if let Some(text_content) = record.data.get(field_name).and_then(|v| v.as_str()) {
                 if !options.force {
-                    // Check if vectorized already
                     let exists = db.has_vector(collection.id, record_id, field_name, &current_model).await
                         .unwrap_or(false);
                         
@@ -356,4 +366,3 @@ pub async fn revectorize_collection_handler(
         "mode": if options.force { "hard (overwrite)" } else { "soft (skip existing)" }
     })))
 }
-

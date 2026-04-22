@@ -321,6 +321,20 @@ pub async fn import_data_handler(
 
     let duration = start_time.elapsed();
 
+    // --- [NEW] AUTO RE-INDEX OSE AFTER BULK IMPORT ---
+    // We run this in the background so the API returns quickly, 
+    // but the search index gets fully rebuilt with the newly imported data.
+    let db_clone = db.clone();
+    tokio::spawn(async move {
+        tracing::info!("Bulk import finished. Re-indexing collection {} for search...", collection_id);
+        if let Err(e) = db_clone.reindex_collection(collection_id).await {
+            tracing::error!("Failed to re-index collection {} after import: {}", collection_id, e);
+        } else {
+            tracing::info!("Re-indexing complete for collection {}.", collection_id);
+        }
+    });
+    // -------------------------------------------------
+
     Ok(Json(ImportResponseDto {
         collection_id,
         records_imported,

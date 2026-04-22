@@ -254,7 +254,12 @@ impl CandleEmbedder {
         if clip_lock.is_none() {
             tracing::info!("Apex Vector: Lazy-loading CLIP model for image vectorization...");
             let api = ApiBuilder::new().build()?;
-            let repo = api.repo(Repo::new("openai/clip-vit-base-patch32".to_string(), RepoType::Model));
+            let repo = api.repo(Repo::with_revision(
+                "openai/clip-vit-base-patch32".to_string(), 
+                RepoType::Model,
+                "refs/pr/15".to_string()
+            ));
+            
             let weights = repo.get("model.safetensors")?;
             
             let vision_config = ClipVisionConfig {

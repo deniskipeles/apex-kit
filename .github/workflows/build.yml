@@ -137,23 +137,28 @@ jobs:
           sha256sum * > checksums.txt
           cat checksums.txt
 
-      # 5. Sync Dockerfile, README, and docs to Public Repo
+      # 5. Sync Dockerfile, README, docs, and logo to Public Repo
       - name: Update Public Repo Files
         run: |
-          # Copy files from private to public workspace
+          # 1. Copy standard files from private to public workspace
           cp private-repo/Dockerfile public-repo/ 2>/dev/null || :
           cp private-repo/README.md public-repo/ 2>/dev/null || :
           cp -r private-repo/docs public-repo/ 2>/dev/null || :
+          
+          # 2. NEW: Copy the logo file
+          # Ensure the directory exists in the public repo first
+          mkdir -p public-repo/static/images
+          cp private-repo/static/images/apexkit-logo.svg public-repo/static/images/
           
           cd public-repo
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           
-          # Add copied files and directories
-          git add Dockerfile README.md docs
+          # 3. Add all files including the new static directory
+          git add Dockerfile README.md docs static/images
           
           # Commit only if there are changes
-          git diff --quiet && git diff --staged --quiet || git commit -m "Sync Dockerfile, README, and docs for release ${{ github.ref_name }}"
+          git diff --quiet && git diff --staged --quiet || git commit -m "Sync assets and docs for release ${{ github.ref_name }}"
           git push origin main
           
           # Create the tag on the public repo so the release attaches correctly

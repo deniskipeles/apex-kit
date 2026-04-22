@@ -565,6 +565,9 @@ export const apiClient = {
     searchVector: async (collectionId: string, field: string, vector: number[], limit = 10) => {
       return await pb.collection(collectionId).searchVector(field, vector, limit);
     },
+    searchImageVector: async (collectionId: string | number, imageData: string, limit = 10) => {
+      return await pb.collection(collectionId).searchImageVector(imageData, limit);
+    },
     getVector: async (collectionId: string, recordId: number | string) => {
       return await pb.collection(collectionId).getVector(recordId);
     },

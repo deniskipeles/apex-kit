@@ -15,6 +15,8 @@ use std::time::{Instant, Duration};
 use tokio::sync::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use apexkit_core::realtime::EventScope;
+use crate::AppState;
 
 pub mod pb {
     tonic::include_proto!("replication");
@@ -219,7 +221,11 @@ pub async fn init_master_replica_tracker(mut rx: tokio::sync::broadcast::Receive
     });
 }
 
-pub struct MasterReplicationService { pub event_tx: tokio::sync::broadcast::Sender<ChangesetEvent> }
+// [UPDATED] MasterReplicationService now holds AppState
+pub struct MasterReplicationService { 
+    pub event_tx: tokio::sync::broadcast::Sender<ChangesetEvent>,
+    pub state: AppState, 
+}
 
 #[tonic::async_trait]
 impl Replication for MasterReplicationService {
@@ -365,6 +371,31 @@ impl Replication for MasterReplicationService {
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    // [NEW] Handles file replication from Replicas to Master via gRPC
+    async fn sync_file(&self, req: Request<pb::SyncFileRequest>) -> Result<Response<pb::SyncFileResponse>, Status> {
+        let request = req.into_inner();
+        
+        let scope = if request.scope == "root" {
+            EventScope::Root
+        } else if let Some(tid) = request.scope.strip_prefix("tenant:") {
+            EventScope::Tenant(tid.to_string())
+        } else if let Some(sid) = request.scope.strip_prefix("sandbox:") {
+            EventScope::Sandbox(sid.to_string())
+        } else {
+            EventScope::Root
+        };
+
+        tracing::info!("📥 [gRPC] Received file sync from replica: {} (Scope: {:?})", request.filename, scope);
+
+        use apexkit_core::storage::StorageBackend;
+        let storage = crate::storage::ScopedDynamicStorage::new(self.state.clone(), scope);
+        
+        match storage.save(&request.filename, &request.data, &request.mime_type).await {
+            Ok(_) => Ok(Response::new(pb::SyncFileResponse { success: true, error: "".into() })),
+            Err(e) => Ok(Response::new(pb::SyncFileResponse { success: false, error: e.to_string() }))
+        }
+    }
 }
 
 pub struct GrpcWriteForwarder { 
@@ -398,7 +429,11 @@ impl GrpcWriteForwarder {
 impl WriteForwarder for GrpcWriteForwarder {
     async fn forward_write(&self, db_path: String, sql: String, params: Vec<rusqlite::types::Value>) -> Result<(i64, u64), String> {
         let channel = self.get_channel().await?;
-        let mut client = pb::replication_client::ReplicationClient::with_interceptor(channel, client_auth_interceptor);
+        // [FIX] Ensure message size is uncapped
+        let mut client = pb::replication_client::ReplicationClient::with_interceptor(channel, client_auth_interceptor)
+            .max_decoding_message_size(100 * 1024 * 1024)
+            .max_encoding_message_size(100 * 1024 * 1024);
+            
         let mut json_params = Vec::new();
         
         for p in params {
@@ -423,9 +458,34 @@ impl WriteForwarder for GrpcWriteForwarder {
     }
 }
 
+// [NEW] Helper to push a file up to the Master node via gRPC
+pub async fn forward_file_to_master(master_url: &str, scope: &str, filename: &str, mime: &str, data: &[u8]) -> Result<(), String> {
+    let channel = build_grpc_channel(master_url).await?;
+    let mut client = pb::replication_client::ReplicationClient::with_interceptor(channel, client_auth_interceptor)
+        .max_decoding_message_size(100 * 1024 * 1024) // 100 MB limit
+        .max_encoding_message_size(100 * 1024 * 1024);
+    
+    let req = tonic::Request::new(pb::SyncFileRequest {
+        scope: scope.to_string(),
+        filename: filename.to_string(),
+        mime_type: mime.to_string(),
+        data: data.to_vec(),
+    });
+
+    let res = client.sync_file(req).await.map_err(|e| e.to_string())?.into_inner();
+    
+    if res.success {
+        Ok(())
+    } else {
+        Err(res.error)
+    }
+}
+
 pub async fn fetch_snapshot_from_master(master_url: &str, db_path: &str) -> Result<(), String> {
     let channel = build_grpc_channel(master_url).await?;
-    let mut client = pb::replication_client::ReplicationClient::with_interceptor(channel, client_auth_interceptor);
+    let mut client = pb::replication_client::ReplicationClient::with_interceptor(channel, client_auth_interceptor)
+        .max_decoding_message_size(100 * 1024 * 1024)
+        .max_encoding_message_size(100 * 1024 * 1024);
         
     let req = tonic::Request::new(pb::SnapshotRequest { db_path: db_path.to_string() });
     
@@ -548,7 +608,9 @@ pub async fn start_event_streamer(master_url: String, state: Option<crate::AppSt
         Err(e) => { tracing::error!("Connect error: {}", e); return; }
     };
     
-    let mut client = pb::replication_client::ReplicationClient::with_interceptor(channel, client_auth_interceptor);
+    let mut client = pb::replication_client::ReplicationClient::with_interceptor(channel, client_auth_interceptor)
+        .max_decoding_message_size(100 * 1024 * 1024)
+        .max_encoding_message_size(100 * 1024 * 1024);
     
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel(32);
     EVENT_SUB_TX.set(sub_tx.clone()).unwrap();
