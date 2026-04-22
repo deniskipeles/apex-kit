@@ -76,7 +76,7 @@ For complex logic (e.g., joining data, external API calls, permissions), verify 
         const category = req.body.params.category || "general";
         
         // 2. Fetch from DB
-        const posts = await $db.find('posts', { category: category });
+        const posts = await $db.records.list('posts', { filter: { category: category } });
         
         // 3. Return data object
         return new Response({ 

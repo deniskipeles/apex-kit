@@ -127,13 +127,13 @@ Collections are **physically isolated**.
 Management of collections is handled via the `admins` namespace.
 
 ```javascript
-import { pb } from './apiClient';
+import { apex } from './apiClient';
 
 // 1. List all collections
-const cols = await pb.admins.listCollections();
+const cols = await apex.admins.listCollections();
 
 // 2. Create a new collection
-const newCol = await pb.admins.createCollection("products", {
+const newCol = await apex.admins.createCollection("products", {
     fields: {
         sku: { type: "string", required: true, unique: true },
         price: { type: "number", min: 0 }
@@ -141,7 +141,7 @@ const newCol = await pb.admins.createCollection("products", {
 });
 
 // 3. Update a schema
-await pb.admins.patchCollection(newCol.id, {
+await apex.admins.patchCollection(newCol.id, {
     schema: {
         fields: {
             ...newCol.schema.fields,

@@ -107,7 +107,7 @@ Scripts run in a sandboxed environment on the server.
 ```javascript
 export default async function(req) {
     const { name } = await req.json();
-    const id = await $db.insert('users', { name });
+    const id = await $db.records.create('users', { name });
     return new Response({ success: true, id });
 }
 ```

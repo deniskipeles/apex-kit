@@ -45,7 +45,7 @@ export default async function(req) {
     const { folder_name } = await req.json();
     
     // 1. Fetch metadata for files in this "folder"
-    const files = await $db.find("attachments", { folder: folder_name });
+    const files = await $db.records.list("attachments", { filter: { folder: folder_name } });
     
     const zipMap = {};
     for (const file of files) {

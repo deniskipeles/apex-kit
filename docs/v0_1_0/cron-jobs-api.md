@@ -48,7 +48,7 @@ If the payload is a simple string (e.g., `process-billing`), the scheduler looks
 // Trigger: cron
 export default async function(req) {
     log("Starting billing cycle...");
-    const overdue = await $db.find("invoices", { status: "pending" });
+    const overdue = await $db.records.list("invoices", { filter: { status: "pending" } });
     // logic...
 }
 ```
@@ -76,10 +76,10 @@ ApexKit runs several hardcoded maintenance jobs automatically in the background:
 Cron jobs are part of the system settings. You manage them by updating the `cron_jobs` array in the system configuration.
 
 ```javascript
-import { pb } from './apiClient';
+import { apex } from './apiClient';
 
 // 1. Get current jobs
-const settings = await pb.admins.getSettings();
+const settings = await apex.admins.getSettings();
 const currentJobs = settings.cron_jobs || [];
 
 // 2. Add a new job
@@ -95,7 +95,7 @@ const updatedJobs = [
 ];
 
 // 3. Save settings
-await pb.admins.patchSettings({
+await apex.admins.patchSettings({
     cron_jobs: updatedJobs
 });
 ```

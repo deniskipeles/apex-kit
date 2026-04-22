@@ -125,24 +125,24 @@ Storage is strictly isolated based on the execution context:
 
 ## 5. JavaScript SDK Usage
 
-The `pb.files` namespace provides convenient methods for frontend integration.
+The `apex.files` namespace provides convenient methods for frontend integration.
 
 ```javascript
-import { pb } from './apiClient';
+import { apex } from './apiClient';
 
 // 1. Upload from a file input
 const fileInput = document.querySelector('input[type="file"]');
-const uploaded = await pb.files.upload(fileInput.files[0]);
+const uploaded = await apex.files.upload(fileInput.files[0]);
 
 // 2. List with pagination
-const { items, total } = await pb.files.list(1, 20);
+const { items, total } = await apex.files.list(1, 20);
 
 // 3. Delete
-await pb.files.delete(uploaded.id);
+await apex.files.delete(uploaded.id);
 
 // 4. Generate URL (Tenant-Aware)
 // Returns correct path regardless of whether you are in root or tenant context
-const url = pb.files.getFileUrl(uploaded.filename);
+const url = apex.files.getFileUrl(uploaded.filename);
 ```
 
 ---

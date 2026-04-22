@@ -123,12 +123,12 @@ If you request a relation that does not exist or has a typo, the API will not cr
 
 ## 7. JavaScript SDK Usage
 
-Expansion is natively supported in the `pb.collection().list()` and `get()` methods.
+Expansion is natively supported in the `apex.collection().list()` and `get()` methods.
 
 ```javascript
-import { pb } from './apiClient';
+import { apex } from './apiClient';
 
-const posts = await pb.collection('posts').list({
+const posts = await apex.collection('posts').list({
     page: 1,
     expand: 'author_id,comments(5).user_id'
 });

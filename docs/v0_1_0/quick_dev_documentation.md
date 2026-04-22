@@ -2,7 +2,7 @@
 
 **Version:** 0.1.0  
 **Base URL:** `http://localhost:5000/api/v1` (Default)  
-**SDK Requirement:** `apexkit-sdk` v0.1.0+
+**SDK Requirement:** `@apexkit/sdk` v0.1.0+
 
 ApexKit is a monolithic Backend-as-a-Service providing a type-safe REST API, high-performance search, real-time subscriptions, and a sandboxed JavaScript runtime.
 
@@ -13,7 +13,7 @@ ApexKit is a monolithic Backend-as-a-Service providing a type-safe REST API, hig
 Install the SDK via npm or use the ESM module directly.
 
 ```javascript
-import { ApexKit } from 'apexkit-sdk';
+import { ApexKit } from '@apexkit/sdk';
 
 // Initialize the client
 const apex = new ApexKit('https://api.your-app.com');
@@ -126,7 +126,7 @@ const stats = await apex.collection('sales').query({
 ### Instant Search (Tantivy)
 Fast fuzzy search for autocomplete and global search. Requires `ose_indexed: true`.
 ```javascript
-const hits = await apex.collection('products').searchRecordsInstantlyWithOSE("iphne");
+const hits = await apex.collection('products').instantSearch("iphne");
 // Returns: [{ id: 1, score: 2.1, snippet: { name: "<b>iPhone</b> 15" } }]
 ```
 
@@ -177,7 +177,7 @@ const thumb = `${url}?thumb=100x100`;
 Subscribe to changes with server-side filtering.
 
 ```javascript
-import { ApexKitRealtimeWSClient } from 'apexkit-sdk';
+import { ApexKitRealtimeWSClient } from '@apexkit/sdk';
 
 const realtime = new ApexKitRealtimeWSClient(apex.baseUrl, apex.getToken());
 realtime.connect();

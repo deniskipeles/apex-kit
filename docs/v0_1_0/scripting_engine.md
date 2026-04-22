@@ -32,17 +32,21 @@ export default async function(req) {
 
 ## 2. Global API Reference
 
-### `$db.records` (Database Access)
+### `$db` (Database Access)
 Provides scope-aware access to your collections. Operations automatically target the current Tenant or Sandbox.
 
+#### Records API (`$db.records`)
 | Method | Description |
 | :--- | :--- |
-| `find(col, filter)` | Returns an array of records matching the filter. |
-| `find_one(col, id)`| Returns a single record or null. |
-| `insert(col, data)` | Creates a record and returns the new ID. |
+| `list(col, opts)` | Returns a list of records (supports filtering/paging). |
+| `get(col, id, expand?)`| Returns a single record or null. |
+| `create(col, data)` | Creates a record and returns the new ID. |
 | `update(col, id, data)`| Performs a partial update. |
 | `delete(col, id)` | Removes a record. |
-| `query(null, queryObj)`| Executes the **Analytical Engine** for aggregations/grouping. |
+| `instantSearch(col, q, limit)` | Fast full-text search. |
+
+#### Analytical Query API (`$db.query`)
+*   **`query(queryObj)`**: Executes the **Analytical Engine** for aggregations/grouping.
 
 ### `$run` (Workflow Orchestration)
 Allows calling other scripts. This is the primary way to reuse logic.
@@ -99,7 +103,7 @@ Root Admins can create scripts with **Public Visibility**. These scripts act as 
 ### Complex Analytics (Analytical Engine)
 ```javascript
 export default async function(req) {
-    const report = await $db.query(null, {
+    const report = await $db.query({
         "from": "sales",
         "select": [
             "category",
@@ -115,7 +119,7 @@ export default async function(req) {
 ```javascript
 export default async function(req) {
     const logo = await $zip.readFile("logo.png");
-    const data = await $db.find("settings", {});
+    const { items: data } = await $db.records.list("settings", {});
 
     const archive = await $zip.create({
         "assets/logo.png": logo,
