@@ -1,0 +1,79 @@
+# --- Stage 1: Build the Frontend (Admin UI) ---
+FROM node:20-slim AS frontend-builder
+WORKDIR /app/admin-ui
+
+# Copy package files and install dependencies
+COPY admin-ui/package*.json ./
+RUN npm install
+
+# Copy the rest of the frontend source and build
+COPY admin-ui/ .
+RUN npm run build
+
+# --- Stage 2: Build the Backend (Rust) ---
+FROM rust:1.81-bookworm AS backend-builder
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    cmake \
+    nasm \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# 1. Copy workspace and manifests
+COPY Cargo.toml ./
+COPY apexkit-api/Cargo.toml ./apexkit-api/
+COPY apexkit-core/Cargo.toml ./apexkit-core/
+COPY apex-vector/Cargo.toml ./apex-vector/
+
+# 2. Create dummy source files for caching dependencies
+RUN mkdir -p apexkit-api/src apexkit-core/src apex-vector/src \
+    && echo "fn main() {}" > apexkit-api/src/main.rs \
+    && touch apexkit-core/src/lib.rs \
+    && touch apex-vector/src/lib.rs
+
+# 3. Build dependencies only (to cache this layer)
+RUN cargo build --release -p apexkit-api
+
+# 4. Copy the actual source code and static assets
+# The backend uses `rust_embed` to bundle the `static/` directory
+COPY proto/ ./proto/
+COPY static/ ./static/
+COPY apexkit-api/src/ ./apexkit-api/src/
+COPY apexkit-api/build.rs ./apexkit-api/
+COPY apexkit-core/src/ ./apexkit-core/src/
+COPY apex-vector/src/ ./apex-vector/src/
+
+# 5. Overwrite the dashboard assets with the ones we built in Stage 1
+COPY --from=frontend-builder /app/admin-ui/dist ./static/dashboard
+
+# 6. Build the final binary (which now includes the embedded static assets)
+RUN touch apexkit-api/src/main.rs \
+    && cargo build --release -p apexkit-api
+
+# --- Stage 3: Final Image ---
+FROM debian:bookworm-slim
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the binary from the backend builder
+COPY --from=backend-builder /app/target/release/apexkit-api /usr/local/bin/apexkit
+
+# Prepare storage directories
+RUN mkdir -p storage/system storage/tenants storage/sandboxes storage/backups
+
+# Expose the default port
+EXPOSE 5000
+
+# Set the volume for persistent data
+VOLUME ["/app/storage"]
+
+# Run the application
+# Defaults to port 5000, but can be overridden by $PORT environment variable
+CMD ["sh", "-c", "apexkit --port ${PORT:-5000}"]
