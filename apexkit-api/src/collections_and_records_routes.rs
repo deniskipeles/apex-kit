@@ -135,6 +135,11 @@ pub async fn create_collection(
     // [TRIGGER]
     let _ = trigger_void_hook(&state, "after_collection_create", json!({ "id": id, "name": payload.name }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
 
+    // --- AUTO RELOAD SCOPE ---
+    let state_clone = state.clone();
+    let scope_clone = event_scope.clone();
+    tokio::spawn(async move { trigger_scope_reload(state_clone, scope_clone).await; });
+
     Ok((StatusCode::CREATED, Json(CollectionResponse{id, name: payload.name, schema: payload.schema, index: payload.index})))
 }
 
@@ -169,6 +174,11 @@ pub async fn update_collection(
     // [TRIGGER]
     let _ = trigger_void_hook(&state, "after_collection_update", json!({ "id": c.id }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
 
+    // --- AUTO RELOAD SCOPE ---
+    let state_clone = state.clone();
+    let scope_clone = event_scope.clone();
+    tokio::spawn(async move { trigger_scope_reload(state_clone, scope_clone).await; });
+
     Ok(Json(CollectionResponse{id: c.id, name: c.name, schema: c.schema, index: c.index}))
 }
 
@@ -198,6 +208,11 @@ pub async fn delete_collection(
     // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "id": col.id }));
     let _ = db.log_audit_event("warning", "Collection Deleted", "api", Some(meta)).await;
+
+    // --- AUTO RELOAD SCOPE ---
+    let state_clone = state.clone();
+    let scope_clone = event_scope.clone();
+    tokio::spawn(async move { trigger_scope_reload(state_clone, scope_clone).await; });
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -769,4 +784,30 @@ pub async fn delete_relation(
     let _ = trigger_void_hook(&state, "after_relation_delete", json!({ "relation": p.relation_name }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+
+async fn trigger_scope_reload(state: AppState, scope: EventScope) {
+    match scope {
+        EventScope::Root => {
+            let relation_loader = async_graphql::dataloader::DataLoader::new(
+                crate::graphql::RelationLoader::new(state.db.clone()), 
+                tokio::spawn
+            );
+            if let Ok(new_schema) = crate::graphql::build_schema(state.clone(), std::sync::Arc::new(relation_loader)).await {
+                let mut lock = state.schema.write().await;
+                *lock = new_schema;
+                tracing::info!("[System] Root GraphQL schema automatically reloaded due to schema change.");
+            }
+        },
+        EventScope::Tenant(id) => {
+            state.tenant_manager.invalidate(&id).await;
+            tracing::info!("[System] Tenant '{}' cache invalidated due to schema change.", id);
+        },
+        EventScope::Sandbox(id) => {
+            state.sandbox_manager.invalidate(&id).await;
+            tracing::info!("[System] Sandbox '{}' cache invalidated due to schema change.", id);
+        },
+        _ => {}
+    }
 }

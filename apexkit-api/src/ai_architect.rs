@@ -33,42 +33,46 @@ const APEXKIT_DOCS_CORE: &str = r#"
   - `select`: Requires `options` array.
 
 ### 2. SCRIPTING API (Server-Side JS)
-Scripts run on the server. They must export a default async function.
+Scripts run on the server using V8/Boa. You must export a default async function.
 **Signature**: `export default async function(req) { ... }`
-**Routes**: To run a script from HTMX/Frontend, use **`/run/{script_name}`**.
 
-**Global Objects**:
+**Global Objects available in Scripts AND Templates:**
 - **$db**: Database Access
-  - `await $db.find_one(col_name, id)` -> Object | null
-  - `await $db.find(col_name, filter_object)` -> Array<Object>
-  - `await $db.insert(col_name, data_object)` -> ID (number)
-  - `await $db.update(col_name, id, data_object)` -> Object
-  - `await $db.delete(col_name, id)` -> bool
-- **$http**: External Requests
-  - `await $http.get(url)` -> String
-  - `await $http.post(url, json_body)` -> String
-- **$util**: 
-  - `$util.uuid()` -> String
-- **$ai**: AI Embeddings
-  - `await $ai.embed(text, "local")` -> Array<float>
-- **$env**: Secrets
-  - `await $env.get("KEY_NAME")` -> String
+  - `await $db.records.get(col_name, id)` -> Object | null
+  - `await $db.records.list(col_name, filter_object)` -> { items: [], total: 0 }
+  - `await $db.records.create(col_name, data_object)` -> { id: number }
+  - `await $db.records.update(col_name, id, data_object)` -> Object
+  - `await $db.records.delete(col_name, id)` -> bool
+- **$http**: `await $http.get(url)`
+- **$ai**: `await $ai.embed(text)`
+- **$fs**: `await $fs.read(path)`
+- **ApexKit**: `const client = new ApexKit();` (The full TS/JS SDK is injected server-side!)
 
-**Request/Response**:
-- `req.json()` -> Promise<Object>
-- `req.body` -> Object (if pre-parsed)
-- `return new Response(body_object, { status: 200 })`
+### 3. TEMPLATING (Server-Side Rendering)
+Templates support Server-Side Javascript via a Frontmatter block at the very top (similar to Astro).
+The returned JSON is injected into the Tera HTML context.
 
-### 3. TEMPLATING (Tera / HTML)
-Templates are HTML files rendered on the server.
-- **Data Context**: 
-  - If a **Script** is linked (`loader_script`), the JSON object returned by the script's `Response` is merged into the template context.
-  - Example: Script returns `{ "tasks": [...] }` -> Template uses `{% for t in tasks %}`.
-- **Helpers**:
-  - `{% set users = db_find(col='users', filter=null) %}` (Fetch all)
-  - `{% set item = db_find_one(col='items', id=1) %}`
-  - **IMPORTANT**: Use keyword arguments (e.g. `col=`, `id=`) inside helper functions.
-- **Variables**: `{{ params.slug }}`, `{{ headers['user-agent'] }}`, `{{ user.email }}`.
+```html
+---
+export default async function(req) {
+    const data = await req.json(); // contains { params, headers }
+    
+    // Fetch data using the exact same $db API!
+    const post = await $db.records.get('posts', data.params.id);
+    const comments = await $db.records.list('comments', { filter: { post_id: data.params.id } });
+    
+    return { post, comments: comments.items };
+}
+---
+<div>
+    <h1>{{ post.title }}</h1>
+    <ul>
+        {% for comment in comments %}
+            <li>{{ comment.text }}</li>
+        {% endfor %}
+    </ul>
+</div>
+```
 
 ### 4. ARCHITECTURE PATTERNS
 - **HTMX**: Use `hx-get="/render/my-page"` for dynamic partials.

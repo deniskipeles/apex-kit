@@ -29,8 +29,9 @@ export const CodeEditor = ({
     const editorRef = useRef<any>(null);
     const monacoRef = useRef<any>(null);
     
-    // FIX: Store the disposable returned by addExtraLib here
+    // Store disposables for cleanup
     const dynamicLibDisposable = useRef<any>(null);
+    const htmlCompletionDisposable = useRef<any>(null); // [NEW] HTML Completion
 
     const [copied, setCopied] = useState(false);
     const [cursorPos, setCursorPos] = useState({ line: 1, column: 1 });
@@ -44,200 +45,49 @@ export const CodeEditor = ({
             editor.layout();
         }, 300); 
 
-        editor.onDidChangeCursorPosition((e) => {
+        editor.onDidChangeCursorPosition((e: any) => {
             setCursorPos({
                 line: e.position.lineNumber,
                 column: e.position.column
             });
         });
 
-        // Configure TypeScript/JavaScript settings
-        if (language === 'javascript' || language === 'typescript') {
-            monacoInstance.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
-                noSemanticValidation: true,
-                noSyntaxValidation: false,
-            });
+        // Configure TypeScript/JavaScript settings globally
+        monacoInstance.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
+            noSemanticValidation: true,
+            noSyntaxValidation: false,
+        });
 
-            monacoInstance.languages.typescript.typescriptDefaults.setCompilerOptions({
-                target: monacoInstance.languages.typescript.ScriptTarget.ES2020,
-                allowNonTsExtensions: true,
-                moduleResolution: monacoInstance.languages.typescript.ModuleResolutionKind.NodeJs,
-            });
+        monacoInstance.languages.typescript.typescriptDefaults.setCompilerOptions({
+            target: monacoInstance.languages.typescript.ScriptTarget.ES2020,
+            allowNonTsExtensions: true,
+            moduleResolution: monacoInstance.languages.typescript.ModuleResolutionKind.NodeJs,
+        });
 
-            if (withTypes) {
-                // 1. Load Static System Types
-                // We don't need to track this one as it never changes
-                const baseLibSource = `
-                    // --- Primitives ---
-                    type JsonValue = string | number | boolean | null | { [key: string]: JsonValue } | JsonValue[];
-                    
-                    interface Request {
-                        method: string;
-                        headers: Headers;
-                        body: any; // Raw parsed body
-                        args: any; // Alias for body
-                        json(): Promise<any>;
-                        text(): Promise<string>;
-                    }
+        if (withTypes) {
+            // 1. Load Static System Types (For JS/TS Mode)
+            const baseLibSource = `
+                type JsonValue = string | number | boolean | null | { [key: string]: JsonValue } | JsonValue[];
+                interface Request { method: string; headers: Headers; body: any; args: any; json(): Promise<any>; text(): Promise<string>; }
+                interface ResponseInit { status?: number; headers?: Record<string, string>; }
+                declare class Response { constructor(body: any, init?: ResponseInit); }
+                interface Headers { get(name: string): string | null; set(name: string, value: string): void; }
+                declare const console: { log(...args: any[]): void; error(...args: any[]): void; };
+                declare const $http: { get(url: string): Promise<string>; post(url: string, body: object): Promise<string>; };
+                declare const $util: { uuid(): string; slugify(text: string): string; hash(text: string, alg: 'sha256' | 'sha512'): string; hmac(text: string, key: string): string; sleep(ms: number): Promise<void>; };
+                declare const $ai: { embed(text: string): Promise<number[]>; };
+                declare const $env: { get(key: string): Promise<string>; APP_URL: string; };
+                declare const $fs: { readText(filename: string): Promise<string>; };
+                interface QueryOptions { filter?: string | object; sort?: string; page?: number; per_page?: number; expand?: string; }
+                interface CollectionAPI { list(options?: QueryOptions): Promise<{ items: any[], total: number }>; get(id: number | string, options?: { expand?: string }): Promise<any>; create(data: object): Promise<{ id: number }>; update(id: number | string, data: object): Promise<any>; delete(id: number | string): Promise<boolean>; search(query: string): Promise<any[]>; searchVector(field: string, vector: number[], limit?: number): Promise<any[]>; getVector(id: number | string): Promise<any[]>; instantSearch(query: string, limit?: number): Promise<Array<{id: number, score: number, snippet: any}>>; }
+                declare const $db: { records: { list(col: string, opts: any): Promise<any>; create(col: string, data: any): Promise<any>; update(col: string, id: number, data: any): Promise<any>; delete(col: string, id: number): Promise<any>; get(col: string, id: number): Promise<any>; search(col: string, query: string): Promise<any>; }; query(q: any): Promise<any>; };
+                declare function log(msg: any): void;
+            `;
+            const baseLibUri = 'ts:filename/apexkit_base.d.ts';
+            monacoInstance.languages.typescript.javascriptDefaults.addExtraLib(baseLibSource, baseLibUri);
 
-                    interface ResponseInit {
-                        status?: number;
-                        headers?: Record<string, string>;
-                    }
-
-                    declare class Response {
-                        constructor(body: any, init?: ResponseInit);
-                    }
-
-                    interface Headers {
-                        get(name: string): string | null;
-                        set(name: string, value: string): void;
-                    }
-
-                    // --- Global Tools ---
-                    declare const console: {
-                        log(...args: any[]): void;
-                        error(...args: any[]): void;
-                    };
-
-                    declare const $http: {
-                        get(url: string): Promise<string>;
-                        post(url: string, body: object): Promise<string>;
-                    };
-
-                    declare const $util: {
-                        uuid(): string;
-                        slugify(text: string): string;
-                        hash(text: string, alg: 'sha256' | 'sha512'): string;
-                        hmac(text: string, key: string): string;
-                        sleep(ms: number): Promise<void>;
-                    };
-
-                    declare const $ai: {
-                        embed(text: string): Promise<number[]>;
-                    };
-
-                    declare const $env: {
-                        get(key: string): Promise<string>;
-                        APP_URL: string;
-                    };
-                    
-                    declare const $fs: {
-                        readText(filename: string): Promise<string>;
-                    };
-                    
-                    declare const $archive: {
-                        create(jsonTree: object, filename: string): Promise<string>;
-                    };
-                    
-                    declare const $realtime: {
-                        send(channel: string, event: string, data: object): Promise<boolean>;
-                    };
-                    
-                    declare const $mail: {
-                        send(to: string, subject: string, body: string): Promise<boolean>;
-                    };
-
-                    // --- ApexKit SDK ---
-                    
-                    interface QueryOptions {
-                        filter?: string | object;
-                        sort?: string;
-                        page?: number;
-                        per_page?: number;
-                        expand?: string;
-                    }
-
-                    interface ApexQuery {
-                        from: string;
-                        select?: string[];
-                        where?: object;
-                        sort?: string;
-                        limit?: number;
-                        offset?: number;
-                        populate?: string[];
-                        aggregate?: Record<string, { $sum?: string, $count?: string, $avg?: string, $min?: string, $max?: string }>;
-                        group_by?: string;
-                    }
-
-                    interface CollectionAPI {
-                        list(options?: QueryOptions): Promise<{ items: any[], total: number }>;
-                        get(id: number | string, options?: { expand?: string }): Promise<any>;
-                        create(data: object): Promise<{ id: number }>;
-                        update(id: number | string, data: object): Promise<any>;
-                        delete(id: number | string): Promise<boolean>;
-                        search(query: string): Promise<any[]>;
-                        searchVector(field: string, vector: number[], limit?: number): Promise<any[]>;
-                        getVector(id: number | string): Promise<any[]>;
-                        instantSearch(query: string, limit?: number): Promise<Array<{id: number, score: number, snippet: any}>>;
-                    }
-
-                    interface UsersAPI {
-                        list(query?: string, limit?: number, offset?: number): Promise<any[]>;
-                        get(email: string): Promise<any>;
-                        create(email: string, password?: string, role?: string): Promise<any>;
-                    }
-                    
-                    interface FilesAPI {
-                        list(limit?: number, offset?: number): Promise<any[]>;
-                    }
-                    
-                    interface CollectionsAPI {
-                        list(): Promise<any[]>;
-                        create(name: string, schema?: object): Promise<{ id: number }>;
-                    }
-
-                    declare class ApexKit {
-                        constructor(contextId?: string | null);
-                        tenant(id: string): ApexKit;
-                        sandbox(id: string): ApexKit;
-                        
-                        collection(name: string): CollectionAPI;
-                        
-                        readonly users: UsersAPI;
-                        readonly files: FilesAPI;
-                        readonly collections: CollectionsAPI;
-                        
-                        query(q: ApexQuery): Promise<any>;
-                    }
-                    
-                    // --- Entry Points ---
-                    declare const $apex: ApexKit;
-                    declare const pb: ApexKit; // Alias
-
-                    // Low-level $db (internal use)
-                    declare const $db: {
-                        records: {
-                            list(ctx: string | null, col: string, opts: any): Promise<any>;
-                            create(ctx: string | null, col: string, data: any): Promise<any>;
-                            update(ctx: string | null, col: string, id: number, data: any): Promise<any>;
-                            delete(ctx: string | null, col: string, id: number): Promise<any>;
-                            get(ctx: string | null, col: string, id: number): Promise<any>;
-                            search(ctx: string | null, col: string, query: string): Promise<any>;
-                        };
-                        query(ctx: string | null, q: any): Promise<any>;
-                    };
-                    
-                    // --- Hook Event Context ---
-                    // e is passed to hook scripts
-                    declare const e: {
-                        trigger: string;
-                        auth?: { id: number, email: string, role: string };
-                        record?: { id: number, data: any };
-                        collection?: { id: number, name: string };
-                        data?: any; // For list hooks
-                    };
-                    
-                    // Helper for log
-                    declare function log(msg: any): void;
-                `;
-                const baseLibUri = 'ts:filename/apexkit_base.d.ts';
-                // Add if not exists (addExtraLib overwrites if same URI, but best to be safe)
-                monacoInstance.languages.typescript.javascriptDefaults.addExtraLib(baseLibSource, baseLibUri);
-
-                // 2. Load Initial Dynamic Types
-                updateDynamicTypes(monacoInstance, collections);
-            }
+            // 2. Load Initial Dynamic Types
+            updateDynamicTypes(monacoInstance, collections);
         }
 
         if (language === 'json') {
@@ -252,31 +102,121 @@ export const CodeEditor = ({
         }
     };
 
-    // Helper to inject types
+    // Helper to inject types & HTML autocompletions
     const updateDynamicTypes = (monaco: any, cols: Collection[]) => {
         if (!withTypes || !monaco) return;
         
+        // A. Inject TS definitions for JS/TS mode
         const dynamicSource = generateTypeScriptDefs(cols);
         const dynamicUri = 'ts:filename/apexkit_dynamic.d.ts';
 
-        // FIX: Dispose of the previous definition using the stored reference
         if (dynamicLibDisposable.current) {
             dynamicLibDisposable.current.dispose();
         }
-
-        // FIX: Add new definition and store the disposable reference
         dynamicLibDisposable.current = monaco.languages.typescript.javascriptDefaults.addExtraLib(
             dynamicSource, 
             dynamicUri
         );
+
+        // B. Inject Custom Completion Provider for HTML mode <script> tags
+        if (htmlCompletionDisposable.current) {
+            htmlCompletionDisposable.current.dispose();
+        }
+
+        htmlCompletionDisposable.current = monaco.languages.registerCompletionItemProvider('html', {
+            triggerCharacters: ['.', '$', "'", '"'],
+            provideCompletionItems: function (model: any, position: any) {
+                // Check if we are inside a <script> block
+                const textUntilPosition = model.getValueInRange({
+                    startLineNumber: 1, startColumn: 1, 
+                    endLineNumber: position.lineNumber, endColumn: position.column
+                });
+                const lastScriptOpen = textUntilPosition.lastIndexOf('<script');
+                const lastScriptClose = textUntilPosition.lastIndexOf('</script>');
+                
+                if (lastScriptOpen === -1 || lastScriptOpen < lastScriptClose) {
+                    return { suggestions: [] }; // Not inside a script tag
+                }
+
+                const word = model.getWordUntilPosition(position);
+                const range = {
+                    startLineNumber: position.lineNumber,
+                    endLineNumber: position.lineNumber,
+                    startColumn: word.startColumn,
+                    endColumn: word.endColumn
+                };
+
+                const linePrefix = model.getLineContent(position.lineNumber).substring(0, position.column - 1);
+
+                // Suggest Collection Names if typing inside methods
+                if (linePrefix.match(/\$db\.records\.(list|get|create|update|delete|searchVector|getVector|instantSearch)\(['"]$/)) {
+                    return {
+                        suggestions: cols.map(c => ({
+                            label: c.name,
+                            kind: monaco.languages.CompletionItemKind.EnumMember,
+                            insertText: c.name,
+                            detail: 'Collection',
+                            range
+                        }))
+                    };
+                }
+
+                // Suggest $db properties
+                if (linePrefix.endsWith('$db.')) {
+                    return {
+                        suggestions: [
+                            { label: 'records', kind: monaco.languages.CompletionItemKind.Property, insertText: 'records', range },
+                            { label: 'query', kind: monaco.languages.CompletionItemKind.Method, insertText: 'query({ from: "${1:collection}", select: [], where: {} })', insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range },
+                            { label: 'users', kind: monaco.languages.CompletionItemKind.Property, insertText: 'users', range },
+                            { label: 'collections', kind: monaco.languages.CompletionItemKind.Property, insertText: 'collections', range },
+                            { label: 'files', kind: monaco.languages.CompletionItemKind.Property, insertText: 'files', range },
+                        ]
+                    };
+                }
+
+                // Suggest $db.records methods
+                if (linePrefix.endsWith('$db.records.')) {
+                    return {
+                        suggestions: [
+                            { label: 'list', kind: monaco.languages.CompletionItemKind.Method, insertText: "list('${1:collection}', { filter: {} })", insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, detail: "List records", range },
+                            { label: 'get', kind: monaco.languages.CompletionItemKind.Method, insertText: "get('${1:collection}', ${2:id})", insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, detail: "Get one record", range },
+                            { label: 'create', kind: monaco.languages.CompletionItemKind.Method, insertText: "create('${1:collection}', { ${2:data} })", insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, detail: "Create record", range },
+                            { label: 'update', kind: monaco.languages.CompletionItemKind.Method, insertText: "update('${1:collection}', ${2:id}, { ${3:data} })", insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, detail: "Update record", range },
+                            { label: 'delete', kind: monaco.languages.CompletionItemKind.Method, insertText: "delete('${1:collection}', ${2:id})", insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, detail: "Delete record", range },
+                        ]
+                    };
+                }
+
+                // Suggest $http methods
+                if (linePrefix.endsWith('$http.')) {
+                    return {
+                        suggestions: [
+                            { label: 'get', kind: monaco.languages.CompletionItemKind.Method, insertText: "get('${1:url}')", insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range },
+                            { label: 'post', kind: monaco.languages.CompletionItemKind.Method, insertText: "post('${1:url}', ${2:body})", insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range },
+                        ]
+                    };
+                }
+
+                // Global Script Scope suggestions
+                return {
+                    suggestions: [
+                        { label: '$db', kind: monaco.languages.CompletionItemKind.Variable, insertText: '$db', detail: 'ApexKit Database', range },
+                        { label: '$http', kind: monaco.languages.CompletionItemKind.Variable, insertText: '$http', detail: 'ApexKit HTTP Client', range },
+                        { label: '$ai', kind: monaco.languages.CompletionItemKind.Variable, insertText: '$ai', detail: 'ApexKit AI Tools', range },
+                        { label: '$fs', kind: monaco.languages.CompletionItemKind.Variable, insertText: '$fs', detail: 'ApexKit File System', range },
+                        { label: '$env', kind: monaco.languages.CompletionItemKind.Variable, insertText: '$env', detail: 'ApexKit Secrets', range },
+                        { label: 'ApexKit', kind: monaco.languages.CompletionItemKind.Class, insertText: 'ApexKit', detail: 'SDK Client', range },
+                    ]
+                };
+            }
+        });
     };
 
     // Cleanup on unmount
     useEffect(() => {
         return () => {
-            if (dynamicLibDisposable.current) {
-                dynamicLibDisposable.current.dispose();
-            }
+            if (dynamicLibDisposable.current) dynamicLibDisposable.current.dispose();
+            if (htmlCompletionDisposable.current) htmlCompletionDisposable.current.dispose();
         };
     }, []);
 

@@ -1,172 +1,247 @@
-# ApexKit Renderer & Templating Documentation
+# Server-Side Rendering & Templates
 
-The ApexKit Renderer is a **Hybrid Server-Side Rendering (SSR) Engine** built on top of [Tera](https://keats.github.io/tera/). It allows you to build dynamic web applications using HTML mixed with logic, seamlessly integrated with the ApexKit database and Scripting Engine.
+ApexKit features a powerful built-in Server-Side Rendering (SSR) engine. It combines the flexibility of **JavaScript Controllers** with the blazing-fast **Tera HTML templating engine**. 
 
-It is designed to work perfectly with **HTMX** for dynamic, SPA-like experiences without the complexity of client-side routing.
-
----
-
-## 1. Basic Concepts
-
-### URL Structure
-To render a template, access it via the `/render/` endpoint using its **slug**:
-
-*   **Template Slug:** `pages/home`
-*   **Public URL:** `https://your-app.com/render/pages/home`
-
-### The Context
-Every template has access to a global `context` object containing data. You can access variables using double curly braces: `{{ variable_name }}`.
-
-**Default Variables:**
-| Variable | Description | Example |
-| :--- | :--- | :--- |
-| `params` | URL Query parameters | `{{ params.search }}` |
-| `headers` | HTTP Request headers | `{{ headers['user-agent'] }}` |
-| `is_htmx` | Boolean, true if request came from HTMX | `{% if is_htmx %}...{% endif %}` |
-| `body` | JSON or Form body (if POST request) | `{{ body.title }}` |
+This architecture allows you to fetch data securely on the server and render dynamic HTML before it ever reaches the user's browser.
 
 ---
 
-## 2. Data Access Methods
+## 1. Anatomy of a Template
 
-There are two ways to get data into your templates.
+A template in ApexKit consists of two parts:
+1. **The Controller (JS):** A Server-Side JavaScript block that executes securely on the backend.
+2. **The View (HTML):** A Tera HTML template that consumes the JSON returned by the Controller.
 
-### Method A: Database Helpers (Direct Access)
-You can query the database directly inside your HTML using helper functions.
-
-**⚠️ IMPORTANT SYNTAX RULE:** You **MUST** use keyword arguments (e.g., `col='...'`). Positional arguments (e.g., `('users', 1)`) will cause an error.
-
-#### `db_find(col, filter)`
-Fetches a list of records.
-*   `col`: (string) Collection name.
-*   `filter`: (optional, json/object) MongoDB-style filter (currently simple equality).
+To enable syntax highlighting in standard code editors (like VS Code), we wrap the Controller logic inside a standard `<script>` tag using special `// ---@@ssr` delimiters.
 
 ```html
-<!-- Fetch all posts -->
-{% set posts = db_find(col='posts') %}
-
-<!-- Fetch active users -->
-{% set active_users = db_find(col='users', filter={"status": "active"}) %}
-
-<ul>
-{% for user in active_users %}
-    <li>{{ user.email }}</li>
-{% endfor %}
-</ul>
-```
-
-#### `db_find_one(col, id)`
-Fetches a single record by ID.
-
-```html
-{% set author = db_find_one(col='users', id=123) %}
-<h1>Author: {{ author.email }}</h1>
-```
-
----
-
-### Method B: Loader Scripts (Complex Logic)
-For complex logic (e.g., joining data, external API calls, permissions), verify data in a **Script** before rendering.
-
-1.  **Create a Script** (e.g., `load_dashboard_data`):
-    ```javascript
-    // Script: load_dashboard_data
-    export default async function(req) {
-        // 1. Get query param
-        const category = req.body.params.category || "general";
-        
-        // 2. Fetch from DB
-        const posts = await $db.records.list('posts', { filter: { category: category } });
-        
-        // 3. Return data object
-        return new Response({ 
-            page_title: "Dashboard - " + category,
-            recent_posts: posts,
-            stats: { count: posts.length }
-        });
-    }
-    ```
-
-2.  **Attach Script to Template:**
-    In the Admin UI -> Templates -> Edit Template -> Select `load_dashboard_data` in the **Linked Script** dropdown.
-
-3.  **Use Data in Template:**
-    The script's return object is merged into the template context.
-    ```html
-    <!-- Template: dashboard -->
-    <h1>{{ page_title }}</h1>
-    <p>Total posts: {{ stats.count }}</p>
+<script>
+// ---@@ssr
+export default async function(req) {
+    // 1. Parse the incoming request
+    const payload = await req.json();
     
-    {% for post in recent_posts %}
-       <div>{{ post.title }}</div>
-    {% endfor %}
-    ```
+    // 2. Fetch data using the global $db API
+    const posts = await $db.records.list('posts', { limit: 5 });
+    
+    // 3. Return JSON to the HTML template
+    return { 
+        posts: posts.items,
+        title: "Latest News",
+        viewer: payload.headers['user-agent']
+    };
+}
+// ---@@ssr
+</script>
 
----
-
-## 3. Composing UI (Includes)
-
-You can build reusable components (navbars, cards, footers) and include them in other templates.
-
-**Syntax:** `{% include "slug/of/template" %}`
-
-**Example:**
-*   Template 1 (`components/header`):
-    ```html
-    <nav>Logo | Home | About</nav>
-    ```
-*   Template 2 (`pages/home`):
-    ```html
-    {% include "components/header" %}
-    <main>Welcome!</main>
-    ```
-
----
-
-## 4. HTMX Integration (The "Hybrid" Architecture)
-
-ApexKit is optimized for HTMX. You can request *specific components* to update parts of a page without reloading.
-
-### Example: Dynamic Search
-**1. The Component (`components/search_results`):**
-```html
-<!-- This template lists results based on 'q' param -->
-{% set results = db_find(col='products', filter={"name": params.q}) %}
-<ul id="results-list">
-    {% for item in results %}
-        <li>{{ item.name }}</li>
-    {% endfor %}
-</ul>
-```
-
-**2. The Main Page (`pages/search`):**
-```html
-<input type="text" 
-       name="q"
-       hx-get="/render/components/search_results" 
-       hx-target="#results-list" 
-       hx-trigger="keyup changed delay:500ms"
-       placeholder="Search products...">
-
-<div id="results-list">
-    <!-- Initial empty state or default results -->
-    {% include "components/search_results" %}
+<!-- The HTML below receives the returned JSON as variables -->
+<div class="container mx-auto p-8">
+    <h1>{{ title }}</h1>
+    <ul>
+        {% for post in posts %}
+            <li>{{ post.title }}</li>
+        {% else %}
+            <li>No posts found.</li>
+        {% endfor %}
+    </ul>
+    <small>Rendered for: {{ viewer }}</small>
 </div>
 ```
 
 ---
 
-## 5. Troubleshooting / Common Errors
+## 2. The Request Payload & Authorization
 
-### `Template Engine Compilation Failed`
-*   **Cause:** You likely used positional arguments in a helper function.
-*   **Wrong:** `db_find('users', null)`
-*   **Right:** `db_find(col='users')` or `db_find(col='users', filter=null)`
+Templates are automatically accessible via the `/render/{slug}` URL. 
 
-### `Template not found`
-*   **Cause:** The slug in your URL (`/render/my-slug`) or your `{% include 'my-slug' %}` tag does not match any template in the database exactly.
-*   **Fix:** Check the Admin UI > Templates list for the exact slug.
+When a user visits a template route, the Controller's `req.json()` method yields a payload containing URL parameters, headers, and the authenticated user's claims.
 
-### Variables not showing up
-*   **Cause:** If using a Loader Script, ensure the script returns a `Response` object with a JSON body.
-*   **Fix:** Ensure script ends with `return new Response({ my_var: "value" });`.
+### The Payload Object
+```json
+{
+  "params": { 
+    "id": "5" // Extracted from URL query string (e.g., ?id=5)
+  },
+  "headers": { 
+    "user-agent": "Mozilla/5.0...",
+    "host": "localhost:5000"
+  },
+  "is_htmx": true, // True if the request was made via HTMX
+  "auth": { 
+    "id": 1, 
+    "email": "user@example.com", 
+    "role": "admin" 
+  } // Null if the user is not logged in
+}
+```
+
+### Protecting a Route
+You can easily build secure, private pages by checking the `auth` object. If the user is not authenticated, simply return a standard HTTP Response with a `401 Unauthorized` status. The frontend client (`apex.js`) will catch this and redirect the user to the login page.
+
+```javascript
+<script>
+// ---@@ssr
+export default async function(req) {
+    const payload = await req.json();
+    
+    // Block unauthenticated users
+    if (!payload.auth) {
+        return new Response({ error: "Unauthorized" }, { status: 401 });
+    }
+    
+    // Fetch data specifically for this user
+    const myTasks = await $db.records.list('tasks', { 
+        filter: { owner_id: payload.auth.id } 
+    });
+
+    return { user: payload.auth, tasks: myTasks.items };
+}
+// ---@@ssr
+</script>
+```
+
+---
+
+## 3. The Universal Client (`apex.js`) & HTMX
+
+ApexKit is uniquely designed to run multi-tenant architecture and isolated sandboxes natively. To ensure your HTML templates work flawlessly across the Root app, Tenants, and Sandboxes *without hardcoding URLs*, ApexKit includes a built-in script called `apex.js`.
+
+### What `apex.js` does:
+1. **Dynamic Routing:** Automatically detects if the app is running in `/tenant/xyz` or `/sandbox/abc` and prefixes all API requests.
+2. **Token Injection:** Automatically retrieves the JWT from `localStorage` and injects it into all `fetch()` and `htmx` headers.
+3. **Auth Helpers:** Exposes a global `$apex` object with `.login()` and `.logout()` methods.
+
+### Setting up the Base Layout
+Always include HTMX and `apex.js` in your base template or `index.html`:
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="/static/js/htmx.js"></script>
+    <!-- Automatically handles Auth Headers & Scope Routing! -->
+    <script src="/static/js/apex.js"></script>
+</head>
+<body>
+    <!-- 
+        HTMX requests are auto-prefixed and auto-authenticated.
+        You write "/api/v1/run/buy_now", but apex.js converts it to 
+        "/tenant/123/api/v1/run/buy_now" behind the scenes!
+    -->
+    <button hx-post="/api/v1/run/buy_now">Purchase</button>
+</body>
+</html>
+```
+
+### Creating a Login Form
+Use the `$apex` helper to easily log users in and route them to the dashboard:
+
+```html
+<form onsubmit="event.preventDefault(); handleLogin(this)">
+    <input id="email" type="email" placeholder="Email">
+    <input id="password" type="password" placeholder="Password">
+    <button type="submit">Login</button>
+</form>
+
+<script>
+async function handleLogin(form) {
+    const res = await $apex.login(form.email.value, form.password.value);
+    
+    if (res.ok) {
+        // $apex.scope contains the current environment prefix (e.g. "/tenant/123")
+        window.location.href = $apex.scope + '/render/dashboard';
+    } else {
+        alert(res.data.message);
+    }
+}
+</script>
+```
+
+---
+
+## 4. Components & Includes
+
+As your UI grows, you should split it into reusable components. ApexKit supports this natively via the `{% include %}` tag.
+
+### ⚠️ The Golden Rule of Components
+**The SSR JavaScript block (`// ---@@ssr`) only executes on the Route Controller.**
+Any JavaScript written inside an included component template will be ignored. The Route template (the one mapped to the URL) must fetch **all** the necessary data for itself and its children, and pass it down.
+
+**Example Component (`components/navbar`):**
+```html
+<nav class="bg-dark text-white p-4 flex justify-between">
+    <div class="logo">My App</div>
+    <div>
+        {% if user %}
+            <span>Hello, {{ user.email }}</span>
+            <button onclick="$apex.logout()">Logout</button>
+        {% else %}
+            <a href="/render/login">Login</a>
+        {% endif %}
+    </div>
+</nav>
+```
+
+**Example Route Controller (`dashboard`):**
+```html
+<script>
+// ---@@ssr
+export default async function(req) {
+    const payload = await req.json();
+    return { user: payload.auth };
+}
+// ---@@ssr
+</script>
+
+<div>
+    <!-- The navbar component automatically inherits the 'user' variable -->
+    {% include "components/navbar" %}
+
+    <main class="p-8">
+        <h1>Dashboard Content</h1>
+    </main>
+</div>
+```
+
+---
+
+## 5. Tera Syntax Cheat Sheet
+
+ApexKit uses the Tera templating engine (similar to Jinja2, Django, and Twig).
+
+### Variables & Output
+```html
+<!-- Print a variable -->
+{{ user.email }}
+
+<!-- Apply filters -->
+{{ post.title | upper }}
+{{ post.content | safe }} <!-- Renders HTML without escaping -->
+{{ posts | length }}
+
+<!-- Dump JSON (Great for debugging!) -->
+{{ data | debug }}
+```
+
+### Conditionals
+```html
+{% if user.role == "admin" %}
+    <a href="/admin">Admin Panel</a>
+{% elif user.role == "editor" %}
+    <a href="/editor">Editor Panel</a>
+{% else %}
+    <p>Standard User</p>
+{% endif %}
+```
+
+### Loops
+```html
+<ul>
+{% for item in items %}
+    <!-- loop.index starts at 1, loop.index0 starts at 0 -->
+    <li>{{ loop.index }}. {{ item.name }}</li>
+{% else %}
+    <li>No items found.</li>
+{% endfor %}
+</ul>
+```

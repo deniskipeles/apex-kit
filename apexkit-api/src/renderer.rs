@@ -1,11 +1,12 @@
 use axum::{
     extract::{Path, State, Query},
     response::{Html, IntoResponse, Response},
-    http::{HeaderMap}, 
+    http::{HeaderMap, StatusCode}, 
     Extension, 
+    Json, 
 };
 use serde_json::{json, Value};
-use tera::{Tera, Context, Function}; 
+use tera::{Tera}; 
 use crate::{AppState, AppError, DatabaseConnection};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +14,8 @@ use apexkit_core::Db;
 use tracing::{warn, info};
 use crate::BaseUrl;
 use apexkit_core::realtime::EventScope;
-
+use regex::Regex;
+use apexkit_core::auth::Claims; // [NEW] Import Claims
 
 // --- HELPERS ---
 fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
@@ -35,75 +37,28 @@ fn merge_json(a: &mut Value, b: Value) {
     }
 }
 
-// --- TERA DB FUNCTIONS ---
-struct FindOneFn { db: Arc<dyn Db> }
-impl Function for FindOneFn {
-    fn call(&self, args: &HashMap<String, Value>) -> tera::Result<Value> {
-        let col = args.get("col").and_then(|v| v.as_str()).ok_or("Missing 'col' argument")?;
-        let id_val = args.get("id").ok_or("Missing 'id' argument")?;
-        
-        let id = if let Some(n) = id_val.as_i64() { n } 
-        else if let Some(s) = id_val.as_str() { s.parse::<i64>().unwrap_or(0) } 
-        else { return Ok(Value::Null); };
-        
-        let db = self.db.clone();
-        let col_name = col.to_string();
-
-        let result = tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                let cols = db.list_collections().await.map_err(|e| e.to_string())?;
-                let col_id = cols.into_iter().find(|c| c.name == col_name).map(|c| c.id)
-                    .ok_or_else(|| format!("Collection '{}' not found", col_name))?;
-                db.get_record(col_id, id, None).await.map_err(|e| e.to_string())
-            })
-        }).map_err(|e| tera::Error::msg(e))?;
-
-        match result {
-            Some(rec) => {
-                let mut v = rec.data;
-                if let Some(o) = v.as_object_mut() { o.insert("id".into(), json!(rec.id)); }
-                Ok(v)
-            },
-            None => Ok(Value::Null)
+fn extract_ssr_js(content: &str) -> (Option<String>, String) {
+    if let Ok(re) = Regex::new(r"(?s)<script[^>]*>\s*//\s*---@@ssr\s*(.*?)\s*//\s*---@@ssr\s*</script>") {
+        if let Some(caps) = re.captures(content) {
+            if let Some(js_match) = caps.get(1) {
+                let js_code = js_match.as_str().trim().to_string();
+                let html_content = re.replace(content, "").to_string();
+                return (Some(js_code), html_content);
+            }
         }
     }
-}
 
-struct FindFn { db: Arc<dyn Db> }
-impl Function for FindFn {
-    fn call(&self, args: &HashMap<String, Value>) -> tera::Result<Value> {
-        let col = args.get("col").and_then(|v| v.as_str()).ok_or("Missing 'col' argument")?;
-        let filter_arg = args.get("filter"); 
-        let filter_str = match filter_arg {
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(Value::Object(_)) => Some(serde_json::to_string(filter_arg.unwrap()).unwrap()),
-            _ => None
-        };
-
-        let db = self.db.clone();
-        let col_name = col.to_string();
-
-        let result = tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                let cols = db.list_collections().await.map_err(|e| e.to_string())?;
-                let col_id = cols.into_iter().find(|c| c.name == col_name).map(|c| c.id)
-                    .ok_or_else(|| format!("Collection '{}' not found", col_name))?;
-                
-                let mut opts = apexkit_core::query::QueryOptions::default();
-                opts.filter = filter_str;
-                opts.per_page = Some(100);
-                db.list_records(col_id, opts).await.map_err(|e| e.to_string())
-            })
-        }).map_err(|e| tera::Error::msg(e))?;
-
-        let list: Vec<Value> = result.items.into_iter().map(|r| {
-            let mut v = r.data;
-            if let Some(o) = v.as_object_mut() { o.insert("id".into(), json!(r.id)); }
-            v
-        }).collect();
-
-        Ok(json!(list))
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("---") {
+        if let Some(end_idx) = trimmed[3..].find("\n---") {
+            let js_code = trimmed[3..3+end_idx].trim().to_string();
+            let html_start = 3 + end_idx + 4; 
+            let html_content = trimmed[html_start..].to_string();
+            return (Some(js_code), html_content);
+        }
     }
+
+    (None, content.to_string())
 }
 
 // --- CORE RENDERER ---
@@ -117,7 +72,8 @@ async fn render_view_core(
     body: String,
     source_label: &str,
     _base_url: Option<String>,
-    scope: EventScope 
+    scope: EventScope,
+    auth: Option<Claims> // [NEW] Accept Auth Claims
 ) -> Result<Response, AppError> {
     info!("[Renderer] Serving '{}' from source: {}", slug, source_label);
 
@@ -128,19 +84,19 @@ async fn render_view_core(
         .find(|t| t.slug == slug)
         .ok_or_else(|| AppError::NotFound(format!("Template '{}' not found", slug)))?;
 
-    // Context Setup
     let is_htmx = headers.contains_key("HX-Request");
+    
+    // [NEW] Inject Auth object into the JSON payload accessible by the SSR script
     let mut context_data = json!({
         "params": params,
         "headers": headers_to_map(&headers),
         "is_htmx": is_htmx,
+        "auth": auth.map(|c| json!({ "id": c.uid, "email": c.sub, "role": c.role })),
     });
 
-    // --- Derive Base URL from Headers ---
     let base_url = headers.get("host")
         .and_then(|h| h.to_str().ok())
-        .map(|h| format!("http://{}", h)); // Assume http behind proxy or handle https via config if needed
-    // ----------------------------------------
+        .map(|h| format!("http://{}", h)); 
 
     if !body.is_empty() {
         if let Ok(j) = serde_json::from_str::<Value>(&body) { merge_json(&mut context_data, json!({"body": j})); } 
@@ -153,42 +109,69 @@ async fn render_view_core(
         scope: scope.clone(),
     });
 
+    // 1. RUN LINKED SCRIPT
     if let Some(script_id) = target_template.script_id {
         let scripts = db.list_scripts().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
         if let Some(script) = scripts.into_iter().find(|s| s.id == script_id) {
             let script_res = state.script_engine.run_script(
                 &script.code, 
                 context_data.clone(), 
-                context,
-                base_url, 
+                context.clone(),
+                base_url.clone(), 
                 Some(headers_to_map(&headers))
-            ).await.map_err(|e| AppError::UnknownError(format!("Script Error: {}", e)))?;
+            ).await.map_err(|e| AppError::UnknownError(format!("Linked Script Error: {}", e)))?;
+            
+            // If the script returns an error response object (e.g. { error: "unauthorized" }), forward it
+            if let Some(obj) = script_res.as_object() {
+                if obj.contains_key("error") && obj.contains_key("status") {
+                    let status = StatusCode::from_u16(obj.get("status").unwrap().as_u64().unwrap_or(400) as u16).unwrap_or(StatusCode::BAD_REQUEST);
+                    return Ok((status, Json(script_res)).into_response());
+                }
+            }
             merge_json(&mut context_data, script_res);
         }
     }
 
-    // Engine Setup
+    // 2. EXTRACT & RUN INLINE SSR JS
+    let (inline_js, _) = extract_ssr_js(&target_template.content);
+    if let Some(js_code) = inline_js {
+        let script_res = state.script_engine.run_script(
+            &js_code, 
+            context_data.clone(), 
+            context.clone(),
+            base_url.clone(), 
+            Some(headers_to_map(&headers))
+        ).await.map_err(|e| AppError::UnknownError(format!("Template JS Error: {}", e)))?;
+        
+        // Handle explicit Responses (e.g. redirect or unauthorized)
+        if let Some(obj) = script_res.as_object() {
+            if obj.contains_key("error") && obj.contains_key("status") {
+                let status = StatusCode::from_u16(obj.get("status").unwrap().as_u64().unwrap_or(400) as u16).unwrap_or(StatusCode::BAD_REQUEST);
+                return Ok((status, Json(script_res)).into_response());
+            }
+        }
+        merge_json(&mut context_data, script_res);
+    }
+
+    // 3. TERA SETUP
     let mut tera = Tera::default();
     let register_helpers = |t: &mut Tera| {
-        t.register_function("db_find", FindFn { db: db.clone() });
-        t.register_function("db_find_one", FindOneFn { db: db.clone() });
         t.register_filter("debug", |value: &Value, _: &HashMap<String, Value>| {
             Ok(serde_json::to_string_pretty(value).unwrap().into())
         });
     };
     register_helpers(&mut tera);
 
-    // --- ROBUST TEMPLATE LOADING (Multi-Pass) ---
+    // 4. STRIP SSR AND LOAD TERA
     let template_vec: Vec<(String, String)> = all_templates.iter()
-        .map(|t| (t.slug.clone(), t.content.clone()))
+        .map(|t| {
+            let (_, html) = extract_ssr_js(&t.content);
+            (t.slug.clone(), html)
+        })
         .collect();
     
-    // 1. Try Batch Load
     if let Err(e) = tera.add_raw_templates(template_vec.clone()) {
         warn!("Batch template load failed: {}. Switching to resilient loading.", e);
-        
-        // 2. Resilient Load Loop
-        // We loop up to 3 times to resolve out-of-order dependencies (e.g. child loaded before parent)
         tera = Tera::default(); 
         register_helpers(&mut tera);
         
@@ -201,26 +184,16 @@ async fn render_view_core(
 
             for (tslug, content) in pending {
                 if let Err(_) = tera.add_raw_template(&tslug, &content) {
-                    // Failed (maybe parent missing?), keep for next pass
                     next_pending.push((tslug, content));
                 } else {
-                    // Success
                     made_progress = true;
                 }
             }
-
             pending = next_pending;
             passes += 1;
-
-            if !made_progress {
-                // No templates successfully added in this pass, stop trying to prevent infinite loop
-                break;
-            }
+            if !made_progress { break; }
         }
 
-        // 3. Check if Critical Template is Missing
-        // If the requested slug is still in pending, it means it failed to compile even after retries.
-        // We try to add it one last time to capture the specific error message for the user.
         if pending.iter().any(|(s, _)| s == &slug) {
              if let Some((_, content)) = pending.iter().find(|(s, _)| s == &slug) {
                  if let Err(err) = tera.add_raw_template(&slug, content) {
@@ -230,12 +203,26 @@ async fn render_view_core(
         }
     }
 
-    // Render
-    let context = Context::from_value(context_data)
+    // 5. RENDER HTML
+    let context = tera::Context::from_value(context_data)
         .map_err(|e| AppError::UnknownError(format!("Context Error: {}", e)))?;
 
-    let rendered = tera.render(&slug, &context)
+    let mut rendered = tera.render(&slug, &context)
         .map_err(|e| AppError::UnknownError(format!("Render Error: {}", e)))?;
+
+    // --- [NEW] AUTO-INJECT APEX.JS ---
+    // We only inject if it's a full HTML document (contains </head> or </body>).
+    // This prevents injecting it multiple times into small HTMX partials.
+    if !rendered.contains("apex.js") {
+        let script_tag = "\n    <script src=\"/static/js/apex.js\"></script>";
+        if rendered.contains("</head>") {
+            rendered = rendered.replace("</head>", &format!("{}</head>", script_tag));
+        } else if rendered.contains("</body>") {
+            rendered = rendered.replace("</body>", &format!("{}</body>", script_tag));
+        } else if rendered.to_lowercase().contains("<html") {
+            rendered.push_str(script_tag);
+        }
+    }
 
     Ok(Html(rendered).into_response())
 }
@@ -243,6 +230,7 @@ async fn render_view_core(
 // --- PUBLIC HANDLERS ---
 
 pub async fn render_view(
+    auth: Option<Extension<Claims>>, // [NEW]
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,
@@ -253,36 +241,40 @@ pub async fn render_view(
     body: String, 
 ) -> Result<Response, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    render_view_core(db, state, slug, params, headers, body, "Root App", Some(base_url), event_scope).await
+    let claims = auth.map(|e| e.0);
+    render_view_core(db, state, slug, params, headers, body, "Root App", Some(base_url), event_scope, claims).await
 }
 
 pub async fn render_sandbox_view(
+    auth: Option<Extension<Claims>>, // [NEW]
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,
     scope: Option<Extension<EventScope>>,
-    Path((session_id, slug)): Path<(String, String)>, // Accepts 2 params
+    Path((session_id, slug)): Path<(String, String)>, 
     Query(params): Query<HashMap<String, String>>, 
     headers: HeaderMap,
     body: String, 
 ) -> Result<Response, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let claims = auth.map(|e| e.0);
     let label = format!("Sandbox {}", session_id);
-    render_view_core(db, state, slug, params, headers, body, &label, Some(base_url), event_scope).await
+    render_view_core(db, state, slug, params, headers, body, &label, Some(base_url), event_scope, claims).await
 }
 
-// [NEW] Handler for Tenant Routes
 pub async fn render_tenant_view(
+    auth: Option<Extension<Claims>>, // [NEW]
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,
     scope: Option<Extension<EventScope>>,
-    Path((tenant_id, slug)): Path<(String, String)>, // Accepts 2 params
+    Path((tenant_id, slug)): Path<(String, String)>, 
     Query(params): Query<HashMap<String, String>>, 
     headers: HeaderMap,
     body: String, 
 ) -> Result<Response, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let claims = auth.map(|e| e.0);
     let label = format!("Tenant {}", tenant_id);
-    render_view_core(db, state, slug, params, headers, body, &label, Some(base_url), event_scope).await
+    render_view_core(db, state, slug, params, headers, body, &label, Some(base_url), event_scope, claims).await
 }

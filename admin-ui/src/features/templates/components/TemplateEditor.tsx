@@ -100,6 +100,7 @@ export const TemplateEditor = ({ isOpen, onClose, onSave, initialData }: Templat
                         value={formData.content || ''}
                         onChange={(val) => setFormData({...formData, content: val})}
                         language="html"
+                        withTypes={true} // [NEW] Enable Type Injections
                         height="100%"
                         label="TEMPLATE CODE"
                     />
