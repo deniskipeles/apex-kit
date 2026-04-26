@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Archive, Clock, Play, Trash2, Plus, Save, Download, RotateCcw, FileArchive, Loader2, ShieldAlert, Folder, Search } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Archive, Clock, Play, Trash2, Plus, Save, Download, RotateCcw, FileArchive, Loader2, ShieldAlert, Folder, Search, Database, BrainCircuit, Globe, Upload, RefreshCw } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Input, Label, Switch, Button, Badge, Select } from '../../../components/ui/Elements';
 import { AppSettings, CronJob } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
@@ -13,15 +13,10 @@ interface BackupSettingsProps {
     onSave: (data: Partial<AppSettings>) => Promise<void>;
 }
 
-// Simple Cron Regex (Basic validation)
-const CRON_REGEX = /^(\*|([0-9]|1[0-9]|2[0-9]|3[0-9]|4[0-9]|5[0-9])|\*\/([0-9]|1[0-9]|2[0-9]|3[0-9]|4[0-9]|5[0-9])) (\*|([0-9]|1[0-9]|2[0-3])|\*\/([0-9]|1[0-9]|2[0-3])) (\*|([1-9]|1[0-9]|2[0-9]|3[0-1])|\*\/([1-9]|1[0-9]|2[0-9]|3[0-1])) (\*|([1-9]|1[0-2])|\*\/([1-9]|1[0-2])) (\*|([0-6])|\*\/([0-6]))$/;
-
 const validateCron = (cron: string) => {
-    // Basic check for 5 parts
     const parts = cron.trim().split(/\s+/);
     if (parts.length !== 5 && parts.length !== 6) return false;
-    // Allow basic * and numbers
-    return true; // Use robust library if needed, or simple regex
+    return true; 
 };
 
 export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsProps) => {
@@ -37,18 +32,20 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
     const [isRestoring, setIsRestoring] = useState(false);
     const [restoreTarget, setRestoreTarget] = useState<string | null>(null);
 
+    // Upload Backup State
+    const [isUploadingRestore, setIsUploadingRestore] = useState(false);
+    const fileInputRef = useRef<HTMLInputElement>(null);
+
     // Root Policy State
     const [isRootScope, setIsRootScope] = useState(false);
     const [allowNonRootBackup, setAllowNonRootBackup] = useState(false);
 
     useEffect(() => {
-        // Check scope
         const path = window.location.pathname;
         const isRoot = !path.includes('/tenant/') && !path.includes('/sandbox/') && (apiClient.getScope().type == 'root');
         setIsRootScope(isRoot);
 
         if (isRoot) {
-            // Load dedicated config key
             configService.list().then(list => {
                 const conf = list.find(c => c.key === 'ALLOW_NON_ROOT_BACKUP');
                 if (conf && conf.value) {
@@ -77,7 +74,6 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
             active: true
         };
 
-        // Update parent state immediately
         const updatedJobs = [...(settings.cronJobs || []), newJob];
         onChange({ cronJobs: updatedJobs });
 
@@ -99,13 +95,11 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
     const handleSaveClick = async () => {
         setIsSaving(true);
         try {
-            // 1. Save Backup & Cron Settings via Main Settings Endpoint
             await onSave({
                 backups: settings.backups,
                 cronJobs: settings.cronJobs
             });
 
-            // 2. Save Root Policy (Independent Key)
             if (isRootScope) {
                 await configService.set('ALLOW_NON_ROOT_BACKUP', allowNonRootBackup ? 'true' : 'false', false);
             }
@@ -155,6 +149,38 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
         }
     };
 
+    // --- [NEW] Upload Backup Handler ---
+    const handleUploadRestore = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        if (!file.name.endsWith('.tar.gz')) {
+            toast('Backup file must be a .tar.gz archive', 'error');
+            return;
+        }
+
+        if (!confirm(`Uploading and restoring ${file.name} will overwrite your current database and files. Proceed?`)) {
+            e.target.value = ''; // Reset input
+            return;
+        }
+
+        setIsUploadingRestore(true);
+        toast("Uploading and extracting backup... Please wait.", "info");
+
+        try {
+            await apiClient.system.restoreBackup(file);
+            toast("Backup restored successfully. Server is restarting...", "success");
+            // Give the server a few seconds to reboot before refreshing the UI
+            setTimeout(() => window.location.reload(), 4000);
+        } catch (err: any) {
+            console.error(err);
+            toast(err.message || "Failed to upload/restore backup", "error");
+            setIsUploadingRestore(false);
+        } finally {
+            e.target.value = ''; // Reset input
+        }
+    };
+
     const handleDownload = async (filename: string) => {
         try {
             await apiClient.system.downloadBackup(filename);
@@ -197,7 +223,7 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
             <Card>
                 <CardHeader>
                     <div className="flex items-center justify-between">
-                        <CardTitle className="flex items-center gap-2"><Archive className="h-4 w-4" /> Database Backups</CardTitle>
+                        <CardTitle className="flex items-center gap-2"><Archive className="h-4 w-4" /> System Backups</CardTitle>
                         <Switch checked={settings.backups.enabled} onCheckedChange={(c: boolean) => updateBackup({ enabled: c })} />
                     </div>
                 </CardHeader>
@@ -223,26 +249,66 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
                             </div>
                         </div>
 
-                        {/* Included Data Options */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 rounded-lg bg-secondary/10 border border-border">
-                            <div className="flex items-center justify-between">
-                                <div className="space-y-0.5">
-                                    <Label className="flex items-center gap-2 cursor-pointer" onClick={() => updateBackup({ includeUploads: !settings.backups.includeUploads })}>
-                                        <Folder className="h-4 w-4 text-blue-500" /> Include Uploads
-                                    </Label>
-                                    <p className="text-[10px] text-muted-foreground">Backup user uploaded files (images, documents).</p>
+                        {/* Included Data Options - GRID */}
+                        <div className="space-y-2">
+                            <Label>What to include in the backup archive:</Label>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 p-4 rounded-lg bg-secondary/10 border border-border">
+                                
+                                {/* Databases */}
+                                <div className="flex items-center justify-between bg-background p-2.5 rounded border border-border/50 shadow-sm">
+                                    <div className="space-y-0.5">
+                                        <Label className="flex items-center gap-2 cursor-pointer text-xs" onClick={() => updateBackup({ includeDatabases: !settings.backups.includeDatabases })}>
+                                            <Database className="h-3.5 w-3.5 text-blue-500" /> Databases
+                                        </Label>
+                                        <p className="text-[9px] text-muted-foreground">core, data, logs, system</p>
+                                    </div>
+                                    <Switch checked={settings.backups.includeDatabases ?? true} onCheckedChange={(c) => updateBackup({ includeDatabases: c })} />
                                 </div>
-                                <Switch checked={settings.backups.includeUploads} onCheckedChange={(c) => updateBackup({ includeUploads: c })} />
-                            </div>
 
-                            <div className="flex items-center justify-between">
-                                <div className="space-y-0.5">
-                                    <Label className="flex items-center gap-2 cursor-pointer" onClick={() => updateBackup({ includeIndexes: !settings.backups.includeIndexes })}>
-                                        <Search className="h-4 w-4 text-purple-500" /> Include Indexes
-                                    </Label>
-                                    <p className="text-[10px] text-muted-foreground">Backup Tantivy search indexes (faster restore, larger size).</p>
+                                {/* Vectors */}
+                                <div className="flex items-center justify-between bg-background p-2.5 rounded border border-border/50 shadow-sm">
+                                    <div className="space-y-0.5">
+                                        <Label className="flex items-center gap-2 cursor-pointer text-xs" onClick={() => updateBackup({ includeVectors: !settings.backups.includeVectors })}>
+                                            <BrainCircuit className="h-3.5 w-3.5 text-purple-500" /> Vector DB
+                                        </Label>
+                                        <p className="text-[9px] text-muted-foreground">vectors.db (Can be large)</p>
+                                    </div>
+                                    <Switch checked={settings.backups.includeVectors} onCheckedChange={(c) => updateBackup({ includeVectors: c })} />
                                 </div>
-                                <Switch checked={settings.backups.includeIndexes} onCheckedChange={(c) => updateBackup({ includeIndexes: c })} />
+
+                                {/* Static Site */}
+                                <div className="flex items-center justify-between bg-background p-2.5 rounded border border-border/50 shadow-sm">
+                                    <div className="space-y-0.5">
+                                        <Label className="flex items-center gap-2 cursor-pointer text-xs" onClick={() => updateBackup({ includeStaticSite: !settings.backups.includeStaticSite })}>
+                                            <Globe className="h-3.5 w-3.5 text-cyan-500" /> Static Site
+                                        </Label>
+                                        <p className="text-[9px] text-muted-foreground">The 'public' folder contents</p>
+                                    </div>
+                                    <Switch checked={settings.backups.includeStaticSite} onCheckedChange={(c) => updateBackup({ includeStaticSite: c })} />
+                                </div>
+
+                                {/* Uploads */}
+                                <div className="flex items-center justify-between bg-background p-2.5 rounded border border-border/50 shadow-sm">
+                                    <div className="space-y-0.5">
+                                        <Label className="flex items-center gap-2 cursor-pointer text-xs" onClick={() => updateBackup({ includeUploads: !settings.backups.includeUploads })}>
+                                            <Folder className="h-3.5 w-3.5 text-orange-500" /> Uploads
+                                        </Label>
+                                        <p className="text-[9px] text-muted-foreground">User uploaded files & images</p>
+                                    </div>
+                                    <Switch checked={settings.backups.includeUploads} onCheckedChange={(c) => updateBackup({ includeUploads: c })} />
+                                </div>
+
+                                {/* Indexes */}
+                                <div className="flex items-center justify-between bg-background p-2.5 rounded border border-border/50 shadow-sm">
+                                    <div className="space-y-0.5">
+                                        <Label className="flex items-center gap-2 cursor-pointer text-xs" onClick={() => updateBackup({ includeIndexes: !settings.backups.includeIndexes })}>
+                                            <Search className="h-3.5 w-3.5 text-pink-500" /> Search Indexes
+                                        </Label>
+                                        <p className="text-[9px] text-muted-foreground">Tantivy folders (Can be rebuilt)</p>
+                                    </div>
+                                    <Switch checked={settings.backups.includeIndexes} onCheckedChange={(c) => updateBackup({ includeIndexes: c })} />
+                                </div>
+
                             </div>
                         </div>
                     </div>
@@ -254,8 +320,30 @@ export const BackupSettings = ({ settings, onChange, onSave }: BackupSettingsPro
                             <div className="flex justify-between items-center mb-4">
                                 <h4 className="text-sm font-semibold">Backup History</h4>
                                 <div className="flex gap-2">
-                                    <Button size="sm" variant="ghost" onClick={loadBackups} isLoading={isLoadingBackups}>Refresh</Button>
-                                    <Button size="sm" onClick={handleCreateBackup}><Play className="mr-2 h-3 w-3" /> Run Backup Now</Button>
+                                    {/* [NEW] Upload Backup Button */}
+                                    <input 
+                                        type="file" 
+                                        accept=".tar.gz" 
+                                        ref={fileInputRef} 
+                                        className="hidden" 
+                                        onChange={handleUploadRestore}
+                                    />
+                                    <Button 
+                                        size="sm" 
+                                        variant="outline" 
+                                        onClick={() => fileInputRef.current?.click()} 
+                                        isLoading={isUploadingRestore}
+                                    >
+                                        <Upload className="mr-2 h-3 w-3" /> Upload Backup
+                                    </Button>
+
+                                    <Button size="sm" variant="ghost" onClick={loadBackups} isLoading={isLoadingBackups}>
+                                        <RefreshCw className="h-3 w-3" />
+                                    </Button>
+                                    
+                                    <Button size="sm" onClick={handleCreateBackup}>
+                                        <Play className="mr-2 h-3 w-3" /> Run Backup Now
+                                    </Button>
                                 </div>
                             </div>
 

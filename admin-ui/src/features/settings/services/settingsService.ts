@@ -41,8 +41,11 @@ const mapToFrontend = (apiData: any): AppSettings => {
             schedule: apiData.backups?.schedule || '0 0 * * *', 
             retention: apiData.backups?.retention || 7, 
             destination: apiData.backups?.destination || 'local',
+            includeDatabases: apiData.backups?.include_databases ?? true,
+            includeVectors: apiData.backups?.include_vectors || false,
             includeUploads: apiData.backups?.include_uploads || false,
             includeIndexes: apiData.backups?.include_indexes || false,
+            includeStaticSite: apiData.backups?.include_static_site || false,
         },
         cronJobs: apiData.cron_jobs || [],
         apiTokens: [],
@@ -123,8 +126,11 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
             schedule: settings.backups.schedule,
             retention: settings.backups.retention,
             destination: settings.backups.destination,
+            include_databases: settings.backups.includeDatabases,
+            include_vectors: settings.backups.includeVectors,
             include_uploads: settings.backups.includeUploads,
             include_indexes: settings.backups.includeIndexes,
+            include_static_site: settings.backups.includeStaticSite,
         };
     }
 

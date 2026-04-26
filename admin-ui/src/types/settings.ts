@@ -48,8 +48,12 @@ export interface BackupConfig {
   schedule: string; // Cron expression
   retention: number; // Days to keep
   destination: 'local' | 's3';
+  
+  includeDatabases?: boolean;
+  includeVectors?: boolean;
   includeUploads?: boolean;
   includeIndexes?: boolean;
+  includeStaticSite?: boolean;
 }
 
 export interface CronJob {

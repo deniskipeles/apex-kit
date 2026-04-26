@@ -87,11 +87,21 @@ pub struct BackupConfigDto {
     pub schedule: String, // e.g. "0 0 * * *"
     pub retention: u32,   // Days
     pub destination: String, // "local" | "s3"
+    
+    // --- [NEW] Granular Backup Options ---
+    #[serde(default = "default_true")]
+    pub include_databases: bool,
+    #[serde(default)]
+    pub include_vectors: bool,
     #[serde(default)]
     pub include_uploads: bool,
     #[serde(default)]
     pub include_indexes: bool,
+    #[serde(default)]
+    pub include_static_site: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for BackupConfigDto {
     fn default() -> Self {
@@ -100,8 +110,11 @@ impl Default for BackupConfigDto {
             schedule: "0 0 * * *".to_string(),
             retention: 7,
             destination: "local".to_string(),
-            include_uploads: false, // Default off to save space
+            include_databases: true,
+            include_vectors: false, // Default off (can be large)
+            include_uploads: false, // Default off (can be large)
             include_indexes: false, // Default off (can be rebuilt)
+            include_static_site: false,
         }
     }
 }
