@@ -47,7 +47,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "blo
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
 # Email
-lettre = { version = "0.11", features = ["tokio1", "smtp-transport", "builder", "tokio1-native-tls", "sendmail-transport"] }
+lettre = { version = "0.11", features = ["tokio1", "smtp-transport", "builder", "tokio1-native-tls", "sendmail-transport", "file-transport"] }
 
 # Auth & Crypto
 bcrypt = "0.15"
@@ -73,3 +73,6 @@ walkdir = "2.4"
 regex = "1.10"
 url = "2.5"
 ring = "0.17.14"
+
+[dev-dependencies]
+tempfile = "3.27.0"

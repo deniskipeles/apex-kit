@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use lettre::{Message, SmtpTransport, Transport, SendmailTransport};
+use lettre::{Message, SmtpTransport, Transport, SendmailTransport, FileTransport};
 use lettre::transport::smtp::authentication::Credentials;
 use std::sync::Arc;
 use crate::{Db, VectorProvider, security::{ Vault, EncryptedValue }, schema::CollectionSchema};
@@ -190,6 +190,8 @@ struct SmtpSettings {
     username: Option<String>,
     password: Option<String>, 
     from_email: String,
+    // [NEW] For testing/logging without real SMTP
+    file_path: Option<String>,
 }
 
 //  Public and returns Result
@@ -198,11 +200,17 @@ pub async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &
     
     // Default: SMTP disabled, try sendmail
     let settings: SmtpSettings = if let Some(val) = settings_val {
-        serde_json::from_value(val).unwrap_or_else(|_| SmtpSettings { 
-            enabled: false, host: "".into(), port: 587, username: None, password: None, from_email: "noreply@localhost".into() 
-        })
+        match serde_json::from_value::<SmtpSettings>(val) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[SMTP] Failed to parse settings: {}. Using defaults.", e);
+                SmtpSettings {
+                    enabled: false, host: "".into(), port: 587, username: None, password: None, from_email: "noreply@localhost".into(), file_path: None
+                }
+            }
+        }
     } else {
-        SmtpSettings { enabled: false, host: "".into(), port: 587, username: None, password: None, from_email: "noreply@localhost".into() }
+        SmtpSettings { enabled: false, host: "".into(), port: 587, username: None, password: None, from_email: "noreply@localhost".into(), file_path: None }
     };
 
     // Safer From Address Construction
@@ -220,8 +228,18 @@ pub async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &
         .body(body.to_string())
         .map_err(|e: lettre::error::Error| e.to_string())?;
 
-    // Logic: If SMTP enabled, use SMTP. Else, fallback to Sendmail.
-    if settings.enabled && !settings.host.is_empty() {
+    // Logic: File Transport > SMTP > Sendmail fallback
+    if let Some(path) = settings.file_path {
+        let mailer = FileTransport::new(path);
+        match mailer.send(&email) {
+            Ok(_) => { println!("[File] Email saved for {}", to); Ok(()) },
+            Err(e) => {
+                let err_msg = format!("{:?}", e);
+                eprintln!("[File] Failed: {}", err_msg);
+                Err(err_msg)
+            }
+        }
+    } else if settings.enabled && !settings.host.is_empty() {
         let decrypted_password = if let Some(encrypted_str) = settings.password {
              // ... decrypt logic ...
              match serde_json::from_str::<EncryptedValue>(&encrypted_str) {

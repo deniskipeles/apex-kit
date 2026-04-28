@@ -102,6 +102,7 @@ protobuf-src = "2.1.1"
 [dev-dependencies]
 assert-json-diff = "2.0.2"
 hyper = "1.8.1"
+tempfile = "3.27.0"
 
 [features]
 default = []

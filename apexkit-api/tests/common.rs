@@ -19,6 +19,7 @@ use async_graphql::Value as GqlValue;
 
 pub struct TestContext {
     pub state: AppState,
+    #[allow(dead_code)]
     pub base_path: String,
 }
 
@@ -35,18 +36,19 @@ pub async fn setup_test_context() -> TestContext {
     #[async_trait::async_trait]
     impl VectorProvider for MockVectorProvider {
         async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> { Ok(vec![0.0; 384]) }
+        async fn embed_image(&self, _b64: &str) -> Result<Vec<f32>, String> { Ok(vec![0.0; 384]) }
         async fn search(&self, _c: i64, _f: &str, _v: &[f32], _l: usize) -> Result<Vec<(i64, f32)>, String> { Ok(vec![]) }
         async fn index(&self, _c: i64, _r: i64, _f: &str, _v: &[f32]) -> Result<(), String> { Ok(()) }
     }
     let vector_provider: Arc<dyn VectorProvider> = Arc::new(MockVectorProvider);
 
     // 3. DB
-    let raw_db = apexkit_core::ApexKit::init_filesystem(&base_path, vector_provider.clone()).await.unwrap();
+    let raw_db = apexkit_core::ApexKit::init_filesystem(&base_path, vector_provider.clone(), None, None, "root".to_string()).await.unwrap();
     let cached_db = Arc::new(CachedDb::new(Arc::new(raw_db)));
 
     // 4. Managers
-    let tenant_manager = Arc::new(TenantManager::new(None, 10));
-    let sandbox_manager = Arc::new(SandboxManager::new(None));
+    let tenant_manager = Arc::new(TenantManager::new(None, cached_db.clone(), 10, None, None));
+    let sandbox_manager = Arc::new(SandboxManager::new(None, None, None));
 
     // 5. Job System
     let job_context = Arc::new(GlobalJobContext {
@@ -93,6 +95,8 @@ pub async fn setup_test_context() -> TestContext {
         embedder,
         vector_provider,
         port: 0,
+        root_script_cache: Cache::builder().max_capacity(10).build(),
+        record_count_cache: Cache::builder().max_capacity(10).build(),
     };
 
     TestContext {
@@ -101,6 +105,7 @@ pub async fn setup_test_context() -> TestContext {
     }
 }
 
+#[allow(dead_code)]
 pub async fn setup_test_app() -> Router {
     let ctx = setup_test_context().await;
     app_router(ctx.state)
