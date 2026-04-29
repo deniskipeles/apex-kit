@@ -30,7 +30,7 @@ async fn test_admin_smtp_test_endpoint_file() {
             base_request()
                 .method("POST")
                 .uri("/api/v1/admin/smtp/test")
-                .body(json!({ "email": "test-recipient-file@example.com" }).to_string())
+                .body(json!({ "email": "narydjin@gmail.com" }).to_string())
                 .unwrap(),
         )
         .await
@@ -44,7 +44,7 @@ async fn test_admin_smtp_test_endpoint_file() {
     assert!(!files.is_empty(), "No email file generated");
 
     let content = std::fs::read_to_string(&files[0]).unwrap();
-    assert!(content.contains("To: test-recipient-file@example.com"));
+    assert!(content.contains("To: narydjin@gmail.com"));
 }
 
 #[tokio::test]
@@ -67,7 +67,7 @@ async fn test_welcome_email_job_file() {
     // Trigger welcome email job manually
     use apexkit_core::jobs::Job;
     ctx.state.queue.enqueue(Job::SendWelcomeEmail {
-        email: "newuser-file@example.com".to_string(),
+        email: "narydjin@gmail.com".to_string(),
         user_id: 1
     }).await;
 
@@ -88,7 +88,7 @@ async fn test_welcome_email_job_file() {
     let entries = std::fs::read_dir(mail_path).unwrap();
     let files: Vec<_> = entries.map(|e| e.unwrap().path()).collect();
     let content = std::fs::read_to_string(&files[0]).unwrap();
-    assert!(content.contains("To: newuser-file@example.com"));
+    assert!(content.contains("To: narydjin@gmail.com"));
     assert!(content.contains("Welcome to ApexKit!"));
 }
 
@@ -123,7 +123,7 @@ async fn test_smtp_with_password() {
             base_request()
                 .method("POST")
                 .uri("/api/v1/admin/smtp/test")
-                .body(json!({ "email": "test-password@example.com" }).to_string())
+                .body(json!({ "email": "narydjin@gmail.com" }).to_string())
                 .unwrap(),
         )
         .await
@@ -135,7 +135,7 @@ async fn test_smtp_with_password() {
     let entries = std::fs::read_dir(mail_path).unwrap();
     let files: Vec<_> = entries.map(|e| e.unwrap().path()).collect();
     let content = std::fs::read_to_string(&files[0]).unwrap();
-    assert!(content.contains("To: test-password@example.com"));
+    assert!(content.contains("To: narydjin@gmail.com"));
 }
 
 #[tokio::test]
@@ -177,7 +177,7 @@ async fn test_sendmail_fallback_logic() {
             base_request()
                 .method("POST")
                 .uri("/api/v1/admin/smtp/test")
-                .body(json!({ "email": "test@example.com" }).to_string())
+                .body(json!({ "email": "narydjin@gmail.com" }).to_string())
                 .unwrap(),
         )
         .await

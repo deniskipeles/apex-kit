@@ -37,7 +37,7 @@ async fn test_send_email_file_transport() {
     let master_key = MasterKey::from_string("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()).unwrap();
     let vault = Arc::new(Vault::new(&master_key));
 
-    let result = jobs::send_email(db, vault, "recipient@example.com", "Test Subject", "Test Body").await;
+    let result = jobs::send_email(db, vault, "narydjin@gmail.com", "Test Subject", "Test Body").await;
     assert!(result.is_ok(), "Failed to send email: {:?}", result.err());
 
     // Verify file exists in mail_path
@@ -46,7 +46,7 @@ async fn test_send_email_file_transport() {
     assert!(!files.is_empty(), "No email file generated");
 
     let content = std::fs::read_to_string(&files[0]).unwrap();
-    assert!(content.contains("To: recipient@example.com"));
+    assert!(content.contains("To: narydjin@gmail.com"));
     assert!(content.contains("Subject: Test Subject"));
     assert!(content.contains("Test Body"));
 }
