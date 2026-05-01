@@ -30,6 +30,11 @@ async-graphql-axum = "7.0"
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
+# Dynamic gRPC and Protobufs
+prost-reflect = { version = "0.14", features = ["serde"] }
+protox = "0.7"
+bytes = "1.5"
+
 # Utilities
 validator = { version = "0.18.1", features = ["derive"] }
 uuid = { version = "1.8", features = ["v4", "fast-rng"] }

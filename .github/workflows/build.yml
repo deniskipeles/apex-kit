@@ -91,9 +91,23 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
+          # The binary Cargo outputs
           SRC_BIN="target/${{ matrix.target }}/release/apexkit-api${{ matrix.extension }}"
-          DEST_BIN="dist/${{ matrix.binary_name }}-${{ matrix.target }}${{ matrix.extension }}"
-          cp "$SRC_BIN" "$DEST_BIN"
+          # The clean name we want inside the archive
+          BIN_NAME="apexkit${{ matrix.extension }}"
+          
+          # Copy it locally so the archive doesn't include the 'target/.../release/' folder structure
+          cp "$SRC_BIN" "$BIN_NAME"
+
+          if [ "${{ matrix.os_name }}" == "Windows" ]; then
+            # Windows: Zip compression
+            DEST_ARCHIVE="dist/${{ matrix.binary_name }}-${{ matrix.target }}.zip"
+            zip "$DEST_ARCHIVE" "$BIN_NAME"
+          else
+            # Linux: Tar.gz compression
+            DEST_ARCHIVE="dist/${{ matrix.binary_name }}-${{ matrix.target }}.tar.gz"
+            tar -czvf "$DEST_ARCHIVE" "$BIN_NAME"
+          fi
 
       - name: Upload to Actions
         uses: actions/upload-artifact@v4
