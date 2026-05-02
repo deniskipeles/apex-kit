@@ -9,6 +9,15 @@ Welcome to the ApexKit documentation. ApexKit is a monolithic, single-binary Bac
 - [Full Developer Documentation](full_dev_documentation.md) - Deep dive into architecture and core concepts.
 - [Sandbox & Multi-tenancy](sandbox-and-multitenancy-api.md) - Understanding isolated environments.
 
+### 🏗️ Architecture & Deep Dives
+- [System Overview](architecture/overview.md) - Single-binary philosophy and components.
+- [Request Data Flow](architecture/data-flow.md) - How requests travel through the system.
+- [Authentication & Security](architecture/authentication.md) - JWT scoping and policy evaluation.
+- [GraphQL Deep Dive](architecture/graphql.md) - Advanced queries, resolvers, and dataloaders.
+- [Advanced Scripting](architecture/scripting-advanced.md) - External APIs, hooks, and cron jobs.
+- [File Storage Internals](architecture/storage.md) - Drivers, processing, and security.
+- [Advanced Templating](architecture/templating-advanced.md) - SSR, HTMX, and complex UI patterns.
+
 ### Core API
 - [Collections](collections-api.md) - Creating and managing collections.
 - [Records](records-api.md) - Standard CRUD operations.
