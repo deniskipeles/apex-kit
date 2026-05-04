@@ -1,7 +1,7 @@
 # ApexKit Comprehensive Developer Documentation
 
 **Version:** 0.1.0
-**System Architecture:** Rust (Axum) + SQLite (LibSQL) + Boa (JS Engine) + Tera (Templating)
+**System Architecture:** Rust (Axum) + SQLite (Rusqlite) + Boa (JS Engine) + Tera (Templating)
 
 ---
 
@@ -23,7 +23,7 @@
 ApexKit is a monolithic, single-binary Backend-as-a-Service. Unlike traditional frameworks, it combines the database, API server, and logic engine into one process.
 
 *   **Multi-Tenancy:** ApexKit supports multiple isolated environments (Tenants/Sandboxes) within a single instance.
-*   **Database:** Uses **LibSQL** (SQLite fork) for data storage. It uses JSON columns (`data`) for flexibility while maintaining relational integrity.
+*   **Database:** Uses **Rusqlite** (SQLite) for data storage. It uses JSON columns (`data`) for flexibility while maintaining relational integrity.
 *   **Search:** Integrated **Tantivy** engine provides full-text and vector search. It automatically syncs with SQLite transactions.
 *   **Logic:** A v8-compatible JavaScript engine (**Boa**) runs inside the Rust process.
 *   **Storage:** Abstracts local disk and AWS S3-compatible storage transparently.

@@ -3,7 +3,7 @@
 **Version:** 0.1.0
 **Context:** Infrastructure Tuning and System Configuration
 
-ApexKit is designed for high-performance data ingestion. It uses a specialized **Write Manager** to overcome the single-writer limitation of SQLite/LibSQL, grouping individual operations into atomic batches to minimize disk I/O overhead.
+ApexKit is designed for high-performance data ingestion. It uses a specialized **Write Manager** to overcome the single-writer limitation of SQLite, grouping individual operations into atomic batches to minimize disk I/O overhead.
 
 ---
 
