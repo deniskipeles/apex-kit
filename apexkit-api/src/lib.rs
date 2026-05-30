@@ -1617,6 +1617,8 @@ fn make_api_router() -> Router<AppState> {
         .route("/auth/google/callback", get(auth_advanced::google_callback))
         .route("/auth/verify", get(auth_advanced::verify_email))
         .route("/auth/verify/resend", post(auth_advanced::resend_verification))
+        .route("/auth/request-password-reset", post(auth_advanced::request_password_reset))
+        .route("/auth/confirm-password-reset", post(auth_advanced::confirm_password_reset))
         .route("/collections", post(collections_and_records_routes::create_collection).get(collections_and_records_routes::list_collections))
         .route("/collections/{id}", get(collections_and_records_routes::get_collection).patch(collections_and_records_routes::update_collection).put(collections_and_records_routes::update_collection).delete(collections_and_records_routes::delete_collection))
         .route("/collections/{id}/records", post(collections_and_records_routes::create_record).get(collections_and_records_routes::list_records))
@@ -1689,6 +1691,15 @@ pub fn app_router(state: AppState) -> Router {
     let renderer_routes = Router::new().route("/render/{*slug}", get(renderer::render_view).post(renderer::render_view));
     let scalar_router: Router<AppState> = Scalar::with_url("/scalar", ApiDoc::openapi()).into();
 
+    // [NEW] Isolated Replication Router protected STRICTLY by Master Key Middleware
+    let replication_api = Router::new()
+        .route("/write", post(replication::fallback_write_handler))
+        .route("/snapshot", get(replication::fallback_snapshot_handler))
+        .route("/sync-file", post(replication::fallback_sync_file_handler))
+        .route("/ws", axum::routing::get(replication::ws_replication_handler))
+        .layer(middleware::from_fn(replication::master_auth_middleware))
+        .with_state(state.clone());
+
     let sandbox_router = Router::new()
         .nest("/api/v1", core_api.clone())
         // Explicit route for sandbox renderer (2 params)
@@ -1731,6 +1742,7 @@ pub fn app_router(state: AppState) -> Router {
         .merge(root_and_subdomain_router)
         .nest("/sandbox/{session_id}", sandbox_router)
         .nest("/tenant/{tenant_id}", tenant_path_router)
+        .nest("/replication", replication_api) // <--- MOUNTED ISOLATED AT THE ROOT
         .route(
             "/api/v1/admin/tenants", 
             get(tenant_routes::list_tenants_handler)
@@ -1771,6 +1783,7 @@ pub fn app_router(state: AppState) -> Router {
 #[openapi(
     paths(
         auth_advanced::login, auth_advanced::register, 
+        auth_advanced::request_password_reset, auth_advanced::confirm_password_reset,
         collections_and_records_routes::list_collections, collections_and_records_routes::create_collection, collections_and_records_routes::get_collection, collections_and_records_routes::update_collection, collections_and_records_routes::delete_collection, 
         collections_and_records_routes::list_records, collections_and_records_routes::create_record, collections_and_records_routes::get_record, collections_and_records_routes::update_record, collections_and_records_routes::delete_record,
         collections_and_records_routes::search_records, collections_and_records_routes::instant_search_handler,
@@ -1833,6 +1846,7 @@ pub fn app_router(state: AppState) -> Router {
         import_data_routes::ImportSchemaRequest,
         import_data_routes::ImportSchemaResponse,
         export_data_routes::ExportQuery,
+        auth_advanced::RequestPasswordResetReq, auth_advanced::ConfirmPasswordResetReq,
         vector_routes::VectorSearchReq, 
         vector_routes::RecordVectorPath, 
         vector_routes::TextVectorSearchReq,

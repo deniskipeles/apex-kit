@@ -351,6 +351,12 @@ pub async fn build_schema(
 
         if let Some(schema) = &col.schema {
             for (field_name, def) in &schema.fields {
+                // [CRITICAL FIX]: Prevent GraphQL Panic
+                // Skip 'id' since it is already natively registered above
+                if field_name == "id" {
+                    continue;
+                }
+
                 let name_clone = field_name.clone();
                 let is_owner = def.r#type == FieldType::Owner;
 

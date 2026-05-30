@@ -113,6 +113,9 @@ export const RecordsListPage = () => {
   const { page, setPage, perPage } = usePagination(1, 20);
   const [totalItems, setTotalItems] = useState(0);
 
+  // Selection State for Bulk Delete
+  const [selectedRecordIds, setSelectedRecordIds] = useState<string[]>([]);
+
   // Version State
   const [versions, setVersions] = useState<AppVersions | null>(null);
   const [isVersionsOpen, setIsVersionsOpen] = useState(false);
@@ -123,6 +126,11 @@ export const RecordsListPage = () => {
   useEffect(() => {
     apiClient.getVersions().then(setVersions);
   }, []);
+
+  // Clear selection on page change
+  useEffect(() => {
+      setSelectedRecordIds([]);
+  }, [page]);
 
   // 1. Initial Load: Fetch Collections
   useEffect(() => {
@@ -191,12 +199,14 @@ export const RecordsListPage = () => {
     setPage(1);
     setSearchText('');
     setActiveFilters({});
+    setSelectedRecordIds([]);
   };
 
   // Called by InstantSearchInput on Enter
   const handleDeepSearch = (query: string) => {
     setSearchText(query);
     setPage(1);
+    setSelectedRecordIds([]);
   };
 
   // Called by InstantSearchInput on selection
@@ -214,6 +224,7 @@ export const RecordsListPage = () => {
     setActiveFilters(filters);
     setPage(1);
     setIsFilterOpen(false);
+    setSelectedRecordIds([]);
   };
 
   const handleSave = async (data: any) => {
@@ -279,6 +290,49 @@ export const RecordsListPage = () => {
       toast('Network error during import', 'error');
     } finally {
       setIsImporting(false); // Stop loading
+    }
+  };
+
+  const handleSelectRow = (id: string) => {
+    setSelectedRecordIds(prev =>
+        prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+    );
+  };
+
+  const handleSelectAll = () => {
+    if (selectedRecordIds.length === records.length && records.length > 0) {
+        setSelectedRecordIds([]);
+    } else {
+        setSelectedRecordIds(records.map(r => r.id));
+    }
+  };
+
+  const handleBulkDelete = async () => {
+    if (!collection || selectedRecordIds.length === 0) return;
+    if (!confirm(`Are you sure you want to delete ${selectedRecordIds.length} records? This action cannot be undone.`)) return;
+
+    setIsLoading(true);
+    let successCount = 0;
+    let errCount = 0;
+    try {
+        for (const id of selectedRecordIds) {
+            try {
+                await recordsService.delete(collection.id, id);
+                successCount++;
+            } catch(e) {
+                errCount++;
+            }
+        }
+        if (errCount > 0) {
+            toast(`Deleted ${successCount} records, ${errCount} failed.`, 'warning');
+        } else {
+            toast(`Deleted ${successCount} records`, 'success');
+        }
+    } catch (e) {
+        toast('Failed to delete records', 'error');
+    } finally {
+        setSelectedRecordIds([]);
+        loadData();
     }
   };
 
@@ -419,6 +473,12 @@ export const RecordsListPage = () => {
               </div>
             )}
 
+            {selectedRecordIds.length > 0 && (
+                <Button variant="destructive" size="sm" className="h-8 text-xs shadow-sm whitespace-nowrap" onClick={handleBulkDelete}>
+                    <Trash2 className="mr-1.5 h-3.5 w-3.5" /> Delete ({selectedRecordIds.length})
+                </Button>
+            )}
+
             <div className="hidden xl:flex gap-2">
               <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => setIsFilterOpen(true)}><Filter className="mr-2 h-3 w-3" /> Filter</Button>
               <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => setIsImportOpen(true)}><Upload className="mr-2 h-3 w-3" /> Import</Button>
@@ -448,7 +508,16 @@ export const RecordsListPage = () => {
                 <div className="h-8 w-8 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
               </div>
             ) : null}
-            <DataGrid data={records} columns={columns} keyField="id" isLoading={isLoading && records.length === 0} onRowClick={(row) => setPreviewRec(row)} />
+            <DataGrid 
+                data={records} 
+                columns={columns} 
+                keyField="id" 
+                isLoading={isLoading && records.length === 0} 
+                onRowClick={(row) => setPreviewRec(row)} 
+                selectedIds={selectedRecordIds}
+                onSelectAll={handleSelectAll}
+                onSelectRow={handleSelectRow}
+            />
           </div>
 
           <div className="flex-shrink-0 pt-4 px-4 sm:px-0 flex justify-between items-center border-t border-border mt-2 bg-background sm:bg-transparent">

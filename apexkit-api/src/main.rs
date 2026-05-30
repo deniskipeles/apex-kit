@@ -389,7 +389,7 @@ async fn main() {
     } else {
         tracing::info!("Running in MASTER mode. Multiplexing HTTP and gRPC.");
         
-        init_master_replica_tracker(sqlite_event_tx.subscribe()).await;
+        init_master_replica_tracker(sqlite_event_tx.clone()).await;
 
         // 1. Initialize the server and set the limits FIRST
         let master_service = ReplicationServer::new(MasterReplicationService {

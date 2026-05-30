@@ -1757,7 +1757,8 @@ fn register_mail(ctx: &mut Context) -> Result<(), String> {
         let res = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
                 handle.block_on(async {
-                    crate::jobs::send_email(app.get_db(), app.get_vault(), &to, &subj, &body).await
+                    let db = crate::scripting_db::resolve_db(None, app.clone()).await?;
+                    crate::jobs::send_email(db, app.get_vault(), &to, &subj, &body).await
                 })
             } else { Err("Context lost".into()) }
         });

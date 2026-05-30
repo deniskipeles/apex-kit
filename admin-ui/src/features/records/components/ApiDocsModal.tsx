@@ -179,38 +179,103 @@ export const ApiDocsModal = ({ isOpen, onClose, collection, context }: ApiDocsMo
                             {/* USERS & AUTH */}
                             {activeTab === 'auth' && (
                                 <div className="animate-in fade-in slide-in-from-bottom-2 duration-300 space-y-10">
-                                    <SectionHeader title="Users & Authentication" icon={Users} description="Manage user identity, roles, and sessions." />
+                                    <SectionHeader title="Users & Authentication" icon={Users} description="Complete workflows for user identity, roles, sessions, and recovery." />
 
-                                    <div className="space-y-8">
+                                    <div className="space-y-12">
+                                        
+                                        {/* 1. Email / Password */}
                                         <div>
-                                            <h5 className="font-bold text-sm mb-2 flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div> Email / Password Auth</h5>
-                                            <CodeBlock label="JS" code={`
-// Register a new user
-const newAuth = await client.auth.register('user@example.com', 'password123');
+                                            <h5 className="font-bold text-lg mb-2 flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div> 1. Registration & Login</h5>
+                                            <p className="text-sm text-muted-foreground mb-4 leading-relaxed">
+                                                Standard email and password authentication. When logged in, the client SDK automatically attaches the JWT token as a Bearer Header (<code>Authorization: Bearer &lt;token&gt;</code>) to all future requests.
+                                            </p>
+                                            <CodeBlock label="SDK (TypeScript / Javascript)" code={`// 1. Register a new user
+const res = await client.auth.register('user@example.com', 'password123');
 
-// Login (Token is automatically saved in the SDK client)
+// 2. Login (Token is automatically cached in the SDK instance)
 const authData = await client.auth.login('user@example.com', 'password123');
 
-console.log("Token:", authData.token);
+console.log("JWT Token:", authData.token);
 console.log("User Data:", authData.user);
 
-// Fetch current logged-in profile
+// 3. Fetch current logged-in profile (Requires valid token)
 const me = await client.auth.getMe();
 
-// Logout
-client.auth.logout();
-                                    `} />
+// 4. Logout (Clears internal token)
+client.auth.logout();`} />
                                         </div>
 
+                                        {/* 2. Password Reset Flow */}
                                         <div>
-                                            <h5 className="font-bold text-sm mb-2 flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-orange-500"></div> OAuth (Google / GitHub)</h5>
-                                            <p className="text-xs text-muted-foreground mb-3">Redirects the user to the provider, and returns back to your callback URL.</p>
-                                            <CodeBlock label="JS" code={`
-// Redirects window.location to the OAuth flow
-client.auth.loginWithGoogle('https://myapp.com/callback');
+                                            <h5 className="font-bold text-lg mb-2 flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.5)]"></div> 2. Password Reset Flow</h5>
+                                            <p className="text-sm text-muted-foreground mb-4 leading-relaxed">
+                                                If a user forgets their password, they can request a reset link. This requires SMTP to be configured in the dashboard. The email will contain a secure token.
+                                            </p>
+                                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                                <CodeBlock label="Step 1: Request Reset (Frontend)" code={`// Triggers an email to the user with a token
+await fetch(client.baseUrl + '/api/v1/auth/request-password-reset', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email: 'user@example.com' })
+});`} />
+                                                <CodeBlock label="Step 2: Confirm Reset (Frontend)" code={`// User clicked the link in their email and is now on your site
+// e.g., https://yourfrontend.com/reset-password?token=abc-123
 
-client.auth.loginWithGithub('https://myapp.com/callback');
-                                    `} />
+const urlParams = new URLSearchParams(window.location.search);
+const token = urlParams.get('token');
+
+await fetch(client.baseUrl + '/api/v1/auth/confirm-password-reset', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ 
+    token: token, 
+    new_password: 'new_secure_password' 
+  })
+});`} />
+                                            </div>
+                                        </div>
+
+                                        {/* 3. Email Verification Flow */}
+                                        <div>
+                                            <h5 className="font-bold text-lg mb-2 flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]"></div> 3. Email Verification Flow</h5>
+                                            <p className="text-sm text-muted-foreground mb-4 leading-relaxed">
+                                                When a user registers, they are marked as unverified (<code>is_verified = false</code>). You can restrict database access to only verified users using custom Scripts, or manually prompt them.
+                                            </p>
+                                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                                <CodeBlock label="Resend Verification Email" code={`// Triggers the verification email again
+await fetch(client.baseUrl + '/api/v1/auth/verify/resend', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email: 'user@example.com' })
+});`} />
+                                                <CodeBlock label="Verify User (From Email Link)" code={`// The email contains a link like: 
+// https://your-app-url.com/api/v1/auth/verify?token=abc-123
+// This is a GET request. When clicked, it automatically verifies the user in the database.
+
+// You can also hit it via code:
+await fetch(client.baseUrl + '/api/v1/auth/verify?token=abc-123');`} />
+                                            </div>
+                                        </div>
+
+                                        {/* 4. OAuth */}
+                                        <div>
+                                            <h5 className="font-bold text-lg mb-2 flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.5)]"></div> 4. OAuth (Google / GitHub)</h5>
+                                            <p className="text-sm text-muted-foreground mb-4 leading-relaxed">
+                                                Allow users to sign in using third-party providers. The SDK will redirect the user to the provider, and ApexKit will handle the callback and token generation.
+                                            </p>
+                                            <CodeBlock label="SDK (TypeScript / Javascript)" code={`// Redirects window.location to the OAuth consent screen.
+// Once complete, ApexKit will redirect back to your specified callback URL.
+// The resulting URL will have ?token=<jwt> appended to it.
+
+client.auth.loginWithGoogle('https://myapp.com/auth-callback');
+
+client.auth.loginWithGithub('https://myapp.com/auth-callback');
+
+// --- On your frontend callback page ---
+// const params = new URLSearchParams(window.location.search);
+// const token = params.get('token');
+// client.setToken(token);
+`} />
                                         </div>
                                     </div>
                                 </div>

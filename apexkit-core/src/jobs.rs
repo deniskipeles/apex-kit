@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use lettre::{Message, SmtpTransport, Transport, SendmailTransport};
+use lettre::{Message, Transport, SendmailTransport};
 use lettre::transport::smtp::authentication::Credentials;
 use std::sync::Arc;
 use crate::{Db, VectorProvider, security::{ Vault, EncryptedValue }, schema::CollectionSchema};
@@ -9,9 +9,9 @@ use async_trait::async_trait;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Job {
-    SendWelcomeEmail { email: String, user_id: i64 },
-    SendPasswordReset { email: String, token: String },
-    SendVerification { email: String, token: String },
+    SendWelcomeEmail { tenant_id: Option<String>, email: String, user_id: i64 },
+    SendPasswordReset { tenant_id: Option<String>, email: String, token: String },
+    SendVerification { tenant_id: Option<String>, email: String, token: String },
     ProcessImage { record_id: i64 },
     
     // --- Vectorization Job ---
@@ -81,25 +81,67 @@ pub fn start_background_worker(
             tokio::spawn(async move {
                 match job {
                     // --- Email Jobs ---
-                    Job::SendWelcomeEmail { email, user_id: _ } => {
-                        if let Some((db, _)) = resolver.resolve(None).await {
-                            if let Err(e) = send_email(db, vault_clone, &email, "Welcome to ApexKit!", "Thanks for signing up!").await {
+                    Job::SendWelcomeEmail { tenant_id, email, user_id: _ } => {
+                        if let Some((db, _)) = resolver.resolve(tenant_id.as_deref()).await {
+                            let gen_val = db.get_config("general").await.unwrap_or(None);
+                            let app_name = gen_val.as_ref().and_then(|v| v.get("app_name").and_then(|s| s.as_str())).unwrap_or("ApexKit").to_string();
+                            
+                            let smtp_val = db.get_config("smtp").await.unwrap_or(None);
+                            let smtp: SmtpSettings = smtp_val.map(|v| serde_json::from_value(v).unwrap_or_default()).unwrap_or_default();
+                            
+                            let mut body = smtp.template_welcome.filter(|s| !s.is_empty()).unwrap_or_else(|| "Thanks for signing up!".to_string());
+                            body = body.replace("{{app_name}}", &app_name);
+                            body = body.replace("{{email}}", &email);
+
+                            let subject = format!("Welcome to {}!", app_name);
+
+                            if let Err(e) = send_email(db, vault_clone, &email, &subject, &body).await {
                                 eprintln!("[Job] Welcome email failed: {}", e);
                             }
                         }
                     }
-                    Job::SendPasswordReset { email, token } => {
-                        if let Some((db, _)) = resolver.resolve(None).await {
-                            let body = format!("Reset: http://localhost:5000/reset-password?token={}", token);
-                            if let Err(e) = send_email(db, vault_clone, &email, "Reset Password", &body).await {
+                    Job::SendPasswordReset { tenant_id, email, token } => {
+                        if let Some((db, _)) = resolver.resolve(tenant_id.as_deref()).await {
+                            let gen_val = db.get_config("general").await.unwrap_or(None);
+                            let app_name = gen_val.as_ref().and_then(|v| v.get("app_name").and_then(|s| s.as_str())).unwrap_or("ApexKit").to_string();
+                            let app_url = gen_val.as_ref().and_then(|v| v.get("app_url").and_then(|s| s.as_str())).unwrap_or("http://localhost:5000").to_string();
+                            
+                            let smtp_val = db.get_config("smtp").await.unwrap_or(None);
+                            let smtp: SmtpSettings = smtp_val.map(|v| serde_json::from_value(v).unwrap_or_default()).unwrap_or_default();
+
+                            let link = format!("{}/_dashboard/login?token={}", app_url.trim_end_matches('/'), token);
+                            let mut body = smtp.template_reset.filter(|s| !s.is_empty()).unwrap_or_else(|| format!("Reset: {}", link));
+                            body = body.replace("{{app_name}}", &app_name);
+                            body = body.replace("{{email}}", &email);
+                            body = body.replace("{{link}}", &link);
+                            body = body.replace("{{token}}", &token);
+
+                            let subject = format!("Reset your password for {}", app_name);
+
+                            if let Err(e) = send_email(db, vault_clone, &email, &subject, &body).await {
                                 eprintln!("[Job] Reset password email failed: {}", e);
                             }
                         }
                     }
-                    Job::SendVerification { email, token } => {
-                        if let Some((db, _)) = resolver.resolve(None).await {
-                            let body = format!("Verify: http://localhost:5000/verify?token={}", token);
-                            if let Err(e) = send_email(db, vault_clone, &email, "Verify Email", &body).await {
+                    Job::SendVerification { tenant_id, email, token } => {
+                        if let Some((db, _)) = resolver.resolve(tenant_id.as_deref()).await {
+                            let gen_val = db.get_config("general").await.unwrap_or(None);
+                            let app_name = gen_val.as_ref().and_then(|v| v.get("app_name").and_then(|s| s.as_str())).unwrap_or("ApexKit").to_string();
+                            let app_url = gen_val.as_ref().and_then(|v| v.get("app_url").and_then(|s| s.as_str())).unwrap_or("http://localhost:5000").to_string();
+                            
+                            let smtp_val = db.get_config("smtp").await.unwrap_or(None);
+                            let smtp: SmtpSettings = smtp_val.map(|v| serde_json::from_value(v).unwrap_or_default()).unwrap_or_default();
+
+                            let link = format!("{}/api/v1/auth/verify?token={}", app_url.trim_end_matches('/'), token);
+                            let mut body = smtp.template_verify.filter(|s| !s.is_empty()).unwrap_or_else(|| format!("Verify: {}", link));
+                            body = body.replace("{{app_name}}", &app_name);
+                            body = body.replace("{{email}}", &email);
+                            body = body.replace("{{link}}", &link);
+                            body = body.replace("{{token}}", &token);
+
+                            let subject = format!("Verify your email for {}", app_name);
+
+                            if let Err(e) = send_email(db, vault_clone, &email, &subject, &body).await {
                                 eprintln!("[Job] Verification email failed: {}", e);
                             }
                         }
@@ -182,14 +224,21 @@ pub fn start_background_worker(
 }
 
 // --- SMTP CONFIG STRUCT ---
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct SmtpSettings {
+    #[serde(default)]
     enabled: bool,
+    #[serde(default)]
     host: String,
+    #[serde(default)]
     port: u16,
     username: Option<String>,
     password: Option<String>, 
+    #[serde(default)]
     from_email: String,
+    template_welcome: Option<String>,
+    template_reset: Option<String>,
+    template_verify: Option<String>,
 }
 
 //  Public and returns Result
@@ -198,11 +247,9 @@ pub async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &
     
     // Default: SMTP disabled, try sendmail
     let settings: SmtpSettings = if let Some(val) = settings_val {
-        serde_json::from_value(val).unwrap_or_else(|_| SmtpSettings { 
-            enabled: false, host: "".into(), port: 587, username: None, password: None, from_email: "noreply@localhost".into() 
-        })
+        serde_json::from_value(val).unwrap_or_default()
     } else {
-        SmtpSettings { enabled: false, host: "".into(), port: 587, username: None, password: None, from_email: "noreply@localhost".into() }
+        SmtpSettings::default()
     };
 
     // Safer From Address Construction
@@ -233,9 +280,18 @@ pub async fn send_email(db: Arc<dyn Db>, vault: Arc<Vault>, to: &str, subject: &
             }
         } else { None };
 
-        let mut builder = SmtpTransport::relay(&settings.host)
-            .map_err(|e| e.to_string())?
+        let tls_params = lettre::transport::smtp::client::TlsParameters::new(settings.host.clone())
+            .map_err(|e| e.to_string())?;
+
+        let mut builder = lettre::transport::smtp::SmtpTransport::builder_dangerous(&settings.host)
             .port(settings.port);
+
+        // Intelligently select TLS mode based on the port
+        builder = match settings.port {
+            465 => builder.tls(lettre::transport::smtp::client::Tls::Wrapper(tls_params)),
+            25 | 2525 | 1025 => builder.tls(lettre::transport::smtp::client::Tls::None),
+            _ => builder.tls(lettre::transport::smtp::client::Tls::Opportunistic(tls_params)),
+        };
 
         if let Some(user) = settings.username {
              builder = builder.credentials(Credentials::new(user, decrypted_password.unwrap_or_default()));

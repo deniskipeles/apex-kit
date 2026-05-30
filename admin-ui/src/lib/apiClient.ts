@@ -242,7 +242,7 @@ export const apiClient = {
 
   system: {
     reload: async (target = null) => await pb.admins.reloadSystem(target),
-    testEmail: async (email: string) => await pb.admins.testEmail(email),
+    testEmail: async (email: string, templateType?: string) => await pb.admins.testEmail(email, templateType),
     createBackup: async () => await pb.admins.createBackup(),
     listBackups: async () => await pb.admins.listBackups(),
     downloadBackup: async (filename: string) => {
@@ -292,7 +292,7 @@ export const apiClient = {
     listTenants: async (): Promise<Tenant[]> => {
       // FIX 1: Map SDK result (any[]) to local Tenant type, providing defaults for missing fields
       const res = await basePb.admins.listTenants();
-      return res.map((t: any) => ({
+      return (res || []).map((t: any) => ({
         id: t.id,
         name: t.name,
         status: t.status,
@@ -340,6 +340,12 @@ export const apiClient = {
       pb.auth.logout();
       localStorage.removeItem(APEX_TOKEN);
       return true;
+    },
+    requestPasswordReset: async (email: string) => {
+      return await pb.auth.requestPasswordReset(email);
+    },
+    confirmPasswordReset: async (token: string, newPassword: string) => {
+      return await pb.auth.confirmPasswordReset(token, newPassword);
     }
   },
 

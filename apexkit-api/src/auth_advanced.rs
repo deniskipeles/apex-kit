@@ -290,23 +290,90 @@ pub async fn verify_email(
     Ok("Email verified successfully!".to_string())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct ResendRequest {
-    email: String,
+    pub email: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct RequestPasswordResetReq {
+    pub email: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct ConfirmPasswordResetReq {
+    pub token: String,
+    #[schema(example = "newpassword123")]
+    pub new_password: String,
 }
 
 pub async fn resend_verification(
+    scope: Option<Extension<EventScope>>,
     DatabaseConnection(db): DatabaseConnection, // [FIX] Inject scoped DB
     State(state): State<AppState>,
     Json(payload): Json<ResendRequest>,
 ) -> Result<StatusCode, AppError> {
+    let tenant_id = crate::get_tenant_id_from_scope(scope.as_ref().map(|e| &e.0));
     if let Some(user) = db.get_user_by_email(&payload.email).await.unwrap() {
         let token = uuid::Uuid::new_v4().to_string();
         db.create_auth_token(user.id, "verify", &token).await.unwrap();
-        state.queue.enqueue(Job::SendVerification { email: user.email, token }).await;
+        state.queue.enqueue(Job::SendVerification { tenant_id, email: user.email, token }).await;
     }
     // Always return OK to prevent enumeration
     Ok(StatusCode::OK)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/request-password-reset",
+    request_body = RequestPasswordResetReq,
+    responses((status = 200, description = "Reset email sent"))
+)]
+pub async fn request_password_reset(
+    scope: Option<Extension<EventScope>>,
+    DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    Json(payload): Json<RequestPasswordResetReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant_id = crate::get_tenant_id_from_scope(scope.as_ref().map(|e| &e.0));
+    
+    // Check if user exists
+    if let Ok(Some(user)) = db.get_user_by_email(&payload.email).await {
+        let token = uuid::Uuid::new_v4().to_string();
+        // Save the reset token to the database
+        db.create_auth_token(user.id, "reset", &token).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        // Enqueue the background email job
+        state.queue.enqueue(Job::SendPasswordReset { tenant_id, email: user.email, token }).await;
+    }
+    
+    // Always return 200 OK to prevent email enumeration attacks
+    Ok(Json(json!({ "success": true, "message": "If the email exists, a reset link has been sent." })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/confirm-password-reset",
+    request_body = ConfirmPasswordResetReq,
+    responses((status = 200, description = "Password updated successfully"))
+)]
+pub async fn confirm_password_reset(
+    DatabaseConnection(db): DatabaseConnection,
+    Json(payload): Json<ConfirmPasswordResetReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if payload.new_password.len() < 6 {
+        return Err(AppError::JsonError("Password must be at least 6 characters long".into()));
+    }
+
+    // Attempt to consume the token. Will return None if invalid or expired.
+    let user_id = db.consume_auth_token(&payload.token, "reset").await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?
+        .ok_or(AppError::Unauthorized("Invalid or expired reset token".into()))?;
+
+    // Update the password
+    db.update_user(user_id, None, None, None, Some(payload.new_password)).await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(Json(json!({ "success": true, "message": "Password updated successfully" })))
 }
 
 #[utoipa::path(
@@ -378,6 +445,7 @@ pub async fn list_roles_handler(
 #[derive(Deserialize, ToSchema)]
 pub struct TestEmailReq {
     pub email: String,
+    pub template_type: Option<String>,
 }
 
 #[utoipa::path(
@@ -388,15 +456,50 @@ pub struct TestEmailReq {
 )]
 pub async fn test_email_handler(
     Extension(claims): Extension<Claims>,
+    DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     Json(payload): Json<TestEmailReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
 
-    let subject = "Test Email from ApexKit";
-    let body = "If you are reading this, your SMTP or Sendmail configuration is working correctly.";
+    let gen_val = db.get_config("general").await.unwrap_or(None);
+    let app_name = gen_val.as_ref().and_then(|v| v.get("app_name").and_then(|s| s.as_str())).unwrap_or("ApexKit").to_string();
+    let app_url = gen_val.as_ref().and_then(|v| v.get("app_url").and_then(|s| s.as_str())).unwrap_or("http://localhost:5000").to_string();
 
-    jobs::send_email(state.db.clone(), state.vault.clone(), &payload.email, subject, body).await
+    let smtp_val = db.get_config("smtp").await.unwrap_or(None);
+
+    let (subject, mut body, link, mock_token) = match payload.template_type.as_deref() {
+        Some("welcome") => {
+            let tmpl = smtp_val.as_ref().and_then(|v| v.get("template_welcome").and_then(|s| s.as_str())).unwrap_or("Welcome to {{app_name}}!");
+            (format!("Welcome to {}!", app_name), tmpl.to_string(), None, None)
+        },
+        Some("reset") => {
+            let tmpl = smtp_val.as_ref().and_then(|v| v.get("template_reset").and_then(|s| s.as_str())).unwrap_or("Click here to reset: {{link}}");
+            let mock_token = uuid::Uuid::new_v4().to_string();
+            let mock_link = format!("{}/_dashboard/login?token={}", app_url.trim_end_matches('/'), mock_token);
+            (format!("Reset your password for {}", app_name), tmpl.to_string(), Some(mock_link), Some(mock_token))
+        },
+        Some("verify") => {
+            let tmpl = smtp_val.as_ref().and_then(|v| v.get("template_verify").and_then(|s| s.as_str())).unwrap_or("Verify your email: {{link}}");
+            let mock_token = uuid::Uuid::new_v4().to_string();
+            let mock_link = format!("{}/api/v1/auth/verify?token={}", app_url.trim_end_matches('/'), mock_token);
+            (format!("Verify your email for {}", app_name), tmpl.to_string(), Some(mock_link), Some(mock_token))
+        },
+        _ => {
+            ("Test Email from ApexKit".to_string(), "If you are reading this, your SMTP or Sendmail configuration is working correctly.".to_string(), None, None)
+        }
+    };
+
+    body = body.replace("{{app_name}}", &app_name);
+    body = body.replace("{{email}}", &payload.email);
+    if let Some(l) = link {
+        body = body.replace("{{link}}", &l);
+    }
+    if let Some(t) = mock_token {
+        body = body.replace("{{token}}", &t);
+    }
+
+    jobs::send_email(db, state.vault.clone(), &payload.email, &subject, &body).await
         .map_err(|e| AppError::UnknownError(format!("Failed to send: {}", e)))?;
 
     Ok(Json(json!({ "success": true, "message": "Email sent." })))
@@ -529,7 +632,7 @@ pub async fn register(
         }
     }
     
-    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let event_scope = scope.clone().map(|e| e.0).unwrap_or(EventScope::Root);
     let scope_str = match &event_scope {
         EventScope::Tenant(id) => format!("tenant:{}", id),
         EventScope::Sandbox(id) => format!("sandbox:{}", id),
@@ -562,7 +665,8 @@ pub async fn register(
     // [FIX] Pass scope to JWT
     let token = auth::create_jwt(u.id, &u.email, &u.role, &scope_str).map_err(|_| AppError::UnknownError("JWT fail".into()))?;
     
-    state.queue.enqueue(Job::SendWelcomeEmail { email: u.email.clone(), user_id: u.id }).await;
+    let tenant_id = crate::get_tenant_id_from_scope(scope.as_ref().map(|e| &e.0));
+    state.queue.enqueue(Job::SendWelcomeEmail { tenant_id, email: u.email.clone(), user_id: u.id }).await;
     
     Ok(Json(AuthResponse{token, user: UserDto{id: u.id, email: u.email, role: u.role, metadata: u.metadata, scope: Some(scope_str)}}))
 }

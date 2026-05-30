@@ -416,6 +416,18 @@ export class ApexKit {
                 if (redirectTo) url.searchParams.append('redirect_to', redirectTo);
                 window.location.href = url.toString();
             },
+
+            requestPasswordReset: (email: string) => 
+                this._request<{ success: boolean; message: string }>('/auth/request-password-reset', {
+                    method: 'POST',
+                    body: { email }
+                }),
+
+            confirmPasswordReset: (token: string, newPassword: string) => 
+                this._request<{ success: boolean; message: string }>('/auth/confirm-password-reset', {
+                    method: 'POST',
+                    body: { token, new_password: newPassword }
+                }),
         };
     }
 
@@ -480,7 +492,7 @@ export class ApexKit {
 
             // System
             reloadSystem: (target: string | null) => this._request('/admin/system/reload', { method: 'POST', body: {target} }),
-            testEmail: (email: string) => this._request('/admin/smtp/test', { method: 'POST', body: { email } }),
+            testEmail: (email: string, templateType?: string) => this._request('/admin/smtp/test', { method: 'POST', body: { email, template_type: templateType } }),
             reIndex: (collectionId?: string | number) =>
                 this._request(`/admin/collections/${collectionId || ''}/reindex`, { method: 'POST', body: {} }),
             revectorizeCollection: (collectionId: string | number) =>
