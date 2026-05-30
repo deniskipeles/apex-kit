@@ -1,91 +1,193 @@
-name: Build Swalang
+name: Build and Publish ApexKit
 
 on:
   push:
     tags: [ "v*" ]
 
+env:
+  CARGO_TERM_COLOR: always
+  OPENSSL_STATIC: 1
+  PKG_CONFIG_ALL_STATIC: 1
+
+permissions:
+  contents: write
+
 jobs:
   build:
-    name: Build Swalang & Dependencies
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
+    name: Build ${{ matrix.os_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os_name: Linux
+            binary_name: apexkit
+            extension: ""
+          - target: x86_64-pc-windows-gnu
+            os_name: Windows
+            binary_name: apexkit
+            extension: ".exe"
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: Setup Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23.0'
+      - name: Cache Tailwind CSS
+        id: cache-tailwind
+        uses: actions/cache@v4
+        with:
+          path: static/tailwind-dark.full.css
+          key: tailwind-css-2.2.19
 
-    - name: Setup Node.js (For VSCode Extension)
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
+      - name: Download Tailwind CSS
+        if: steps.cache-tailwind.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p static
+          curl -L -o static/tailwind-dark.full.css https://unpkg.com/tailwindcss@2.2.19/dist/tailwind-dark.css
 
-    - name: Install System Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake build-essential curl wget tar zip
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 musl-tools nasm perl cmake
 
-    - name: Install Zig
-      run: bash scripts/setup/install-zig.sh
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+          cache-dependency-path: 'admin-ui/package-lock.json'
 
-    - name: Cross-Compile LibFFI
-      run: bash scripts/setup/cross-compile-libffi.sh
+      - name: Build Admin UI
+        working-directory: admin-ui
+        run: |
+          npm install
+          npm run build
 
-    - name: Build Standard Shared Libraries
-      run: bash scripts/build-shared-libs.sh
+      - name: Move Admin Assets
+        run: |
+          mkdir -p static/dashboard
+          cp -r admin-ui/dist/* static/dashboard/
 
-    - name: Build UI Libraries (LVGL, SDL2, Nuklear)
-      run: bash scripts/build-ui-libs.sh
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-    - name: Build Swalang Interpreter
-      run: bash scripts/build-interpreter.sh
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "v1-${{ matrix.target }}"
 
-    - name: Build VSCode Extension
-      run: |
-        cd vscode-ext
-        npm install
-        npm run build
-        npm run package
-        cd ..
+      - name: Install cargo-zigbuild
+        run: |
+          sudo pip install ziglang cargo-zigbuild
 
-    - name: Package Release Artifacts
-      run: |
-        mkdir -p release_artifacts
-        
-        # Package Linux Build
-        tar -czvf release_artifacts/swalang-linux-x86_64.tar.gz -C builds/linux-x86_64 .
-        
-        # Package Windows Build
-        cd builds/win64-x86_64
-        zip -r ../../release_artifacts/swalang-windows-x86_64.zip ./*
-        cd ../..
-        
-        # Copy VSCode Extension into the release artifacts
-        cp vscode-ext/*.vsix release_artifacts/
+      - name: Build (${{ matrix.target }})
+        run: |
+          cargo zigbuild --target ${{ matrix.target }} --release -p apexkit-api
 
-        # Generate SHA256 Checksums
-        cd release_artifacts
-        sha256sum * > checksums.txt
-        cat checksums.txt
-        cd ..
+      - name: Prepare Artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          # The binary Cargo outputs
+          SRC_BIN="target/${{ matrix.target }}/release/apexkit-api${{ matrix.extension }}"
+          # The clean name we want inside the archive
+          BIN_NAME="apexkit${{ matrix.extension }}"
+          
+          # Copy it locally so the archive doesn't include the 'target/.../release/' folder structure
+          cp "$SRC_BIN" "$BIN_NAME"
 
-    - name: Upload Artifacts to GitHub Actions
-      uses: actions/upload-artifact@v4
-      with:
-        name: swalang-build-artifacts
-        path: release_artifacts/*
+          if [ "${{ matrix.os_name }}" == "Windows" ]; then
+            # Windows: Zip compression
+            DEST_ARCHIVE="dist/${{ matrix.binary_name }}-${{ matrix.target }}.zip"
+            zip "$DEST_ARCHIVE" "$BIN_NAME"
+          else
+            # Linux: Tar.gz compression
+            DEST_ARCHIVE="dist/${{ matrix.binary_name }}-${{ matrix.target }}.tar.gz"
+            tar -czvf "$DEST_ARCHIVE" "$BIN_NAME"
+          fi
 
-    - name: Publish to GitHub Releases (Tags Only)
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: release_artifacts/*
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload to Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          retention-days: 1
+
+  publish_to_public:
+    name: Publish to Public Repo
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout the PRIVATE repo to grab Dockerfile and README
+      - name: Checkout Private Repo
+        uses: actions/checkout@v4
+        with:
+          path: private-repo
+
+      # 2. Checkout the PUBLIC repo to push files
+      # CHANGE 'deniskipeles/apexkit' to your exact public repository name
+      - name: Checkout Public Repo
+        uses: actions/checkout@v4
+        with:
+          repository: deniskipeles/apexkit
+          token: ${{ secrets.PUBLIC_REPO_PAT }}
+          path: public-repo
+
+      # 3. Download binaries from the build job
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: all-binaries
+          merge-multiple: true
+
+      # 4. Generate Checksums
+      - name: Generate Checksums
+        run: |
+          cd all-binaries
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      # 5. Sync Dockerfile, README, docs, and logo to Public Repo
+      - name: Update Public Repo Files
+        run: |
+          # 1. Copy standard files from private to public workspace
+          cp private-repo/Dockerfile public-repo/ 2>/dev/null || :
+          cp private-repo/README.md public-repo/ 2>/dev/null || :
+          cp -r private-repo/docs public-repo/ 2>/dev/null || :
+          
+          # 2. NEW: Copy the logo file
+          # Ensure the directory exists in the public repo first
+          mkdir -p public-repo/static/images
+          cp private-repo/static/images/apexkit-logo.svg public-repo/static/images/
+          
+          cd public-repo
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          
+          # 3. Add all files including the new static directory
+          git add Dockerfile README.md docs static/images
+          
+          # Commit only if there are changes
+          git diff --quiet && git diff --staged --quiet || git commit -m "Sync assets and docs for release ${{ github.ref_name }}"
+          git push origin main
+          
+          # Create the tag on the public repo so the release attaches correctly
+          git tag ${{ github.ref_name }} || true
+          git push origin ${{ github.ref_name }} || true
+
+      # 6. Create the Release on the PUBLIC Repo using the PAT
+      # CHANGE 'deniskipeles/apexkit' to your exact public repository name
+      - name: Create Release on Public Repo
+        uses: softprops/action-gh-release@v1
+        with:
+          repository: deniskipeles/apexkit
+          token: ${{ secrets.PUBLIC_REPO_PAT }}
+          files: all-binaries/*
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
