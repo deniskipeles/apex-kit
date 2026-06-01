@@ -17,18 +17,28 @@ pub fn check_access(
     record_data: Option<&Value>,
 ) -> bool {
     let policy = policy_string.trim();
-    if policy.is_empty() { return false; } 
-    if policy == "public" { return true; }
-    
-    // Admins bypass RLS
-    if user.map_or(false, |u| u.role == "admin") { return true; }
+    if policy.is_empty() {
+        return false;
+    }
+    if policy == "public" {
+        return true;
+    }
 
-    if policy == "admin" { return false; }
+    // Admins bypass RLS
+    if user.is_some_and(|u| u.role == "admin") {
+        return true;
+    }
+
+    if policy == "admin" {
+        return false;
+    }
 
     let tokens = match Tokenizer::new(policy).tokenize() {
         Ok(t) => t,
         Err(_) => {
-            if policy.starts_with("owner:") { return check_owner_policy(policy, user, record_data); }
+            if policy.starts_with("owner:") {
+                return check_owner_policy(policy, user, record_data);
+            }
             return false;
         }
     };
@@ -37,7 +47,9 @@ pub fn check_access(
     let ast = match parser.parse() {
         Ok(a) => a,
         Err(_) => {
-             if policy.starts_with("owner:") { return check_owner_policy(policy, user, record_data); }
+            if policy.starts_with("owner:") {
+                return check_owner_policy(policy, user, record_data);
+            }
             return false;
         }
     };
@@ -47,12 +59,16 @@ pub fn check_access(
 
 fn check_owner_policy(rule: &str, user: Option<&Claims>, record_data: Option<&Value>) -> bool {
     if let Some(u) = user {
-        let field_name = &rule[6..]; 
-        
-        if let Some(data) = record_data {
-            if let Some(owner_val) = data.get(field_name) {
-                if let Some(owner_id) = owner_val.as_i64() { return owner_id == u.uid; }
-                if let Some(owner_str) = owner_val.as_str() { return owner_str == u.uid.to_string(); }
+        let field_name = &rule[6..];
+
+        if let Some(data) = record_data
+            && let Some(owner_val) = data.get(field_name)
+        {
+            if let Some(owner_id) = owner_val.as_i64() {
+                return owner_id == u.uid;
+            }
+            if let Some(owner_str) = owner_val.as_str() {
+                return owner_str == u.uid.to_string();
             }
         }
         false
@@ -64,39 +80,78 @@ fn check_owner_policy(rule: &str, user: Option<&Claims>, record_data: Option<&Va
 // --- EXPRESSION ENGINE ---
 
 #[derive(Debug, Clone, PartialEq)]
-enum Token { LParen, RParen, And, Or, Eq, Neq, String(String), Identifier(String) }
+enum Token {
+    LParen,
+    RParen,
+    And,
+    Or,
+    Eq,
+    Neq,
+    String(String),
+    Identifier(String),
+}
 
-struct Tokenizer<'a> { chars: Peekable<Chars<'a>> }
+struct Tokenizer<'a> {
+    chars: Peekable<Chars<'a>>,
+}
 
 impl<'a> Tokenizer<'a> {
-    fn new(input: &'a str) -> Self { Self { chars: input.chars().peekable() } }
+    fn new(input: &'a str) -> Self {
+        Self {
+            chars: input.chars().peekable(),
+        }
+    }
 
     fn tokenize(&mut self) -> Result<Vec<Token>, String> {
         let mut tokens = Vec::new();
         while let Some(&c) = self.chars.peek() {
             match c {
-                ' ' | '\t' | '\n' | '\r' => { self.chars.next(); }
-                '(' => { tokens.push(Token::LParen); self.chars.next(); }
-                ')' => { tokens.push(Token::RParen); self.chars.next(); }
+                ' ' | '\t' | '\n' | '\r' => {
+                    self.chars.next();
+                }
+                '(' => {
+                    tokens.push(Token::LParen);
+                    self.chars.next();
+                }
+                ')' => {
+                    tokens.push(Token::RParen);
+                    self.chars.next();
+                }
                 '&' => {
                     self.chars.next();
-                    if let Some('&') = self.chars.peek() { self.chars.next(); tokens.push(Token::And); } 
-                    else { return Err("Expected &&".into()); }
+                    if let Some('&') = self.chars.peek() {
+                        self.chars.next();
+                        tokens.push(Token::And);
+                    } else {
+                        return Err("Expected &&".into());
+                    }
                 }
                 '|' => {
                     self.chars.next();
-                    if let Some('|') = self.chars.peek() { self.chars.next(); tokens.push(Token::Or); } 
-                    else { return Err("Expected ||".into()); }
+                    if let Some('|') = self.chars.peek() {
+                        self.chars.next();
+                        tokens.push(Token::Or);
+                    } else {
+                        return Err("Expected ||".into());
+                    }
                 }
                 '=' => {
                     self.chars.next();
-                    if let Some('=') = self.chars.peek() { self.chars.next(); tokens.push(Token::Eq); } 
-                    else { return Err("Expected ==".into()); }
+                    if let Some('=') = self.chars.peek() {
+                        self.chars.next();
+                        tokens.push(Token::Eq);
+                    } else {
+                        return Err("Expected ==".into());
+                    }
                 }
                 '!' => {
                     self.chars.next();
-                    if let Some('=') = self.chars.peek() { self.chars.next(); tokens.push(Token::Neq); } 
-                    else { return Err("Expected !=".into()); }
+                    if let Some('=') = self.chars.peek() {
+                        self.chars.next();
+                        tokens.push(Token::Neq);
+                    } else {
+                        return Err("Expected !=".into());
+                    }
                 }
                 '"' | '\'' => {
                     let quote_char = c;
@@ -107,7 +162,10 @@ impl<'a> Tokenizer<'a> {
                         match self.chars.next() {
                             Some(nc) if nc == quote_char && !escaped => break,
                             Some('\\') if !escaped => escaped = true,
-                            Some(nc) => { s.push(nc); escaped = false; }
+                            Some(nc) => {
+                                s.push(nc);
+                                escaped = false;
+                            }
                             None => return Err("Unterminated string".into()),
                         }
                     }
@@ -117,13 +175,22 @@ impl<'a> Tokenizer<'a> {
                     if c.is_alphanumeric() || c == '.' || c == ':' || c == '_' || c == '@' {
                         let mut s = String::new();
                         while let Some(&nc) = self.chars.peek() {
-                            if nc.is_alphanumeric() || nc == '.' || nc == ':' || nc == '_' || nc == '@' {
+                            if nc.is_alphanumeric()
+                                || nc == '.'
+                                || nc == ':'
+                                || nc == '_'
+                                || nc == '@'
+                            {
                                 s.push(nc);
                                 self.chars.next();
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                         tokens.push(Token::Identifier(s));
-                    } else { return Err(format!("Unexpected char: {}", c)); }
+                    } else {
+                        return Err(format!("Unexpected char: {}", c));
+                    }
                 }
             }
         }
@@ -133,18 +200,29 @@ impl<'a> Tokenizer<'a> {
 
 #[derive(Debug)]
 enum Expr {
-    Binary { op: Token, left: Box<Expr>, right: Box<Expr> },
+    Binary {
+        op: Token,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     Literal(String),
     Identifier(String),
 }
 
-struct Parser { tokens: Vec<Token>, pos: usize }
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self { Self { tokens, pos: 0 } }
+    fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens, pos: 0 }
+    }
 
     fn parse(&mut self) -> Result<Expr, String> {
-        if self.tokens.is_empty() { return Err("Empty expression".into()); }
+        if self.tokens.is_empty() {
+            return Err("Empty expression".into());
+        }
         self.parse_or()
     }
 
@@ -153,7 +231,11 @@ impl Parser {
         while let Some(Token::Or) = self.peek() {
             self.advance();
             let right = self.parse_and()?;
-            expr = Expr::Binary { op: Token::Or, left: Box::new(expr), right: Box::new(right) };
+            expr = Expr::Binary {
+                op: Token::Or,
+                left: Box::new(expr),
+                right: Box::new(right),
+            };
         }
         Ok(expr)
     }
@@ -163,7 +245,11 @@ impl Parser {
         while let Some(Token::And) = self.peek() {
             self.advance();
             let right = self.parse_equality()?;
-            expr = Expr::Binary { op: Token::And, left: Box::new(expr), right: Box::new(right) };
+            expr = Expr::Binary {
+                op: Token::And,
+                left: Box::new(expr),
+                right: Box::new(right),
+            };
         }
         Ok(expr)
     }
@@ -176,7 +262,11 @@ impl Parser {
                     let op = op.clone();
                     self.advance();
                     let right = self.parse_primary()?;
-                    expr = Expr::Binary { op, left: Box::new(expr), right: Box::new(right) };
+                    expr = Expr::Binary {
+                        op,
+                        left: Box::new(expr),
+                        right: Box::new(right),
+                    };
                 }
                 _ => {}
             }
@@ -186,47 +276,63 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.peek() {
-            Some(Token::Identifier(s)) => { let s = s.clone(); self.advance(); Ok(Expr::Identifier(s)) }
-            Some(Token::String(s)) => { let s = s.clone(); self.advance(); Ok(Expr::Literal(s)) }
+            Some(Token::Identifier(s)) => {
+                let s = s.clone();
+                self.advance();
+                Ok(Expr::Identifier(s))
+            }
+            Some(Token::String(s)) => {
+                let s = s.clone();
+                self.advance();
+                Ok(Expr::Literal(s))
+            }
             Some(Token::LParen) => {
                 self.advance();
                 let expr = self.parse_or()?;
-                if let Some(Token::RParen) = self.peek() { self.advance(); Ok(expr) } 
-                else { Err("Expected )".into()) }
+                if let Some(Token::RParen) = self.peek() {
+                    self.advance();
+                    Ok(expr)
+                } else {
+                    Err("Expected )".into())
+                }
             }
             None => Err("Unexpected end of expression".into()),
             _ => Err("Unexpected token in primary expression".into()),
         }
     }
 
-    fn peek(&self) -> Option<&Token> { self.tokens.get(self.pos) }
-    fn advance(&mut self) { self.pos += 1; }
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+    fn advance(&mut self) {
+        self.pos += 1;
+    }
 }
 
 fn evaluate(expr: &Expr, user: Option<&Claims>, record: Option<&Value>) -> bool {
     match expr {
-        Expr::Binary { op, left, right } => {
-            match op {
-                Token::And => evaluate(left, user, record) && evaluate(right, user, record),
-                Token::Or => evaluate(left, user, record) || evaluate(right, user, record),
-                Token::Eq => get_value(left, user, record) == get_value(right, user, record),
-                Token::Neq => get_value(left, user, record) != get_value(right, user, record),
-                _ => false,
-            }
+        Expr::Binary { op, left, right } => match op {
+            Token::And => evaluate(left, user, record) && evaluate(right, user, record),
+            Token::Or => evaluate(left, user, record) || evaluate(right, user, record),
+            Token::Eq => get_value(left, user, record) == get_value(right, user, record),
+            Token::Neq => get_value(left, user, record) != get_value(right, user, record),
+            _ => false,
         },
-        Expr::Identifier(s) => {
-            match s.as_str() {
-                "public" => true,
-                "auth" => user.is_some(),
-                "admin" => user.map(|u| u.role == "admin").unwrap_or(false),
-                _ => {
-                    if s.starts_with("owner:") { return check_owner_policy(s, user, record); }
-                    if let Some(val_str) = resolve_value(s, user, record) { return val_str == "true" || val_str == "1"; }
-                    false
+        Expr::Identifier(s) => match s.as_str() {
+            "public" => true,
+            "auth" => user.is_some(),
+            "admin" => user.map(|u| u.role == "admin").unwrap_or(false),
+            _ => {
+                if s.starts_with("owner:") {
+                    return check_owner_policy(s, user, record);
                 }
+                if let Some(val_str) = resolve_value(s, user, record) {
+                    return val_str == "true" || val_str == "1";
+                }
+                false
             }
         },
-        Expr::Literal(s) => !s.is_empty(), 
+        Expr::Literal(s) => !s.is_empty(),
     }
 }
 
@@ -234,29 +340,39 @@ fn get_value(expr: &Expr, user: Option<&Claims>, record: Option<&Value>) -> Stri
     match expr {
         Expr::Literal(s) => s.clone(),
         Expr::Identifier(s) => resolve_value(s, user, record).unwrap_or_default(),
-        _ => "".to_string(), 
+        _ => "".to_string(),
     }
 }
 
 fn resolve_value(key: &str, user: Option<&Claims>, record: Option<&Value>) -> Option<String> {
-    if key == "auth.id" { return user.map(|u| u.uid.to_string()); }
-    if key == "auth.role" { return user.map(|u| u.role.clone()); }
-    if key == "auth.email" { return user.map(|u| u.sub.clone()); }
-    if let Some(stripped) = key.strip_prefix("field:") { return extract_field(stripped, record); }
-    if key != "auth" && key != "admin" && key != "public" { return extract_field(key, record); }
+    if key == "auth.id" {
+        return user.map(|u| u.uid.to_string());
+    }
+    if key == "auth.role" {
+        return user.map(|u| u.role.clone());
+    }
+    if key == "auth.email" {
+        return user.map(|u| u.sub.clone());
+    }
+    if let Some(stripped) = key.strip_prefix("field:") {
+        return extract_field(stripped, record);
+    }
+    if key != "auth" && key != "admin" && key != "public" {
+        return extract_field(key, record);
+    }
     None
 }
 
 fn extract_field(field_name: &str, record: Option<&Value>) -> Option<String> {
-    if let Some(rec) = record {
-        if let Some(val) = rec.get(field_name) {
-            return match val {
-                Value::String(v) => Some(v.clone()),
-                Value::Number(n) => Some(n.to_string()),
-                Value::Bool(b) => Some(b.to_string()),
-                _ => Some(val.to_string())
-            };
-        }
+    if let Some(rec) = record
+        && let Some(val) = rec.get(field_name)
+    {
+        return match val {
+            Value::String(v) => Some(v.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => Some(val.to_string()),
+        };
     }
     None
 }
@@ -277,21 +393,42 @@ impl Expr {
                     _ => "=",
                 };
                 format!("({} {} {})", l, sql_op, r)
-            },
-            Expr::Identifier(s) => {
-                match s.as_str() {
-                    "public" => "1=1".to_string(),
-                    "auth" => if user.is_some() { "1=1".to_string() } else { "1=0".to_string() },
-                    "admin" => if user.map_or(false, |u| u.role == "admin") { "1=1".to_string() } else { "1=0".to_string() },
-                    "auth.id" => user.map(|u| format!("'{}'", u.uid)).unwrap_or("NULL".to_string()),
-                    "auth.role" => user.map(|u| format!("'{}'", u.role.replace("'", "''"))).unwrap_or("NULL".to_string()),
-                    "auth.email" => user.map(|u| format!("'{}'", u.sub.replace("'", "''"))).unwrap_or("NULL".to_string()),
-                    _ => {
-                        if let Some(field) = s.strip_prefix("field:") {
-                            format!("json_extract(records.data, '$.{}')", field.replace("'", "''"))
-                        } else {
-                            if s == "true" || s == "false" { s.to_string() } else { format!("'{}'", s.replace("'", "''")) }
-                        }
+            }
+            Expr::Identifier(s) => match s.as_str() {
+                "public" => "1=1".to_string(),
+                "auth" => {
+                    if user.is_some() {
+                        "1=1".to_string()
+                    } else {
+                        "1=0".to_string()
+                    }
+                }
+                "admin" => {
+                    if user.is_some_and(|u| u.role == "admin") {
+                        "1=1".to_string()
+                    } else {
+                        "1=0".to_string()
+                    }
+                }
+                "auth.id" => user
+                    .map(|u| format!("'{}'", u.uid))
+                    .unwrap_or("NULL".to_string()),
+                "auth.role" => user
+                    .map(|u| format!("'{}'", u.role.replace("'", "''")))
+                    .unwrap_or("NULL".to_string()),
+                "auth.email" => user
+                    .map(|u| format!("'{}'", u.sub.replace("'", "''")))
+                    .unwrap_or("NULL".to_string()),
+                _ => {
+                    if let Some(field) = s.strip_prefix("field:") {
+                        format!(
+                            "json_extract(records.data, '$.{}')",
+                            field.replace("'", "''")
+                        )
+                    } else if s == "true" || s == "false" {
+                        s.to_string()
+                    } else {
+                        format!("'{}'", s.replace("'", "''"))
                     }
                 }
             },
@@ -302,18 +439,34 @@ impl Expr {
 
 pub fn compile_to_sql(policy_string: &str, user: Option<&Claims>) -> Result<String, String> {
     let policy = policy_string.trim();
-    if policy == "public" || policy.is_empty() { return Ok("1=1".to_string()); }
-    
-    // Admins bypass RLS natively
-    if user.map_or(false, |u| u.role == "admin") { return Ok("1=1".to_string()); }
+    if policy == "public" || policy.is_empty() {
+        return Ok("1=1".to_string());
+    }
 
-    if policy == "admin" { return Ok("1=0".to_string()); } // Admin check failed above
-    if policy == "auth" { return if user.is_some() { Ok("1=1".to_string()) } else { Ok("1=0".to_string()) }; }
-    
-    if policy.starts_with("owner:") {
-        let field_name = &policy[6..];
+    // Admins bypass RLS natively
+    if user.is_some_and(|u| u.role == "admin") {
+        return Ok("1=1".to_string());
+    }
+
+    // Admin check failed above
+    if policy == "admin" {
+        return Ok("1=0".to_string());
+    }
+    if policy == "auth" {
+        return if user.is_some() {
+            Ok("1=1".to_string())
+        } else {
+            Ok("1=0".to_string())
+        };
+    }
+
+    if let Some(field_name) = policy.strip_prefix("owner:") {
         if let Some(u) = user {
-            return Ok(format!("json_extract(records.data, '$.{}') = '{}'", field_name.replace("'", "''"), u.uid));
+            return Ok(format!(
+                "json_extract(records.data, '$.{}') = '{}'",
+                field_name.replace("'", "''"),
+                u.uid
+            ));
         } else {
             return Ok("1=0".to_string());
         }

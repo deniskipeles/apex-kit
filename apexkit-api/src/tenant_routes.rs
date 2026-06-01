@@ -1,16 +1,16 @@
+use crate::DatabaseConnection;
+use crate::{AppError, AppState, BaseUrl};
+use crate::{extract_log_meta, trigger_void_hook};
+use apexkit_core::{auth::Claims, models::Tenant};
 use axum::{
-    extract::{Path, State, Json, ConnectInfo},
-    http::{StatusCode, HeaderMap},
     Extension,
+    extract::{ConnectInfo, Json, Path, State},
+    http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
-use apexkit_core::{auth::Claims, models::Tenant};
-use crate::{AppState, AppError, BaseUrl};
-use crate::{trigger_void_hook, extract_log_meta};
 use utoipa::ToSchema;
-use crate::DatabaseConnection;
 
 // --- DTOs ---
 
@@ -44,22 +44,40 @@ pub struct UpdateTenantStatusReq {
 )]
 pub async fn list_tenants_handler(
     auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection, 
+    DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap
+    headers: HeaderMap,
 ) -> Result<Json<Vec<Tenant>>, AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Only admins".into())); }
+    let claims = auth
+        .ok_or(AppError::Unauthorized("Login required".into()))?
+        .0;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Only admins".into()));
+    }
 
-    trigger_void_hook(&state, "before_list_tenants", json!({}), Some(&claims), None, Some(base_url.clone())).await?;
+    trigger_void_hook(
+        &state,
+        "before_list_tenants",
+        json!({}),
+        Some(&claims),
+        None,
+        Some(base_url.clone()),
+    )
+    .await?;
 
     // [UPDATED] Returns objects now
-    let tenants = db.list_tenants().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let tenants = db
+        .list_tenants()
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     let meta = extract_log_meta(&headers, Some(addr), json!({ "count": tenants.len() }));
-    let _ = state.db.log_audit_event("info", "Tenants Listed", "admin", Some(meta)).await;
+    let _ = state
+        .db
+        .log_audit_event("info", "Tenants Listed", "admin", Some(meta))
+        .await;
 
     Ok(Json(tenants))
 }
@@ -82,36 +100,75 @@ pub async fn create_tenant_handler(
     headers: HeaderMap,
     Json(payload): Json<CreateTenantReq>,
 ) -> Result<(StatusCode, Json<TenantResponse>), AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Only admins can create tenants".into())); }
+    let claims = auth
+        .ok_or(AppError::Unauthorized("Login required".into()))?
+        .0;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Only admins can create tenants".into()));
+    }
 
     // [TRIGGER] Before Create
-    trigger_void_hook(&state, "before_tenant_create", json!({ "tenant_id": payload.tenant_id, "meta": payload }), Some(&claims), None, Some(base_url.clone())).await?;
+    trigger_void_hook(
+        &state,
+        "before_tenant_create",
+        json!({ "tenant_id": payload.tenant_id, "meta": payload }),
+        Some(&claims),
+        None,
+        Some(base_url.clone()),
+    )
+    .await?;
 
     // 1. [CRITICAL] Register in Management Table (Root DB) with injected data
     // We pass the new optional fields to the register_tenant method
-    state.db.register_tenant(
-        &payload.tenant_id, 
-        payload.owner_id, 
-        payload.name.clone(), 
-        payload.tier.clone()
-    ).await.map_err(|e| AppError::UnknownError(format!("Failed to register tenant metadata: {}", e)))?;
+    state
+        .db
+        .register_tenant(
+            &payload.tenant_id,
+            payload.owner_id,
+            payload.name.clone(),
+            payload.tier.clone(),
+        )
+        .await
+        .map_err(|e| {
+            AppError::UnknownError(format!("Failed to register tenant metadata: {}", e))
+        })?;
 
     // 2. Create Resources on Disk (Provisioning)
-    state.tenant_manager.create_tenant(payload.tenant_id.clone()).await
+    state
+        .tenant_manager
+        .create_tenant(payload.tenant_id.clone())
+        .await
         .map_err(|e| AppError::UnknownError(e))?;
-    
+
     // [LOG]
-    let meta = extract_log_meta(&headers, Some(addr), json!({ "tenant_id": payload.tenant_id, "admin": claims.sub, "tier": payload.tier }));
-    let _ = state.db.log_audit_event("info", "Tenant Created", "admin", Some(meta)).await;
+    let meta = extract_log_meta(
+        &headers,
+        Some(addr),
+        json!({ "tenant_id": payload.tenant_id, "admin": claims.sub, "tier": payload.tier }),
+    );
+    let _ = state
+        .db
+        .log_audit_event("info", "Tenant Created", "admin", Some(meta))
+        .await;
 
     // [TRIGGER] After Create
-    let _ = trigger_void_hook(&state, "after_tenant_create", json!({ "tenant_id": payload.tenant_id }), Some(&claims), None, Some(base_url.clone())).await;
+    let _ = trigger_void_hook(
+        &state,
+        "after_tenant_create",
+        json!({ "tenant_id": payload.tenant_id }),
+        Some(&claims),
+        None,
+        Some(base_url.clone()),
+    )
+    .await;
 
-    Ok((StatusCode::CREATED, Json(TenantResponse {
-        tenant_id: payload.tenant_id,
-        status: "created".to_string()
-    })))
+    Ok((
+        StatusCode::CREATED,
+        Json(TenantResponse {
+            tenant_id: payload.tenant_id,
+            status: "created".to_string(),
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -128,19 +185,33 @@ pub async fn update_tenant_status(
     Path(id): Path<String>,
     Json(payload): Json<UpdateTenantStatusReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     // 1. Update Root DB
-    state.db.update_tenant_status(&id, &payload.status).await
+    state
+        .db
+        .update_tenant_status(&id, &payload.status)
+        .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 2. [CRITICAL] Invalidate Cache to apply suspension immediately
     state.tenant_manager.invalidate(&id).await;
-    
-    // [LOG]
-    let _ = state.db.log_system_event("warning", "Tenant Status Change", &format!("Tenant {} set to {}", id, payload.status)).await;
 
-    Ok(Json(json!({ "success": true, "new_status": payload.status })))
+    // [LOG]
+    let _ = state
+        .db
+        .log_system_event(
+            "warning",
+            "Tenant Status Change",
+            &format!("Tenant {} set to {}", id, payload.status),
+        )
+        .await;
+
+    Ok(Json(
+        json!({ "success": true, "new_status": payload.status }),
+    ))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -159,17 +230,36 @@ pub async fn delete_tenant_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    let claims = auth
+        .ok_or(AppError::Unauthorized("Login required".into()))?
+        .0;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     // 1. Check Root DB Metadata
-    state.db.delete_tenant_metadata(&id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
+    state
+        .db
+        .delete_tenant_metadata(&id)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
     // 2. Delete Physical Resources via Manager
-    state.tenant_manager.delete_tenant(&id).await.map_err(|e| AppError::UnknownError(e))?;
-    
+    state
+        .tenant_manager
+        .delete_tenant(&id)
+        .await
+        .map_err(|e| AppError::UnknownError(e))?;
+
     // Log
-    let _ = state.db.log_system_event("warning", "Tenant Deleted", &format!("Deleted tenant {}", id)).await;
+    let _ = state
+        .db
+        .log_system_event(
+            "warning",
+            "Tenant Deleted",
+            &format!("Deleted tenant {}", id),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -186,9 +276,14 @@ pub async fn update_tenant_details(
     Path(id): Path<String>,
     Json(payload): Json<UpdateTenantReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if !matches!(auth.map(|c| c.0.role), Some(r) if r == "admin") { return Err(AppError::Forbidden("Admins only".into())); }
+    if !matches!(auth.map(|c| c.0.role), Some(r) if r == "admin") {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
-    state.db.update_tenant_full(&id, payload.name, None, payload.tier).await
+    state
+        .db
+        .update_tenant_full(&id, payload.name, None, payload.tier)
+        .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     Ok(Json(json!({ "success": true })))

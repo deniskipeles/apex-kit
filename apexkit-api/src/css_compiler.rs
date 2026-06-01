@@ -1,9 +1,9 @@
-use std::sync::Arc;
-use std::collections::HashSet;
 use apexkit_core::Db;
 use regex::Regex;
-use tracing::{info, error };
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Instant;
+use tracing::{error, info};
 
 // Embed the CSS.
 const FULL_CSS: &str = include_str!("../../static/tailwind-dark.full.css");
@@ -59,18 +59,21 @@ pub async fn compile_styles(db: Arc<dyn Db>) -> Result<String, String> {
 
     // 1. Remove comments to clean up the input
     let clean_source = remove_css_comments(FULL_CSS);
-    
+
     // 2. Fetch Templates
     let templates = db.list_templates().await.map_err(|e| e.to_string())?;
-    
+
     // 3. Extract Classes
     let mut used_classes = HashSet::new();
     for tmpl in &templates {
         let extracted = extract_classes_from_html(&tmpl.content);
         used_classes.extend(extracted);
     }
-    
-    info!("CSS Compiler: Extracted {} unique classes.", used_classes.len());
+
+    info!(
+        "CSS Compiler: Extracted {} unique classes.",
+        used_classes.len()
+    );
 
     // 4. Normalize Classes
     // e.g. "w-1/2" -> ".w-1\/2"
@@ -86,7 +89,11 @@ pub async fn compile_styles(db: Arc<dyn Db>) -> Result<String, String> {
     // 6. Combine Preflight + Utilities
     let final_css = format!("{}\n{}", PREFLIGHT, purged_utilities);
 
-    info!("CSS Compiler: Compiled in {:?}. Final size: {} bytes", start_total.elapsed(), final_css.len());
+    info!(
+        "CSS Compiler: Compiled in {:?}. Final size: {} bytes",
+        start_total.elapsed(),
+        final_css.len()
+    );
 
     Ok(final_css)
 }
@@ -132,14 +139,16 @@ fn parse_utilities(content: &str, search_selectors: &HashSet<String>) -> String 
     let mut buffer = String::new();
     let mut is_inside_rule = false;
     let mut keep_current_rule = false;
-    
+
     // STRICTER Regex: Matches start of class rule:  .classname {
     // Does NOT match element selectors like "html {" or "* {"
     let class_rule_regex = Regex::new(r"^\s*(\.[^{]+)\{\s*$").unwrap();
 
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
 
         // 1. Media Queries
         if trimmed.starts_with("@media") && trimmed.ends_with("{") {
@@ -157,7 +166,7 @@ fn parse_utilities(content: &str, search_selectors: &HashSet<String>) -> String 
             buffer.clear();
             buffer.push_str(line); // e.g. ".bg-red-500 {"
             // Removed newline for minification effect
-            
+
             let selector_str = caps.get(1).unwrap().as_str();
             keep_current_rule = false;
 
@@ -174,7 +183,9 @@ fn parse_utilities(content: &str, search_selectors: &HashSet<String>) -> String 
                         break;
                     }
                 }
-                if keep_current_rule { break; }
+                if keep_current_rule {
+                    break;
+                }
             }
             continue;
         }
@@ -182,11 +193,11 @@ fn parse_utilities(content: &str, search_selectors: &HashSet<String>) -> String 
         // 3. Inside Rule
         if is_inside_rule {
             // Simple minification: trim spaces
-            buffer.push_str(trimmed); 
+            buffer.push_str(trimmed);
 
             if trimmed == "}" {
                 is_inside_rule = false;
-                
+
                 if keep_current_rule {
                     if let Some(ref mq) = current_media_query {
                         output.push_str(mq);

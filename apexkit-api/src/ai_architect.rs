@@ -1,20 +1,20 @@
-use axum::{
-    extract::{Path, State, Json},
-    Extension,
-};
-use serde::Deserialize; // Added Deserialize
-use serde_json::{json, Value};
+use crate::sandbox_manager::CloneStrategy;
+use crate::{AppError, AppState};
 use apexkit_core::{
+    Db,
+    ai_models::{AiSession, ChatMessage, ChatReq, CreateSessionReq, Plugin},
     auth::Claims,
     models::{AppManifest, CreateTemplateReq},
     script_models::{self},
-    ai_models::{AiSession, ChatMessage, CreateSessionReq, ChatReq, Plugin},
-    Db, 
 };
-use crate::{AppState, AppError};
-use tracing::{info, error};
+use axum::{
+    Extension,
+    extract::{Json, Path, State},
+};
+use serde::Deserialize; // Added Deserialize
+use serde_json::{Value, json};
 use std::sync::Arc;
-use crate::sandbox_manager::CloneStrategy;
+use tracing::{error, info};
 
 // --- CONSTANTS & PROMPTS ---
 
@@ -148,19 +148,18 @@ You must output **STRICT JSON** matching this `AppManifest` structure. No Markdo
 fn get_docs() -> String {
     let mut docs = String::from(APEXKIT_DOCS_CORE);
     let docs_path = std::path::Path::new("./docs");
-    
+
     if let Ok(entries) = std::fs::read_dir(docs_path) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "md") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                        docs.push_str("\n\n--- EXTERNAL DOC: ");
-                        docs.push_str(file_name);
-                        docs.push_str(" ---\n");
-                        docs.push_str(&content);
-                    }
-                }
+            if path.extension().is_some_and(|ext| ext == "md")
+                && let Ok(content) = std::fs::read_to_string(&path)
+                && let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+            {
+                docs.push_str("\n\n--- EXTERNAL DOC: ");
+                docs.push_str(file_name);
+                docs.push_str(" ---\n");
+                docs.push_str(&content);
             }
         }
     }
@@ -186,7 +185,9 @@ pub async fn start_session(
     State(state): State<AppState>,
     Json(req): Json<CreateSessionReq>,
 ) -> Result<Json<AiSession>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     info!("AI Architect: Initializing Sandbox Session '{}'", id);
@@ -198,22 +199,30 @@ pub async fn start_session(
         Some("full") => CloneStrategy::Full,
         _ => CloneStrategy::None,
     };
-    
+
     // 1. Create Physical Sandbox (Manager)
-    let _ = state.sandbox_manager.create_sandbox(&id, strategy, state.db.clone()).await
+    let _ = state
+        .sandbox_manager
+        .create_sandbox(&id, strategy, state.db.clone())
+        .await
         .map_err(|e| AppError::UnknownError(e))?;
 
     // 2. [NEW] Register in Root DB _sandboxes table
     // Capture user ID from claims if available (e.g., if we allow non-admins to create sandboxes later)
-    let owner_id = claims.uid; 
-    
+    let owner_id = claims.uid;
+
     // Default expiry: 24 hours
     let expires_at = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::hours(24))
         .map(|d| d.to_rfc3339());
 
-    state.db.register_sandbox(&id, Some(owner_id), Some(req.name.clone()), expires_at).await
-        .map_err(|e| AppError::UnknownError(format!("Failed to register sandbox metadata: {}", e)))?;
+    state
+        .db
+        .register_sandbox(&id, Some(owner_id), Some(req.name.clone()), expires_at)
+        .await
+        .map_err(|e| {
+            AppError::UnknownError(format!("Failed to register sandbox metadata: {}", e))
+        })?;
 
     // 3. Create Session Record (AI Context)
     let session = AiSession {
@@ -227,7 +236,11 @@ pub async fn start_session(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    state.db.create_ai_session(&session).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    state
+        .db
+        .create_ai_session(&session)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 4. If prompt exists, run generation
     if let Some(prompt) = req.initial_prompt {
@@ -250,8 +263,10 @@ pub async fn continue_chat(
     Path(path): Path<SessionIdPath>, // FIXED: Use struct
     Json(req): Json<ChatReq>,
 ) -> Result<Json<AiSession>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+
     chat_handler(path.id, req.prompt, req.model, state).await
 }
 
@@ -266,34 +281,48 @@ pub async fn apply_changes(
     State(state): State<AppState>,
     Path(path): Path<SessionIdPath>, // FIXED: Use struct
 ) -> Result<Json<AiSession>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     let id = path.id;
-    let mut session = state.db.get_ai_session(&id).await
+    let mut session = state
+        .db
+        .get_ai_session(&id)
+        .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Session not found".into()))?;
 
     if let Some(pending) = &session.pending_manifest {
         // 1. Load Sandbox DB -> USE STATE MANAGER
-        let sandbox_db = state.sandbox_manager.get_sandbox(&id).await
+        let sandbox_db = state
+            .sandbox_manager
+            .get_sandbox(&id)
+            .await
             .map_err(|_| AppError::NotFound("Sandbox not initialized".into()))?;
 
         // 2. Deploy to Sandbox
-        deploy_manifest(sandbox_db, pending).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+        deploy_manifest(sandbox_db, pending)
+            .await
+            .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
         // 3. Update Session State
         session.current_manifest = Some(pending.clone());
         session.pending_manifest = None;
         session.diff_summary = None;
         session.last_error = None;
-        
+
         session.messages.push(ChatMessage {
             role: "assistant".into(),
-            content: "Changes have been applied to the Sandbox environment.".into()
+            content: "Changes have been applied to the Sandbox environment.".into(),
         });
 
-        state.db.update_ai_session(&session).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-        
+        state
+            .db
+            .update_ai_session(&session)
+            .await
+            .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
         Ok(Json(session))
     } else {
         Err(AppError::Validation(vec![])) // No pending changes
@@ -311,40 +340,54 @@ pub async fn publish_plugin(
     State(state): State<AppState>,
     Path(path): Path<SessionIdPath>, // FIXED: Use struct
 ) -> Result<Json<Plugin>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     let id = path.id;
 
     // 1. Get Session
-    let session = state.db.get_ai_session(&id).await
+    let session = state
+        .db
+        .get_ai_session(&id)
+        .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Session not found".into()))?;
 
-    let manifest = session.current_manifest.ok_or_else(|| {
-        AppError::Validation(vec![]) 
-    })?;
+    let manifest = session
+        .current_manifest
+        .ok_or_else(|| AppError::Validation(vec![]))?;
 
     info!("AI Architect: Committing Sandbox {} to Production...", id);
 
     // 2. Deploy Manifest to MAIN DB (Production)
     // Note: This applies schema changes to the root database
-    deploy_manifest(state.db.clone(), &manifest).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    deploy_manifest(state.db.clone(), &manifest)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 3. Create Plugin Record
     let plugin = Plugin {
         id: uuid::Uuid::new_v4().to_string(),
         name: manifest.app_name.clone(),
         version: "1.0.0".to_string(),
-        manifest: manifest,
+        manifest,
         description: Some(format!("Exported from session: {}", session.name)),
     };
 
-    state.db.save_plugin(&plugin).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
+    state
+        .db
+        .save_plugin(&plugin)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
     // 4. Cleanup Sandbox -> USE STATE MANAGER
     state.sandbox_manager.cleanup_sandbox(&id);
-    
-    info!("AI Architect: Plugin '{}' published successfully.", plugin.name);
+
+    info!(
+        "AI Architect: Plugin '{}' published successfully.",
+        plugin.name
+    );
 
     Ok(Json(plugin))
 }
@@ -359,9 +402,14 @@ pub async fn list_plugins(
     Extension(claims): Extension<Claims>,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Plugin>>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
-    let plugins = state.db.list_plugins().await
+    let plugins = state
+        .db
+        .list_plugins()
+        .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     Ok(Json(plugins))
@@ -377,13 +425,14 @@ pub async fn list_sessions(
     Extension(claims): Extension<Claims>,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AiSession>>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
-    let sessions = state.db.list_ai_sessions().await
-        .map_err(|e| {
-            error!("Failed to list AI sessions: {}", e);
-            AppError::UnknownError(e.to_string())
-        })?;
+    let sessions = state.db.list_ai_sessions().await.map_err(|e| {
+        error!("Failed to list AI sessions: {}", e);
+        AppError::UnknownError(e.to_string())
+    })?;
 
     Ok(Json(sessions))
 }
@@ -391,21 +440,27 @@ pub async fn list_sessions(
 // --- INTERNAL LOGIC ---
 
 async fn chat_handler(
-    session_id: String, 
-    user_prompt: String, 
-    model_override: Option<String>, 
+    session_id: String,
+    user_prompt: String,
+    model_override: Option<String>,
     state: AppState,
 ) -> Result<Json<AiSession>, AppError> {
     info!("AI Architect: Processing prompt for session {}", session_id);
 
     // 1. Fetch Session
-    let mut session = state.db.get_ai_session(&session_id).await
+    let mut session = state
+        .db
+        .get_ai_session(&session_id)
+        .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Session not found".into()))?;
 
     // 2. Prepare Context (Use Pending if exists, else Current)
-    let base_manifest = session.pending_manifest.as_ref().or(session.current_manifest.as_ref());
-    
+    let base_manifest = session
+        .pending_manifest
+        .as_ref()
+        .or(session.current_manifest.as_ref());
+
     let current_state_str = if let Some(m) = base_manifest {
         serde_json::to_string(m).unwrap_or_else(|_| "{}".into())
     } else {
@@ -414,17 +469,14 @@ async fn chat_handler(
 
     let docs = get_docs();
     let full_prompt = format!(
-        "{}\n\n{}\n\n### CURRENT APP MANIFEST (JSON):\n{}\n\n### USER INSTRUCTION:\n{}", 
-        ARCHITECT_SYSTEM_PROMPT,
-        docs,
-        current_state_str, 
-        user_prompt
+        "{}\n\n{}\n\n### CURRENT APP MANIFEST (JSON):\n{}\n\n### USER INSTRUCTION:\n{}",
+        ARCHITECT_SYSTEM_PROMPT, docs, current_state_str, user_prompt
     );
 
     // 3. Call LLM
-    let api_key = get_api_key(&state).await?; 
+    let api_key = get_api_key(&state).await?;
     let model = model_override.unwrap_or("gemini-2.0-flash".to_string());
-    
+
     let response_text = call_llm(api_key.clone(), &model, &full_prompt).await?;
 
     // 4. Parse & Diff
@@ -432,19 +484,25 @@ async fn chat_handler(
         Ok(new_manifest) => {
             // Calculate Diff
             let diff = generate_diff(session.current_manifest.as_ref(), &new_manifest);
-            
-            session.messages.push(ChatMessage { role: "user".into(), content: user_prompt });
+
+            session.messages.push(ChatMessage {
+                role: "user".into(),
+                content: user_prompt,
+            });
             session.messages.push(ChatMessage { 
                 role: "assistant".into(), 
                 content: "I have drafted the changes. Check the **Preview** tab to see the diff, then click **Apply** to deploy.".into() 
             });
-            
+
             session.pending_manifest = Some(new_manifest);
             session.diff_summary = Some(diff);
             session.last_error = None;
-        },
+        }
         Err(e) => {
-            session.messages.push(ChatMessage { role: "user".into(), content: user_prompt });
+            session.messages.push(ChatMessage {
+                role: "user".into(),
+                content: user_prompt,
+            });
             session.last_error = Some(format!("Failed to parse AI response: {}", e));
             session.messages.push(ChatMessage { 
                 role: "assistant".into(), 
@@ -453,7 +511,11 @@ async fn chat_handler(
         }
     }
 
-    state.db.update_ai_session(&session).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    state
+        .db
+        .update_ai_session(&session)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     Ok(Json(session))
 }
@@ -479,9 +541,9 @@ fn generate_diff(current: Option<&AppManifest>, new: &AppManifest) -> String {
     let old_cols = current.map(|m| &m.collections).unwrap_or(&empty_cols);
     for new_col in &new.collections {
         if let Some(_) = old_cols.iter().find(|c| c.name == new_col.name) {
-             diffs.push(format!("~ Modify Collection: {}", new_col.name));
+            diffs.push(format!("~ Modify Collection: {}", new_col.name));
         } else {
-             diffs.push(format!("+ Create Collection: {}", new_col.name));
+            diffs.push(format!("+ Create Collection: {}", new_col.name));
         }
     }
 
@@ -501,9 +563,9 @@ fn generate_diff(current: Option<&AppManifest>, new: &AppManifest) -> String {
     let old_tmpls = current.map(|m| &m.templates).unwrap_or(&empty_tmpls);
     for t in &new.templates {
         if !old_tmpls.iter().any(|ot| ot.slug == t.slug) {
-             diffs.push(format!("+ Create Page: {}", t.slug));
+            diffs.push(format!("+ Create Page: {}", t.slug));
         } else {
-             diffs.push(format!("~ Update Page: {}", t.slug));
+            diffs.push(format!("~ Update Page: {}", t.slug));
         }
     }
 
@@ -517,50 +579,60 @@ fn generate_diff(current: Option<&AppManifest>, new: &AppManifest) -> String {
 async fn deploy_manifest(db: Arc<dyn Db>, manifest: &AppManifest) -> Result<(), AppError> {
     info!("AI Architect: Deploying Manifest '{}'", manifest.app_name);
 
-     // A. Collections (Upsert Logic)
-     let existing_cols = db.list_collections().await.unwrap_or_default();
-     for col in &manifest.collections {
-         if let Some(existing) = existing_cols.iter().find(|c| c.name == col.name) {
-             info!("Updating collection: {}", col.name);
-             db.update_collection(existing.id, None, Some(col.schema.clone())).await
-                 .map_err(|e| AppError::UnknownError(format!("DB Update Error on col {}: {}", col.name, e)))?;
-         } else {
-             info!("Creating collection: {}", col.name);
-             db.create_collection(&col.name, &Some(col.schema.clone()), None).await
-                 .map_err(|e| AppError::UnknownError(format!("DB Create Error on col {}: {}", col.name, e)))?;
-         }
-     }
+    // A. Collections (Upsert Logic)
+    let existing_cols = db.list_collections().await.unwrap_or_default();
+    for col in &manifest.collections {
+        if let Some(existing) = existing_cols.iter().find(|c| c.name == col.name) {
+            info!("Updating collection: {}", col.name);
+            db.update_collection(existing.id, None, Some(col.schema.clone()))
+                .await
+                .map_err(|e| {
+                    AppError::UnknownError(format!("DB Update Error on col {}: {}", col.name, e))
+                })?;
+        } else {
+            info!("Creating collection: {}", col.name);
+            db.create_collection(&col.name, &Some(col.schema.clone()), None)
+                .await
+                .map_err(|e| {
+                    AppError::UnknownError(format!("DB Create Error on col {}: {}", col.name, e))
+                })?;
+        }
+    }
 
     // B. Scripts
     for script in &manifest.scripts {
         info!("Deploying script: {}", script.name);
-        
+
         db.create_script(script_models::CreateScriptReq {
             name: script.name.clone(),
             trigger_type: script.trigger_type.clone(),
             target_collection: None, // Explicitly set target_collection (required by struct)
             code: script.code.clone(),
             active: true,
-            visibility: "private".to_string()
-        }).await.map_err(|e| AppError::UnknownError(format!("Script Error {}: {}", script.name, e)))?;
+            visibility: "private".to_string(),
+        })
+        .await
+        .map_err(|e| AppError::UnknownError(format!("Script Error {}: {}", script.name, e)))?;
     }
 
     // C. Templates
     for tmpl in &manifest.templates {
         info!("Deploying template: {}", tmpl.slug);
-        
+
         let mut script_id = None;
-        if let Some(s_name) = &tmpl.loader_script {
-            if let Some(s) = db.get_script_by_name(s_name).await.unwrap_or(None) {
-                script_id = Some(s.id);
-            }
+        if let Some(s_name) = &tmpl.loader_script
+            && let Some(s) = db.get_script_by_name(s_name).await.unwrap_or(None)
+        {
+            script_id = Some(s.id);
         }
 
         db.create_template(CreateTemplateReq {
             slug: tmpl.slug.clone(),
             content: tmpl.content.clone(),
-            script_id
-        }).await.map_err(|e| AppError::UnknownError(format!("Template Error {}: {}", tmpl.slug, e)))?;
+            script_id,
+        })
+        .await
+        .map_err(|e| AppError::UnknownError(format!("Template Error {}: {}", tmpl.slug, e)))?;
     }
 
     info!("AI Architect: Deployment Complete.");
@@ -568,34 +640,52 @@ async fn deploy_manifest(db: Arc<dyn Db>, manifest: &AppManifest) -> Result<(), 
 }
 
 async fn get_api_key(state: &AppState) -> Result<String, AppError> {
-    let ai_settings = state.db.get_config("ai").await
+    let ai_settings = state
+        .db
+        .get_config("ai")
+        .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
+
     match ai_settings {
         Some(val) => {
-            let conf: crate::settings::AiConfigDto = serde_json::from_value(val).unwrap_or_default();
-            if !conf.enabled { return Err(AppError::Forbidden("AI disabled in settings".into())); }
-            
-            let raw = conf.api_key.ok_or(AppError::UnknownError("AI Key missing".into()))?;
+            let conf: crate::settings::AiConfigDto =
+                serde_json::from_value(val).unwrap_or_default();
+            if !conf.enabled {
+                return Err(AppError::Forbidden("AI disabled in settings".into()));
+            }
+
+            let raw = conf
+                .api_key
+                .ok_or(AppError::UnknownError("AI Key missing".into()))?;
             let enc: apexkit_core::security::EncryptedValue = serde_json::from_str(&raw)
                 .map_err(|_| AppError::UnknownError("Bad key format".into()))?;
-            
-            state.vault.decrypt(&enc).map_err(|_| AppError::UnknownError("Decrypt fail".into()))
-        },
-        None => Err(AppError::UnknownError("AI not configured".into()))
+
+            state
+                .vault
+                .decrypt(&enc)
+                .map_err(|_| AppError::UnknownError("Decrypt fail".into()))
+        }
+        None => Err(AppError::UnknownError("AI not configured".into())),
     }
 }
 
 async fn call_llm(api_key: String, model: &str, prompt: &str) -> Result<String, AppError> {
     let client = reqwest::Client::new();
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}", model, api_key);
-    
-    let body = json!({ 
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    let body = json!({
         "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
         "generationConfig": { "responseMimeType": "application/json" }
     });
 
-    let res = client.post(url).json(&body).send().await
+    let res = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
         .map_err(|e| AppError::UnknownError(format!("Network Error: {}", e)))?;
 
     if !res.status().is_success() {
@@ -603,9 +693,11 @@ async fn call_llm(api_key: String, model: &str, prompt: &str) -> Result<String, 
         return Err(AppError::UnknownError(format!("LLM API Error: {}", err)));
     }
 
-    let json: Value = res.json().await
+    let json: Value = res
+        .json()
+        .await
         .map_err(|e| AppError::UnknownError(format!("Invalid Response: {}", e)))?;
-    
+
     Ok(json["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .unwrap_or("{}")

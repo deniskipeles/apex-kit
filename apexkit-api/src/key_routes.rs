@@ -1,13 +1,13 @@
 // apexkit-api/src/key_routes.rs
+use crate::{AppError, DatabaseConnection};
+use apexkit_core::{auth::Claims, models::ApiKey};
 use axum::{
-    extract::{Path, Json},
     Extension,
+    extract::{Json, Path},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json};
-use apexkit_core::{auth::Claims, models::ApiKey};
-use crate::{AppError, DatabaseConnection};
+use serde_json::json;
 use utoipa::ToSchema;
 
 #[derive(Deserialize, ToSchema)]
@@ -21,8 +21,12 @@ pub struct CreateKeyReq {
     pub bypass_cors: bool,
 }
 
-fn default_scope() -> String { "root".to_string() }
-fn default_role() -> String { "admin".to_string() }
+fn default_scope() -> String {
+    "root".to_string()
+}
+fn default_role() -> String {
+    "admin".to_string()
+}
 
 #[derive(Serialize, ToSchema)]
 pub struct CreateKeyResponse {
@@ -39,8 +43,13 @@ pub async fn list_keys(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection,
 ) -> Result<Json<Vec<ApiKey>>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    let keys = db.list_api_keys().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+    let keys = db
+        .list_api_keys()
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(keys))
 }
 
@@ -55,9 +64,18 @@ pub async fn create_key(
     DatabaseConnection(db): DatabaseConnection,
     Json(payload): Json<CreateKeyReq>,
 ) -> Result<Json<CreateKeyResponse>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    
-    let (key, info) = db.create_api_key(&payload.name, &payload.role, &payload.scope, payload.bypass_cors).await
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+
+    let (key, info) = db
+        .create_api_key(
+            &payload.name,
+            &payload.role,
+            &payload.scope,
+            payload.bypass_cors,
+        )
+        .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     Ok(Json(CreateKeyResponse { key, info }))
@@ -73,8 +91,12 @@ pub async fn delete_key(
     DatabaseConnection(db): DatabaseConnection,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    db.delete_api_key(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+    db.delete_api_key(id)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -98,10 +120,19 @@ pub async fn update_key(
     Path(id): Path<i64>,
     Json(payload): Json<UpdateKeyReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    
-    db.update_api_key(id, payload.name, payload.role, payload.scope, payload.bypass_cors).await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+
+    db.update_api_key(
+        id,
+        payload.name,
+        payload.role,
+        payload.scope,
+        payload.bypass_cors,
+    )
+    .await
+    .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     Ok(Json(json!({ "success": true })))
 }

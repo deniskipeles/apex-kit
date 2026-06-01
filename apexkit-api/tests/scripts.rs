@@ -1,12 +1,12 @@
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::StatusCode,
 };
-use tower::ServiceExt;
 use serde_json::json;
+use tower::ServiceExt;
 
 mod common;
-use common::{setup_test_app, base_request, test_request};
+use common::{base_request, setup_test_app, test_request};
 
 #[tokio::test]
 async fn test_script_lifecycle_and_execution() {
@@ -23,16 +23,20 @@ export default async function(req) {
 }
 "#;
 
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("POST")
                 .uri("/api/v1/admin/scripts")
-                .body(Body::from(json!({
-                    "name": "hello-script",
-                    "trigger_type": "manual",
-                    "code": script_code
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "name": "hello-script",
+                        "trigger_type": "manual",
+                        "code": script_code
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -41,7 +45,8 @@ export default async function(req) {
     assert_eq!(response.status(), StatusCode::OK);
 
     // 2. List scripts
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("GET")
@@ -55,10 +60,16 @@ export default async function(req) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 1_048_576).await.unwrap();
     let res: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(res.as_array().unwrap().iter().any(|s| s["name"] == "hello-script"));
+    assert!(
+        res.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "hello-script")
+    );
 
     // 3. Execute script
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             test_request()
                 .method("POST")

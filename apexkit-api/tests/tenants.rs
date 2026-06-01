@@ -1,12 +1,12 @@
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::StatusCode,
 };
-use tower::ServiceExt;
 use serde_json::json;
+use tower::ServiceExt;
 
 mod common;
-use common::{setup_test_app, base_request};
+use common::{base_request, setup_test_app};
 
 #[tokio::test]
 async fn test_tenant_creation_and_isolation() {
@@ -14,14 +14,18 @@ async fn test_tenant_creation_and_isolation() {
     let tenant_id = format!("tenant-{}", uuid::Uuid::new_v4());
 
     // 1. Create a tenant
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("POST")
                 .uri("/api/v1/admin/tenants")
-                .body(Body::from(json!({
-                    "tenant_id": tenant_id
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "tenant_id": tenant_id
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -30,7 +34,8 @@ async fn test_tenant_creation_and_isolation() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     // 2. List tenants
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("GET")
@@ -47,7 +52,8 @@ async fn test_tenant_creation_and_isolation() {
     assert!(tenants.contains(&tenant_id));
 
     // 3. Create a collection in the tenant
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("POST")
@@ -61,7 +67,8 @@ async fn test_tenant_creation_and_isolation() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     // 4. List collections in root - should be empty
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("GET")
@@ -78,7 +85,8 @@ async fn test_tenant_creation_and_isolation() {
     assert_eq!(collections.as_array().unwrap().len(), 0);
 
     // 5. List collections in tenant - should have TenantPosts
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("GET")

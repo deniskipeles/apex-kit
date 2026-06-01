@@ -1,11 +1,11 @@
-use std::path::Path;
-use std::fs;
-use std::sync::Arc;
-use apexkit_core::{Db, security::Vault, security::EncryptedValue, realtime::EventScope};
-use crate::settings::{StorageConfigDto, BackupConfigDto};
-use chrono::Utc;
-use tracing::{info, warn};
+use crate::settings::{BackupConfigDto, StorageConfigDto};
 use apexkit_core::storage::StorageBackend;
+use apexkit_core::{Db, realtime::EventScope, security::EncryptedValue, security::Vault};
+use chrono::Utc;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use tracing::{info, warn};
 
 fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
     fs::create_dir_all(&dst)?;
@@ -22,27 +22,41 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result
 }
 
 pub async fn perform_backup(
-    db: Arc<dyn Db>, 
+    db: Arc<dyn Db>,
     vault: Arc<Vault>,
     config: BackupConfigDto,
-    scope: EventScope 
+    scope: EventScope,
 ) -> Result<(), String> {
-    if !config.enabled { return Ok(()); }
+    if !config.enabled {
+        return Ok(());
+    }
 
     info!("Starting backup for scope {:?}...", scope);
 
     let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
     let backup_filename = format!("backup_{}.tar.gz", timestamp);
-    
+
     let (source_dir, backup_dir_local, s3_prefix) = match &scope {
-        EventScope::Root => ("storage/system".to_string(), "storage/backups".to_string(), "backups".to_string()),
-        EventScope::Tenant(id) => (format!("storage/tenants/{}", id), format!("storage/tenants/{}/backups", id), format!("tenants/{}/backups", id)),
-        EventScope::Sandbox(id) => (format!("storage/sandboxes/session_{}", id), format!("storage/sandboxes/session_{}/backups", id), format!("sandboxes/{}/backups", id)),
+        EventScope::Root => (
+            "storage/system".to_string(),
+            "storage/backups".to_string(),
+            "backups".to_string(),
+        ),
+        EventScope::Tenant(id) => (
+            format!("storage/tenants/{}", id),
+            format!("storage/tenants/{}/backups", id),
+            format!("tenants/{}/backups", id),
+        ),
+        EventScope::Sandbox(id) => (
+            format!("storage/sandboxes/session_{}", id),
+            format!("storage/sandboxes/session_{}/backups", id),
+            format!("sandboxes/{}/backups", id),
+        ),
         _ => return Err("Unsupported scope for backup".into()),
     };
 
-    let temp_dir = format!("{}/backup_staging_{}", source_dir, timestamp); 
-    let archive_path = format!("{}/{}", source_dir, backup_filename); 
+    let temp_dir = format!("{}/backup_staging_{}", source_dir, timestamp);
+    let archive_path = format!("{}/{}", source_dir, backup_filename);
 
     fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
 
@@ -65,7 +79,8 @@ pub async fn perform_backup(
             let schema_json = serde_json::to_string_pretty(&serde_json::json!({
                 "collections": cols,
                 "strategy": "overwrite"
-            })).unwrap_or_default();
+            }))
+            .unwrap_or_default();
             fs::write(bundle_dir.join("apex_schema.json"), schema_json).ok();
         }
 
@@ -78,7 +93,7 @@ pub async fn perform_backup(
             let templates_json = serde_json::to_string_pretty(&templates).unwrap_or_default();
             fs::write(bundle_dir.join("apex_templates.json"), templates_json).ok();
         }
-        
+
         if let Ok(actions) = db.list_ai_actions().await {
             let actions_json = serde_json::to_string_pretty(&actions).unwrap_or_default();
             fs::write(bundle_dir.join("apex_ai_actions.json"), actions_json).ok();
@@ -119,58 +134,86 @@ pub async fn perform_backup(
 
     // CREATE ARCHIVE
     let output = std::process::Command::new("tar")
-        .arg("-czf").arg(&archive_path).arg("-C").arg(&temp_dir).arg(".")
-        .output().map_err(|e| format!("Tar execution failed: {}", e))?;
+        .arg("-czf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&temp_dir)
+        .arg(".")
+        .output()
+        .map_err(|e| format!("Tar execution failed: {}", e))?;
 
     if !output.status.success() {
         let _ = fs::remove_dir_all(&temp_dir);
-        return Err(format!("Tar failed: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "Tar failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     // UPLOAD / MOVE
     match config.destination.as_str() {
         "s3" => {
-             let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
+            let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
             if let Some(val) = storage_settings {
-                let storage_conf: StorageConfigDto = serde_json::from_value(val).unwrap_or_default();
+                let storage_conf: StorageConfigDto =
+                    serde_json::from_value(val).unwrap_or_default();
                 if storage_conf.s3.enabled {
                     let secret = if let Some(enc_str) = storage_conf.s3.secret_key {
                         let enc: EncryptedValue = serde_json::from_str(&enc_str).unwrap();
                         vault.decrypt(&enc).unwrap_or_default()
-                    } else { String::new() };
+                    } else {
+                        String::new()
+                    };
 
                     let s3 = apexkit_core::storage::S3Storage::new_with_creds(
-                        &storage_conf.s3.bucket, &storage_conf.s3.region, &storage_conf.s3.endpoint,
-                        "", &storage_conf.s3.access_key, &secret, ""
-                    ).await;
+                        &storage_conf.s3.bucket,
+                        &storage_conf.s3.region,
+                        &storage_conf.s3.endpoint,
+                        "",
+                        &storage_conf.s3.access_key,
+                        &secret,
+                        "",
+                    )
+                    .await;
 
                     let bytes = fs::read(&archive_path).map_err(|e| e.to_string())?;
-                    s3.save(&format!("{}/{}", s3_prefix, backup_filename), &bytes, "application/gzip").await
-                        .map_err(|e| e.to_string())?;
-                        
+                    s3.save(
+                        &format!("{}/{}", s3_prefix, backup_filename),
+                        &bytes,
+                        "application/gzip",
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+
                     info!("Backup uploaded to S3: {}/{}", s3_prefix, backup_filename);
                 } else {
                     return Err("S3 not enabled".into());
                 }
             }
-        },
+        }
         "local" | _ => {
             fs::create_dir_all(&backup_dir_local).ok();
-            fs::rename(&archive_path, format!("{}/{}", backup_dir_local, backup_filename))
-                .map_err(|e| e.to_string())?;
-            info!("Backup saved locally: {}/{}", backup_dir_local, backup_filename);
-            
+            fs::rename(
+                &archive_path,
+                format!("{}/{}", backup_dir_local, backup_filename),
+            )
+            .map_err(|e| e.to_string())?;
+            info!(
+                "Backup saved locally: {}/{}",
+                backup_dir_local, backup_filename
+            );
+
             // Prune
             if config.retention > 0 {
                 let cutoff = Utc::now() - chrono::Duration::days(config.retention as i64);
                 if let Ok(entries) = fs::read_dir(&backup_dir_local) {
                     for entry in entries.flatten() {
-                        if let Ok(meta) = entry.metadata() {
-                            if let Ok(modified) = meta.modified() {
-                                let dt: chrono::DateTime<Utc> = modified.into();
-                                if dt < cutoff {
-                                    let _ = fs::remove_file(entry.path());
-                                }
+                        if let Ok(meta) = entry.metadata()
+                            && let Ok(modified) = meta.modified()
+                        {
+                            let dt: chrono::DateTime<Utc> = modified.into();
+                            if dt < cutoff {
+                                let _ = fs::remove_file(entry.path());
                             }
                         }
                     }
@@ -180,19 +223,24 @@ pub async fn perform_backup(
     }
 
     let _ = fs::remove_dir_all(&temp_dir);
-    if config.destination == "s3" { let _ = fs::remove_file(&archive_path); }
+    if config.destination == "s3" {
+        let _ = fs::remove_file(&archive_path);
+    }
 
     Ok(())
 }
 
 pub async fn restore_backup(
-    file_path: &str, 
+    file_path: &str,
     is_s3: bool,
     db: Arc<dyn Db>,
     vault: Arc<Vault>,
-    scope: EventScope
+    scope: EventScope,
 ) -> Result<(), String> {
-    info!("Starting restoration for scope {:?} from {}", scope, file_path);
+    info!(
+        "Starting restoration for scope {:?} from {}",
+        scope, file_path
+    );
 
     let target_dir = match &scope {
         EventScope::Root => "storage/system".to_string(),
@@ -202,53 +250,80 @@ pub async fn restore_backup(
     };
 
     let temp_restore_dir = format!("{}/restore_staging", target_dir);
-    
+
     let local_archive_path = if is_s3 {
-         let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
-        
+        let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
+
         let s3_client = if let Some(val) = storage_settings {
             let storage_conf: StorageConfigDto = serde_json::from_value(val).unwrap_or_default();
             if storage_conf.s3.enabled {
                 let secret = if let Some(enc_str) = storage_conf.s3.secret_key {
-                     let enc: EncryptedValue = serde_json::from_str(&enc_str).unwrap();
-                     vault.decrypt(&enc).unwrap_or_default()
-                } else { String::new() };
+                    let enc: EncryptedValue = serde_json::from_str(&enc_str).unwrap();
+                    vault.decrypt(&enc).unwrap_or_default()
+                } else {
+                    String::new()
+                };
 
                 apexkit_core::storage::S3Storage::new_with_creds(
-                    &storage_conf.s3.bucket, &storage_conf.s3.region, &storage_conf.s3.endpoint,
-                    "", &storage_conf.s3.access_key, &secret, "" 
-                ).await
-            } else { return Err("S3 not enabled".into()); }
-        } else { return Err("Storage config missing".into()); };
+                    &storage_conf.s3.bucket,
+                    &storage_conf.s3.region,
+                    &storage_conf.s3.endpoint,
+                    "",
+                    &storage_conf.s3.access_key,
+                    &secret,
+                    "",
+                )
+                .await
+            } else {
+                return Err("S3 not enabled".into());
+            }
+        } else {
+            return Err("Storage config missing".into());
+        };
 
         let s3_prefix = match &scope {
-             EventScope::Root => "backups".to_string(),
-             EventScope::Tenant(id) => format!("tenants/{}/backups", id),
-             EventScope::Sandbox(id) => format!("sandboxes/{}/backups", id),
-             _ => return Err("Invalid scope".into()),
+            EventScope::Root => "backups".to_string(),
+            EventScope::Tenant(id) => format!("tenants/{}/backups", id),
+            EventScope::Sandbox(id) => format!("sandboxes/{}/backups", id),
+            _ => return Err("Invalid scope".into()),
         };
-        
+
         let s3_key = format!("{}/{}", s3_prefix, file_path);
-        let data = s3_client.get(&s3_key).await
-             .map_err(|e: Box<dyn std::error::Error + Send + Sync>| e.to_string())?;
-             
-        let temp_download_path = format!("{}/restore_download_{}.tar.gz", target_dir, uuid::Uuid::new_v4());
+        let data = s3_client
+            .get(&s3_key)
+            .await
+            .map_err(|e: Box<dyn std::error::Error + Send + Sync>| e.to_string())?;
+
+        let temp_download_path = format!(
+            "{}/restore_download_{}.tar.gz",
+            target_dir,
+            uuid::Uuid::new_v4()
+        );
         fs::write(&temp_download_path, data).map_err(|e| e.to_string())?;
-        
+
         temp_download_path
     } else {
         file_path.to_string()
     };
 
-    if Path::new(&temp_restore_dir).exists() { fs::remove_dir_all(&temp_restore_dir).map_err(|e| e.to_string())?; }
+    if Path::new(&temp_restore_dir).exists() {
+        fs::remove_dir_all(&temp_restore_dir).map_err(|e| e.to_string())?;
+    }
     fs::create_dir_all(&temp_restore_dir).map_err(|e| e.to_string())?;
 
     let output = std::process::Command::new("tar")
-        .arg("-xzf").arg(&local_archive_path).arg("-C").arg(&temp_restore_dir)
-        .output().map_err(|e| format!("Tar extract failed: {}", e))?;
+        .arg("-xzf")
+        .arg(&local_archive_path)
+        .arg("-C")
+        .arg(&temp_restore_dir)
+        .output()
+        .map_err(|e| format!("Tar extract failed: {}", e))?;
 
     if !output.status.success() {
-        return Err(format!("Tar extract failed: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "Tar extract failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
@@ -275,7 +350,9 @@ pub async fn restore_backup(
     }
 
     if dbs_restored == 0 {
-        warn!("No databases found in backup archive. (This is normal if it was a Schema-Only backup)");
+        warn!(
+            "No databases found in backup archive. (This is normal if it was a Schema-Only backup)"
+        );
     }
 
     // 2. Restore Directories (Uploads / Indexes / Public Site)
@@ -283,7 +360,7 @@ pub async fn restore_backup(
     for dir in dirs_to_restore {
         let staged = Path::new(&temp_restore_dir).join(dir);
         let live = Path::new(&target_dir).join(dir);
-        
+
         if staged.exists() {
             if live.exists() {
                 let backup_path = Path::new(&target_dir).join(format!("{}_bak_{}", dir, timestamp));
@@ -298,12 +375,12 @@ pub async fn restore_backup(
     let bundle_dir = Path::new(&temp_restore_dir).join("apex_bundle");
     if bundle_dir.exists() {
         info!("Deploying Schema/Code bundle from backup...");
-        // This is handled by the server restarting and loading the DB, 
+        // This is handled by the server restarting and loading the DB,
         // OR we could auto-import the JSON files here if they wanted to overwrite an existing DB.
-        // Since we already restore the `.db` files perfectly, the JSONs in `apex_bundle` are mostly 
+        // Since we already restore the `.db` files perfectly, the JSONs in `apex_bundle` are mostly
         // there for CI/CD portability. If the user only backed up the schema (no .db files),
         // we should arguably import them. Let's do that for safety!
-        
+
         if dbs_restored == 0 {
             info!("No DBs restored. Applying JSON bundle to current database...");
             // Simulate import (Minimal implementation, full logic relies on HTTP import routes usually)
@@ -312,7 +389,9 @@ pub async fn restore_backup(
     }
 
     let _ = fs::remove_dir_all(&temp_restore_dir);
-    if is_s3 { let _ = fs::remove_file(&local_archive_path); }
+    if is_s3 {
+        let _ = fs::remove_file(&local_archive_path);
+    }
 
     info!("Restoration complete.");
     Ok(())

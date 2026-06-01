@@ -1,7 +1,10 @@
 use regex::Regex;
+use ring::{
+    digest, hmac,
+    rand::{SecureRandom, SystemRandom},
+};
+use serde_json::{Map, Value};
 use std::fmt::Write;
-use ring::{rand::{SystemRandom, SecureRandom}, digest, hmac};
-use serde_json::{Value, Map};
 
 /// Converts a byte slice to a lowercase hex string
 pub fn to_hex(bytes: &[u8]) -> String {
@@ -49,36 +52,47 @@ pub fn hmac_sha256(key: &str, data: &str) -> String {
     to_hex(tag.as_ref())
 }
 
-
 pub fn apply_projection(data: &mut Value, fields_param: &str) {
-    if fields_param.trim().is_empty() || fields_param == "*" { return; }
+    if fields_param.trim().is_empty() || fields_param == "*" {
+        return;
+    }
 
-    let raw_fields: Vec<&str> = fields_param.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-    if raw_fields.is_empty() { return; }
+    let raw_fields: Vec<&str> = fields_param
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if raw_fields.is_empty() {
+        return;
+    }
 
     // Check mode based on first field (exclude starts with '-')
     let is_exclude = raw_fields[0].starts_with('-');
 
-    // Build a tree structure for nested fields: 
+    // Build a tree structure for nested fields:
     // "author.name" -> tree["author"] = ["name"]
     let mut tree: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     let mut root_fields: Vec<String> = Vec::new();
 
     for rf in raw_fields {
         let clean = rf.trim_start_matches('-');
-        
+
         // Validation: Ensure mixed modes aren't used (silent fail or strict?)
         // For resilience, we stick to the mode detected from the first valid field.
-        if is_exclude && !rf.starts_with('-') { continue; } 
-        if !is_exclude && rf.starts_with('-') { continue; }
+        if is_exclude && !rf.starts_with('-') {
+            continue;
+        }
+        if !is_exclude && rf.starts_with('-') {
+            continue;
+        }
 
         if let Some((root, rest)) = clean.split_once('.') {
-            tree.entry(root.to_string()).or_default().push(rest.to_string());
+            tree.entry(root.to_string())
+                .or_default()
+                .push(rest.to_string());
             // Implicitly include the root key if we are in include mode so we can traverse it
-            if !is_exclude {
-                if !root_fields.contains(&root.to_string()) {
-                    root_fields.push(root.to_string());
-                }
+            if !is_exclude && !root_fields.contains(&root.to_string()) {
+                root_fields.push(root.to_string());
             }
         } else {
             root_fields.push(clean.to_string());
@@ -89,10 +103,10 @@ pub fn apply_projection(data: &mut Value, fields_param: &str) {
 }
 
 fn apply_projection_recursive(
-    value: &mut Value, 
-    roots: &[String], 
-    tree: &std::collections::HashMap<String, Vec<String>>, 
-    is_exclude: bool
+    value: &mut Value,
+    roots: &[String],
+    tree: &std::collections::HashMap<String, Vec<String>>,
+    is_exclude: bool,
 ) {
     match value {
         Value::Object(map) => {
@@ -103,9 +117,13 @@ fn apply_projection_recursive(
                     if let Some(sub_fields) = tree.get(key) {
                         // If exclusion targets "meta.private", we don't delete "meta", we recurse.
                         if let Some(sub_val) = map.get_mut(key) {
-                             // Re-join subfields to pass down
-                             let sub_param = sub_fields.iter().map(|s| format!("-{}", s)).collect::<Vec<_>>().join(",");
-                             apply_projection(sub_val, &sub_param);
+                            // Re-join subfields to pass down
+                            let sub_param = sub_fields
+                                .iter()
+                                .map(|s| format!("-{}", s))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            apply_projection(sub_val, &sub_param);
                         }
                     } else {
                         // Simple exclusion "email" -> delete it
@@ -116,19 +134,19 @@ fn apply_projection_recursive(
                 // Include Mode
                 // Create replacement map
                 let mut new_map = Map::new();
-                
+
                 // Always keep "id", "created", "updated" unless explicitly excluded?
                 // Standard API practice: IDs usually stick around, but strict projection removes everything else.
                 // Let's stick to strict projection. If user wants id, they ask for it.
                 // Exception: We apply this to the full RecordResponse which has {id, data, expand}.
                 // So this logic typically runs on the `data` object.
-                
+
                 for key in roots {
                     if let Some(val) = map.remove(key) {
                         new_map.insert(key.clone(), val);
                     }
                 }
-                
+
                 // 2. Handle Nested Inclusions via "expand"
                 // If the user requested "author.name", we kept "author" in roots.
                 // Now we need to recurse into "author" and filter it.
@@ -138,21 +156,21 @@ fn apply_projection_recursive(
                         let sub_param = sub_fields.join(",");
                         apply_projection(sub_val, &sub_param);
                     } else if let Some(_val) = map.remove(key) {
-                         // Case: "expand.author" might exist in the record but wasn't in roots?
-                         // If "author.name" was requested, "author" IS in roots.
-                         // But if we are processing the `expand` object separately, we need care.
+                        // Case: "expand.author" might exist in the record but wasn't in roots?
+                        // If "author.name" was requested, "author" IS in roots.
+                        // But if we are processing the `expand` object separately, we need care.
                     }
                 }
 
                 *map = new_map;
             }
-        },
+        }
         Value::Array(arr) => {
             // Apply to all items in array
             for item in arr {
                 apply_projection_recursive(item, roots, tree, is_exclude);
             }
-        },
+        }
         _ => {}
     }
 }

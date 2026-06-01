@@ -24,7 +24,7 @@ RUN echo "Downloading latest public release archive..." && \
 # 3. Prepare storage
 RUN mkdir -p storage/system storage/tenants storage/sandboxes storage/backups
 
-# 4. Run with dynamic port
-#    - Koyeb provides the $PORT variable automatically.
-#    - Defaults to 5000 if not provided.
-CMD ["sh", "-c", "apexkit --port ${PORT:-5000}"]
+# 4. Run with dynamic port and Replica ID injection
+#    - Cloud providers (like Koyeb/Render) provide the $PORT variable automatically.
+#    - If $APEX_REPLICA_ID is set, it forces the app to use that ID to survive disk wipes.
+CMD ["sh", "-c", "if [ -n \"$APEX_REPLICA_ID\" ]; then mkdir -p storage/system && echo \"$APEX_REPLICA_ID\" > storage/system/.replica_id && echo \"[Init] Injected static Replica ID: $APEX_REPLICA_ID\"; fi; exec apexkit --port ${PORT:-5000}"]

@@ -4,12 +4,22 @@ use std::fmt::Write;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterOp {
-    Eq, Neq, Gt, Gte, Lt, Lte, In, Nin, Like, Contains
+    Eq,
+    Neq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    In,
+    Nin,
+    Like,
+    Contains,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicOp {
-    And, Or
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +40,7 @@ pub enum FilterNode {
 
 impl FilterNode {
     /// Parses a JSON object into a Filter Tree
-    /// Supports MongoDB-style syntax: 
+    /// Supports MongoDB-style syntax:
     /// { "age": { "$gt": 18 }, "$or": [...] }
     pub fn parse(json: &Value) -> Self {
         match json {
@@ -40,9 +50,14 @@ impl FilterNode {
                 for (key, val) in map {
                     if key == "$and" || key == "$or" {
                         // Logical Group
-                        let op = if key == "$and" { LogicOp::And } else { LogicOp::Or };
+                        let op = if key == "$and" {
+                            LogicOp::And
+                        } else {
+                            LogicOp::Or
+                        };
                         if let Value::Array(arr) = val {
-                            let children: Vec<FilterNode> = arr.iter().map(FilterNode::parse).collect();
+                            let children: Vec<FilterNode> =
+                                arr.iter().map(FilterNode::parse).collect();
                             conditions.push(FilterNode::Group { op, children });
                         }
                     } else {
@@ -57,7 +72,10 @@ impl FilterNode {
                     conditions.pop().unwrap()
                 } else {
                     // Implicit top-level AND
-                    FilterNode::Group { op: LogicOp::And, children: conditions }
+                    FilterNode::Group {
+                        op: LogicOp::And,
+                        children: conditions,
+                    }
                 }
             }
             _ => FilterNode::Empty,
@@ -73,48 +91,50 @@ impl FilterNode {
                     // Equality
                     "$eq" | "eq" | "_eq" => FilterOp::Eq,
                     "$neq" | "neq" | "_neq" => FilterOp::Neq,
-                    
+
                     // Numeric / Range
                     "$gt" | "gt" | "_gt" => FilterOp::Gt,
                     "$gte" | "gte" | "_gte" => FilterOp::Gte,
                     "$lt" | "lt" | "_lt" => FilterOp::Lt,
                     "$lte" | "lte" | "_lte" => FilterOp::Lte,
-                    
+
                     // Lists
                     "$in" | "in" | "_in" => FilterOp::In,
                     "$nin" | "nin" | "_nin" => FilterOp::Nin,
-                    
+
                     // String Matching
                     "$like" | "like" | "_like" => FilterOp::Like,
                     "$contains" | "contains" | "_contains" => FilterOp::Contains,
-                    
+
                     // Default: Treat entire object as a literal equality match
-                    _ => return FilterNode::Condition { 
-                        field: field.to_string(), 
-                        op: FilterOp::Eq, 
-                        value: val.clone() 
+                    _ => {
+                        return FilterNode::Condition {
+                            field: field.to_string(),
+                            op: FilterOp::Eq,
+                            value: val.clone(),
+                        };
                     }
                 };
-                
+
                 // Return the condition using the detected operator and the INNER value
-                return FilterNode::Condition { 
-                    field: field.to_string(), 
-                    op, 
-                    value: op_val.clone() 
+                return FilterNode::Condition {
+                    field: field.to_string(),
+                    op,
+                    value: op_val.clone(),
                 };
             }
         }
-        
+
         // Handle Primitive Values (Implicit Equality): { "status": "active" }
-        FilterNode::Condition { 
-            field: field.to_string(), 
-            op: FilterOp::Eq, 
-            value: val.clone() 
+        FilterNode::Condition {
+            field: field.to_string(),
+            op: FilterOp::Eq,
+            value: val.clone(),
         }
     }
 
     // --- SQL GENERATION (For Database Queries) ---
-    
+
     pub fn to_sql(&self) -> Option<(String, Vec<rusqlite::types::Value>)> {
         let mut params = Vec::new();
         let sql = self.build_sql(&mut params)?;
@@ -125,30 +145,45 @@ impl FilterNode {
         match self {
             FilterNode::Empty => None,
             FilterNode::Group { op, children } => {
-                let parts: Vec<String> = children.iter()
+                let parts: Vec<String> = children
+                    .iter()
                     .filter_map(|c| c.build_sql(params))
                     .collect();
-                
-                if parts.is_empty() { return None; }
-                
-                let joiner = match op { LogicOp::And => " AND ", LogicOp::Or => " OR " };
+
+                if parts.is_empty() {
+                    return None;
+                }
+
+                let joiner = match op {
+                    LogicOp::And => " AND ",
+                    LogicOp::Or => " OR ",
+                };
                 Some(format!("({})", parts.join(joiner)))
-            },
+            }
             FilterNode::Condition { field, op, value } => {
                 let column = Self::format_json_column(field);
-                
+
                 match op {
                     FilterOp::In | FilterOp::Nin => {
                         if let Value::Array(arr) = value {
-                            if arr.is_empty() { return Some("1=0".to_string()); } 
-                            let placeholders: Vec<String> = arr.iter().map(|_| "?".to_string()).collect();
-                            for v in arr { params.push(json_to_sql_val(v)); }
-                            let not = if matches!(op, FilterOp::Nin) { "NOT " } else { "" };
+                            if arr.is_empty() {
+                                return Some("1=0".to_string());
+                            }
+                            let placeholders: Vec<String> =
+                                arr.iter().map(|_| "?".to_string()).collect();
+                            for v in arr {
+                                params.push(json_to_sql_val(v));
+                            }
+                            let not = if matches!(op, FilterOp::Nin) {
+                                "NOT "
+                            } else {
+                                ""
+                            };
                             Some(format!("{} {}IN ({})", column, not, placeholders.join(",")))
                         } else {
-                            None 
+                            None
                         }
-                    },
+                    }
                     _ => {
                         let sql_op = match op {
                             FilterOp::Eq => "=",
@@ -158,16 +193,16 @@ impl FilterNode {
                             FilterOp::Lt => "<",
                             FilterOp::Lte => "<=",
                             FilterOp::Like => "LIKE",
-                            FilterOp::Contains => "LIKE", 
-                            _ => "=" 
+                            FilterOp::Contains => "LIKE",
+                            _ => "=",
                         };
-                        
+
                         let mut final_val = json_to_sql_val(value);
-                        
-                        if matches!(op, FilterOp::Contains) {
-                            if let Value::String(s) = value {
-                                final_val = rusqlite::types::Value::Text(format!("%{}%", s));
-                            }
+
+                        if matches!(op, FilterOp::Contains)
+                            && let Value::String(s) = value
+                        {
+                            final_val = rusqlite::types::Value::Text(format!("%{}%", s));
                         }
 
                         params.push(final_val);
@@ -180,12 +215,16 @@ impl FilterNode {
 
     // Handles dot notation: "address.zip" -> "data -> 'address' ->> 'zip'"
     fn format_json_column(key: &str) -> String {
-        if key == "id" { return "id".to_string(); } // Native ID column
-        if key == "created" { return "created".to_string(); } // TODO: Add created/updated columns to schema if not json
-        
+        if key == "id" {
+            return "id".to_string();
+        } // Native ID column
+        if key == "created" {
+            return "created".to_string();
+        } // TODO: Add created/updated columns to schema if not json
+
         let parts: Vec<&str> = key.split('.').collect();
         let mut sql = "data".to_string();
-        
+
         for (i, part) in parts.iter().enumerate() {
             if i == parts.len() - 1 {
                 write!(sql, " ->> '{}'", part).unwrap(); // Last one extracts value
@@ -197,15 +236,13 @@ impl FilterNode {
     }
 
     // --- IN-MEMORY MATCHING (For WebSockets/Subscriptions) ---
-    
+
     pub fn matches(&self, record_data: &Value) -> bool {
         match self {
             FilterNode::Empty => true,
-            FilterNode::Group { op, children } => {
-                match op {
-                    LogicOp::And => children.iter().all(|c| c.matches(record_data)),
-                    LogicOp::Or => children.iter().any(|c| c.matches(record_data)),
-                }
+            FilterNode::Group { op, children } => match op {
+                LogicOp::And => children.iter().all(|c| c.matches(record_data)),
+                LogicOp::Or => children.iter().any(|c| c.matches(record_data)),
             },
             FilterNode::Condition { field, op, value } => {
                 let record_val = Self::extract_json_val(record_data, field);
@@ -237,20 +274,28 @@ impl FilterNode {
             FilterOp::Lt => json_cmp(act, expected).map(|r| r < 0).unwrap_or(false),
             FilterOp::Lte => json_cmp(act, expected).map(|r| r <= 0).unwrap_or(false),
             FilterOp::In => {
-                if let Value::Array(arr) = expected { arr.contains(act) } else { false }
-            },
+                if let Value::Array(arr) = expected {
+                    arr.contains(act)
+                } else {
+                    false
+                }
+            }
             FilterOp::Nin => {
-                if let Value::Array(arr) = expected { !arr.contains(act) } else { true }
-            },
+                if let Value::Array(arr) = expected {
+                    !arr.contains(act)
+                } else {
+                    true
+                }
+            }
             FilterOp::Contains => {
-                if let Value::String(s_act) = act {
-                    if let Value::String(s_exp) = expected {
-                        return s_act.contains(s_exp);
-                    }
+                if let Value::String(s_act) = act
+                    && let Value::String(s_exp) = expected
+                {
+                    return s_act.contains(s_exp);
                 }
                 false
             }
-            _ => false
+            _ => false,
         }
     }
 }
@@ -269,8 +314,12 @@ fn json_to_sql_val(v: &Value) -> rusqlite::types::Value {
 // Compare two JSON values numerically or lexically
 fn json_cmp(a: &Value, b: &Value) -> Option<i32> {
     if let (Some(n1), Some(n2)) = (a.as_f64(), b.as_f64()) {
-        if n1 < n2 { return Some(-1); }
-        if n1 > n2 { return Some(1); }
+        if n1 < n2 {
+            return Some(-1);
+        }
+        if n1 > n2 {
+            return Some(1);
+        }
         return Some(0);
     }
     if let (Some(s1), Some(s2)) = (a.as_str(), b.as_str()) {

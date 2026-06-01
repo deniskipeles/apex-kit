@@ -1,8 +1,7 @@
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
-use serde_json::Value;
 use crate::schema::CollectionSchema;
-
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use utoipa::ToSchema;
 
 // --- ADD NEW MODELS ---
 
@@ -32,13 +31,13 @@ pub struct DashboardData {
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct Record {
     #[serde(skip_deserializing)] // ID is handled by DB on create
-    pub id: i64, 
+    pub id: i64,
     #[schema(value_type = Object)]
     pub data: Value,
     // Skip deserializing timestamps (Client doesn't send them)
     // Use default value ("") when reading from JSON payload
     #[serde(skip_deserializing)]
-    #[serde(default)] 
+    #[serde(default)]
     pub created: String,
     #[serde(skip_deserializing)]
     #[serde(default)]
@@ -55,7 +54,7 @@ pub struct Collection {
     pub name: String,
     pub schema: Option<CollectionSchema>,
     // Stable unique identifier for schema portability
-    #[serde(default)] 
+    #[serde(default)]
     pub index: Option<String>,
 }
 
@@ -106,8 +105,8 @@ pub struct InstantResult {
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct Template {
     pub id: i64,
-    pub slug: String,         // e.g. "chat-room" or "components/like-button"
-    pub content: String,      // The HTML/Tera code
+    pub slug: String,           // e.g. "chat-room" or "components/like-button"
+    pub content: String,        // The HTML/Tera code
     pub script_id: Option<i64>, // The script that provides data for this template
     pub created_at: String,
 }
@@ -137,15 +136,15 @@ pub struct ManifestCollection {
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ManifestScript {
-    pub name: String,       // e.g. "create-task"
+    pub name: String,         // e.g. "create-task"
     pub trigger_type: String, // "manual", "before_create", etc.
-    pub code: String,       // JS Code
+    pub code: String,         // JS Code
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ManifestTemplate {
-    pub slug: String,       // e.g. "dashboard/tasks"
-    pub content: String,    // HTML + Tera
+    pub slug: String,                  // e.g. "dashboard/tasks"
+    pub content: String,               // HTML + Tera
     pub loader_script: Option<String>, // Name of script to run before rendering
 }
 
@@ -171,9 +170,9 @@ pub struct ApiKey {
     pub name: String,
     pub prefix: String, // First 8 chars for display
     #[serde(skip_serializing)]
-    pub hash: String,   // Hashed full key
+    pub hash: String, // Hashed full key
     pub role: String,   // Usually 'admin' or 'user'
-    pub scope: String, 
+    pub scope: String,
     pub bypass_cors: bool,
     pub created_at: String,
 }

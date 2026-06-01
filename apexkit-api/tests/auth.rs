@@ -1,9 +1,9 @@
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::StatusCode,
 };
-use tower::ServiceExt;
 use serde_json::json;
+use tower::ServiceExt;
 
 mod common;
 use common::{setup_test_app, test_request};
@@ -13,17 +13,21 @@ async fn test_auth_register_and_login() {
     let app = setup_test_app().await;
 
     // 1. Register
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             test_request()
                 .method("POST")
                 .uri("/api/v1/auth/register")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "email": "test@example.com",
-                    "password": "password123",
-                    "role": "user"
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "email": "test@example.com",
+                        "password": "password123",
+                        "role": "user"
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -36,16 +40,20 @@ async fn test_auth_register_and_login() {
     assert_eq!(res["user"]["email"], "test@example.com");
 
     // 2. Login
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             test_request()
                 .method("POST")
                 .uri("/api/v1/auth/login")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "email": "test@example.com",
-                    "password": "password123"
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "email": "test@example.com",
+                        "password": "password123"
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -85,10 +93,13 @@ async fn test_auth_login_fail() {
                 .method("POST")
                 .uri("/api/v1/auth/login")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "email": "nonexistent@example.com",
-                    "password": "wrongpassword"
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "email": "nonexistent@example.com",
+                        "password": "wrongpassword"
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await

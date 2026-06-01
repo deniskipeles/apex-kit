@@ -1,11 +1,11 @@
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::StatusCode,
 };
 use tower::ServiceExt;
 
 mod common;
-use common::{setup_test_app, admin_token, test_request};
+use common::{admin_token, setup_test_app, test_request};
 
 #[tokio::test]
 async fn test_storage_lifecycle() {
@@ -21,13 +21,17 @@ async fn test_storage_lifecycle() {
         --{boundary}--\r\n"
     );
 
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             test_request()
                 .method("POST")
                 .uri("/api/v1/storage/upload")
                 .header("authorization", format!("Bearer {}", admin_token()))
-                .header("content-type", format!("multipart/form-data; boundary={}", boundary))
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={}", boundary),
+                )
                 .body(Body::from(body_content))
                 .unwrap(),
         )
@@ -36,14 +40,22 @@ async fn test_storage_lifecycle() {
 
     let status = response.status();
     let body_bytes = to_bytes(response.into_body(), 1_048_576).await.unwrap();
-    assert_eq!(status, StatusCode::CREATED, "Upload failed with body: {:?}", String::from_utf8_lossy(&body_bytes));
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "Upload failed with body: {:?}",
+        String::from_utf8_lossy(&body_bytes)
+    );
 
     let res: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    let filename = res["filename"].as_str().expect("filename should be present");
+    let filename = res["filename"]
+        .as_str()
+        .expect("filename should be present");
     let file_id = res["id"].as_i64().expect("id should be present");
 
     // 2. List Files
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             test_request()
                 .method("GET")
@@ -61,7 +73,8 @@ async fn test_storage_lifecycle() {
     assert!(res["items"].as_array().unwrap().len() >= 1);
 
     // 3. Serve File
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             test_request()
                 .method("GET")
@@ -77,7 +90,8 @@ async fn test_storage_lifecycle() {
     assert_eq!(body, "Hello Storage!");
 
     // 4. Delete File
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             test_request()
                 .method("DELETE")
@@ -92,7 +106,8 @@ async fn test_storage_lifecycle() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     // 5. Verify Deletion
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             test_request()
                 .method("GET")

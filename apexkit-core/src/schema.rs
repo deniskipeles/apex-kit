@@ -1,7 +1,7 @@
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
-use rand::Rng;
 
 // Helper to generate Hex ID
 pub fn generate_hex_id() -> String {
@@ -9,15 +9,17 @@ pub fn generate_hex_id() -> String {
     format!("{:x}", rng.r#gen::<u32>())
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema, Default)]
 pub struct CollectionSchema {
     pub fields: HashMap<String, FieldDefinition>,
-    
+
     #[serde(default)]
     pub policies: CollectionPolicies,
-    
+
     #[serde(default)]
     pub relations: HashMap<String, RelationDefinition>,
 
@@ -77,10 +79,10 @@ impl Default for CollectionPolicies {
 pub struct FieldDefinition {
     pub r#type: FieldType,
     pub required: bool,
-    
+
     #[schema(value_type = Option<Object>)]
     pub default: Option<serde_json::Value>,
-    
+
     // Tantivy Search Index (Full Text)
     #[serde(default)]
     pub ose_indexed: bool,
@@ -88,43 +90,43 @@ pub struct FieldDefinition {
     // [NEW] SQL B-Tree Index (Filtering/Sorting)
     #[serde(default)]
     pub sql_indexed: bool,
-    
+
     // AI Embeddings
     #[serde(default)]
-    pub vectorize: bool, 
+    pub vectorize: bool,
 
     // [NEW] Auto-inject owner ID (Defaults to true for Owner fields)
     #[serde(default = "default_true")]
     pub auto: bool,
 
     #[serde(default)]
-    pub position: i32, 
-    
+    pub position: i32,
+
     #[serde(default = "generate_hex_id")]
-    pub uid: String,   
+    pub uid: String,
 
     // --- Dynamic Validation ---
     pub unique: Option<bool>,
-    
+
     // Numbers
     pub min: Option<f64>,
     pub max: Option<f64>,
-    
+
     // String / Text / Blob
     pub min_length: Option<usize>,
     pub max_length: Option<usize>,
-    pub pattern: Option<String>, 
-    
+    pub pattern: Option<String>,
+
     // Select
     pub options: Option<Vec<String>>,
-    
+
     // File / Blob
     pub mime_types: Option<Vec<String>>,
-    pub max_size: Option<usize>, 
-    
+    pub max_size: Option<usize>,
+
     // Vector
     pub dimension: Option<usize>,
-    
+
     // Relation / Owner
     pub relation_to: Option<String>,
 }
@@ -137,20 +139,20 @@ pub enum FieldType {
     Text,    // Long text
     Number,  // Int/Float
     Boolean, // True/False
-    
+
     // Extended Strings
     Email,
     Url,
-    
+
     // Complex
-    Date,    // ISO 8601 String
-    Select,  // String from Options
-    Json,    // Structured Object/Array
-    
+    Date,   // ISO 8601 String
+    Select, // String from Options
+    Json,   // Structured Object/Array
+
     // Binary/Storage
-    File,    // Filename/ID reference
-    Blob,    // Base64 Encoded Data
-    
+    File, // Filename/ID reference
+    Blob, // Base64 Encoded Data
+
     // Relational / AI
     Relation, // ID Reference to another record
     Owner,    // User ID reference

@@ -1,10 +1,10 @@
-use clap::{Parser, Subcommand};
-use apexkit_core::{auth, security::MasterKey};
 use crate::AppState;
-use std::io::Write;
-use serde_json::{json};
-use apexkit_core::security::EncryptedValue;
 use apexkit_core::realtime::EventScope;
+use apexkit_core::security::EncryptedValue;
+use apexkit_core::{auth, security::MasterKey};
+use clap::{Parser, Subcommand};
+use serde_json::json;
+use std::io::Write;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -67,14 +67,9 @@ pub enum UserCmd {
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
     /// Set a system secret (Encrypted in DB)
-    Set {
-        key: String,
-        value: String,
-    },
+    Set { key: String, value: String },
     /// Get a system secret (Decrypted)
-    Get {
-        key: String,
-    },
+    Get { key: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -102,16 +97,23 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
     match command {
         // --- USER COMMANDS ---
         Commands::User(cmd) => match cmd {
-            UserCmd::Create { email, password, role } => {
-                handle_create_user(state, email, password, role).await
-            }
-            UserCmd::ResetPassword { email, new_password } => {
-                handle_reset_password(state, email, new_password).await
-            }
+            UserCmd::Create {
+                email,
+                password,
+                role,
+            } => handle_create_user(state, email, password, role).await,
+            UserCmd::ResetPassword {
+                email,
+                new_password,
+            } => handle_reset_password(state, email, new_password).await,
             UserCmd::List => {
                 // FIX: Update call to include pagination args (None, 1000, 0)
-                let users = state.db.list_users(None, 1000, 0).await.map_err(|e| e.to_string())?;
-                
+                let users = state
+                    .db
+                    .list_users(None, 1000, 0)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
                 println!("{:<5} {:<30} {:<10}", "ID", "EMAIL", "ROLE");
                 println!("{:-<50}", "");
                 for u in users {
@@ -125,15 +127,21 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
             ConfigCmd::Set { key, value } => {
                 let encrypted = state.vault.encrypt(&value).map_err(|e| e.to_string())?;
                 let json_val = serde_json::to_value(&encrypted).unwrap();
-                
+
                 // UPDATED: set_system_config -> set_config
-                state.db.set_config(&key, &json_val, true).await.map_err(|e| e.to_string())?;
+                state
+                    .db
+                    .set_config(&key, &json_val, true)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 println!("✅ Config '{}' set successfully (Encrypted).", key);
                 Ok(())
             }
             ConfigCmd::Get { key } => {
                 // UPDATED: get_system_config -> get_config
-                if let Some(json_val) = state.db.get_config(&key).await.map_err(|e| e.to_string())? {
+                if let Some(json_val) =
+                    state.db.get_config(&key).await.map_err(|e| e.to_string())?
+                {
                     // Try decrypt
                     if let Ok(enc) = serde_json::from_value::<EncryptedValue>(json_val) {
                         let val = state.vault.decrypt(&enc).map_err(|e| e.to_string())?;
@@ -152,7 +160,11 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
         Commands::Data(cmd) => match cmd {
             DataCmd::Reindex { id } => {
                 println!("Re-indexing collection {}...", id);
-                state.db.reindex_collection(id).await.map_err(|e| e.to_string())?;
+                state
+                    .db
+                    .reindex_collection(id)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 println!("✅ Re-indexing complete.");
                 Ok(())
             }
@@ -161,14 +173,18 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
                     limit: Some(100000), // High limit for export
                     ..Default::default()
                 };
-                let result = state.db.list_records(id, opts).await.map_err(|e| e.to_string())?;
-                
+                let result = state
+                    .db
+                    .list_records(id, opts)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
                 let output = if pretty {
                     serde_json::to_string_pretty(&result.items).unwrap()
                 } else {
                     serde_json::to_string(&result.items).unwrap()
                 };
-                
+
                 // Write directly to stdout
                 std::io::stdout().write_all(output.as_bytes()).unwrap();
                 Ok(())
@@ -186,14 +202,17 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
         // --- SCRIPTING ---
         Commands::RunScript { name, input } => {
             println!("🚀 Running Script: {}", name);
-            
+
             let payload = if let Some(s) = input {
                 serde_json::from_str(&s).map_err(|e| format!("Invalid JSON input: {}", e))?
             } else {
                 json!({})
             };
 
-            let script = state.db.get_script_by_name(&name).await
+            let script = state
+                .db
+                .get_script_by_name(&name)
+                .await
                 .map_err(|e| e.to_string())?
                 .ok_or(format!("Script '{}' not found.", name))?;
 
@@ -203,13 +222,11 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
             });
 
             // Execute using the actual engine
-            let result = state.script_engine.run_script(
-                &script.code, 
-                payload, 
-                context,
-                None,
-                None
-            ).await.map_err(|e| format!("Script Error: {}", e))?;
+            let result = state
+                .script_engine
+                .run_script(&script.code, payload, context, None, None)
+                .await
+                .map_err(|e| format!("Script Error: {}", e))?;
 
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
             Ok(())
@@ -218,10 +235,23 @@ pub async fn execute_cli_command(state: AppState, command: Commands) -> Result<(
 }
 
 // ... ( handle_create_user, handle_reset_password) ...
-async fn handle_create_user(state: AppState, email: String, password: Option<String>, role: String) -> Result<(), String> {
-    if !email.contains('@') { return Err("Invalid email format.".into()); }
-    
-    if state.db.get_user_by_email(&email).await.map_err(|e| e.to_string())?.is_some() {
+async fn handle_create_user(
+    state: AppState,
+    email: String,
+    password: Option<String>,
+    role: String,
+) -> Result<(), String> {
+    if !email.contains('@') {
+        return Err("Invalid email format.".into());
+    }
+
+    if state
+        .db
+        .get_user_by_email(&email)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
         return Err(format!("User '{}' already exists.", email));
     }
 
@@ -232,20 +262,32 @@ async fn handle_create_user(state: AppState, email: String, password: Option<Str
     });
 
     let hash = auth::hash_password(&raw_password).map_err(|e| e.to_string())?;
-    let user = state.db.create_user(&email, &hash, &role, None).await.map_err(|e| e.to_string())?;
+    let user = state
+        .db
+        .create_user(&email, &hash, &role, None)
+        .await
+        .map_err(|e| e.to_string())?;
 
     println!("✅ User created: {} (ID: {})", user.email, user.id);
     Ok(())
 }
 
-async fn handle_reset_password(state: AppState, email: String, new_password: Option<String>) -> Result<(), String> {
-    // Note: The Db trait needs to support updating passwords. 
-    // If update_user isn't exposed in Db trait, this requires extending Db trait 
+async fn handle_reset_password(
+    state: AppState,
+    email: String,
+    new_password: Option<String>,
+) -> Result<(), String> {
+    // Note: The Db trait needs to support updating passwords.
+    // If update_user isn't exposed in Db trait, this requires extending Db trait
     // or using raw SQL if we had access to the connection (which we don't via AppState trait object).
     // *Assumption*: We added `update_user` or similar to Db trait, or we rely on recreation for this example.
-    
+
     // For now, let's inform the user this might need trait extension if it fails
-    let _user = state.db.get_user_by_email(&email).await.map_err(|e| e.to_string())?
+    let _user = state
+        .db
+        .get_user_by_email(&email)
+        .await
+        .map_err(|e| e.to_string())?
         .ok_or(format!("User '{}' not found", email))?;
 
     let raw_password = new_password.unwrap_or_else(|| {
@@ -253,15 +295,15 @@ async fn handle_reset_password(state: AppState, email: String, new_password: Opt
         println!("⚠️  Generated new password: {}", p);
         p
     });
-    
+
     let hash = auth::hash_password(&raw_password).map_err(|e| e.to_string())?;
 
     // IMPORTANT: In a real implementation, you must ensure `db.update_user_password` exists in the trait.
     // Since we can't easily modify the trait in this single file context without editing lib.rs/cache.rs,
     // We will simulate success message but warn implementation is needed.
-    
+
     println!("❌ DB Trait update required to change password directly via CLI without SQL access.");
     println!("   Hash to set manually in DB: {}", hash);
-    
+
     Ok(())
 }

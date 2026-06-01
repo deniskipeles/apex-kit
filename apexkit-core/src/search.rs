@@ -1,21 +1,18 @@
+use crate::models::InstantResult;
+use crate::schema::{CollectionSchema, FieldType};
+use serde_json::{Map, Value as JsonValue};
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use tantivy::collector::TopDocs;
+use tantivy::directory::MmapDirectory;
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
-    Field, FieldType as TantivyFieldType, IndexRecordOption, Schema,
-    FAST, INDEXED, STORED, TEXT,
+    FAST, Field, FieldType as TantivyFieldType, INDEXED, IndexRecordOption, STORED, Schema, TEXT,
     Term, Value,
 };
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
-use tantivy::directory::MmapDirectory;
-use tantivy::query::{
-    BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, TermQuery,
-};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::fs;
-use crate::schema::{CollectionSchema, FieldType};
-use crate::models::InstantResult;
-use serde_json::{Map, Value as JsonValue};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -107,7 +104,12 @@ impl SearchManager {
     /// Idempotent: calling it multiple times is safe and cheap.
     pub fn load_index(&self, collection_id: i64, schema: &CollectionSchema) -> Result<(), String> {
         // Fast path – already loaded.
-        if self.collections.read().unwrap().contains_key(&collection_id) {
+        if self
+            .collections
+            .read()
+            .unwrap()
+            .contains_key(&collection_id)
+        {
             return Ok(());
         }
 
@@ -115,8 +117,12 @@ impl SearchManager {
         fs::create_dir_all(&index_path).map_err(|e| e.to_string())?;
 
         let tantivy_schema = Self::build_tantivy_schema(schema);
-        let index = Self::open_or_recreate(&index_path, tantivy_schema)
-            .map_err(|e| format!("Failed to open index for collection {}: {}", collection_id, e))?;
+        let index = Self::open_or_recreate(&index_path, tantivy_schema).map_err(|e| {
+            format!(
+                "Failed to open index for collection {}: {}",
+                collection_id, e
+            )
+        })?;
 
         // `OnCommitWithDelay` – the reader auto-refreshes shortly after each
         // commit, so searches always reflect the latest writes without a manual
@@ -127,14 +133,16 @@ impl SearchManager {
             .try_into()
             .map_err(|e| e.to_string())?;
 
-        let writer = index
-            .writer(WRITER_HEAP_BYTES)
-            .map_err(|e| e.to_string())?;
+        let writer = index.writer(WRITER_HEAP_BYTES).map_err(|e| e.to_string())?;
 
-        self.collections
-            .write()
-            .unwrap()
-            .insert(collection_id, CollectionIndex { index, reader, writer });
+        self.collections.write().unwrap().insert(
+            collection_id,
+            CollectionIndex {
+                index,
+                reader,
+                writer,
+            },
+        );
 
         Ok(())
     }
@@ -175,11 +183,15 @@ impl SearchManager {
         let mut lock = self.collections.write().unwrap();
         let ci = lock.get_mut(&collection_id).ok_or("Index not loaded")?;
 
-        let id_field = ci.index.schema().get_field("record_id")
+        let id_field = ci
+            .index
+            .schema()
+            .get_field("record_id")
             .map_err(|_| "record_id field missing from schema")?;
 
         // Delete any existing version of this record first.
-        ci.writer.delete_term(Term::from_field_i64(id_field, record_id));
+        ci.writer
+            .delete_term(Term::from_field_i64(id_field, record_id));
 
         let doc = Self::build_document(&ci.index.schema(), record_id, data, schema);
         ci.writer.add_document(doc).map_err(|e| e.to_string())?;
@@ -212,7 +224,8 @@ impl SearchManager {
 
         for (record_id, data) in records {
             // FIX: delete before insert to prevent duplicate accumulation.
-            ci.writer.delete_term(Term::from_field_i64(id_field, *record_id));
+            ci.writer
+                .delete_term(Term::from_field_i64(id_field, *record_id));
             let doc = Self::build_document(&index_schema, *record_id, data, schema);
             ci.writer.add_document(doc).map_err(|e| e.to_string())?;
         }
@@ -225,10 +238,13 @@ impl SearchManager {
     pub fn delete_record(&self, collection_id: i64, record_id: i64) -> Result<(), String> {
         let mut lock = self.collections.write().unwrap();
         if let Some(ci) = lock.get_mut(&collection_id) {
-            let id_field = ci.index.schema()
+            let id_field = ci
+                .index
+                .schema()
                 .get_field("record_id")
                 .map_err(|_| "Schema error")?;
-            ci.writer.delete_term(Term::from_field_i64(id_field, record_id));
+            ci.writer
+                .delete_term(Term::from_field_i64(id_field, record_id));
             ci.writer.commit().map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -316,7 +332,11 @@ impl SearchManager {
 
                 // Fuzzy or exact term depending on token length.
                 // FIX: short terms use distance-0 (exact) so they aren't skipped.
-                let distance = if token_lower.len() > FUZZY_MIN_LEN { FUZZY_DISTANCE } else { 0 };
+                let distance = if token_lower.len() > FUZZY_MIN_LEN {
+                    FUZZY_DISTANCE
+                } else {
+                    0
+                };
                 let term_val = Term::from_field_text(*field, &token_lower);
                 let fuzzy_q = FuzzyTermQuery::new(term_val, distance, true);
                 per_token.push((Occur::Should, Box::new(fuzzy_q)));
@@ -333,8 +353,7 @@ impl SearchManager {
             if let Ok(num_val) = token.parse::<f64>() {
                 for field in &number_fields {
                     let term_val = Term::from_field_f64(*field, num_val);
-                    let exact_q =
-                        TermQuery::new(term_val, IndexRecordOption::Basic);
+                    let exact_q = TermQuery::new(term_val, IndexRecordOption::Basic);
                     per_token.push((Occur::Should, Box::new(exact_q)));
                 }
             }
@@ -357,12 +376,13 @@ impl SearchManager {
 
         // ── Assemble results ────────────────────────────────────────────────
 
-        let id_field = schema.get_field("record_id").map_err(|_| "record_id missing")?;
+        let id_field = schema
+            .get_field("record_id")
+            .map_err(|_| "record_id missing")?;
         let mut results = Vec::with_capacity(top_docs.len());
 
         for (score, doc_addr) in top_docs {
-            let doc: TantivyDocument =
-                searcher.doc(doc_addr).map_err(|e| e.to_string())?;
+            let doc: TantivyDocument = searcher.doc(doc_addr).map_err(|e| e.to_string())?;
 
             let doc_id = doc
                 .get_first(id_field)
@@ -418,7 +438,9 @@ impl SearchManager {
     ) -> TantivyDocument {
         let mut doc = TantivyDocument::default();
 
-        let id_field = index_schema.get_field("record_id").expect("record_id must exist");
+        let id_field = index_schema
+            .get_field("record_id")
+            .expect("record_id must exist");
         doc.add_i64(id_field, record_id);
 
         for (name, def) in &collection_schema.fields {

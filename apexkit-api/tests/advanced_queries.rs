@@ -1,12 +1,12 @@
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::StatusCode,
 };
-use tower::ServiceExt;
 use serde_json::json;
+use tower::ServiceExt;
 
 mod common;
-use common::{setup_test_app, base_request};
+use common::{base_request, setup_test_app};
 
 async fn create_collection_with_data(app: &axum::Router) -> i64 {
     let response = app
@@ -15,16 +15,19 @@ async fn create_collection_with_data(app: &axum::Router) -> i64 {
             base_request()
                 .method("POST")
                 .uri("/api/v1/collections")
-                .body(Body::from(json!({
-                    "name": "Products",
-                    "schema": {
-                        "fields": {
-                            "name": { "type": "string", "required": true },
-                            "price": { "type": "number", "required": true },
-                            "category": { "type": "string", "required": true }
+                .body(Body::from(
+                    json!({
+                        "name": "Products",
+                        "schema": {
+                            "fields": {
+                                "name": { "type": "string", "required": true },
+                                "price": { "type": "number", "required": true },
+                                "category": { "type": "string", "required": true }
+                            }
                         }
-                    }
-                }).to_string()))
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -33,7 +36,11 @@ async fn create_collection_with_data(app: &axum::Router) -> i64 {
     let status = response.status();
     let body_bytes = to_bytes(response.into_body(), 1_048_576).await.unwrap();
     if status != StatusCode::CREATED {
-        panic!("Failed to create collection: status={}, body={:?}", status, String::from_utf8_lossy(&body_bytes));
+        panic!(
+            "Failed to create collection: status={}, body={:?}",
+            status,
+            String::from_utf8_lossy(&body_bytes)
+        );
     }
     let collection: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     let collection_id = collection["id"].as_i64().unwrap();
@@ -46,7 +53,8 @@ async fn create_collection_with_data(app: &axum::Router) -> i64 {
     ];
 
     for p in products {
-        let response = app.clone()
+        let response = app
+            .clone()
             .oneshot(
                 base_request()
                     .method("POST")
@@ -59,7 +67,11 @@ async fn create_collection_with_data(app: &axum::Router) -> i64 {
         let status = response.status();
         if status != StatusCode::CREATED {
             let body_bytes = to_bytes(response.into_body(), 1_048_576).await.unwrap();
-            panic!("Failed to create record: status={}, body={:?}", status, String::from_utf8_lossy(&body_bytes));
+            panic!(
+                "Failed to create record: status={}, body={:?}",
+                status,
+                String::from_utf8_lossy(&body_bytes)
+            );
         }
     }
 
@@ -72,14 +84,18 @@ async fn test_advanced_query_filtering() {
     let collection_id = create_collection_with_data(&app).await;
 
     // 1. Filter by category
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("POST")
                 .uri(format!("/api/v1/collections/{}/query", collection_id))
-                .body(Body::from(json!({
-                    "filter": { "category": "Electronics" }
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "filter": { "category": "Electronics" }
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -92,14 +108,18 @@ async fn test_advanced_query_filtering() {
     assert_eq!(res["items"].as_array().unwrap().len(), 2);
 
     // 2. Filter by price > 100
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("POST")
                 .uri(format!("/api/v1/collections/{}/query", collection_id))
-                .body(Body::from(json!({
-                    "filter": { "price": { "$gt": 100 } }
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "filter": { "price": { "$gt": 100 } }
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -111,16 +131,20 @@ async fn test_advanced_query_filtering() {
     assert_eq!(res["total"], 2);
 
     // 3. Sorting and Limit
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             base_request()
                 .method("POST")
                 .uri(format!("/api/v1/collections/{}/query", collection_id))
-                .body(Body::from(json!({
-                    "filter": {},
-                    "sort": "-price",
-                    "limit": 1
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "filter": {},
+                        "sort": "-price",
+                        "limit": 1
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await

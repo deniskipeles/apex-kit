@@ -1,24 +1,27 @@
+use crate::AppState;
+use apexkit_core::{
+    filter::FilterNode,
+    realtime::{DbEvent, EventScope},
+};
 use axum::{
+    Extension,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
-    Extension,
 };
-use serde::{Deserialize}; // Removed unused Serialize
-use apexkit_core::{realtime::{DbEvent, EventScope}, filter::FilterNode};
-use crate::AppState;
-use futures::{sink::SinkExt, stream::StreamExt}; 
-use tracing::{warn}; // Removed debug
+use futures::{sink::SinkExt, stream::StreamExt};
+use serde::Deserialize; // Removed unused Serialize
+use tracing::warn; // Removed debug
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct SubscriptionFilter {
     pub collection_id: Option<i64>,
     pub record_id: Option<i64>,
-    pub event_type: Option<String>, 
+    pub event_type: Option<String>,
     pub filter: Option<serde_json::Value>,
-    pub custom_event: Option<String>, 
+    pub custom_event: Option<String>,
     pub channel: Option<String>,
 }
 
@@ -27,7 +30,7 @@ pub struct SearchRequest {
     pub collection_id: i64,
     pub query: String,
     pub limit: Option<usize>,
-    pub request_id: Option<String>, 
+    pub request_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -50,7 +53,7 @@ pub enum ClientMessage {
 pub async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    scope: Option<Extension<EventScope>>, 
+    scope: Option<Extension<EventScope>>,
 ) -> impl IntoResponse {
     let client_scope = scope.map(|e| e.0).unwrap_or_default();
     ws.on_upgrade(move |socket| handle_socket(socket, state, client_scope))
@@ -88,7 +91,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                         } else {
                                             current_filter_node = FilterNode::Empty;
                                         }
-                                        
+
                                         if let Some(chan) = &filter.channel {
                                             active_namespaced_channel = Some(namespaced_channel(&client_scope, chan));
                                         } else {
@@ -139,14 +142,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                         }
                     },
                     Some(Err(e)) => { warn!("WS Error: {}", e); break; },
-                    None => break, 
+                    None => break,
                 }
             }
             Ok(event) = rx.recv() => {
                 if matches_scope(&event, &client_scope, &active_namespaced_channel) && matches_filter(&event, &current_filter, &current_filter_node) {
                     if let Ok(json_msg) = serde_json::to_string(&event) {
                         if sender.send(Message::Text(json_msg.into())).await.is_err() {
-                            break; 
+                            break;
                         }
                     }
                 }
@@ -155,11 +158,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
     }
 }
 
-fn matches_scope(event: &DbEvent, client_scope: &EventScope, active_channel: &Option<String>) -> bool {
+fn matches_scope(
+    event: &DbEvent,
+    client_scope: &EventScope,
+    active_channel: &Option<String>,
+) -> bool {
     match event {
-        DbEvent::Insert { scope, .. } | DbEvent::Update { scope, .. } | DbEvent::Delete { scope, .. } => {
-            scope == client_scope
-        },
+        DbEvent::Insert { scope, .. }
+        | DbEvent::Update { scope, .. }
+        | DbEvent::Delete { scope, .. } => scope == client_scope,
         DbEvent::Custom { scope, .. } => {
             if let EventScope::Channel(evt_channel) = scope {
                 if let Some(sub_channel) = active_channel {
@@ -172,43 +179,92 @@ fn matches_scope(event: &DbEvent, client_scope: &EventScope, active_channel: &Op
     }
 }
 
-fn matches_filter(
-    event: &DbEvent, 
-    filter: &SubscriptionFilter, 
-    filter_node: &FilterNode
-) -> bool {
+fn matches_filter(event: &DbEvent, filter: &SubscriptionFilter, filter_node: &FilterNode) -> bool {
     match event {
-        DbEvent::Custom { event: evt_name, data, .. } => {
+        DbEvent::Custom {
+            event: evt_name,
+            data,
+            ..
+        } => {
             if let Some(req_evt) = &filter.custom_event {
-                if req_evt != evt_name { return false; }
+                if req_evt != evt_name {
+                    return false;
+                }
             }
             if !matches!(filter_node, FilterNode::Empty) {
                 return filter_node.matches(data);
             }
             true
-        },
-        DbEvent::Insert { collection_id, record_id, data, .. } => 
-            check_db_event(*collection_id, *record_id, "Insert", Some(data), filter, filter_node),
-        DbEvent::Update { collection_id, record_id, data, .. } => 
-            check_db_event(*collection_id, *record_id, "Update", Some(data), filter, filter_node),
-        DbEvent::Delete { collection_id, record_id, .. } => 
-            check_db_event(*collection_id, *record_id, "Delete", None, filter, filter_node),
+        }
+        DbEvent::Insert {
+            collection_id,
+            record_id,
+            data,
+            ..
+        } => check_db_event(
+            *collection_id,
+            *record_id,
+            "Insert",
+            Some(data),
+            filter,
+            filter_node,
+        ),
+        DbEvent::Update {
+            collection_id,
+            record_id,
+            data,
+            ..
+        } => check_db_event(
+            *collection_id,
+            *record_id,
+            "Update",
+            Some(data),
+            filter,
+            filter_node,
+        ),
+        DbEvent::Delete {
+            collection_id,
+            record_id,
+            ..
+        } => check_db_event(
+            *collection_id,
+            *record_id,
+            "Delete",
+            None,
+            filter,
+            filter_node,
+        ),
     }
 }
 
-fn check_db_event(col_id: i64, rec_id: i64, type_str: &str, data: Option<&serde_json::Value>, filter: &SubscriptionFilter, node: &FilterNode) -> bool {
+fn check_db_event(
+    col_id: i64,
+    rec_id: i64,
+    type_str: &str,
+    data: Option<&serde_json::Value>,
+    filter: &SubscriptionFilter,
+    node: &FilterNode,
+) -> bool {
     if let Some(req_col) = filter.collection_id {
-        if req_col != col_id { return false; }
+        if req_col != col_id {
+            return false;
+        }
     }
     if let Some(req_rec) = filter.record_id {
-        if req_rec != rec_id { return false; }
+        if req_rec != rec_id {
+            return false;
+        }
     }
     if let Some(req_type) = &filter.event_type {
-        if !req_type.eq_ignore_ascii_case(type_str) { return false; }
+        if !req_type.eq_ignore_ascii_case(type_str) {
+            return false;
+        }
     }
     if !matches!(node, FilterNode::Empty) {
         if let Some(d) = data {
-            if !node.matches(d) { return false; }
+            if !node.matches(d) {
+                return false;
+            }
         } else {
             return false;
         }

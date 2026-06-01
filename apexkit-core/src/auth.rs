@@ -1,6 +1,6 @@
+use chrono::{Duration, Utc};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
-use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
-use chrono::{Utc, Duration};
 
 // --- Models ---
 
@@ -37,7 +37,12 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     bcrypt::verify(password, hash).unwrap_or(false)
 }
 
-pub fn create_jwt(id: i64, email: &str, role: &str, scope: &str) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn create_jwt(
+    id: i64,
+    email: &str,
+    role: &str,
+    scope: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
     let expiration = Utc::now()
         .checked_add_signed(Duration::hours(24))
         .expect("valid timestamp")
@@ -51,7 +56,11 @@ pub fn create_jwt(id: i64, email: &str, role: &str, scope: &str) -> Result<Strin
         scope: scope.to_owned(),
     };
 
-    encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET))
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(SECRET),
+    )
 }
 
 pub fn decode_jwt(token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {

@@ -6,13 +6,13 @@ pub struct Script {
     pub id: i64,
     pub name: String,
     // e.g., "manual", "before_create", "after_create", "before_update", "after_update", "before_delete", "after_delete"
-    pub trigger_type: String, 
+    pub trigger_type: String,
     // New: If set, only runs for this collection. If None, runs for all (global hook).
-    pub target_collection: Option<String>, 
+    pub target_collection: Option<String>,
     pub code: String,
     pub active: bool,
     //  'private' (default) or 'public' (shared with tenants)
-    #[serde(default)] 
+    #[serde(default)]
     pub visibility: String,
 }
 
@@ -27,4 +27,6 @@ pub struct CreateScriptReq {
     pub visibility: String,
 }
 
-fn default_visibility() -> String { "private".to_string() }
+fn default_visibility() -> String {
+    "private".to_string()
+}

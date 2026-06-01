@@ -1,29 +1,25 @@
-use axum::{
-    extract::{Multipart},
-    Extension,
-    Json,
-};
-use serde::{Serialize, Deserialize};
+use crate::AppError;
+use crate::AppState;
+use crate::Arc;
+use crate::DatabaseConnection;
+use crate::Db;
+use crate::State;
+use apexkit_core::ai_models::CreateActionReq;
+use apexkit_core::models::CreateTemplateReq;
+use apexkit_core::script_models::CreateScriptReq;
 use apexkit_core::{auth::Claims, realtime::EventScope};
-use crate::{AppError};
-use std::path::{PathBuf};
+use axum::extract::Query;
+use axum::http::StatusCode;
+use axum::{Extension, Json, extract::Multipart};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::fs;
 use std::io::Cursor;
-use walkdir::WalkDir;
-use tracing::{info};
-use axum::http::StatusCode;
-use axum::extract::Query;
-use crate::AppState;
-use crate::State;
-use tracing::{ error};
-use apexkit_core::models::{CreateTemplateReq};
-use apexkit_core::script_models::CreateScriptReq;
-use apexkit_core::ai_models::CreateActionReq;
-use crate::DatabaseConnection;
-use serde_json::json;
-use crate::Arc;
-use crate::Db;
 use std::path::Path;
+use std::path::PathBuf;
+use tracing::error;
+use tracing::info;
+use walkdir::WalkDir;
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct SiteFile {
@@ -41,7 +37,9 @@ pub fn get_public_dir(scope: &EventScope) -> PathBuf {
     match scope {
         EventScope::Root => PathBuf::from("storage/system/public"),
         EventScope::Tenant(id) => PathBuf::from(format!("storage/tenants/{}/public", id)),
-        EventScope::Sandbox(id) => PathBuf::from(format!("storage/sandboxes/session_{}/public", id)),
+        EventScope::Sandbox(id) => {
+            PathBuf::from(format!("storage/sandboxes/session_{}/public", id))
+        }
         // Safety fallback, though usually unreachable if middleware works
         _ => PathBuf::from("storage/tmp"),
     }
@@ -60,20 +58,37 @@ pub async fn deploy_site_handler(
     scope: Option<Extension<EventScope>>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     let public_dir = get_public_dir(&event_scope);
-    
+
     // 1. Resolve Limits from Root
-    let general_settings = state.db.get_config("general").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let max_mb = general_settings.and_then(|v| v.get("max_site_size_mb").and_then(|n| n.as_u64())).unwrap_or(50);
+    let general_settings = state
+        .db
+        .get_config("general")
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let max_mb = general_settings
+        .and_then(|v| v.get("max_site_size_mb").and_then(|n| n.as_u64()))
+        .unwrap_or(50);
     let max_bytes = max_mb * 1024 * 1024;
 
-    while let Some(field) = multipart.next_field().await.map_err(|_| AppError::UnknownError("Multipart error".into()))? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| AppError::UnknownError("Multipart error".into()))?
+    {
         if field.name() == Some("file") {
-            let data = field.bytes().await.map_err(|_| AppError::UnknownError("Read failed".into()))?;
-            if (data.len() as u64) > max_bytes { return Err(AppError::UnknownError("Limit exceeded".into())); }
+            let data = field
+                .bytes()
+                .await
+                .map_err(|_| AppError::UnknownError("Read failed".into()))?;
+            if (data.len() as u64) > max_bytes {
+                return Err(AppError::UnknownError("Limit exceeded".into()));
+            }
 
             // 2. Create Staging Area
             let staging_id = uuid::Uuid::new_v4();
@@ -82,12 +97,15 @@ pub async fn deploy_site_handler(
 
             // 3. Extract Entire ZIP to Staging
             let cursor = Cursor::new(data);
-            let mut archive = zip::ZipArchive::new(cursor).map_err(|e| AppError::UnknownError(format!("Invalid ZIP: {}", e)))?;
-            archive.extract(&staging_dir).map_err(|e| AppError::UnknownError(format!("Extraction failed: {}", e)))?;
+            let mut archive = zip::ZipArchive::new(cursor)
+                .map_err(|e| AppError::UnknownError(format!("Invalid ZIP: {}", e)))?;
+            archive
+                .extract(&staging_dir)
+                .map_err(|e| AppError::UnknownError(format!("Extraction failed: {}", e)))?;
 
             // 4. SMART DISCOVERY
             let mut web_root = staging_dir.clone();
-            
+
             // A. Check for index.html at root vs dist
             if !staging_dir.join("index.html").exists() {
                 if staging_dir.join("dist").join("index.html").exists() {
@@ -125,11 +143,14 @@ pub async fn deploy_site_handler(
             }
 
             // 5. Finalize Static Site Move
-            if public_dir.exists() { fs::remove_dir_all(&public_dir).ok(); }
+            if public_dir.exists() {
+                fs::remove_dir_all(&public_dir).ok();
+            }
             fs::create_dir_all(&public_dir).ok();
-            
+
             // Copy files from detected web_root to the public_dir
-            copy_dir_recursive(&web_root, &public_dir).map_err(|e| AppError::UnknownError(e.to_string()))?;
+            copy_dir_recursive(&web_root, &public_dir)
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
             // 6. Cleanup Staging
             let _ = fs::remove_dir_all(&staging_dir);
@@ -151,38 +172,70 @@ async fn deploy_metadata_item(db: &Arc<dyn Db>, label: &str, content: &[u8]) -> 
     match label {
         "schema" => {
             // Reuses logic from Import Schema (Strategy: Overwrite)
-            let req: crate::import_data_routes::ImportSchemaRequest = serde_json::from_slice(content).map_err(|e| e.to_string())?;
+            let req: crate::import_data_routes::ImportSchemaRequest =
+                serde_json::from_slice(content).map_err(|e| e.to_string())?;
             for col in req.collections {
-                let existing = db.list_collections().await.unwrap_or_default().into_iter().find(|c| c.name == col.name);
+                let existing = db
+                    .list_collections()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|c| c.name == col.name);
                 if let Some(e) = existing {
-                    db.update_collection(e.id, None, col.schema).await.map_err(|e| e.to_string())?;
+                    db.update_collection(e.id, None, col.schema)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 } else {
-                    db.create_collection(&col.name, &col.schema, col.index).await.map_err(|e| e.to_string())?;
+                    db.create_collection(&col.name, &col.schema, col.index)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
             }
-        },
+        }
         "scripts" => {
-            let items: Vec<apexkit_core::script_models::Script> = serde_json::from_slice(content).map_err(|e| e.to_string())?;
+            let items: Vec<apexkit_core::script_models::Script> =
+                serde_json::from_slice(content).map_err(|e| e.to_string())?;
             for s in items {
                 db.create_script(CreateScriptReq {
-                    name: s.name, trigger_type: s.trigger_type, target_collection: s.target_collection, code: s.code, active: s.active, visibility: s.visibility
-                }).await.map_err(|e| e.to_string())?;
+                    name: s.name,
+                    trigger_type: s.trigger_type,
+                    target_collection: s.target_collection,
+                    code: s.code,
+                    active: s.active,
+                    visibility: s.visibility,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
             }
-        },
+        }
         "templates" => {
-            let items: Vec<apexkit_core::models::Template> = serde_json::from_slice(content).map_err(|e| e.to_string())?;
+            let items: Vec<apexkit_core::models::Template> =
+                serde_json::from_slice(content).map_err(|e| e.to_string())?;
             for t in items {
-                db.create_template(CreateTemplateReq { slug: t.slug, content: t.content, script_id: t.script_id }).await.map_err(|e| e.to_string())?;
+                db.create_template(CreateTemplateReq {
+                    slug: t.slug,
+                    content: t.content,
+                    script_id: t.script_id,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
             }
-        },
+        }
         "ai_actions" => {
-            let items: Vec<apexkit_core::ai_models::AiAction> = serde_json::from_slice(content).map_err(|e| e.to_string())?;
+            let items: Vec<apexkit_core::ai_models::AiAction> =
+                serde_json::from_slice(content).map_err(|e| e.to_string())?;
             for a in items {
-                db.create_ai_action(CreateActionReq { 
-                    name: a.name, slug: a.slug, model: a.model, system_prompt: a.system_prompt, template: a.template 
-                }).await.map_err(|e| e.to_string())?;
+                db.create_ai_action(CreateActionReq {
+                    name: a.name,
+                    slug: a.slug,
+                    model: a.model,
+                    system_prompt: a.system_prompt,
+                    template: a.template,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
             }
-        },
+        }
         _ => {}
     }
     Ok(())
@@ -212,18 +265,25 @@ pub async fn list_site_files_handler(
     // [SCOPE AWARE]
     scope: Option<Extension<EventScope>>,
 ) -> Result<Json<Vec<SiteFile>>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     let public_dir = get_public_dir(&event_scope);
-    
+
     let mut files = Vec::new();
 
     if public_dir.exists() {
         for entry in WalkDir::new(&public_dir).into_iter().filter_map(|e| e.ok()) {
             if entry.file_type().is_file() {
                 // Return path relative to public root (e.g. "index.html", "css/style.css")
-                let path = entry.path().strip_prefix(&public_dir).unwrap().to_string_lossy().to_string();
+                let path = entry
+                    .path()
+                    .strip_prefix(&public_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 files.push(SiteFile { path, size });
             }
@@ -247,24 +307,28 @@ pub async fn delete_site_file_handler(
     scope: Option<Extension<EventScope>>,
     Query(params): Query<DeleteSiteFileReq>,
 ) -> Result<StatusCode, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     let public_dir = get_public_dir(&event_scope);
 
     // Sanitize Path: Prevent traversal (../)
-    let safe_path = params.path.trim_start_matches('/').replace("..", ""); 
-    
+    let safe_path = params.path.trim_start_matches('/').replace("..", "");
+
     // Safety check: ensure we aren't deleting the root public dir via empty path
     if safe_path.is_empty() || safe_path == "." || safe_path == "./" {
-         return Err(AppError::Forbidden("Cannot delete root directory".into()));
+        return Err(AppError::Forbidden("Cannot delete root directory".into()));
     }
 
     let target_path = public_dir.join(&safe_path);
 
     // Verify it is strictly inside public_dir
     if !target_path.starts_with(&public_dir) {
-        return Err(AppError::Forbidden("Access denied: Path traversal detected".into()));
+        return Err(AppError::Forbidden(
+            "Access denied: Path traversal detected".into(),
+        ));
     }
 
     if !target_path.exists() {

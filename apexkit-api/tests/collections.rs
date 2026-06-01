@@ -1,11 +1,11 @@
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::StatusCode,
 };
 use tower::ServiceExt;
 
 mod common;
-use common::{setup_test_app, base_request};
+use common::{base_request, setup_test_app};
 
 #[tokio::test]
 async fn test_create_collection() {

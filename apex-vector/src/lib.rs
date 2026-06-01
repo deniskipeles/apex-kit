@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use anyhow::Result;
+use std::sync::Arc;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -22,10 +22,7 @@ impl VectorEngine {
         let cfg = config.unwrap_or_default();
         let embedder = Arc::new(CandleEmbedder::new(cfg)?);
         let index = Arc::new(VectorIndex::new());
-        
-        Ok(Self {
-            embedder,
-            index,
-        })
+
+        Ok(Self { embedder, index })
     }
 }

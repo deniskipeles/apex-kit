@@ -1,21 +1,22 @@
-use std::sync::Arc;
-use std::net::SocketAddr;
-use tokio::sync::{broadcast, RwLock};
-use axum::{Router, extract::ConnectInfo};
-use apexkit_api::{app_router, AppState, GlobalJobContext};
-use apexkit_api::tenant_manager::TenantManager;
 use apexkit_api::sandbox_manager::SandboxManager;
+use apexkit_api::tenant_manager::TenantManager;
+use apexkit_api::{AppState, GlobalJobContext, app_router};
 use apexkit_core::{
-    jobs::{self}, cache::CachedDb,
-    storage::{StorageBackend, LocalStorage},
-    security::{MasterKey, Vault},
-    scripting::ScriptEngine,
-    embeddings::EmbedderService,
     VectorProvider,
+    cache::CachedDb,
+    embeddings::EmbedderService,
+    jobs::{self},
+    scripting::ScriptEngine,
+    security::{MasterKey, Vault},
+    storage::{LocalStorage, StorageBackend},
 };
-use moka::future::Cache;
-use async_graphql::dynamic::{Schema, Object, Field, TypeRef, FieldFuture};
 use async_graphql::Value as GqlValue;
+use async_graphql::dynamic::{Field, FieldFuture, Object, Schema, TypeRef};
+use axum::{Router, extract::ConnectInfo};
+use moka::future::Cache;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::{RwLock, broadcast};
 
 pub struct TestContext {
     pub state: AppState,
@@ -27,21 +28,36 @@ pub async fn setup_test_context() -> TestContext {
     std::fs::create_dir_all(&base_path).unwrap();
 
     // 1. Vault
-    let master_key = MasterKey::from_string("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()).unwrap();
+    let master_key =
+        MasterKey::from_string("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()).unwrap();
     let vault = Arc::new(Vault::new(&master_key));
 
     // 2. Vector Provider (Mock)
     struct MockVectorProvider;
     #[async_trait::async_trait]
     impl VectorProvider for MockVectorProvider {
-        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> { Ok(vec![0.0; 384]) }
-        async fn search(&self, _c: i64, _f: &str, _v: &[f32], _l: usize) -> Result<Vec<(i64, f32)>, String> { Ok(vec![]) }
-        async fn index(&self, _c: i64, _r: i64, _f: &str, _v: &[f32]) -> Result<(), String> { Ok(()) }
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Ok(vec![0.0; 384])
+        }
+        async fn search(
+            &self,
+            _c: i64,
+            _f: &str,
+            _v: &[f32],
+            _l: usize,
+        ) -> Result<Vec<(i64, f32)>, String> {
+            Ok(vec![])
+        }
+        async fn index(&self, _c: i64, _r: i64, _f: &str, _v: &[f32]) -> Result<(), String> {
+            Ok(())
+        }
     }
     let vector_provider: Arc<dyn VectorProvider> = Arc::new(MockVectorProvider);
 
     // 3. DB
-    let raw_db = apexkit_core::ApexKit::init_filesystem(&base_path, vector_provider.clone()).await.unwrap();
+    let raw_db = apexkit_core::ApexKit::init_filesystem(&base_path, vector_provider.clone())
+        .await
+        .unwrap();
     let cached_db = Arc::new(CachedDb::new(Arc::new(raw_db)));
 
     // 4. Managers
@@ -62,17 +78,24 @@ pub async fn setup_test_context() -> TestContext {
 
     // 7. Storage
     let storage_path = format!("{}/storage", base_path);
-    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(LocalStorage::new(&storage_path, "/api/v1/storage/file/").await);
 
     // 8. Script Engine & Other
     let script_engine = Arc::new(ScriptEngine::new().await);
-    let scheduler = Arc::new(RwLock::new(apexkit_api::scheduler::SchedulerService::new().await));
+    let scheduler = Arc::new(RwLock::new(
+        apexkit_api::scheduler::SchedulerService::new().await,
+    ));
     let thumb_cache = Cache::builder().max_capacity(10).build();
     let embedder = Arc::new(EmbedderService::new());
 
     // 9. Schema
     let dummy_schema = Schema::build("Query", None, None)
-        .register(Object::new("Query").field(Field::new("version", TypeRef::named_nn(TypeRef::STRING), |_| FieldFuture::new(async {Ok(Some(GqlValue::from("1.0")))}))))
+        .register(Object::new("Query").field(Field::new(
+            "version",
+            TypeRef::named_nn(TypeRef::STRING),
+            |_| FieldFuture::new(async { Ok(Some(GqlValue::from("1.0"))) }),
+        )))
         .finish()
         .unwrap();
 
@@ -95,10 +118,7 @@ pub async fn setup_test_context() -> TestContext {
         port: 0,
     };
 
-    TestContext {
-        state,
-        base_path,
-    }
+    TestContext { state, base_path }
 }
 
 pub async fn setup_test_app() -> Router {

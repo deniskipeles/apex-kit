@@ -2,12 +2,17 @@ use hnsw_rs::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-type IndexKey = (i64, String); 
+type IndexKey = (i64, String);
 
 pub struct VectorIndex {
     indexes: Arc<RwLock<HashMap<IndexKey, Hnsw<'static, f32, DistL2>>>>,
 }
 
+impl Default for VectorIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl VectorIndex {
     pub fn new() -> Self {
         Self {
@@ -17,7 +22,7 @@ impl VectorIndex {
 
     pub fn insert(&self, col_id: i64, rec_id: i64, field: &str, vector: &[f32]) {
         let key = (col_id, field.to_string());
-        
+
         // Double-check pattern
         let exists = { self.indexes.read().unwrap().contains_key(&key) };
         if !exists {
@@ -40,13 +45,15 @@ impl VectorIndex {
         let key = (col_id, field.to_string());
 
         if let Some(index) = readers.get(&key) {
-            let results = index.search(query, limit, 24); 
-            results.into_iter().map(|n| (n.d_id as i64, n.distance)).collect()
+            let results = index.search(query, limit, 24);
+            results
+                .into_iter()
+                .map(|n| (n.d_id as i64, n.distance))
+                .collect()
         } else {
             vec![]
         }
     }
-    
-    pub fn delete(&self, _col_id: i64, _field: &str, _rec_id: i64) {
-    }
+
+    pub fn delete(&self, _col_id: i64, _field: &str, _rec_id: i64) {}
 }

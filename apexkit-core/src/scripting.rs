@@ -1,25 +1,23 @@
-use std::sync::Arc;
-use serde_json::{Value as JsonValue, json};
 use crate::ScriptContext;
 use crate::realtime::{DbEvent, EventScope};
-use tokio::sync::broadcast;
 use regex::Regex;
-use std::path::{PathBuf};
+use serde_json::{Value as JsonValue, json};
 use std::cell::RefCell;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::broadcast;
 
-use boa_engine::{
-    Context, JsValue, JsResult, NativeFunction, JsError, JsString, JsArgs,
-    object::ObjectInitializer,
-    property::Attribute,
-    builtins::promise::PromiseState
-};
-use std::io::{Cursor, Read, Write};
-use zip::{ZipArchive, ZipWriter};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use zip::write::FileOptions;
-use std::collections::HashMap;
-use std::time::UNIX_EPOCH;
 use crate::scripting_db::resolve_db;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use boa_engine::{
+    Context, JsArgs, JsError, JsResult, JsString, JsValue, NativeFunction,
+    builtins::promise::PromiseState, object::ObjectInitializer, property::Attribute,
+};
+use std::collections::HashMap;
+use std::io::{Cursor, Read, Write};
+use std::time::UNIX_EPOCH;
+use zip::write::FileOptions;
+use zip::{ZipArchive, ZipWriter};
 
 // --- PRELUDE ---
 const JS_PRELUDE: &str = r#"
@@ -187,33 +185,38 @@ const JS_PRELUDE: &str = r#"
     };
 "#;
 
+// Type alias to satisfy Clippy's type complexity limits natively
+pub type ActiveScriptContextTuple = (
+    Arc<dyn ScriptContext>,
+    tokio::runtime::Handle,
+    Option<String>,
+    Option<broadcast::Sender<DbEvent>>,
+    EventScope,
+);
+
 thread_local! {
-    pub static ACTIVE_CONTEXT: RefCell<Option<(
-        Arc<dyn ScriptContext>,           
-        tokio::runtime::Handle,           
-        Option<String>,                   
-        Option<broadcast::Sender<DbEvent>>,
-        EventScope                        
-    )>> = RefCell::new(None);
+    pub static ACTIVE_CONTEXT: RefCell<Option<ActiveScriptContextTuple>> = RefCell::new(None);
 }
 
 #[derive(Clone)]
 pub struct ScriptEngine;
 
 impl ScriptEngine {
-    pub async fn new() -> Self { Self }
+    pub async fn new() -> Self {
+        Self
+    }
 
     pub async fn run_script(
-        &self, 
-        code: &str, 
-        input_data: JsonValue, 
+        &self,
+        code: &str,
+        input_data: JsonValue,
         context: Arc<dyn ScriptContext>,
         base_url: Option<String>,
-        headers: Option<HashMap<String, String>> // <--- NEW ARGUMENT
+        headers: Option<HashMap<String, String>>, // <--- NEW ARGUMENT
     ) -> Result<JsonValue, String> {
         self.execute_js_task(code, context, base_url, move |ctx| {
             let js_body = JsValue::from_json(&input_data, ctx).map_err(|e| e.to_string())?;
-            
+
             // 1. Build Headers Object
             let mut header_init = ObjectInitializer::new(ctx);
             if let Some(h) = headers {
@@ -224,84 +227,131 @@ impl ScriptEngine {
             let js_headers = header_init.build();
 
             // 2. Build Request Init
-            let request_cls = ctx.global_object().get(JsString::from("Request"), ctx).unwrap();
+            let request_cls = ctx
+                .global_object()
+                .get(JsString::from("Request"), ctx)
+                .unwrap();
             let req_init = ObjectInitializer::new(ctx)
-                .property(JsString::from("method"), JsString::from("POST"), Attribute::all())
+                .property(
+                    JsString::from("method"),
+                    JsString::from("POST"),
+                    Attribute::all(),
+                )
                 .property(JsString::from("body"), js_body, Attribute::all())
                 .property(JsString::from("headers"), js_headers, Attribute::all()) // <--- INJECT HEADERS
                 .build();
-            
-            let request_obj = request_cls.as_constructor().unwrap()
-                .construct(&[JsValue::undefined(), JsValue::from(req_init)], Some(&request_cls.as_object().unwrap()), ctx)
+
+            let request_obj = request_cls
+                .as_constructor()
+                .unwrap()
+                .construct(
+                    &[JsValue::undefined(), JsValue::from(req_init)],
+                    Some(&request_cls.as_object().unwrap()),
+                    ctx,
+                )
                 .map_err(|e| format!("Failed to create Request: {}", e))?;
 
-            let handler = ctx.global_object().get(JsString::from("__mainHandler"), ctx);
+            let handler = ctx
+                .global_object()
+                .get(JsString::from("__mainHandler"), ctx);
             let promise = match handler {
-                Ok(h) if h.is_callable() => h.as_callable().unwrap().call(&JsValue::undefined(), &[request_obj.into()], ctx),
-                _ => return Err("No 'export default' found".to_string())
+                Ok(h) if h.is_callable() => {
+                    h.as_callable()
+                        .unwrap()
+                        .call(&JsValue::undefined(), &[request_obj.into()], ctx)
+                }
+                _ => return Err("No 'export default' found".to_string()),
             };
 
             let _ = ctx.run_jobs();
             let final_val = Self::resolve_promise(promise, ctx)?;
 
-            if let Some(obj) = final_val.as_object() {
-                if obj.has_property(JsString::from("body"), ctx).unwrap_or(false) {
-                    let body = obj.get(JsString::from("body"), ctx).unwrap_or_default();
-                    let json = body.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
-                    return Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null));
-                }
+            if let Some(obj) = final_val.as_object()
+                && obj
+                    .has_property(JsString::from("body"), ctx)
+                    .unwrap_or(false)
+            {
+                let body = obj.get(JsString::from("body"), ctx).unwrap_or_default();
+                let json = body
+                    .to_json(ctx)
+                    .unwrap_or(None)
+                    .unwrap_or(serde_json::Value::Null);
+                return Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null));
             }
-            
-            let json = final_val.to_json(ctx).unwrap_or(None).unwrap_or(serde_json::Value::Null);
+
+            let json = final_val
+                .to_json(ctx)
+                .unwrap_or(None)
+                .unwrap_or(serde_json::Value::Null);
             Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null))
-        }).await
+        })
+        .await
     }
-    
+
     pub async fn run_hook(
         &self,
         code: &str,
-        event_data: JsonValue, 
+        event_data: JsonValue,
         context: Arc<dyn ScriptContext>,
         base_url: Option<String>,
-        scope: Option<EventScope>
+        scope: Option<EventScope>,
     ) -> Result<Option<JsonValue>, String> {
         let _actual_scope = scope.unwrap_or(EventScope::Root);
-        let wrapped_code = format!(r#"
+        let wrapped_code = format!(
+            r#"
             (async () => {{
                 {}
                 const e = globalThis.__hook_context__;
                 if (globalThis.__mainHandler) {{ return await globalThis.__mainHandler(e); }}
                 return null;
             }})()
-        "#, code);
+        "#,
+            code
+        );
 
         self.execute_js_task(&wrapped_code, context, base_url, move |ctx| {
             let js_event = JsValue::from_json(&event_data, ctx).map_err(|e| e.to_string())?;
-            ctx.register_global_property(JsString::from("__hook_context__"), js_event.clone(), Attribute::all()).unwrap();
+            ctx.register_global_property(
+                JsString::from("__hook_context__"),
+                js_event.clone(),
+                Attribute::all(),
+            )
+            .unwrap();
 
-            let handler = ctx.global_object().get(JsString::from("__mainHandler"), ctx);
+            let handler = ctx
+                .global_object()
+                .get(JsString::from("__mainHandler"), ctx);
             let promise = match handler {
-                Ok(h) if h.is_callable() => h.as_callable().unwrap().call(&JsValue::undefined(), &[js_event], ctx),
-                _ => return Ok(None) 
+                Ok(h) if h.is_callable() => {
+                    h.as_callable()
+                        .unwrap()
+                        .call(&JsValue::undefined(), &[js_event], ctx)
+                }
+                _ => return Ok(None),
             };
 
             let _ = ctx.run_jobs();
             let final_val = Self::resolve_promise(promise, ctx)?;
 
-            if final_val.is_null() || final_val.is_undefined() { return Ok(None); }
+            if final_val.is_null() || final_val.is_undefined() {
+                return Ok(None);
+            }
 
             // [FIX] Only check boolean if the value is actually a boolean type.
             // Objects/Strings/Numbers should NOT trigger this check.
-            if let Some(b) = final_val.as_boolean() {
-                 if !b { return Err("Hook blocked operation".to_string()); }
+            if let Some(b) = final_val.as_boolean()
+                && !b
+            {
+                return Err("Hook blocked operation".to_string());
             }
-            
+
             if final_val.is_object() {
                 let json = final_val.to_json(ctx).unwrap().unwrap();
                 return Ok(Some(json));
             }
             Ok(None)
-        }).await
+        })
+        .await
     }
 
     async fn execute_js_task<F, R>(
@@ -309,16 +359,18 @@ impl ScriptEngine {
         code: &str,
         context: Arc<dyn ScriptContext>,
         base_url: Option<String>,
-        task_logic: F
+        task_logic: F,
     ) -> Result<R, String>
     where
         F: FnOnce(&mut Context) -> Result<R, String> + Send + 'static,
-        R: Send + 'static
+        R: Send + 'static,
     {
-        let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)").map_err(|e| e.to_string())?;
+        let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
+            .map_err(|e| e.to_string())?;
         let code_cleaned = re_config.replace_all(code, "");
-        let processed_code = code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
-        
+        let processed_code =
+            code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
+
         let handle = tokio::runtime::Handle::current();
 
         // Get TX from context
@@ -327,28 +379,38 @@ impl ScriptEngine {
 
         // 1. Get Timeout
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
-            .ok().and_then(|s| s.parse::<u64>().ok())
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30); // Default 30s
-            
+
         let execution_future = tokio::task::spawn_blocking(move || -> Result<R, String> {
             let mut context_boa = Context::default();
-            ACTIVE_CONTEXT.with(|c| { *c.borrow_mut() = Some((context, handle.clone(), base_url, tx, execution_scope)); });
+            ACTIVE_CONTEXT.with(|c| {
+                *c.borrow_mut() = Some((context, handle.clone(), base_url, tx, execution_scope));
+            });
             Self::setup_boa(&mut context_boa)?;
-            
+
             // Check for interrupts or inject limiter? Boa has some support but simple OS thread timeout is hard.
             // However, spawn_blocking runs on a thread. We can't easily kill it if it loops infinitely in pure JS (no async yields).
-            // But we can timeout the *waiting* for it. The thread might leak if it's an infinite loop, 
+            // But we can timeout the *waiting* for it. The thread might leak if it's an infinite loop,
             // but the API will respond with timeout.
             // Ideally, we inject an instruction limit or use `context_boa.set_interrupt_handler`.
-            
-            if let Err(e) = context_boa.eval(boa_engine::Source::from_bytes(processed_code.as_bytes())) {
-                 return Err(format!("Script Syntax Error: {}", e));
+
+            if let Err(e) =
+                context_boa.eval(boa_engine::Source::from_bytes(processed_code.as_bytes()))
+            {
+                return Err(format!("Script Syntax Error: {}", e));
             }
             task_logic(&mut context_boa)
         });
 
         // 2. Wrap in Timeout
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), execution_future).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            execution_future,
+        )
+        .await
+        {
             Ok(join_res) => match join_res {
                 Ok(inner_res) => inner_res,
                 Err(e) => Err(format!("System Panic: {}", e)),
@@ -358,8 +420,9 @@ impl ScriptEngine {
     }
 
     fn setup_boa(ctx: &mut Context) -> Result<(), String> {
-        ctx.eval(boa_engine::Source::from_bytes(JS_PRELUDE.as_bytes())).map_err(|e| format!("Prelude Error: {}", e))?;
-        
+        ctx.eval(boa_engine::Source::from_bytes(JS_PRELUDE.as_bytes()))
+            .map_err(|e| format!("Prelude Error: {}", e))?;
+
         register_console(ctx)?;
         register_util(ctx)?;
         register_http(ctx)?;
@@ -379,30 +442,44 @@ impl ScriptEngine {
 
         Ok(())
     }
-    
-    fn resolve_promise(val: Result<JsValue, JsError>, _ctx: &mut Context) -> Result<JsValue, String> {
+
+    fn resolve_promise(
+        val: Result<JsValue, JsError>,
+        _ctx: &mut Context,
+    ) -> Result<JsValue, String> {
         let js_val = val.map_err(|e| e.to_string())?;
         if let Some(p) = js_val.as_promise() {
-             match p.state() {
-                 PromiseState::Fulfilled(v) => Ok(v),
-                 PromiseState::Rejected(err) => Err(format!("Script Rejected: {}", err.display())),
-                 PromiseState::Pending => Err("Script did not complete (Pending Promise)".to_string()),
-             }
-        } else { Ok(js_val) }
+            match p.state() {
+                PromiseState::Fulfilled(v) => Ok(v),
+                PromiseState::Rejected(err) => Err(format!("Script Rejected: {}", err.display())),
+                PromiseState::Pending => {
+                    Err("Script did not complete (Pending Promise)".to_string())
+                }
+            }
+        } else {
+            Ok(js_val)
+        }
     }
 }
 
 // --- JS Return Helper ---
-pub fn return_json_promise(ctx: &mut Context, result: Result<serde_json::Value, String>) -> JsResult<JsValue> {
+pub fn return_json_promise(
+    ctx: &mut Context,
+    result: Result<serde_json::Value, String>,
+) -> JsResult<JsValue> {
     let (promise, resolvers) = boa_engine::object::builtins::JsPromise::new_pending(ctx);
     match result {
         Ok(json_val) => {
             let js_val = JsValue::from_json(&json_val, ctx).unwrap_or(JsValue::null());
-            resolvers.resolve.call(&JsValue::undefined(), &[js_val], ctx)?;
-        },
+            resolvers
+                .resolve
+                .call(&JsValue::undefined(), &[js_val], ctx)?;
+        }
         Err(e) => {
             let err_msg = JsString::from(e);
-            resolvers.reject.call(&JsValue::undefined(), &[err_msg.into()], ctx)?;
+            resolvers
+                .reject
+                .call(&JsValue::undefined(), &[err_msg.into()], ctx)?;
         }
     }
     Ok(promise.into())
@@ -412,7 +489,11 @@ pub fn return_json_promise(ctx: &mut Context, result: Result<serde_json::Value, 
 
 fn register_console(ctx: &mut Context) -> Result<(), String> {
     let log = NativeFunction::from_copy_closure(|_, args, ctx| {
-        let msg = args.iter().map(|a| a.to_string(ctx).unwrap_or_default().to_std_string_escaped()).collect::<Vec<_>>().join(" ");
+        let msg = args
+            .iter()
+            .map(|a| a.to_string(ctx).unwrap_or_default().to_std_string_escaped())
+            .collect::<Vec<_>>()
+            .join(" ");
         println!("[SCRIPT] {}", msg);
         Ok(JsValue::undefined())
     });
@@ -420,54 +501,90 @@ fn register_console(ctx: &mut Context) -> Result<(), String> {
         .function(log.clone(), JsString::from("log"), 1)
         .function(log.clone(), JsString::from("error"), 1)
         .build();
-    ctx.register_global_property(JsString::from("console"), obj, Attribute::all()).map_err(|e| e.to_string())
+    ctx.register_global_property(JsString::from("console"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 fn register_util(ctx: &mut Context) -> Result<(), String> {
-    use crate::utils::{slugify, sha256, sha512, hmac_sha256, generate_random_hex};
+    use crate::utils::{generate_random_hex, hmac_sha256, sha256, sha512, slugify};
 
     // UUID
-    let uuid_fn = NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::from(JsString::from(uuid::Uuid::new_v4().to_string()))));
-    
+    let uuid_fn = NativeFunction::from_fn_ptr(|_, _, _| {
+        Ok(JsValue::from(JsString::from(
+            uuid::Uuid::new_v4().to_string(),
+        )))
+    });
+
     // Slug
     let slug_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        Ok(JsValue::from(JsString::from(slugify(&args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped()))))
+        Ok(JsValue::from(JsString::from(slugify(
+            &args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped(),
+        ))))
     });
 
     // Hash (SHA256 / SHA512)
     let hash_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let alg = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
-        
+        let text = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let alg = args
+            .get_or_undefined(1)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+
         let result = match alg.as_str() {
             "sha256" => sha256(&text),
             "sha512" => sha512(&text),
-            _ => return Err(JsError::from_opaque(JsString::from("Unsupported algorithm (use sha256/sha512)").into()))
+            _ => {
+                return Err(JsError::from_opaque(
+                    JsString::from("Unsupported algorithm (use sha256/sha512)").into(),
+                ));
+            }
         };
         Ok(JsValue::from(JsString::from(result)))
     });
 
     // HMAC
     let hmac_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let key = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+        let text = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let key = args
+            .get_or_undefined(1)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         Ok(JsValue::from(JsString::from(hmac_sha256(&key, &text))))
     });
 
     // Base64 Encode
     let b64_enc_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let text = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         Ok(JsValue::from(JsString::from(STANDARD.encode(text))))
     });
 
     // Base64 Decode (Robust: Handles Standard, URL-Safe, Padded, and Unpadded)
     let b64_dec_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD, URL_SAFE, STANDARD_NO_PAD}};
-        
+        let text = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        use base64::{
+            Engine as _,
+            engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+        };
+
         // Try multiple decoding engines gracefully
-        let decoded = STANDARD.decode(&text)
+        let decoded = STANDARD
+            .decode(&text)
             .or_else(|_| URL_SAFE_NO_PAD.decode(&text))
             .or_else(|_| URL_SAFE.decode(&text))
             .or_else(|_| STANDARD_NO_PAD.decode(&text));
@@ -476,11 +593,13 @@ fn register_util(ctx: &mut Context) -> Result<(), String> {
             Ok(bytes) => {
                 let s = String::from_utf8(bytes).unwrap_or_default();
                 Ok(JsValue::from(JsString::from(s)))
-            },
-            Err(_) => Err(JsError::from_opaque(JsString::from("Invalid Base64 format").into()))
+            }
+            Err(_) => Err(JsError::from_opaque(
+                JsString::from("Invalid Base64 format").into(),
+            )),
         }
     });
-    
+
     // Sleep (Mock/Blocking)
     let sleep_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
         let ms = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as u64;
@@ -505,61 +624,76 @@ fn register_util(ctx: &mut Context) -> Result<(), String> {
         .function(random_hex_fn, JsString::from("randomHex"), 1)
         .build();
 
-    ctx.register_global_property(JsString::from("$util"), obj, Attribute::all()).map_err(|e| e.to_string())
+    ctx.register_global_property(JsString::from("$util"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 // 1. Resolve READ Path (Scope Root)
 fn resolve_read_path(scope: &EventScope, requested_path: &str) -> Result<PathBuf, String> {
-    if requested_path.contains("..") { return Err("Path traversal forbidden".into()); }
+    if requested_path.contains("..") {
+        return Err("Path traversal forbidden".into());
+    }
 
     let base_dir = match scope {
         EventScope::Root => {
             // Root Admin can read anywhere via prefix
             if let Some(stripped) = requested_path.strip_prefix("tenant:") {
-                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-                 if parts.len() < 2 { return Err("Invalid format".into()); }
-                 format!("storage/tenants/{}/{}", parts[0], parts[1])
+                let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                if parts.len() < 2 {
+                    return Err("Invalid format".into());
+                }
+                format!("storage/tenants/{}/{}", parts[0], parts[1])
             } else if let Some(stripped) = requested_path.strip_prefix("sandbox:") {
-                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-                 if parts.len() < 2 { return Err("Invalid format".into()); }
-                 format!("storage/sandboxes/session_{}/{}", parts[0], parts[1])
+                let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                if parts.len() < 2 {
+                    return Err("Invalid format".into());
+                }
+                format!("storage/sandboxes/session_{}/{}", parts[0], parts[1])
             } else {
-                 format!("storage/system/{}", requested_path)
+                format!("storage/system/{}", requested_path)
             }
-        },
+        }
         EventScope::Tenant(id) => format!("storage/tenants/{}/{}", id, requested_path),
         EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/{}", id, requested_path),
-        _ => return Err("Invalid scope".into())
+        _ => return Err("Invalid scope".into()),
     };
-    
+
     Ok(PathBuf::from(base_dir))
 }
 
 // 2. Resolve WRITE Path (Scope TMP Only)
 fn resolve_write_path(scope: &EventScope, requested_path: &str) -> Result<PathBuf, String> {
-    if requested_path.contains("..") { return Err("Path traversal forbidden".into()); }
+    if requested_path.contains("..") {
+        return Err("Path traversal forbidden".into());
+    }
 
-    // Root Admin can write anywhere (Power User) - OR restrict to root/tmp? 
-    // Let's restrict Root to its own root/tmp for consistency, 
+    // Root Admin can write anywhere (Power User) - OR restrict to root/tmp?
+    // Let's restrict Root to its own root/tmp for consistency,
     // unless they explicitly use a prefix to write to a tenant's tmp.
-    
+
     let base_dir = match scope {
         EventScope::Root => {
             if let Some(stripped) = requested_path.strip_prefix("tenant:") {
-                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-                 if parts.len() < 2 { return Err("Invalid format".into()); }
-                 format!("storage/tenants/{}/tmp/{}", parts[0], parts[1])
+                let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                if parts.len() < 2 {
+                    return Err("Invalid format".into());
+                }
+                format!("storage/tenants/{}/tmp/{}", parts[0], parts[1])
             } else if let Some(stripped) = requested_path.strip_prefix("sandbox:") {
-                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-                 if parts.len() < 2 { return Err("Invalid format".into()); }
-                 format!("storage/sandboxes/session_{}/tmp/{}", parts[0], parts[1])
+                let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                if parts.len() < 2 {
+                    return Err("Invalid format".into());
+                }
+                format!("storage/sandboxes/session_{}/tmp/{}", parts[0], parts[1])
             } else {
-                 format!("storage/system/tmp/{}", requested_path)
+                format!("storage/system/tmp/{}", requested_path)
             }
-        },
+        }
         EventScope::Tenant(id) => format!("storage/tenants/{}/tmp/{}", id, requested_path),
-        EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/tmp/{}", id, requested_path),
-        _ => return Err("Invalid scope".into())
+        EventScope::Sandbox(id) => {
+            format!("storage/sandboxes/session_{}/tmp/{}", id, requested_path)
+        }
+        _ => return Err("Invalid scope".into()),
     };
 
     Ok(PathBuf::from(base_dir))
@@ -569,37 +703,54 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
     // Reuses the logic from register_zip's save_file_fn and read_file_fn
     // We can just copy the NativeFunction definitions since they are closures capturing env.
     // Or refactor to shared helpers.
-    
+
     // For now, I will implement them as part of a new `$files` object for cleanliness,
     // or global if strictly requested. The prompt says "$saveFile and $readFile", implying globals or tools.
     // Let's make a `$files` object.
-    
+
     // Reuse logic:
-    
+
     // $files.read(filename) -> Base64
     let read_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
         // See implementation below
-        let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        
+        let filename = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
                 handle.block_on(async {
                     let storage = app.get_storage();
                     match storage.get(&filename).await {
-                        Ok(bytes) => Ok(json!(base64::engine::general_purpose::STANDARD.encode(bytes))),
-                        Err(e) => Err(format!("Read failed: {}", e))
+                        Ok(bytes) => Ok(json!(
+                            base64::engine::general_purpose::STANDARD.encode(bytes)
+                        )),
+                        Err(e) => Err(format!("Read failed: {}", e)),
                     }
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, result)
     });
 
     // $files.save(filename, base64, mime) -> Metadata
     let save_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let b64_data = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
-        let mime_type = args.get(2).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or("application/octet-stream".to_string());
+        let filename = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let b64_data = args
+            .get_or_undefined(1)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let mime_type = args
+            .get(2)
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or("application/octet-stream".to_string());
 
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
@@ -608,17 +759,25 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
                     // We need resolve_db helper from scripting_db.rs? It's private there.
                     // We should move resolve_db to a shared location or make it public.
                     // Assuming we fix visibility or copy logic (it's short):
-                    
+
                     // Logic to get DB:
                     let scope = app.get_scope();
                     let db = match scope {
-                        EventScope::Tenant(id) => app.resolve_tenant_db(&id).await.ok_or("Tenant DB not found".to_string())?,
-                        EventScope::Sandbox(id) => app.resolve_sandbox_db(&id).await.ok_or("Sandbox DB not found".to_string())?,
-                        _ => app.get_db()
+                        EventScope::Tenant(id) => app
+                            .resolve_tenant_db(&id)
+                            .await
+                            .ok_or("Tenant DB not found".to_string())?,
+                        EventScope::Sandbox(id) => app
+                            .resolve_sandbox_db(&id)
+                            .await
+                            .ok_or("Sandbox DB not found".to_string())?,
+                        _ => app.get_db(),
                     };
 
                     let storage = app.get_storage();
-                    let bytes = base64::engine::general_purpose::STANDARD.decode(&b64_data).map_err(|_| "Invalid Base64")?;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(&b64_data)
+                        .map_err(|_| "Invalid Base64")?;
                     let size = bytes.len() as i64;
 
                     // Rename
@@ -626,23 +785,37 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
                     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
                     let storage_filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
 
-                    storage.save(&storage_filename, &bytes, &mime_type).await.map_err(|e| e.to_string())?;
+                    storage
+                        .save(&storage_filename, &bytes, &mime_type)
+                        .await
+                        .map_err(|e| e.to_string())?;
 
-                    let id = db.create_file_metadata(&storage_filename, &filename, &mime_type, size, None).await.map_err(|e| e.to_string())?;
+                    let id = db
+                        .create_file_metadata(&storage_filename, &filename, &mime_type, size, None)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let url = format!("{}{}", storage.get_public_url_base(), storage_filename);
 
                     Ok(json!({ "id": id, "url": url, "filename": storage_filename }))
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, result)
     });
 
     // $files.getSignedUrl(filename, ttl_seconds?) -> string (URL)
     let signed_url_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let filename = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         // Default to 15 minutes (900s) if not specified
-        let ttl = args.get(1).and_then(|v| v.to_number(ctx).ok()).unwrap_or(900.0) as u64;
+        let ttl = args
+            .get(1)
+            .and_then(|v| v.to_number(ctx).ok())
+            .unwrap_or(900.0) as u64;
 
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
@@ -650,10 +823,12 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
                     let storage = app.get_storage();
                     match storage.get_signed_url(&filename, ttl).await {
                         Ok(url) => Ok(json!(url)),
-                        Err(e) => Err(format!("Signing failed: {}", e))
+                        Err(e) => Err(format!("Signing failed: {}", e)),
                     }
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, result)
     });
@@ -661,11 +836,26 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
     // $files.registerMetadata(filename, options) -> Metadata
     // options: { originalName?, mimeType?, size? }
     let register_metadata_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let opts = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(serde_json::json!({}));
+        let filename = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let opts = args
+            .get_or_undefined(1)
+            .to_json(ctx)
+            .unwrap()
+            .unwrap_or(serde_json::json!({}));
 
-        let original_name = opts.get("originalName").and_then(|v| v.as_str()).unwrap_or(&filename).to_string();
-        let mime_type = opts.get("mimeType").and_then(|v| v.as_str()).unwrap_or("application/octet-stream").to_string();
+        let original_name = opts
+            .get("originalName")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&filename)
+            .to_string();
+        let mime_type = opts
+            .get("mimeType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/octet-stream")
+            .to_string();
         let size = opts.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
 
         let result = ACTIVE_CONTEXT.with(|c| {
@@ -675,24 +865,31 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
 
                     // 1. Check for existing filename to ensure consistency
                     if let Ok(Some(_)) = db.get_file_by_filename(&filename).await {
-                        return Err(format!("File '{}' is already registered in metadata.", filename));
+                        return Err(format!(
+                            "File '{}' is already registered in metadata.",
+                            filename
+                        ));
                     }
 
                     // 2. Register in Metadata DB (Does NOT generate UUID, uses provided filename)
-                    let id = db.create_file_metadata(&filename, &original_name, &mime_type, size, None).await
+                    let id = db
+                        .create_file_metadata(&filename, &original_name, &mime_type, size, None)
+                        .await
                         .map_err(|e| e.to_string())?;
-                        
+
                     let storage = app.get_storage();
                     let public_url = format!("{}{}", storage.get_public_url_base(), filename);
 
                     Ok(serde_json::json!({
                         "id": id,
-                        "filename": filename, 
+                        "filename": filename,
                         "url": public_url,
                         "size": size
                     }))
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, result)
     });
@@ -704,128 +901,186 @@ fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
         .function(signed_url_fn, JsString::from("getSignedUrl"), 2)
         .build();
 
-    ctx.register_global_property(JsString::from("$files"), obj, Attribute::all()).map_err(|e| e.to_string())
+    ctx.register_global_property(JsString::from("$files"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 fn register_fs(ctx: &mut Context) -> Result<(), String> {
-
     // $fs.read(path) -> string
     let read_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let fname = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
                 let target = resolve_read_path(scope, &fname)?; // Read from Root
                 handle.block_on(async {
-                     if !target.exists() { return Err("File not found".into()); }
-                     if target.is_dir() { return Err("Cannot read directory".into()); }
-                     tokio::fs::read_to_string(target).await.map_err(|e| e.to_string())
+                    if !target.exists() {
+                        return Err("File not found".into());
+                    }
+                    if target.is_dir() {
+                        return Err("Cannot read directory".into());
+                    }
+                    tokio::fs::read_to_string(target)
+                        .await
+                        .map_err(|e| e.to_string())
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         match result {
             Ok(s) => return_json_promise(ctx, Ok(serde_json::Value::String(s))),
-            Err(e) => return_json_promise(ctx, Err(e))
+            Err(e) => return_json_promise(ctx, Err(e)),
         }
     });
 
     // $fs.write(path, content) -> void (Writes to TMP)
     let write_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let content = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+        let fname = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let content = args
+            .get_or_undefined(1)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
                 let target = resolve_write_path(scope, &fname)?; // Write to TMP
                 handle.block_on(async {
-                     if let Some(parent) = target.parent() {
-                         tokio::fs::create_dir_all(parent).await.ok();
-                     }
-                     tokio::fs::write(target, content).await.map_err(|e| e.to_string())?;
-                     Ok(json!(true))
+                    if let Some(parent) = target.parent() {
+                        tokio::fs::create_dir_all(parent).await.ok();
+                    }
+                    tokio::fs::write(target, content)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!(true))
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, result)
     });
 
     // $fs.delete(path) -> void (Deletes from TMP)
     let delete_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let fname = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
                 let target = resolve_write_path(scope, &fname)?; // Delete from TMP only
-                handle.block_on(async {
-                     if !target.exists() { return Err("File not found in tmp".into()); }
-                     if target.is_dir() {
-                         tokio::fs::remove_dir_all(target).await.map_err(|e| e.to_string())
-                     } else {
-                         tokio::fs::remove_file(target).await.map_err(|e| e.to_string())
-                     }
-                }).map(|_| json!(true))
-            } else { Err("Context lost".into()) }
+                handle
+                    .block_on(async {
+                        if !target.exists() {
+                            return Err("File not found in tmp".into());
+                        }
+                        if target.is_dir() {
+                            tokio::fs::remove_dir_all(target)
+                                .await
+                                .map_err(|e| e.to_string())
+                        } else {
+                            tokio::fs::remove_file(target)
+                                .await
+                                .map_err(|e| e.to_string())
+                        }
+                    })
+                    .map(|_| json!(true))
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, result)
     });
-    
+
     // $fs.list(path) -> Array (Lists from Root)
     let list_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let fname = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
                 let target = resolve_read_path(scope, &fname)?; // List from Root
                 handle.block_on(async {
-                     if !target.exists() { return Err("Path not found".into()); }
-                     
-                     let mut entries = Vec::new();
-                     let mut dir = tokio::fs::read_dir(target).await.map_err(|e| e.to_string())?;
-                     
-                     while let Ok(Some(entry)) = dir.next_entry().await {
-                         let meta = entry.metadata().await.map_err(|e| e.to_string())?;
-                         entries.push(json!({
-                             "name": entry.file_name().to_string_lossy(),
-                             "isDir": meta.is_dir(),
-                             "size": meta.len()
-                         }));
-                     }
-                     Ok(json!(entries))
+                    if !target.exists() {
+                        return Err("Path not found".into());
+                    }
+
+                    let mut entries = Vec::new();
+                    let mut dir = tokio::fs::read_dir(target)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    while let Ok(Some(entry)) = dir.next_entry().await {
+                        let meta = entry.metadata().await.map_err(|e| e.to_string())?;
+                        entries.push(json!({
+                            "name": entry.file_name().to_string_lossy(),
+                            "isDir": meta.is_dir(),
+                            "size": meta.len()
+                        }));
+                    }
+                    Ok(json!(entries))
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, result)
     });
 
     // $fs.exists(path) -> bool (Checks Root)
     let exists_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let fname = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, _, _, _, scope)) = &*c.borrow() {
                 let target = resolve_read_path(scope, &fname); // Check Root
                 match target {
                     Ok(p) => Ok(json!(p.exists())),
-                    Err(_) => Ok(json!(false))
+                    Err(_) => Ok(json!(false)),
                 }
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, result)
     });
 
     // $fs.mkdir(path) -> void (Creates in TMP)
     let mkdir_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let fname = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
                 let target = resolve_write_path(scope, &fname)?; // Mkdir in TMP
                 handle.block_on(async {
-                    tokio::fs::create_dir_all(target).await.map_err(|e| e.to_string())?;
+                    tokio::fs::create_dir_all(target)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok(json!(true))
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, result)
     });
 
     // $fs.stat(path) -> { size, created, modified, isDir } (Checks Root)
     let stat_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let fname = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let fname = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
                 let target = resolve_read_path(scope, &fname)?;
@@ -852,7 +1107,8 @@ fn register_fs(ctx: &mut Context) -> Result<(), String> {
         .function(mkdir_fn, JsString::from("mkdir"), 1)
         .function(stat_fn, JsString::from("stat"), 1)
         .build();
-    ctx.register_global_property(JsString::from("$fs"), obj, Attribute::all()).map_err(|e| e.to_string())
+    ctx.register_global_property(JsString::from("$fs"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 // Shared HTTP Request Logic
@@ -863,7 +1119,6 @@ fn execute_http_request(
     body_val: Option<serde_json::Value>,
     redirect_mode: Option<String>, // Argument
 ) -> Result<serde_json::Value, String> {
-    
     ACTIVE_CONTEXT.with(|c| {
         if let Some((_, handle, _, _, _)) = &*c.borrow() {
             handle.block_on(async {
@@ -872,7 +1127,7 @@ fn execute_http_request(
                 let policy = match redirect_mode.as_deref() {
                     Some("manual") => reqwest::redirect::Policy::none(), // Don't follow
                     Some("error") => reqwest::redirect::Policy::custom(|attempt| {
-                         attempt.error("Redirects not allowed") // Error on redirect
+                        attempt.error("Redirects not allowed") // Error on redirect
                     }),
                     _ => reqwest::redirect::Policy::default(), // Follow (limit 10)
                 };
@@ -882,8 +1137,8 @@ fn execute_http_request(
                     .build()
                     .map_err(|e| format!("Client Build Error: {}", e))?;
 
-                let req_method = reqwest::Method::from_bytes(method.as_bytes())
-                    .unwrap_or(reqwest::Method::GET);
+                let req_method =
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
 
                 let mut req_builder = client.request(req_method, &url);
 
@@ -912,12 +1167,12 @@ fn execute_http_request(
                         let status = res.status().as_u16();
                         let status_text = res.status().canonical_reason().unwrap_or("").to_string();
                         let final_url = res.url().to_string();
-                        
+
                         let mut res_headers = serde_json::Map::new();
                         for (name, value) in res.headers() {
                             res_headers.insert(
-                                name.as_str().to_string(), 
-                                json!(value.to_str().unwrap_or(""))
+                                name.as_str().to_string(),
+                                json!(value.to_str().unwrap_or("")),
                             );
                         }
 
@@ -925,15 +1180,15 @@ fn execute_http_request(
 
                         // Return standardized response object
                         Ok(json!({
-                            "ok": status >= 200 && status < 300,
+                            "ok": (200..300).contains(&status),
                             "status": status,
                             "statusText": status_text,
                             "url": final_url,
                             "headers": res_headers,
-                            "body": body_text 
+                            "body": body_text
                         }))
-                    },
-                    Err(e) => Err(format!("Network Error: {}", e))
+                    }
+                    Err(e) => Err(format!("Network Error: {}", e)),
                 }
             })
         } else {
@@ -944,18 +1199,28 @@ fn execute_http_request(
 
 fn register_fetch(ctx: &mut Context) -> Result<(), String> {
     let fetch_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let opts = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(json!({}));
+        let url = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let opts = args
+            .get_or_undefined(1)
+            .to_json(ctx)
+            .unwrap()
+            .unwrap_or(json!({}));
 
-        let method = opts.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
-        
-        let headers = opts.get("headers")
-            .and_then(|h| h.as_object())
-            .cloned();
+        let method = opts
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_string();
+
+        let headers = opts.get("headers").and_then(|h| h.as_object()).cloned();
 
         let body = opts.get("body").cloned();
-        
-        let redirect_mode = opts.get("redirect")
+
+        let redirect_mode = opts
+            .get("redirect")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
@@ -971,47 +1236,62 @@ fn register_fetch(ctx: &mut Context) -> Result<(), String> {
         .build();
 
     ctx.register_global_property(
-        JsString::from("$__native_fetch"), 
-        fetch_obj, 
-        Attribute::all()
-    ).map_err(|e| e.to_string())
+        JsString::from("$__native_fetch"),
+        fetch_obj,
+        Attribute::all(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn register_http(ctx: &mut Context) -> Result<(), String> {
     // $http.get(url)
     let get = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let url = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         // Pass None for redirect (default follow)
         let result = execute_http_request(url, "GET".to_string(), None, None, None);
 
         // Map result: Extract "body" string or return error
         let mapped_result = result.map(|json_val| {
             // Legacy $http.get returns the raw body string
-            json_val.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string()
+            json_val
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .to_string()
         });
 
         // Convert to JsString for Boa
         match mapped_result {
             Ok(s) => return_json_promise(ctx, Ok(serde_json::Value::String(s))),
-            Err(e) => return_json_promise(ctx, Err(e))
+            Err(e) => return_json_promise(ctx, Err(e)),
         }
     });
 
     // $http.post(url, body)
     let post = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let url = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let body_arg = args.get_or_undefined(1).to_json(ctx).unwrap();
 
         // CALL SHARED HELPER
         let result = execute_http_request(url, "POST".to_string(), None, body_arg, None);
 
         let mapped_result = result.map(|json_val| {
-            json_val.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string()
+            json_val
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .to_string()
         });
 
         match mapped_result {
             Ok(s) => return_json_promise(ctx, Ok(serde_json::Value::String(s))),
-            Err(e) => return_json_promise(ctx, Err(e))
+            Err(e) => return_json_promise(ctx, Err(e)),
         }
     });
 
@@ -1019,12 +1299,12 @@ fn register_http(ctx: &mut Context) -> Result<(), String> {
         .function(get, JsString::from("get"), 1)
         .function(post, JsString::from("post"), 2)
         .build();
-        
-    ctx.register_global_property(JsString::from("$http"), obj, Attribute::all()).map_err(|e| e.to_string())
+
+    ctx.register_global_property(JsString::from("$http"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 fn register_zip(ctx: &mut Context) -> Result<(), String> {
-    
     fn _resolve_storage_path(scope: &EventScope) -> String {
         match scope {
             EventScope::Root => "storage/system/uploads".to_string(),
@@ -1038,18 +1318,26 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
         std::env::var("ARCHIVE_LIMIT")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(10) * 1024 * 1024 
+            .unwrap_or(10)
+            * 1024
+            * 1024
     };
 
     // 1. CREATE
     let create_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let files_val = args.get_or_undefined(0).to_json(ctx).unwrap().unwrap_or(json!({}));
+        let files_val = args
+            .get_or_undefined(0)
+            .to_json(ctx)
+            .unwrap()
+            .unwrap_or(json!({}));
         let limit = get_limit();
 
         let result = (|| -> Result<String, String> {
-            let files = files_val.as_object().ok_or("Input must be an object {filename: content}")?;
+            let files = files_val
+                .as_object()
+                .ok_or("Input must be an object {filename: content}")?;
             let mut buffer = Cursor::new(Vec::new());
-            
+
             // Scope for ZipWriter to enforce borrow drop
             {
                 let mut zip = ZipWriter::new(&mut buffer);
@@ -1061,18 +1349,26 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
 
                 for (name, content_val) in files {
                     let content_str = content_val.as_str().unwrap_or("");
-                    let data = if content_str.len() % 4 == 0 && !content_str.contains(char::is_whitespace) {
-                         BASE64.decode(content_str).unwrap_or_else(|_| content_str.as_bytes().to_vec())
+                    let data = if content_str.len() % 4 == 0
+                        && !content_str.contains(char::is_whitespace)
+                    {
+                        BASE64
+                            .decode(content_str)
+                            .unwrap_or_else(|_| content_str.as_bytes().to_vec())
                     } else {
-                         content_str.as_bytes().to_vec()
+                        content_str.as_bytes().to_vec()
                     };
 
                     // Check uncompressed size accumulation to prevent DoS before compression
                     estimated_size += data.len();
-                    if estimated_size > limit * 2 { // Allow some slack for compression overhead? No, slack for uncompressed input vs output limit.
+                    if estimated_size > limit * 2 {
+                        // Allow some slack for compression overhead? No, slack for uncompressed input vs output limit.
                         // Actually, if we want to limit the OUTPUT zip size, we can't easily check it inside the loop efficiently without flushing.
                         // Limiting input size is a good proxy.
-                        return Err(format!("Input data size exceeds safety limit of {} bytes", limit));
+                        return Err(format!(
+                            "Input data size exceeds safety limit of {} bytes",
+                            limit
+                        ));
                     }
 
                     zip.start_file(name, options).map_err(|e| e.to_string())?;
@@ -1082,50 +1378,68 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
             } // ZipWriter dropped here, releasing borrow on buffer
 
             let zip_bytes = buffer.into_inner();
-            
+
             // Final check on actual archive size
             if zip_bytes.len() > limit {
-                return Err(format!("Final archive size {} exceeds limit {}", zip_bytes.len(), limit));
+                return Err(format!(
+                    "Final archive size {} exceeds limit {}",
+                    zip_bytes.len(),
+                    limit
+                ));
             }
-            
+
             Ok(BASE64.encode(zip_bytes))
         })();
 
-        return_json_promise(ctx, result.map(|s| serde_json::Value::String(s)))
+        return_json_promise(ctx, result.map(serde_json::Value::String))
     });
 
     // 2. EXTRACT
     let extract_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let b64_str = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let b64_str = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let limit = get_limit();
 
         let result = (|| -> Result<serde_json::Value, String> {
-            let bytes = BASE64.decode(&b64_str).map_err(|_| "Invalid Base64".to_string())?;
-            if bytes.len() > limit { return Err("Archive exceeds limit".into()); }
+            let bytes = BASE64
+                .decode(&b64_str)
+                .map_err(|_| "Invalid Base64".to_string())?;
+            if bytes.len() > limit {
+                return Err("Archive exceeds limit".into());
+            }
 
             let cursor = Cursor::new(bytes);
             let mut archive = ZipArchive::new(cursor).map_err(|e| format!("Invalid Zip: {}", e))?;
-            
+
             let mut output = serde_json::Map::new();
             let mut total_extracted = 0;
 
             for i in 0..archive.len() {
                 let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-                if file.is_dir() { continue; }
-                
+                if file.is_dir() {
+                    continue;
+                }
+
                 let name = file.name().to_string();
                 let mut content_buf = Vec::new();
-                
-                if file.size() > (limit as u64) { return Err(format!("File {} too large", name)); }
-                
-                file.read_to_end(&mut content_buf).map_err(|_| "Read fail".to_string())?;
+
+                if file.size() > (limit as u64) {
+                    return Err(format!("File {} too large", name));
+                }
+
+                file.read_to_end(&mut content_buf)
+                    .map_err(|_| "Read fail".to_string())?;
                 total_extracted += content_buf.len();
-                
-                if total_extracted > limit { return Err("Total extracted size exceeds limit".into()); }
+
+                if total_extracted > limit {
+                    return Err("Total extracted size exceeds limit".into());
+                }
 
                 let val = match String::from_utf8(content_buf.clone()) {
                     Ok(s) => json!(s),
-                    Err(_) => json!(BASE64.encode(&content_buf))
+                    Err(_) => json!(BASE64.encode(&content_buf)),
                 };
                 output.insert(name, val);
             }
@@ -1136,10 +1450,15 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
 
     // 3. INSPECT (Metadata)
     let inspect_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let b64_str = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        
+        let b64_str = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+
         let result = (|| -> Result<serde_json::Value, String> {
-            let bytes = BASE64.decode(&b64_str).map_err(|_| "Invalid Base64".to_string())?;
+            let bytes = BASE64
+                .decode(&b64_str)
+                .map_err(|_| "Invalid Base64".to_string())?;
             let cursor = Cursor::new(bytes.clone());
             let mut archive = ZipArchive::new(cursor).map_err(|e| format!("Invalid Zip: {}", e))?;
 
@@ -1149,7 +1468,7 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
 
             for i in 0..archive.len() {
                 let file = archive.by_index(i).map_err(|e| e.to_string())?;
-                
+
                 let size = file.size();
                 let comp_size = file.compressed_size();
                 total_uncompressed += size;
@@ -1157,8 +1476,15 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
 
                 // FIX: DateTime is a struct, not Option
                 let dt = file.last_modified();
-                let modified_str = format!("{}-{:02}-{:02} {:02}:{:02}:{:02}", 
-                    dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
+                let modified_str = format!(
+                    "{}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    dt.year(),
+                    dt.month(),
+                    dt.day(),
+                    dt.hour(),
+                    dt.minute(),
+                    dt.second()
+                );
 
                 files_meta.push(json!({
                     "name": file.name(),
@@ -1186,17 +1512,20 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
 
     // 4. READ FILE (Scope Aware -> Base64)
     let read_file_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        
+        let filename = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
                 handle.block_on(async {
                     // Use get_storage() from context (ScopedDynamicStorage)
                     let storage = app.get_storage();
-                    
+
                     match storage.get(&filename).await {
                         Ok(bytes) => Ok(json!(BASE64.encode(bytes))),
-                        Err(e) => Err(format!("Read failed: {}", e))
+                        Err(e) => Err(format!("Read failed: {}", e)),
                     }
                 })
             } else {
@@ -1208,41 +1537,59 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
 
     // 5. SAVE FILE (Base64 -> Scope Aware Storage)
     let save_file_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let filename = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let b64_data = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
-        let mime_type = args.get(2).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or("application/zip".to_string());
+        let filename = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let b64_data = args
+            .get_or_undefined(1)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let mime_type = args
+            .get(2)
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or("application/zip".to_string());
 
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
                 handle.block_on(async {
                     // 1. Resolve DB (Tenant/Sandbox aware)
                     let db = resolve_db(None, app.clone()).await?;
-                    
+
                     // 2. Resolve Storage (Tenant/Sandbox aware via ScopedDynamicStorage)
                     let storage = app.get_storage();
-                    
-                    let bytes = BASE64.decode(&b64_data).map_err(|_| "Invalid Base64".to_string())?;
+
+                    let bytes = BASE64
+                        .decode(&b64_data)
+                        .map_err(|_| "Invalid Base64".to_string())?;
                     let size = bytes.len() as i64;
-                    
+
                     // 3. Generate unique storage filename
                     let path = std::path::Path::new(&filename);
                     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
                     let storage_filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
-                    
+
                     // 4. Save to Storage (S3 or Local)
-                    storage.save(&storage_filename, &bytes, &mime_type).await.map_err(|e| e.to_string())?;
-                    
-                    // 5. Register in Metadata DB
-                    // Pass None for user_id as script context doesn't implicitly carry a user unless passed in args, 
-                    // or we could extract it from ACTIVE_CONTEXT if we stored auth claims there (we don't currently).
-                    let id = db.create_file_metadata(&storage_filename, &filename, &mime_type, size, None).await
+                    storage
+                        .save(&storage_filename, &bytes, &mime_type)
+                        .await
                         .map_err(|e| e.to_string())?;
-                        
-                    let public_url = format!("{}{}", storage.get_public_url_base(), storage_filename);
+
+                    // 5. Register in Metadata DB
+                    // Pass None for user_id as script context doesn't implicitly carry a user unless passed in args,
+                    // or we could extract it from ACTIVE_CONTEXT if we stored auth claims there (we don't currently).
+                    let id = db
+                        .create_file_metadata(&storage_filename, &filename, &mime_type, size, None)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    let public_url =
+                        format!("{}{}", storage.get_public_url_base(), storage_filename);
 
                     Ok(json!({
                         "id": id,
-                        "filename": storage_filename, 
+                        "filename": storage_filename,
                         "original_name": filename,
                         "url": public_url,
                         "size": size
@@ -1263,48 +1610,58 @@ fn register_zip(ctx: &mut Context) -> Result<(), String> {
         .function(save_file_fn, JsString::from("saveFile"), 2)
         .build();
 
-    ctx.register_global_property(JsString::from("$zip"), obj, Attribute::all()).map_err(|e| e.to_string())
+    ctx.register_global_property(JsString::from("$zip"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
-fn register_run(ctx: &mut Context) -> Result<(), String> { 
+fn register_run(ctx: &mut Context) -> Result<(), String> {
     let script_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let payload = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(json!({}));
+        let name = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let payload = args
+            .get_or_undefined(1)
+            .to_json(ctx)
+            .unwrap()
+            .unwrap_or(json!({}));
 
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _base_url, _, current_scope)) = &*c.borrow() {
                 handle.block_on(async {
-                    
                     // 1. Get the DB for the CURRENT scope (e.g. Tenant DB)
                     let local_db = resolve_db(None, app.clone()).await?;
-                    
+
                     // 2. Try to find the script in the LOCAL scope first.
                     let mut script_opt = local_db.get_script_by_name(&name).await.ok().flatten();
                     let mut exec_scope = current_scope.clone();
 
                     // 3. If NOT FOUND LOCALLY and we are NOT in Root, check Root for a public script.
                     if script_opt.is_none() && !matches!(current_scope, EventScope::Root) {
-                        if let Some(shared) = app.get_shared_script(&name).await {
-                             // Visibility Check: Only 'public' scripts can be shared.
-                             if shared.visibility == "public" {
-                                 script_opt = Some(shared);
-                                 // CRITICAL: Switch execution scope to Root for this call.
-                                 exec_scope = EventScope::Root;
-                             }
+                        // Visibility Check: Only 'public' scripts can be shared.
+                        if let Some(shared) = app.get_shared_script(&name).await
+                            && shared.visibility == "public"
+                        {
+                            script_opt = Some(shared);
+                            // CRITICAL: Switch execution scope to Root for this call.
+                            exec_scope = EventScope::Root;
                         }
                     }
 
                     if let Some(script) = script_opt {
-                        if !script.active { return Err("Script is inactive".into()); }
-                        
+                        if !script.active {
+                            return Err("Script is inactive".into());
+                        }
+
                         let mut call_payload = payload.clone();
                         if let Some(obj) = call_payload.as_object_mut() {
-                             obj.insert("__caller_scope".to_string(), json!(current_scope));
+                            obj.insert("__caller_scope".to_string(), json!(current_scope));
                         }
-                        
-                        let res = app.execute_shared_script(script.code, call_payload, exec_scope).await?;
+
+                        let res = app
+                            .execute_shared_script(script.code, call_payload, exec_scope)
+                            .await?;
                         Ok(res)
-                        
                     } else {
                         Err(format!("Script '{}' not found or not accessible.", name))
                     }
@@ -1321,25 +1678,34 @@ fn register_run(ctx: &mut Context) -> Result<(), String> {
         .function(script_fn, JsString::from("script"), 2)
         .build();
 
-    ctx.register_global_property(JsString::from("$run"), obj, Attribute::all()).map_err(|e| e.to_string())
+    ctx.register_global_property(JsString::from("$run"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 fn register_root(ctx: &mut Context) -> Result<(), String> {
-    let is_root = ACTIVE_CONTEXT.with(|c| c.borrow().as_ref().map(|t| t.4 == EventScope::Root).unwrap_or(false));
-    
+    let is_root = ACTIVE_CONTEXT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|t| t.4 == EventScope::Root)
+            .unwrap_or(false)
+    });
+
     if is_root {
         // Updated Signature: createTenant(id: string, config?: object)
         let create_tenant = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-            
+            let id = args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped();
+
             // Extract config object if present
             let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
-            
+
             let (name, tier, owner_id) = if let Some(serde_json::Value::Object(map)) = config_val {
                 (
                     map.get("name").and_then(|v| v.as_str()).map(String::from),
                     map.get("tier").and_then(|v| v.as_str()).map(String::from),
-                    map.get("owner_id").and_then(|v| v.as_i64()) // Expecting number
+                    map.get("owner_id").and_then(|v| v.as_i64()), // Expecting number
                 )
             } else {
                 (None, None, None)
@@ -1349,58 +1715,89 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         // [CRITICAL FIX]: Register Metadata FIRST so the manager can find it
-                        app.get_db().register_tenant(&id, owner_id, name, tier).await.map_err(|e| e.to_string())?;
-                        
+                        app.get_db()
+                            .register_tenant(&id, owner_id, name, tier)
+                            .await
+                            .map_err(|e| e.to_string())?;
+
                         // Create Physical Resources SECOND
-                        app.admin_create_tenant(id.clone()).await.map_err(|e| e.to_string())?;
-                        
+                        app.admin_create_tenant(id.clone())
+                            .await
+                            .map_err(|e| e.to_string())?;
+
                         Ok(true)
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
-            return_json_promise(ctx, res.map(|b| serde_json::Value::Bool(b)))
+            return_json_promise(ctx, res.map(serde_json::Value::Bool))
         });
 
         // createSandbox(id: string, config?: object)
         let create_sandbox = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+            let id = args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped();
             // Extract config object
             let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
-            let (name, owner_id, expires_at) = if let Some(serde_json::Value::Object(map)) = config_val {
-                (
-                    map.get("name").and_then(|v| v.as_str()).map(String::from),
-                    map.get("owner_id").and_then(|v| v.as_i64()),
-                    map.get("expires_at").and_then(|v| v.as_str()).map(String::from) // ISO String
-                )
-            } else {
-                (None, None, None)
-            };
+            let (name, owner_id, expires_at) =
+                if let Some(serde_json::Value::Object(map)) = config_val {
+                    (
+                        map.get("name").and_then(|v| v.as_str()).map(String::from),
+                        map.get("owner_id").and_then(|v| v.as_i64()),
+                        map.get("expires_at")
+                            .and_then(|v| v.as_str())
+                            .map(String::from), // ISO String
+                    )
+                } else {
+                    (None, None, None)
+                };
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         // 1. Create Physical Resources
-                        app.admin_create_sandbox(id.clone()).await.map_err(|e| e.to_string())?;
+                        app.admin_create_sandbox(id.clone())
+                            .await
+                            .map_err(|e| e.to_string())?;
 
                         // 2. Register Metadata
-                        app.get_db().register_sandbox(&id, owner_id, name, expires_at).await.map_err(|e| e.to_string())?;
-                        
+                        app.get_db()
+                            .register_sandbox(&id, owner_id, name, expires_at)
+                            .await
+                            .map_err(|e| e.to_string())?;
+
                         Ok(true)
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
-            return_json_promise(ctx, res.map(|b| serde_json::Value::Bool(b)))
+            return_json_promise(ctx, res.map(serde_json::Value::Bool))
         });
 
         // 1. createKey(name, config?)
         let create_key = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+            let name = args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped();
             let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
-            
+
             let (role, scope, bypass) = if let Some(serde_json::Value::Object(map)) = config_val {
                 (
-                    map.get("role").and_then(|v| v.as_str()).unwrap_or("admin").to_string(),
-                    map.get("scope").and_then(|v| v.as_str()).unwrap_or("root").to_string(),
-                    map.get("bypass_cors").and_then(|v| v.as_bool()).unwrap_or(false)
+                    map.get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("admin")
+                        .to_string(),
+                    map.get("scope")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("root")
+                        .to_string(),
+                    map.get("bypass_cors")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 )
             } else {
                 ("admin".to_string(), "root".to_string(), false)
@@ -1409,13 +1806,19 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        let (raw_key, info) = app.get_db().create_api_key(&name, &role, &scope, bypass).await.map_err(|e| e.to_string())?;
+                        let (raw_key, info) = app
+                            .get_db()
+                            .create_api_key(&name, &role, &scope, bypass)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         Ok(json!({
                             "key": raw_key,
                             "info": info
                         }))
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
             return_json_promise(ctx, res)
         });
@@ -1425,24 +1828,30 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
             let id = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as i64;
             let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
 
-            let (name, role, scope, bypass) = if let Some(serde_json::Value::Object(map)) = config_val {
-                (
-                    map.get("name").and_then(|v| v.as_str()).map(String::from),
-                    map.get("role").and_then(|v| v.as_str()).map(String::from),
-                    map.get("scope").and_then(|v| v.as_str()).map(String::from),
-                    map.get("bypass_cors").and_then(|v| v.as_bool())
-                )
-            } else {
-                (None, None, None, None)
-            };
+            let (name, role, scope, bypass) =
+                if let Some(serde_json::Value::Object(map)) = config_val {
+                    (
+                        map.get("name").and_then(|v| v.as_str()).map(String::from),
+                        map.get("role").and_then(|v| v.as_str()).map(String::from),
+                        map.get("scope").and_then(|v| v.as_str()).map(String::from),
+                        map.get("bypass_cors").and_then(|v| v.as_bool()),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
 
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        app.get_db().update_api_key(id, name, role, scope, bypass).await.map_err(|e| e.to_string())?;
+                        app.get_db()
+                            .update_api_key(id, name, role, scope, bypass)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         Ok(serde_json::Value::Bool(true))
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
             return_json_promise(ctx, res)
         });
@@ -1450,148 +1859,205 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
         // 3. deleteKey(id)
         let delete_key = NativeFunction::from_copy_closure(move |_, args, ctx| {
             let id = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as i64;
-            
+
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        app.get_db().delete_api_key(id).await.map_err(|e| e.to_string())?;
+                        app.get_db()
+                            .delete_api_key(id)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         Ok(serde_json::Value::Bool(true))
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
             return_json_promise(ctx, res)
         });
-        
+
         // 4. listKeys()
         let list_keys = NativeFunction::from_copy_closure(move |_, _, ctx| {
-             let res = ACTIVE_CONTEXT.with(|c| {
+            let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        let keys = app.get_db().list_api_keys().await.map_err(|e| e.to_string())?;
+                        let keys = app
+                            .get_db()
+                            .list_api_keys()
+                            .await
+                            .map_err(|e| e.to_string())?;
                         Ok(serde_json::to_value(keys).unwrap())
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
             return_json_promise(ctx, res)
         });
 
         // 5. updateTenant(id, updates)
         let update_tenant = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-            let updates = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(json!({}));
-            
+            let id = args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped();
+            let updates = args
+                .get_or_undefined(1)
+                .to_json(ctx)
+                .unwrap()
+                .unwrap_or(json!({}));
+
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        app.admin_update_tenant(id, updates).await.map_err(|e| e.to_string())
+                        app.admin_update_tenant(id, updates)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
             return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
         });
 
         // 6. deleteTenant(id)
         let delete_tenant = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+            let id = args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped();
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         app.admin_delete_tenant(id).await.map_err(|e| e.to_string())
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
             return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
         });
 
         // 7. updateSandbox(id, updates)
         let update_sandbox = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-            let updates = args.get_or_undefined(1).to_json(ctx).unwrap().unwrap_or(json!({}));
+            let id = args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped();
+            let updates = args
+                .get_or_undefined(1)
+                .to_json(ctx)
+                .unwrap()
+                .unwrap_or(json!({}));
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        app.admin_update_sandbox(id, updates).await.map_err(|e| e.to_string())
+                        app.admin_update_sandbox(id, updates)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
             return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
         });
 
         // 8. deleteSandbox(id)
         let delete_sandbox = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+            let id = args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped();
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        app.admin_delete_sandbox(id).await.map_err(|e| e.to_string())
+                        app.admin_delete_sandbox(id)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
-                } else { Err("Context lost".into()) }
+                } else {
+                    Err("Context lost".into())
+                }
             });
             return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
         });
 
         // 9. getTenantUsage(id) -> number (bytes)
         let get_tenant_usage = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-            
+            let id = args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped();
+
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        app.admin_get_tenant_usage(id).await
-                    })
-                } else { Err("Context lost".into()) }
+                    handle.block_on(async { app.admin_get_tenant_usage(id).await })
+                } else {
+                    Err("Context lost".into())
+                }
             });
-            
+
             // Return number (or null on error/empty)
             match res {
                 Ok(bytes) => Ok(JsValue::from(bytes as f64)), // JS uses f64 for numbers
-                Err(e) => Err(JsError::from_opaque(JsString::from(e).into()))
+                Err(e) => Err(JsError::from_opaque(JsString::from(e).into())),
             }
         });
 
         // 10. getSandboxUsage(id)
         let get_sandbox_usage = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-            
+            let id = args
+                .get_or_undefined(0)
+                .to_string(ctx)?
+                .to_std_string_escaped();
+
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        app.admin_get_sandbox_usage(id).await
-                    })
-                } else { Err("Context lost".into()) }
+                    handle.block_on(async { app.admin_get_sandbox_usage(id).await })
+                } else {
+                    Err("Context lost".into())
+                }
             });
-            
+
             match res {
                 Ok(bytes) => Ok(JsValue::from(bytes as f64)),
-                Err(e) => Err(JsError::from_opaque(JsString::from(e).into()))
+                Err(e) => Err(JsError::from_opaque(JsString::from(e).into())),
             }
         });
 
         // 11. listTenants() -> Array
         let list_tenants = NativeFunction::from_copy_closure(move |_, _, ctx| {
             let res = ACTIVE_CONTEXT.with(|c| {
-               if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                   handle.block_on(async {
-                       // list_tenants returns Vec<Tenant>
-                       let tenants = app.get_db().list_tenants().await.map_err(|e| e.to_string())?;
-                       Ok(serde_json::to_value(tenants).unwrap())
-                   })
-               } else { Err("Context lost".into()) }
-           });
-           return_json_promise(ctx, res)
-       });
+                if let Some((app, handle, _, _, _)) = &*c.borrow() {
+                    handle.block_on(async {
+                        // list_tenants returns Vec<Tenant>
+                        let tenants = app
+                            .get_db()
+                            .list_tenants()
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok(serde_json::to_value(tenants).unwrap())
+                    })
+                } else {
+                    Err("Context lost".into())
+                }
+            });
+            return_json_promise(ctx, res)
+        });
 
         // Create DB Object for $root.db
         let db_obj = crate::scripting_db::create_db_object(ctx, crate::scripting_db::DbMode::Root)?;
 
         let obj = ObjectInitializer::new(ctx)
-        // API Keys
+            // API Keys
             .function(create_key, JsString::from("createKey"), 2)
             .function(update_key, JsString::from("updateKey"), 2)
             .function(delete_key, JsString::from("deleteKey"), 1)
             .function(list_keys, JsString::from("listKeys"), 0)
             // Tenant Management
-            .function(create_tenant, JsString::from("createTenant"), 2) 
+            .function(create_tenant, JsString::from("createTenant"), 2)
             .function(update_tenant, JsString::from("updateTenant"), 2)
             .function(delete_tenant, JsString::from("deleteTenant"), 1)
             .function(get_tenant_usage, JsString::from("getTenantDiskUsage"), 1)
@@ -1603,9 +2069,11 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
             .function(get_sandbox_usage, JsString::from("getSandboxDiskUsage"), 1)
             .property(JsString::from("db"), db_obj, Attribute::all())
             .build();
-        ctx.register_global_property(JsString::from("$root"), obj, Attribute::all()).map_err(|e| e.to_string())
+        ctx.register_global_property(JsString::from("$root"), obj, Attribute::all())
+            .map_err(|e| e.to_string())
     } else {
-        ctx.register_global_property(JsString::from("$root"), JsValue::null(), Attribute::all()).map_err(|e| e.to_string())
+        ctx.register_global_property(JsString::from("$root"), JsValue::null(), Attribute::all())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1613,33 +2081,42 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
 fn register_cache(ctx: &mut Context) -> Result<(), String> {
     // 1. GET
     let get = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let key = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let res = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    app.cache_get(&key).await
-                })
-            } else { None }
+                handle.block_on(async { app.cache_get(&key).await })
+            } else {
+                None
+            }
         });
-        
+
         match res {
             Some(val) => Ok(JsValue::from(JsString::from(val))),
-            None => Ok(JsValue::null())
+            None => Ok(JsValue::null()),
         }
     });
 
     // 2. SET
     let set = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let key = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         // Accept string or JSON object (stringify it)
         let val = args.get_or_undefined(1);
         let val_str = if val.is_object() {
-             serde_json::to_string(&val.to_json(ctx).unwrap()).unwrap_or_default()
+            serde_json::to_string(&val.to_json(ctx).unwrap()).unwrap_or_default()
         } else {
-             val.to_string(ctx)?.to_std_string_escaped()
+            val.to_string(ctx)?.to_std_string_escaped()
         };
 
-        let ttl = args.get(2).and_then(|v| v.to_number(ctx).ok()).map(|n| n as u64);
+        let ttl = args
+            .get(2)
+            .and_then(|v| v.to_number(ctx).ok())
+            .map(|n| n as u64);
 
         ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
@@ -1653,10 +2130,15 @@ fn register_cache(ctx: &mut Context) -> Result<(), String> {
 
     // 3. DELETE
     let del = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let key = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async { app.cache_del(&key).await; })
+                handle.block_on(async {
+                    app.cache_del(&key).await;
+                })
             }
         });
         Ok(JsValue::undefined())
@@ -1664,15 +2146,21 @@ fn register_cache(ctx: &mut Context) -> Result<(), String> {
 
     // 4. INCREMENT (For Quotas)
     let incr = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let delta = args.get(1).and_then(|v| v.to_number(ctx).ok()).unwrap_or(1.0) as i64;
+        let key = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let delta = args
+            .get(1)
+            .and_then(|v| v.to_number(ctx).ok())
+            .unwrap_or(1.0) as i64;
 
         let res = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    app.cache_incr(&key, delta).await
-                })
-            } else { 0 }
+                handle.block_on(async { app.cache_incr(&key, delta).await })
+            } else {
+                0
+            }
         });
         Ok(JsValue::from(res))
     });
@@ -1681,12 +2169,12 @@ fn register_cache(ctx: &mut Context) -> Result<(), String> {
     let list_keys = NativeFunction::from_copy_closure(move |_, _, ctx| {
         let res = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    app.cache_list_keys().await
-                })
-            } else { vec![] }
+                handle.block_on(async { app.cache_list_keys().await })
+            } else {
+                vec![]
+            }
         });
-        
+
         let json_arr = serde_json::to_value(res).unwrap_or(serde_json::Value::Array(vec![]));
         return_json_promise(ctx, Ok(json_arr))
     });
@@ -1699,95 +2187,147 @@ fn register_cache(ctx: &mut Context) -> Result<(), String> {
         .function(list_keys, JsString::from("listKeys"), 0) // Register new function
         .build();
 
-    ctx.register_global_property(JsString::from("$cache"), obj, Attribute::all()).map_err(|e| e.to_string())
+    ctx.register_global_property(JsString::from("$cache"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 fn register_env(ctx: &mut Context) -> Result<(), String> {
     let get = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let key = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
                 handle.block_on(async {
                     if let Ok(Some(val)) = app.get_db().get_config(&key).await {
-                         if let Ok(enc) = serde_json::from_value::<crate::security::EncryptedValue>(val.clone()) {
-                             return app.get_vault().decrypt(&enc).map_err(|e| e.to_string());
-                         }
-                         return Ok(val.as_str().unwrap_or("").to_string());
+                        if let Ok(enc) =
+                            serde_json::from_value::<crate::security::EncryptedValue>(val.clone())
+                        {
+                            return app.get_vault().decrypt(&enc).map_err(|e| e.to_string());
+                        }
+                        return Ok(val.as_str().unwrap_or("").to_string());
                     }
                     Ok("".to_string())
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
-        return_json_promise(ctx, result.map(|s| serde_json::Value::String(s)))
+        return_json_promise(ctx, result.map(serde_json::Value::String))
     });
-    
-    let app_url = ACTIVE_CONTEXT.with(|c| c.borrow().as_ref().and_then(|t| t.2.clone())).unwrap_or_default();
-    
+
+    let app_url = ACTIVE_CONTEXT
+        .with(|c| c.borrow().as_ref().and_then(|t| t.2.clone()))
+        .unwrap_or_default();
+
     let obj = ObjectInitializer::new(ctx)
         .function(get, JsString::from("get"), 1)
-        .property(JsString::from("APP_URL"), JsString::from(app_url), Attribute::all())
+        .property(
+            JsString::from("APP_URL"),
+            JsString::from(app_url),
+            Attribute::all(),
+        )
         .build();
-    ctx.register_global_property(JsString::from("$env"), obj, Attribute::all()).map_err(|e| e.to_string())
+    ctx.register_global_property(JsString::from("$env"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 fn register_ai(ctx: &mut Context) -> Result<(), String> {
     let embed = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+        let text = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
         let res = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    app.get_vector_provider().embed(&text).await
-                })
-            } else { Err("Context lost".into()) }
+                handle.block_on(async { app.get_vector_provider().embed(&text).await })
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, res.map(|v| serde_json::to_value(v).unwrap()))
     });
     let obj = ObjectInitializer::new(ctx)
         .function(embed, JsString::from("embed"), 1)
         .build();
-    ctx.register_global_property(JsString::from("$ai"), obj, Attribute::all()).map_err(|e| e.to_string())
+    ctx.register_global_property(JsString::from("$ai"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 fn register_mail(ctx: &mut Context) -> Result<(), String> {
     let send = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let to = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let subj = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
-        let body = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
-        
+        let to = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let subj = args
+            .get_or_undefined(1)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let body = args
+            .get_or_undefined(2)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+
         let res = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
                 handle.block_on(async {
                     let db = crate::scripting_db::resolve_db(None, app.clone()).await?;
                     crate::jobs::send_email(db, app.get_vault(), &to, &subj, &body).await
                 })
-            } else { Err("Context lost".into()) }
+            } else {
+                Err("Context lost".into())
+            }
         });
         return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
     });
-    let obj = ObjectInitializer::new(ctx).function(send, JsString::from("send"), 3).build();
-    ctx.register_global_property(JsString::from("$mail"), obj, Attribute::all()).map_err(|e| e.to_string())
+    let obj = ObjectInitializer::new(ctx)
+        .function(send, JsString::from("send"), 3)
+        .build();
+    ctx.register_global_property(JsString::from("$mail"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }
 
 fn register_realtime(ctx: &mut Context) -> Result<(), String> {
     let send = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let channel = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-        let evt = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
-        let data = args.get_or_undefined(2).to_json(ctx).unwrap().unwrap_or(serde_json::Value::Null);
+        let channel = args
+            .get_or_undefined(0)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let evt = args
+            .get_or_undefined(1)
+            .to_string(ctx)?
+            .to_std_string_escaped();
+        let data = args
+            .get_or_undefined(2)
+            .to_json(ctx)
+            .unwrap()
+            .unwrap_or(serde_json::Value::Null);
 
         let res = ACTIVE_CONTEXT.with(|c| {
             if let Some((_, _, _, Some(tx), scope)) = &*c.borrow() {
-                 let scoped_chan = match scope {
-                     EventScope::Root => format!("root::{}", channel),
-                     EventScope::Tenant(id) => format!("tenant_{}::{}", id, channel),
-                     EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, channel),
-                     _ => channel.clone()
-                 };
-                 let _ = tx.send(DbEvent::Custom { event: evt, data, scope: EventScope::Channel(scoped_chan) });
-                 Ok(true)
-            } else { Err("Context lost".into()) }
+                let scoped_chan = match scope {
+                    EventScope::Root => format!("root::{}", channel),
+                    EventScope::Tenant(id) => format!("tenant_{}::{}", id, channel),
+                    EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, channel),
+                    _ => channel.clone(),
+                };
+                let _ = tx.send(DbEvent::Custom {
+                    event: evt,
+                    data,
+                    scope: EventScope::Channel(scoped_chan),
+                });
+                Ok(true)
+            } else {
+                Err("Context lost".into())
+            }
         });
-        return_json_promise(ctx, res.map(|b| serde_json::Value::Bool(b)))
+        return_json_promise(ctx, res.map(serde_json::Value::Bool))
     });
-    let obj = ObjectInitializer::new(ctx).function(send, JsString::from("send"), 3).build();
-    ctx.register_global_property(JsString::from("$realtime"), obj, Attribute::all()).map_err(|e| e.to_string())
+    let obj = ObjectInitializer::new(ctx)
+        .function(send, JsString::from("send"), 3)
+        .build();
+    ctx.register_global_property(JsString::from("$realtime"), obj, Attribute::all())
+        .map_err(|e| e.to_string())
 }

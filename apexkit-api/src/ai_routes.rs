@@ -1,24 +1,23 @@
-use axum::{
-    extract::{Path, State, Json},
-    http::{StatusCode},
-    Extension,
-};
-use serde::Deserialize;
-use serde_json::{json, Value};
-use apexkit_core::{
-    auth::Claims, 
-    ai_models::{AiAction, CreateActionReq},
-    security::EncryptedValue
-};
-use crate::{AppState, AppError, settings::AiConfigDto, DatabaseConnection}; // Added DatabaseConnection
-use regex::Regex;
-use axum::extract::ConnectInfo;
-use std::net::SocketAddr;
-use crate::{trigger_void_hook, extract_log_meta};
 use crate::BaseUrl;
+use crate::{AppError, AppState, DatabaseConnection, settings::AiConfigDto}; // Added DatabaseConnection
+use crate::{extract_log_meta, trigger_void_hook};
 use apexkit_core::realtime::EventScope;
+use apexkit_core::{
+    ai_models::{AiAction, CreateActionReq},
+    auth::Claims,
+    security::EncryptedValue,
+};
+use axum::extract::ConnectInfo;
+use axum::{
+    Extension,
+    extract::{Json, Path, State},
+    http::StatusCode,
+};
+use regex::Regex;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::net::SocketAddr;
 use utoipa::{IntoParams, ToSchema};
-
 
 #[derive(Deserialize, ToSchema)]
 pub struct ExecutePromptReq {
@@ -42,7 +41,7 @@ fn parse_data_uri(uri: &str) -> Option<(String, String)> {
         if parts.len() == 2 {
             let meta = parts[0]; // "data:image/png;base64"
             let data = parts[1];
-            
+
             let mime_parts: Vec<&str> = meta.split(';').collect();
             if let Some(mime_raw) = mime_parts.first() {
                 let mime = mime_raw.trim_start_matches("data:").to_string();
@@ -63,10 +62,15 @@ fn parse_data_uri(uri: &str) -> Option<(String, String)> {
 pub async fn list_actions(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
-    State(_state): State<AppState>
+    State(_state): State<AppState>,
 ) -> Result<Json<Vec<AiAction>>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    let actions = db.list_ai_actions().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+    let actions = db
+        .list_ai_actions()
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(actions))
 }
 
@@ -80,10 +84,15 @@ pub async fn create_action(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
     State(_state): State<AppState>,
-    Json(payload): Json<CreateActionReq>
+    Json(payload): Json<CreateActionReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    let id = db.create_ai_action(payload).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+    let id = db
+        .create_ai_action(payload)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -97,11 +106,15 @@ pub async fn delete_action(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
     State(_state): State<AppState>,
-    Path(path): Path<DelActionPath>
+    Path(path): Path<DelActionPath>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let id = path.id;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
-    db.delete_ai_action(id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+    db.delete_ai_action(id)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
     Ok(Json(json!({ "success": true })))
 }
 
@@ -116,7 +129,7 @@ pub async fn delete_action(
 )]
 pub async fn run_action(
     auth: Option<Extension<Claims>>,
-    DatabaseConnection(db): DatabaseConnection, 
+    DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>, // [NEW]
     headers: axum::http::HeaderMap,             // [NEW]
@@ -130,16 +143,29 @@ pub async fn run_action(
     let claims = auth.map(|Extension(c)| c);
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     // [TRIGGER] Before AI Run
-    trigger_void_hook(&state, "before_ai_run", json!({ "slug": slug, "vars": payload.variables }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await?;
-    
+    trigger_void_hook(
+        &state,
+        "before_ai_run",
+        json!({ "slug": slug, "vars": payload.variables }),
+        claims.as_ref(),
+        Some(&event_scope.clone()),
+        Some(base_url.clone()),
+    )
+    .await?;
+
     // 1. Get Action Config (From Tenant/Sandbox DB)
-    let action = db.get_ai_action(&slug).await
+    let action = db
+        .get_ai_action(&slug)
+        .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Action not found".into()))?;
 
     // 2. Get API Key from Settings (From Tenant/Sandbox DB)
-    let ai_settings_json = db.get_config("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
+    let ai_settings_json = db
+        .get_config("ai")
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
     let ai_config: AiConfigDto = if let Some(val) = ai_settings_json {
         serde_json::from_value(val).unwrap_or_default()
     } else {
@@ -150,13 +176,17 @@ pub async fn run_action(
         return Err(AppError::Forbidden("AI features disabled".into()));
     }
 
-    let api_key_str = ai_config.api_key.ok_or(AppError::UnknownError("API Key missing".into()))?;
-    
+    let api_key_str = ai_config
+        .api_key
+        .ok_or(AppError::UnknownError("API Key missing".into()))?;
+
     // Decrypt using Global Vault
     let encrypted_val: EncryptedValue = serde_json::from_str(&api_key_str)
         .map_err(|_| AppError::UnknownError("Invalid encrypted key format".into()))?;
-        
-    let api_key = state.vault.decrypt(&encrypted_val)
+
+    let api_key = state
+        .vault
+        .decrypt(&encrypted_val)
         .map_err(|_| AppError::UnknownError("Failed to decrypt API Key".into()))?;
 
     // 3. Construct Request Parts (Multimodal Support)
@@ -164,18 +194,22 @@ pub async fn run_action(
 
     // A. Handle Text Template
     let mut final_prompt = action.template.clone();
-    let re = Regex::new(r"\{\{(\w+)\}\}").unwrap(); 
-    
-    final_prompt = re.replace_all(&final_prompt, |caps: &regex::Captures| {
-        let key = &caps[1];
-        // Only replace text variables here
-        payload.variables.get(key)
-            .and_then(|v| v.as_str())
-            // Ignore data URIs in text replacement to avoid massive logs/errors
-            .filter(|s| !s.starts_with("data:")) 
-            .unwrap_or("") 
-            .to_string()
-    }).to_string();
+    let re = Regex::new(r"\{\{(\w+)\}\}").unwrap();
+
+    final_prompt = re
+        .replace_all(&final_prompt, |caps: &regex::Captures| {
+            let key = &caps[1];
+            // Only replace text variables here
+            payload
+                .variables
+                .get(key)
+                .and_then(|v| v.as_str())
+                // Ignore data URIs in text replacement to avoid massive logs/errors
+                .filter(|s| !s.starts_with("data:"))
+                .unwrap_or("")
+                .to_string()
+        })
+        .to_string();
 
     if !final_prompt.trim().is_empty() {
         content_parts.push(json!({ "text": final_prompt }));
@@ -185,15 +219,15 @@ pub async fn run_action(
     // Look for variables that contain Data URIs (base64 images)
     if let Some(obj) = payload.variables.as_object() {
         for (_key, value) in obj {
-            if let Some(str_val) = value.as_str() {
-                if let Some((mime, data)) = parse_data_uri(str_val) {
-                    content_parts.push(json!({
-                        "inline_data": {
-                            "mime_type": mime,
-                            "data": data
-                        }
-                    }));
-                }
+            if let Some(str_val) = value.as_str()
+                && let Some((mime, data)) = parse_data_uri(str_val)
+            {
+                content_parts.push(json!({
+                    "inline_data": {
+                        "mime_type": mime,
+                        "data": data
+                    }
+                }));
             }
         }
     }
@@ -211,21 +245,22 @@ pub async fn run_action(
         }],
         // You MUST include this to get groundingMetadata back
         "tools": [
-            { "google_search": {} } 
+            { "google_search": {} }
         ]
     });
 
     // Add System Instructions if present
-    if let Some(sys_prompt) = action.system_prompt {
-        if !sys_prompt.trim().is_empty() {
-            request_body["system_instruction"] = json!({
-                "parts": [{ "text": sys_prompt }]
-            });
-        }
+    if let Some(sys_prompt) = action.system_prompt
+        && !sys_prompt.trim().is_empty()
+    {
+        request_body["system_instruction"] = json!({
+            "parts": [{ "text": sys_prompt }]
+        });
     }
 
     // 5. Execute Request
-    let res = client.post(url)
+    let res = client
+        .post(url)
         .json(&request_body)
         .send()
         .await
@@ -233,14 +268,20 @@ pub async fn run_action(
 
     if !res.status().is_success() {
         let err_text = res.text().await.unwrap_or_default();
-        return Err(AppError::UnknownError(format!("Gemini API Error: {}", err_text)));
+        return Err(AppError::UnknownError(format!(
+            "Gemini API Error: {}",
+            err_text
+        )));
     }
 
-    let response_json: Value = res.json().await.map_err(|_| AppError::JsonError("Invalid response".into()))?;
-    
+    let response_json: Value = res
+        .json()
+        .await
+        .map_err(|_| AppError::JsonError("Invalid response".into()))?;
+
     // 6. Parse Response (Handle Text OR Image Output)
     let candidate = &response_json["candidates"][0]["content"]["parts"][0];
-    
+
     let result = if let Some(text) = candidate["text"].as_str() {
         // Text response
         text.to_string()
@@ -250,7 +291,9 @@ pub async fn run_action(
         let data = inline_data["data"].as_str().unwrap_or("");
         format!("data:{};base64,{}", mime, data)
     } else {
-        return Err(AppError::UnknownError("Unsupported Gemini response format".into()));
+        return Err(AppError::UnknownError(
+            "Unsupported Gemini response format".into(),
+        ));
     };
 
     // Extract Metadata (Grounding/Search results)
@@ -258,12 +301,22 @@ pub async fn run_action(
 
     // [LOG]
     let meta = extract_log_meta(&headers, Some(addr), json!({ "slug": slug }));
-    let _ = db.log_audit_event("info", "AI Action Run", "ai", Some(meta)).await;
+    let _ = db
+        .log_audit_event("info", "AI Action Run", "ai", Some(meta))
+        .await;
 
     // [TRIGGER] After AI Run
-    let _ = trigger_void_hook(&state, "after_ai_run", json!({ "slug": slug, "result": result, "metadata": metadata }), claims.as_ref(), Some(&event_scope.clone()), Some(base_url.clone())).await;
+    let _ = trigger_void_hook(
+        &state,
+        "after_ai_run",
+        json!({ "slug": slug, "result": result, "metadata": metadata }),
+        claims.as_ref(),
+        Some(&event_scope.clone()),
+        Some(base_url.clone()),
+    )
+    .await;
 
-    Ok(Json(json!({ 
+    Ok(Json(json!({
         "result": result,
         "metadata": metadata
     })))
@@ -273,8 +326,8 @@ pub async fn run_action(
 pub struct CodeEditReq {
     pub prompt: String,
     pub current_code: String,
-    pub context_type: String,  // "script" or "template"
-    pub model: String, //  Model Field
+    pub context_type: String, // "script" or "template"
+    pub model: String,        //  Model Field
 }
 
 #[utoipa::path(
@@ -289,21 +342,34 @@ pub async fn edit_code(
     State(state): State<AppState>,
     Json(req): Json<CodeEditReq>,
 ) -> Result<Json<Value>, AppError> {
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     // 1. Get Config (From Tenant/Sandbox DB)
-    let ai_settings = db.get_config("ai").await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let ai_settings = db
+        .get_config("ai")
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
     let (api_key, _model) = match ai_settings {
         Some(val) => {
             let conf: AiConfigDto = serde_json::from_value(val).unwrap_or_default();
-            if !conf.enabled { return Err(AppError::Forbidden("AI disabled".into())); }
-            let raw = conf.api_key.ok_or(AppError::UnknownError("AI Key missing".into()))?;
-            let enc: EncryptedValue = serde_json::from_str(&raw).map_err(|_| AppError::UnknownError("Bad key".into()))?;
-            let key = state.vault.decrypt(&enc).map_err(|_| AppError::UnknownError("Decrypt fail".into()))?;
+            if !conf.enabled {
+                return Err(AppError::Forbidden("AI disabled".into()));
+            }
+            let raw = conf
+                .api_key
+                .ok_or(AppError::UnknownError("AI Key missing".into()))?;
+            let enc: EncryptedValue =
+                serde_json::from_str(&raw).map_err(|_| AppError::UnknownError("Bad key".into()))?;
+            let key = state
+                .vault
+                .decrypt(&enc)
+                .map_err(|_| AppError::UnknownError("Decrypt fail".into()))?;
             let modl = conf.model.unwrap_or("gemini-2.5-flash".to_string());
             (key, modl)
-        },
-        None => return Err(AppError::UnknownError("AI not configured".into()))
+        }
+        None => return Err(AppError::UnknownError("AI not configured".into())),
     };
 
     // 2. Construct Prompt
@@ -321,19 +387,39 @@ pub async fn edit_code(
     // 3. Call LLM (Standard Text generation, not JSON mode)
     // Call LLM using req.model
     let client = reqwest::Client::new();
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}", req.model, api_key);
-    
-    let body = json!({ 
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        req.model, api_key
+    );
+
+    let body = json!({
         "contents": [{ "role": "user", "parts": [{ "text": full_prompt }] }]
     });
 
-    let res = client.post(url).json(&body).send().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let res_json: Value = res.json().await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    let mut code = res_json["candidates"][0]["content"]["parts"][0]["text"].as_str().unwrap_or("").to_string();
-    
+    let res = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    let res_json: Value = res
+        .json()
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    let mut code = res_json["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
     // Cleanup markdown if AI ignores instructions
-    code = code.trim().trim_start_matches("```javascript").trim_start_matches("```html").trim_start_matches("```").trim_end_matches("```").to_string();
+    code = code
+        .trim()
+        .trim_start_matches("```javascript")
+        .trim_start_matches("```html")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .to_string();
 
     Ok(Json(json!({ "code": code })))
 }
@@ -348,17 +434,29 @@ pub async fn delete_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?.0;
-    if claims.role != "admin" { return Err(AppError::Forbidden("Admins only".into())); }
+    let claims = auth
+        .ok_or(AppError::Unauthorized("Login required".into()))?
+        .0;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
 
     // 1. Delete Metadata Record
-    state.db.delete_ai_session(&id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
+    state
+        .db
+        .delete_ai_session(&id)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     // 2. Delete Physical Sandbox Files & Cache
     // Note: Also need to delete from _sandboxes metadata table in Root DB
-    state.db.delete_sandbox_metadata(&id).await.map_err(|e| AppError::UnknownError(e.to_string()))?;
-    
-    state.sandbox_manager.cleanup_sandbox(&id); 
+    state
+        .db
+        .delete_sandbox_metadata(&id)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    state.sandbox_manager.cleanup_sandbox(&id);
 
     Ok(StatusCode::NO_CONTENT)
 }
