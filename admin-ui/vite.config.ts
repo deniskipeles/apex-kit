@@ -19,7 +19,10 @@ export default defineConfig(({ mode }) => {
         // Ensure this matches the actual URL you access in the browser
         allowedHosts: [
           "5173-01jp06r43r3zeenk9nb1sbyeyg.cloudspaces.litng.ai",
-          "5173-01ke6hmdydtz0mhahe6ktw06fm.cloudspaces.litng.ai"
+          "5173-01ke6hmdydtz0mhahe6ktw06fm.cloudspaces.litng.ai",
+          "kipeles-vs--5173.hf.space",
+          "kipeles-vs--4173.hf.space",
+          "kipeles-vs.hf.space"
         ], 
         proxy: {
           '/api': {
