@@ -6,8 +6,6 @@ from botocore.client import Config
 from flask import Flask, jsonify
 from datetime import datetime
 
-# Universal S3 Config (Works for R2, AWS, DigitalOcean, etc.)
-# For Cloudflare R2, ENDPOINT_URL is: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
 S3_ENDPOINT_URL = os.getenv('S3_ENDPOINT_URL')
 S3_ACCESS_KEY = os.getenv('S3_ACCESS_KEY')
 S3_SECRET_KEY = os.getenv('S3_SECRET_KEY')
@@ -15,11 +13,11 @@ S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 S3_REGION = os.getenv('S3_REGION', 'auto')
 
 PREFIX = 'apexkit_backup_'
-MAX_BACKUPS_TO_KEEP = 5
+MAX_BACKUPS_TO_KEEP = int(os.getenv('MAX_BACKUPS', '5'))
 
 def get_s3_client():
     if not all([S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET_NAME]):
-        print("⚠️  S3/R2 credentials missing. Skipping cloud storage operations.")
+        print("⚠️  S3 credentials missing. Skipping cloud storage operations.")
         return None
     
     return boto3.client('s3',
@@ -40,10 +38,9 @@ def perform_backup():
     
     print(f"📦 Generating safe database backup via ApexKit CLI...")
     try:
-        # Use the Rust CLI to safely package the database and files
-        # --root="*" means backup everything in root (databases, uploads, vectors, indexes)
+        # Backup all files, across all tenants and root
         subprocess.run(
-            ["./apexkit", "backup", '--root=*', "--out", archive_name], 
+            ["./apexkit", "backup", '--root=*', '--tenants=*', "--out", archive_name], 
             check=True,
             text=True
         )
@@ -56,17 +53,19 @@ def perform_backup():
         s3.upload_file(archive_name, S3_BUCKET_NAME, archive_name)
         print(f"✅ Upload successful! Size: {os.path.getsize(archive_name) / (1024*1024):.2f} MB")
         
-        # Clean up local archive
         os.remove(archive_name)
 
-        # PRUNE OLD BACKUPS
+        # --- PRUNE OLD BACKUPS ---
+        print(f"🧹 Pruning old backups (Keeping {MAX_BACKUPS_TO_KEEP})...")
         response = s3.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=PREFIX)
         if 'Contents' in response:
             backups = sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True)
+            
+            # Slice the array, grabbing everything AFTER the max count
             if len(backups) > MAX_BACKUPS_TO_KEEP:
                 for old_backup in backups[MAX_BACKUPS_TO_KEEP:]:
                     old_key = old_backup['Key']
-                    print(f"🗑️  Deleting old backup to save space: {old_key}")
+                    print(f"  🗑️ Deleting {old_key}")
                     s3.delete_object(Bucket=S3_BUCKET_NAME, Key=old_key)
 
         return True, f"Backup successful: {archive_name}"
@@ -95,7 +94,6 @@ def perform_restore():
         s3.download_file(S3_BUCKET_NAME, latest_backup_key, temp_download_name)
         
         print(f"📦 Restoring databases via ApexKit CLI...")
-        # Use the Rust CLI to safely overwrite and backup existing data
         subprocess.run(
             ["./apexkit", "restore", temp_download_name, "--yes"], 
             check=True,
@@ -110,7 +108,6 @@ def perform_restore():
         print(f"⚠️  Restore failed. Error: {e}")
         return False
 
-# --- LOCAL API SERVER ---
 app = Flask(__name__)
 
 @app.route('/backup', methods=['POST', 'GET'])

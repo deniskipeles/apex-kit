@@ -1,7 +1,7 @@
 FROM alpine:3.19
 
 # 1. Install pure-bash dependencies (curl, openssl for HMAC signing, tar)
-RUN apk add --no-cache curl openssl tar bash jq ca-certificates
+RUN apk add --no-cache curl openssl tar bash jq ca-certificates minio-client
 
 # 2. Add non-root user for security (Koyeb/Render friendly)
 RUN adduser -D -u 1000 user

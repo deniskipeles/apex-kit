@@ -119,6 +119,32 @@ async fn main() {
     dotenv().ok();
     let cli = Cli::parse();
 
+    // [CRITICAL FIX] Intercept Backup & Restore CLI commands immediately.
+    // If we let the system boot up first, it will create empty SQLite databases and lock them,
+    // which breaks the restoration process and causes empty databases to be backed up!
+    if let Some(cmd) = &cli.command {
+        match cmd {
+            cli::Commands::Backup { root, tenants, out } => {
+                if let Err(e) =
+                    apexkit_api::cli::handle_backup(root.clone(), tenants.clone(), out.clone())
+                        .await
+                {
+                    eprintln!("❌ Backup failed: {}", e);
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            cli::Commands::Restore { file, yes } => {
+                if let Err(e) = apexkit_api::cli::handle_restore(file.clone(), *yes).await {
+                    eprintln!("❌ Restore failed: {}", e);
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            _ => {} // Other commands need AppState (Users, Config, etc.), proceed to boot normally
+        }
+    }
+
     apexkit_api::logging::rotate_logs_on_startup("logs.db", "logs");
     let log_rx = apexkit_api::logging::init_logging_system();
     tracing::info!("System starting up...");

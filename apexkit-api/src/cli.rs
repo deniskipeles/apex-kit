@@ -340,7 +340,7 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result
     Ok(())
 }
 
-async fn handle_backup(
+pub async fn handle_backup(
     root: Option<String>,
     tenants: Option<String>,
     out: Option<String>,
@@ -352,10 +352,30 @@ async fn handle_backup(
     fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all("storage/backups").ok();
 
-    let defaults = vec!["core.db", "data.db", "system.db", "public", "uploads"];
-    let optionals = vec!["vectors.db", "logs.db", "indexes"];
+    // [FIX] Included WAL and SHM files to ensure no data loss during live backups
+    let defaults = vec![
+        "core.db",
+        "core.db-wal",
+        "core.db-shm",
+        "data.db",
+        "data.db-wal",
+        "data.db-shm",
+        "system.db",
+        "system.db-wal",
+        "system.db-shm",
+        "public",
+        "uploads",
+    ];
+    let optionals = vec![
+        "vectors.db",
+        "vectors.db-wal",
+        "vectors.db-shm",
+        "logs.db",
+        "logs.db-wal",
+        "logs.db-shm",
+        "indexes",
+    ];
 
-    // Parser for the inclusion logic: Default vs * vs specific files
     let parse_items = |config: &str| -> Vec<String> {
         let mut items = defaults.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         if config == "*" {
@@ -363,8 +383,15 @@ async fn handle_backup(
         } else if config != "default" && !config.is_empty() {
             for item in config.split(',') {
                 let i = item.trim();
-                if optionals.contains(&i) {
-                    items.push(i.to_string());
+                // Match base name for optionals (e.g. "vectors.db" includes wal and shm)
+                if optionals.iter().any(|opt| opt.starts_with(i)) {
+                    // Push all related files
+                    items.extend(
+                        optionals
+                            .iter()
+                            .filter(|opt| opt.starts_with(i))
+                            .map(|s| s.to_string()),
+                    );
                 }
             }
         }
@@ -395,20 +422,39 @@ async fn handle_backup(
 
     // 2. Process Tenant Backups
     if let Some(t_str) = tenants {
-        // Matches: name OR name(args)
-        let re = regex::Regex::new(r"([\w-]+)(?:\(([^)]+)\))?").unwrap();
+        if t_str == "*" {
+            // Wildcard: Backup ALL tenants
+            println!("⏳ Backing up ALL tenants...");
+            if let Ok(entries) = fs::read_dir("storage/tenants") {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        let t_id = entry.file_name().to_string_lossy().to_string();
+                        println!("  - Backing up tenant: {}", t_id);
+                        let items = parse_items("*"); // Full backup for wildcard
+                        copy_items(
+                            &format!("storage/tenants/{}", t_id),
+                            &format!("{}/tenants/{}", tmp_dir, t_id),
+                            &items,
+                        );
+                    }
+                }
+            }
+        } else {
+            // Specific tenants: name OR name(args)
+            let re = regex::Regex::new(r"([\w-]+)(?:\(([^)]+)\))?").unwrap();
 
-        for caps in re.captures_iter(&t_str) {
-            let t_id = &caps[1];
-            let t_conf = caps.get(2).map(|m| m.as_str()).unwrap_or("default");
+            for caps in re.captures_iter(&t_str) {
+                let t_id = &caps[1];
+                let t_conf = caps.get(2).map(|m| m.as_str()).unwrap_or("default");
 
-            println!("⏳ Backing up tenant: {}...", t_id);
-            let items = parse_items(t_conf);
-            copy_items(
-                &format!("storage/tenants/{}", t_id),
-                &format!("{}/tenants/{}", tmp_dir, t_id),
-                &items,
-            );
+                println!("⏳ Backing up tenant: {}...", t_id);
+                let items = parse_items(t_conf);
+                copy_items(
+                    &format!("storage/tenants/{}", t_id),
+                    &format!("{}/tenants/{}", tmp_dir, t_id),
+                    &items,
+                );
+            }
         }
     }
 
@@ -437,7 +483,7 @@ async fn handle_backup(
     Ok(())
 }
 
-async fn handle_restore(file: String, force_yes: bool) -> Result<(), String> {
+pub async fn handle_restore(file: String, force_yes: bool) -> Result<(), String> {
     let path = Path::new(&file);
     if !path.exists() {
         return Err(format!("File not found: {}", file));
@@ -504,7 +550,7 @@ async fn handle_restore(file: String, force_yes: bool) -> Result<(), String> {
     }
 
     // Interactive Prompt
-    let prompt = || -> bool {
+    let mut prompt = || -> bool {
         if force_yes {
             return true;
         }
@@ -524,11 +570,14 @@ async fn handle_restore(file: String, force_yes: bool) -> Result<(), String> {
     }
 
     println!("\n🚀 Restoring data...");
+    let mut bak_dirs = Vec::new();
+
     for (src, dest, label) in to_restore {
         if dest.exists() {
             let bak = format!("{}_bak_{}", dest.display(), ts);
             println!("  [Backing up] {} -> {}", label, bak);
             fs::rename(&dest, &bak).map_err(|e| e.to_string())?;
+            bak_dirs.push(bak);
         } else {
             if let Some(p) = dest.parent() {
                 fs::create_dir_all(p).ok();
@@ -539,7 +588,15 @@ async fn handle_restore(file: String, force_yes: bool) -> Result<(), String> {
         println!("  ✅ Restored {}", label);
     }
 
+    // Clean up temporary extraction directory
     let _ = fs::remove_dir_all(&tmp_dir);
+
+    // [FIX] Clean up .bak files to avoid eating up server disk space over multiple deploys
+    println!("🧹 Cleaning up temporary backup files...");
+    for bak in bak_dirs {
+        let _ = fs::remove_dir_all(bak);
+    }
+
     println!(
         "\n🎉 Restoration complete! Please restart the ApexKit server to reload databases into memory."
     );

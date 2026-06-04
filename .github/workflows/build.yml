@@ -158,6 +158,7 @@ jobs:
           cp private-repo/Dockerfile public-repo/ 2>/dev/null || :
           cp private-repo/README.md public-repo/ 2>/dev/null || :
           cp -r private-repo/docs public-repo/ 2>/dev/null || :
+          cp -r private-repo/hosting public-repo/ 2>/dev/null || :
           
           # 2. NEW: Copy the logo file
           # Ensure the directory exists in the public repo first
