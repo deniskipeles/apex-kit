@@ -38,11 +38,21 @@ pub mod pb {
 use pb::replication_server::Replication;
 
 pub static DB_SYNC_TX: OnceLock<broadcast::Sender<pb::DbChangeEvent>> = OnceLock::new();
-pub static EVENT_SUB_TX: OnceLock<mpsc::Sender<pb::EventSubscription>> = OnceLock::new();
+// [FIX] Upgraded to broadcast sender so WS and gRPC can both listen dynamically
+pub static EVENT_SUB_TX: OnceLock<broadcast::Sender<pb::EventSubscription>> = OnceLock::new();
 pub static MASTER_CHANGESET_TX: OnceLock<broadcast::Sender<ChangesetEvent>> = OnceLock::new();
 
 pub fn get_db_sync_tx() -> broadcast::Sender<pb::DbChangeEvent> {
     DB_SYNC_TX
+        .get_or_init(|| {
+            let (tx, _) = broadcast::channel(100);
+            tx
+        })
+        .clone()
+}
+
+pub fn get_event_sub_tx() -> broadcast::Sender<pb::EventSubscription> {
+    EVENT_SUB_TX
         .get_or_init(|| {
             let (tx, _) = broadcast::channel(100);
             tx
@@ -1210,20 +1220,12 @@ async fn do_sync_env(base_path: &str, force: bool) {
 }
 
 pub fn add_replica_subscription(scope: &str) {
-    if let Some(tx) = EVENT_SUB_TX.get() {
-        let tx = tx.clone();
-        let s = scope.to_string();
-        if let Some(replica_id) = REPLICA_ID.get() {
-            let r_id = replica_id.clone();
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(pb::EventSubscription {
-                        replica_id: r_id,
-                        add_scopes: vec![s],
-                    })
-                    .await;
-            });
-        }
+    let s = scope.to_string();
+    if let Some(replica_id) = REPLICA_ID.get() {
+        let _ = get_event_sub_tx().send(pb::EventSubscription {
+            replica_id: replica_id.clone(),
+            add_scopes: vec![s],
+        });
     }
 }
 
@@ -1283,18 +1285,29 @@ pub async fn start_event_streamer(master_url: String, state: Option<crate::AppSt
     .max_decoding_message_size(100 * 1024 * 1024)
     .max_encoding_message_size(100 * 1024 * 1024);
 
-    let (sub_tx, sub_rx) = tokio::sync::mpsc::channel(32);
-    let _ = EVENT_SUB_TX.set(sub_tx.clone());
+    // Bridge the global broadcast channel to the MPSC stream required by Tonic
+    let mut global_sub_rx = get_event_sub_tx().subscribe();
+    let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel(32);
 
+    // Send initial scopes immediately
     let initial_scopes = get_local_scopes();
-    let _ = sub_tx
+    let _ = mpsc_tx
         .send(pb::EventSubscription {
             replica_id: replica_id.clone(),
             add_scopes: initial_scopes,
         })
         .await;
 
-    let request_stream = tokio_stream::wrappers::ReceiverStream::new(sub_rx);
+    // Listen for dynamic tenant creations
+    tokio::spawn(async move {
+        while let Ok(msg) = global_sub_rx.recv().await {
+            if mpsc_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let request_stream = tokio_stream::wrappers::ReceiverStream::new(mpsc_rx);
 
     match client
         .stream_events(tonic::Request::new(request_stream))
@@ -1302,30 +1315,21 @@ pub async fn start_event_streamer(master_url: String, state: Option<crate::AppSt
     {
         Ok(response) => {
             let mut stream = response.into_inner();
-
             loop {
                 tokio::select! {
                     msg = stream.message() => {
                         match msg {
                             Ok(Some(event)) => {
                                 if event.db_name == "FULL_SYNC_REQUIRED" {
-                                    tracing::warn!(
-                                        "Master requested FULL_SYNC due to prolonged disconnection (> 5m)."
-                                    );
+                                    tracing::warn!("Master requested FULL_SYNC due to prolonged disconnection (> 5m).");
                                     force_replica_sync("storage/system").await;
-                                    if let Some(s) = &state {
-                                        let _ = s.db.reload_connections().await;
-                                    }
+                                    if let Some(s) = &state { let _ = s.db.reload_connections().await; }
                                     continue;
                                 }
 
-                                if event.db_name == "logs" { continue; } // Block incoming logs over stream
+                                if event.db_name == "logs" { continue; }
 
-                                tracing::info!(
-                                    "📥 [Replica] Received DB changes for {}/{}",
-                                    event.scope,
-                                    event.db_name
-                                );
+                                tracing::info!("📥 [Replica] Received DB changes for {}/{}", event.scope, event.db_name);
                                 let _ = get_db_sync_tx().send(event);
                             }
                             Ok(None) => break,
@@ -1352,7 +1356,6 @@ pub async fn start_event_streamer(master_url: String, state: Option<crate::AppSt
         }
     }
 
-    // If we break out of the Ok() loop OR hit Err(), we switch to WS.
     USE_HTTP_FALLBACK.store(true, Ordering::SeqCst);
     start_ws_event_streamer(master_url, state, replica_id).await;
 }
@@ -1386,6 +1389,7 @@ pub async fn start_ws_event_streamer(
                 Ok((mut ws_stream, _)) => {
                     tracing::info!("✅ [WS Streamer] Connected successfully");
 
+                    // Initial subscription
                     let sub_msg = WsReplMsg::Subscribe {
                         replica_id: replica_id.clone(),
                         add_scopes: get_local_scopes(),
@@ -1397,19 +1401,30 @@ pub async fn start_ws_event_streamer(
                         .await;
 
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(25));
+                    let mut global_sub_rx = get_event_sub_tx().subscribe();
 
                     loop {
                         tokio::select! {
                             _ = ping_interval.tick() => {
                                 if ws_stream.send(tokio_tungstenite::tungstenite::protocol::Message::Text(serde_json::to_string(&WsReplMsg::Ping).unwrap().into())).await.is_err() { break; }
                             }
+
+                            // [FIX] Listen for dynamic tenant subscriptions and forward them over WS
+                            Ok(new_sub) = global_sub_rx.recv() => {
+                                let dyn_msg = WsReplMsg::Subscribe {
+                                    replica_id: new_sub.replica_id,
+                                    add_scopes: new_sub.add_scopes,
+                                };
+                                let _ = ws_stream.send(tokio_tungstenite::tungstenite::protocol::Message::Text(serde_json::to_string(&dyn_msg).unwrap().into())).await;
+                            }
+
                             msg = ws_stream.next() => {
                                 match msg {
                                     Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Text(t))) => {
                                         if let Ok(ws_msg) = serde_json::from_str::<WsReplMsg>(&t) {
                                             match ws_msg {
                                                 WsReplMsg::DbEvent { scope, db_name, changeset } => {
-                                                    if db_name == "logs" { continue; } // Block incoming logs over stream
+                                                    if db_name == "logs" { continue; }
 
                                                     use base64::{Engine as _, engine::general_purpose::STANDARD};
                                                     if let Ok(bytes) = STANDARD.decode(&changeset) {
