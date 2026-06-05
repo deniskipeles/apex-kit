@@ -837,7 +837,17 @@ export class ApexKit {
 
   get logs() {
     return {
-      list: () => this._request<SystemLog[]>('/admin/logs'),
+      list: (page = 1, perPage = 50, level = '', source = '', search = '') =>
+        this._request<any>('/admin/logs', {
+          method: 'GET',
+          params: {
+            page,
+            per_page: perPage,
+            level: level || undefined,
+            source: source || undefined,
+            search: search || undefined,
+          },
+        }),
     };
   }
 

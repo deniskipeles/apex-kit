@@ -685,6 +685,17 @@ impl Db for CachedDb {
         self.inner.log_system_event(level, target, message).await
     }
 
+    async fn list_paginated_logs(
+        &self,
+        page: i64,
+        per_page: i64,
+        level: Option<String>,
+        source: Option<String>,
+        search: Option<String>,
+    ) -> std::result::Result<(Vec<serde_json::Value>, i64), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_paginated_logs(page, per_page, level, source, search).await
+    }
+
     // --- AI Actions ---
 
     async fn list_ai_actions(

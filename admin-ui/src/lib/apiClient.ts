@@ -873,18 +873,27 @@ export const apiClient = {
   },
 
   logs: {
-    list: async (): Promise<SystemLog[]> => {
+    list: async (
+      page = 1,
+      perPage = 50,
+      level = '',
+      source = '',
+      search = ''
+    ): Promise<{ items: SystemLog[]; total: number }> => {
       try {
-        const res = await pb.logs.list();
-        return res.map((l: any) => ({
-          id: l.id.toString(),
-          level: l.level,
-          message: l.message,
-          source: l.source,
-          timestamp: l.timestamp,
-        }));
+        const res = await pb.logs.list(page, perPage, level, source, search);
+        return {
+          items: res.items.map((l: any) => ({
+            id: l.id.toString(),
+            level: l.level,
+            message: l.message,
+            source: l.source,
+            timestamp: l.timestamp,
+          })),
+          total: res.total,
+        };
       } catch {
-        return [];
+        return { items: [], total: 0 };
       }
     },
   },

@@ -1781,26 +1781,74 @@ pub async fn reload_system(
     }
 }
 
+// #[utoipa::path(
+//     get,
+//     path = "/api/v1/admin/logs",
+//     responses((status = 200, body = Vec<serde_json::Value>))
+// )]
+// pub async fn list_audit_logs(
+//     auth: Option<Extension<Claims>>,
+//     DatabaseConnection(db): DatabaseConnection,
+// ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+//     let claims = auth
+//         .ok_or(AppError::Unauthorized("Login required".into()))?
+//         .0;
+//     if claims.role != "admin" {
+//         return Err(AppError::Forbidden("Admins only".into()));
+//     }
+//     let logs = db
+//         .list_audit_logs()
+//         .await
+//         .map_err(|e| AppError::UnknownError(e.to_string()))?;
+//     Ok(Json(logs))
+// }
+
+#[derive(Deserialize, ToSchema, IntoParams)]
+pub struct LogsQuery {
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
+    pub level: Option<String>,
+    pub source: Option<String>,
+    pub search: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LogsResponse {
+    pub items: Vec<serde_json::Value>,
+    pub total: i64,
+    pub page: i64,
+    pub per_page: i64,
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/admin/logs",
-    responses((status = 200, body = Vec<serde_json::Value>))
+    params(LogsQuery),
+    responses((status = 200, body = LogsResponse))
 )]
 pub async fn list_audit_logs(
-    auth: Option<Extension<Claims>>,
+    Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    let claims = auth
-        .ok_or(AppError::Unauthorized("Login required".into()))?
-        .0;
+    Query(q): Query<LogsQuery>,
+) -> Result<Json<LogsResponse>, AppError> {
     if claims.role != "admin" {
         return Err(AppError::Forbidden("Admins only".into()));
     }
-    let logs = db
-        .list_audit_logs()
+
+    let page = q.page.unwrap_or(1).max(1);
+    let per_page = q.per_page.unwrap_or(50).clamp(10, 200);
+
+    let (items, total) = db
+        .list_paginated_logs(page, per_page, q.level, q.source, q.search)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(logs))
+
+    Ok(Json(LogsResponse {
+        items,
+        total,
+        page,
+        per_page,
+    }))
 }
 
 #[utoipa::path(

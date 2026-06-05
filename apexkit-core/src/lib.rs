@@ -507,6 +507,16 @@ pub trait Db: Send + Sync {
         message: &str,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+    // [NEW] Paginated & Filterable System Logs
+    async fn list_paginated_logs(
+        &self,
+        page: i64,
+        per_page: i64,
+        level: Option<String>,
+        source: Option<String>,
+        search: Option<String>,
+    ) -> std::result::Result<(Vec<serde_json::Value>, i64), Box<dyn std::error::Error + Send + Sync>>;
+
     // --- API keys ---
     async fn create_api_key(
         &self,
@@ -3303,6 +3313,68 @@ impl Db for ApexKit {
                 Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
             })?;
         Ok(())
+    }
+
+    async fn list_paginated_logs(
+        &self,
+        page: i64,
+        per_page: i64,
+        level: Option<String>,
+        source: Option<String>,
+        search: Option<String>,
+    ) -> std::result::Result<(Vec<serde_json::Value>, i64), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.get_log_read().await;
+        
+        let mut where_clauses = Vec::new();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(lvl) = level {
+            where_clauses.push("level = ?");
+            params.push(lvl.into_val());
+        }
+        if let Some(src) = source {
+            where_clauses.push("target LIKE ?");
+            params.push(format!("%{}%", src).into_val());
+        }
+        if let Some(q) = search {
+            where_clauses.push("(message LIKE ? OR target LIKE ?)");
+            params.push(format!("%{}%", q).into_val());
+            params.push(format!("%{}%", q).into_val());
+        }
+
+        let where_sql = if where_clauses.is_empty() {
+            "".to_string()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        // Get total count matching criteria
+        let count_sql = format!("SELECT COUNT(*) FROM _system_logs {}", where_sql);
+        let mut count_stmt = conn.prepare(&count_sql)?;
+        let total: i64 = count_stmt.query_row(rusqlite::params_from_iter(params.clone()), |row| row.get(0))?;
+
+        // Fetch paginated results
+        let limit = per_page;
+        let offset = (page - 1) * per_page;
+        let select_sql = format!(
+            "SELECT id, level, target, message, timestamp FROM _system_logs {} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
+            where_sql, limit, offset
+        );
+        let mut stmt = conn.prepare(&select_sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        
+        let mut logs = Vec::new();
+        while let Some(row) = rows.next()? {
+            logs.push(serde_json::json!({
+                "id": row.get::<usize, i64>(0)?.to_string(),
+                "level": row.get::<usize, String>(1)?,
+                "source": row.get::<usize, String>(2)?,
+                "message": row.get::<usize, String>(3)?,
+                "timestamp": row.get::<usize, String>(4)?
+            }));
+        }
+
+        Ok((logs, total))
     }
 
     // --- System DB ---
