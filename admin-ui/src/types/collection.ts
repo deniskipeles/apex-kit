@@ -1,6 +1,18 @@
-export type FieldType = 
-  | 'text' | 'string' | 'number' | 'bool' | 'email' | 'url' | 'date' 
-  | 'select' | 'json' | 'file' | 'blob' | 'relation' | 'vector' | 'owner';
+export type FieldType =
+  | 'text'
+  | 'string'
+  | 'number'
+  | 'bool'
+  | 'email'
+  | 'url'
+  | 'date'
+  | 'select'
+  | 'json'
+  | 'file'
+  | 'blob'
+  | 'relation'
+  | 'vector'
+  | 'owner';
 
 export interface SchemaField {
   name: string;
@@ -16,26 +28,26 @@ export interface SchemaField {
   position: number;
   vectorize?: boolean;
   // --- Dynamic Validation ---
-  
+
   // Number
   min?: number | null;
   max?: number | null;
-  
+
   // String / Text / Blob
   minLength?: number | null; // Maps to min_length
   maxLength?: number | null; // Maps to max_length
   pattern?: string;
-  
+
   // Select
   options?: string[];
-  
+
   // File / Blob
   mimeTypes?: string[]; // Maps to mime_types
   maxSize?: number | null; // Maps to max_size (bytes)
-  
+
   // Vector
   dimension?: number | null;
-  
+
   // Relation / Owner
   relationTo?: string; // Target Collection ID/Name
 
@@ -60,5 +72,4 @@ export interface Collection {
   created: string;
   updated: string;
   compositeUnique: string[];
-
 }

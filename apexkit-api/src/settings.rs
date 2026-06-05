@@ -61,11 +61,28 @@ pub struct S3ConfigDto {
     pub secret_key: Option<String>, // Masked on GET
 }
 
-#[derive(Serialize, Deserialize, ToSchema, Clone, Default)]
+#[derive(Serialize, Deserialize, ToSchema, Clone)]
 pub struct SecurityConfigDto {
     pub cors_allow_all: bool,
     pub cors_origins: String,
     pub tenant_transparency: bool,
+    // [NEW] Rate Limits
+    pub global_rate_limit: Option<u64>,
+    pub tenant_free_rate_limit: Option<u64>,
+    pub tenant_pro_rate_limit: Option<u64>,
+}
+
+impl Default for SecurityConfigDto {
+    fn default() -> Self {
+        Self {
+            cors_allow_all: true,
+            cors_origins: "".into(),
+            tenant_transparency: false,
+            global_rate_limit: Some(600),
+            tenant_free_rate_limit: Some(120),
+            tenant_pro_rate_limit: Some(3000),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Default)]
@@ -271,6 +288,9 @@ pub async fn get_settings(
             cors_allow_all: true,
             cors_origins: "".into(),
             tenant_transparency: false,
+            global_rate_limit: Some(600),
+            tenant_free_rate_limit: Some(120),
+            tenant_pro_rate_limit: Some(3000),
         });
     }
 
@@ -446,7 +466,7 @@ pub async fn update_settings(
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
     }
 
-    // 4. Update Security (CORS)
+    // 4. Update Security (CORS & Rate Limits)
     if let Some(new_sec) = &payload.security {
         db.set_config("security", &serde_json::to_value(new_sec).unwrap(), false)
             .await

@@ -1,4 +1,3 @@
-
 import { create } from 'zustand';
 
 interface Toast {
@@ -11,7 +10,7 @@ interface UiState {
   isSidebarOpen: boolean;
   toggleSidebar: () => void;
   closeSidebar: () => void;
-  
+
   toasts: Toast[];
   addToast: (message: string, type?: Toast['type']) => void;
   removeToast: (id: string) => void;

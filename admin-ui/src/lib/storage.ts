@@ -1,4 +1,3 @@
-
 export const storage = {
   get: <T>(key: string, defaultValue: T | null = null): T | null => {
     try {
@@ -32,5 +31,5 @@ export const storage = {
     } catch (e) {
       console.error('Error clearing localStorage', e);
     }
-  }
+  },
 };

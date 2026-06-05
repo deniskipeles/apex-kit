@@ -17,28 +17,34 @@ export const ImportExportToolbar = ({ onExport, onImport }: Props) => {
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    
+
     try {
-        const res = await onImport(file);
-        toast(`Imported: ${res.created} created, ${res.updated} updated`, 'success');
-        if (res.errors?.length) toast('Some items failed to import', 'warning');
-        setTimeout(() => window.location.reload(), 1000); // Simple refresh
-    } catch(err: any) {
-        toast(err.message, 'error');
+      const res = await onImport(file);
+      toast(`Imported: ${res.created} created, ${res.updated} updated`, 'success');
+      if (res.errors?.length) toast('Some items failed to import', 'warning');
+      setTimeout(() => window.location.reload(), 1000); // Simple refresh
+    } catch (err: any) {
+      toast(err.message, 'error');
     }
-    
+
     e.target.value = ''; // Reset
   };
 
   return (
     <div className="flex gap-2">
-       <input type="file" ref={fileInput} className="hidden" accept=".json" onChange={handleFileChange} />
-       <Button variant="outline" size="sm" onClick={onExport}>
-           <Download className="mr-2 h-3 w-3" /> Export
-       </Button>
-       <Button variant="outline" size="sm" onClick={handleImportClick}>
-           <Upload className="mr-2 h-3 w-3" /> Import
-       </Button>
+      <input
+        type="file"
+        ref={fileInput}
+        className="hidden"
+        accept=".json"
+        onChange={handleFileChange}
+      />
+      <Button variant="outline" size="sm" onClick={onExport}>
+        <Download className="mr-2 h-3 w-3" /> Export
+      </Button>
+      <Button variant="outline" size="sm" onClick={handleImportClick}>
+        <Upload className="mr-2 h-3 w-3" /> Import
+      </Button>
     </div>
   );
 };

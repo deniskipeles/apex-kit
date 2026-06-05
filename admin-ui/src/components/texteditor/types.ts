@@ -1,13 +1,12 @@
-
 export interface WebSource {
-    uri: string;
-    title: string;
+  uri: string;
+  title: string;
 }
-  
+
 export interface GroundingChunk {
-    web: WebSource;
+  web: WebSource;
 }
 
 export interface GroundingMetadata {
-    groundingChunks: GroundingChunk[];
+  groundingChunks: GroundingChunk[];
 }

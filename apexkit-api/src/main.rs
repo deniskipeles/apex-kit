@@ -21,8 +21,6 @@ use std::env;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, broadcast};
-use tower_governor::key_extractor::GlobalKeyExtractor;
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::trace::TraceLayer;
 
 use async_graphql::Value;
@@ -396,6 +394,14 @@ async fn main() {
         .time_to_live(std::time::Duration::from_secs(300))
         .build();
 
+    // [NEW] Rate Limiting Governor Cache
+    // This holds the actual GCRA bucket state. Because it maps Quota (u64) to RateLimiter,
+    // it will effectively only hold a few entries (one per tier/limit level).
+    let rate_limiters = Cache::builder()
+        .max_capacity(100)
+        .time_to_live(std::time::Duration::from_secs(3600))
+        .build();
+
     let state = AppState {
         db: cached_db.clone(),
         tenant_manager,
@@ -415,6 +421,7 @@ async fn main() {
         port: cli.port,
         root_script_cache,
         record_count_cache,
+        rate_limiters,
     };
 
     // --- SNAPSHOT REPLICATION APPLIER ---
@@ -505,22 +512,17 @@ async fn main() {
         }
     }
 
-    let governor_conf = Arc::new(
-        GovernorConfigBuilder::default()
-            .per_second(600)
-            .burst_size(1000)
-            .key_extractor(GlobalKeyExtractor)
-            .finish()
-            .unwrap(),
-    );
-
     let axum_app = app_router(state.clone())
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             apexkit_api::dynamic_cors::cors_middleware,
         ))
-        .layer(GovernorLayer::new(governor_conf));
+        // [NEW] Inject our custom Hybrid Rate Limiter
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            apexkit_api::rate_limit_middleware,
+        ));
 
     let addr = format!("0.0.0.0:{}", cli.port);
     let listener = TcpListener::bind(&addr).await.unwrap();

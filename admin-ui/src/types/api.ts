@@ -1,4 +1,3 @@
-
 import { AppRecord } from './record';
 
 export interface ListResult<T> {

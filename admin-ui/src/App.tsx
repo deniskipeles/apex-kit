@@ -10,7 +10,7 @@ const App = () => {
     <ThemeProvider defaultTheme="dark" storageKey={APEX_THEME}>
       <ToastProvider>
         {/* Wrap MainLayout with AuthProvider */}
-        <AuthProvider> 
+        <AuthProvider>
           <MainLayout />
         </AuthProvider>
       </ToastProvider>

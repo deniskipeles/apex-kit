@@ -6,11 +6,11 @@ export const aiService = {
     // The backend returns snake_case, need to map if necessary or ensure types match
     const res = await apiClient.ai.getActions();
     return res.map((a: any) => ({
-        ...a,
-        id: a.id.toString(),
-        // Handle potential nulls
-        system_prompt: a.system_prompt || '', 
-        config: a.config || {}
+      ...a,
+      id: a.id.toString(),
+      // Handle potential nulls
+      system_prompt: a.system_prompt || '',
+      config: a.config || {},
     }));
   },
 
@@ -37,5 +37,4 @@ export const aiService = {
   // codeEdit: async (slug: string, variables: Record<string, string>) => {
   //   return await apiClient.ai.codeEdit(slug, variables);
   // }
-
 };

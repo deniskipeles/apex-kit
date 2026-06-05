@@ -151,7 +151,7 @@ jobs:
           sha256sum * > checksums.txt
           cat checksums.txt
 
-      # 5. Sync Dockerfile, README, docs, and logo to Public Repo
+      # 5. Sync Dockerfile, README, docs, hosting and logo to Public Repo
       - name: Update Public Repo Files
         run: |
           # 1. Copy standard files from private to public workspace
@@ -170,7 +170,7 @@ jobs:
           git config user.email "actions@github.com"
           
           # 3. Add all files including the new static directory
-          git add Dockerfile README.md docs static/images
+          git add Dockerfile README.md docs hosting static/images
           
           # Commit only if there are changes
           git diff --quiet && git diff --staged --quiet || git commit -m "Sync assets and docs for release ${{ github.ref_name }}"

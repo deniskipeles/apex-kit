@@ -1,4 +1,3 @@
-
 import { apiClient } from '../../../lib/apiClient';
 import { StoredFile } from '../../../types';
 
@@ -11,5 +10,5 @@ export const filesService = {
   },
   delete: (id: string) => {
     return apiClient.files.delete(id);
-  }
+  },
 };

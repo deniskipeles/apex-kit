@@ -15,16 +15,22 @@ export const FilePicker = ({ onFilesSelected, multiple = false, accept }: FilePi
   const [files, setFiles] = useState<File[]>([]);
   const inputRef = React.useRef<HTMLInputElement>(null);
 
-  const handleFiles = useCallback((selectedFiles: FileList | null) => {
-    if (selectedFiles) {
-      const newFiles = Array.from(selectedFiles);
-      const updatedFiles = multiple ? [...files, ...newFiles] : newFiles;
-      setFiles(updatedFiles);
-      onFilesSelected(updatedFiles);
-    }
-  }, [files, multiple, onFilesSelected]);
+  const handleFiles = useCallback(
+    (selectedFiles: FileList | null) => {
+      if (selectedFiles) {
+        const newFiles = Array.from(selectedFiles);
+        const updatedFiles = multiple ? [...files, ...newFiles] : newFiles;
+        setFiles(updatedFiles);
+        onFilesSelected(updatedFiles);
+      }
+    },
+    [files, multiple, onFilesSelected]
+  );
 
-  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); };
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
   const handleDragLeave = () => setIsDragging(false);
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -48,10 +54,22 @@ export const FilePicker = ({ onFilesSelected, multiple = false, accept }: FilePi
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
       >
-        <input ref={inputRef} type="file" className="hidden" accept={accept} multiple={multiple} onChange={(e) => handleFiles(e.target.files)} />
+        <input
+          ref={inputRef}
+          type="file"
+          className="hidden"
+          accept={accept}
+          multiple={multiple}
+          onChange={(e) => handleFiles(e.target.files)}
+        />
         <div className="flex flex-col items-center gap-2 text-center">
           <UploadCloud className="h-8 w-8 text-muted-foreground" />
-          <p className="font-semibold">Drag & drop files or <span className="text-primary cursor-pointer" onClick={() => inputRef.current?.click()}>browse</span></p>
+          <p className="font-semibold">
+            Drag & drop files or{' '}
+            <span className="text-primary cursor-pointer" onClick={() => inputRef.current?.click()}>
+              browse
+            </span>
+          </p>
           <p className="text-xs text-muted-foreground">Supports images, videos, and documents.</p>
         </div>
       </div>
@@ -60,7 +78,10 @@ export const FilePicker = ({ onFilesSelected, multiple = false, accept }: FilePi
           <h4 className="text-sm font-medium">Selected Files ({files.length})</h4>
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
             {files.map((file, index) => (
-              <div key={index} className="group relative rounded-md border border-border overflow-hidden">
+              <div
+                key={index}
+                className="group relative rounded-md border border-border overflow-hidden"
+              >
                 <FileThumbnail file={file} />
                 <div className="absolute bottom-0 left-0 right-0 bg-black/50 text-white text-xs p-1.5 backdrop-blur-sm">
                   <p className="truncate font-medium">{file.name}</p>

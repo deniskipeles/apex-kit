@@ -7,5 +7,5 @@ export const scriptsService = {
   delete: (id: string) => apiClient.scripts.delete(id),
   run: (name: string, variables: any) => apiClient.scripts.run(name, variables),
   export: () => apiClient.scripts.export(),
-  import: (file: File) => apiClient.scripts.import(file)
+  import: (file: File) => apiClient.scripts.import(file),
 };

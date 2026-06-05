@@ -13,4 +13,4 @@ export const UrlInput = React.forwardRef<HTMLInputElement, any>((props, ref) => 
     />
   );
 });
-UrlInput.displayName = "UrlInput";
+UrlInput.displayName = 'UrlInput';

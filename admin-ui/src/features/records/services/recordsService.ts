@@ -26,5 +26,4 @@ export const recordsService = {
   getOne: async (collectionId: string, recordId: string, expand = '') => {
     return await apiClient.records.getOne(collectionId, recordId, expand);
   },
-
 };

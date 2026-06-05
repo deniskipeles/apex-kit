@@ -1,4 +1,3 @@
-
 export const formatDate = (date: string | Date, locale: string = 'en-US'): string => {
   if (!date) return '';
   const d = new Date(date);
@@ -7,11 +6,15 @@ export const formatDate = (date: string | Date, locale: string = 'en-US'): strin
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
-    minute: '2-digit'
+    minute: '2-digit',
   }).format(d);
 };
 
-export const formatCurrency = (amount: number, currency: string = 'USD', locale: string = 'en-US'): string => {
+export const formatCurrency = (
+  amount: number,
+  currency: string = 'USD',
+  locale: string = 'en-US'
+): string => {
   return new Intl.NumberFormat(locale, {
     style: 'currency',
     currency,

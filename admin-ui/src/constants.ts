@@ -1,13 +1,12 @@
-
 import { Collection, AppRecord, SystemLog, AuthUser, StoredFile } from './types';
 
-export const APEX_NUMBER_OF_RECORD_FIELDS = 10
-export const APEX_TRUNCATION_SIZE = 25
-export const APEX_USER = "apex-user"
-export const APEX_TOKEN = "apex-token"
-export const APEX_AUTH = "apex-auth"
-export const APEX_THEME = "apex-theme"
-export const APEX_FILES_THUMB_SIZE = "100x100"
+export const APEX_NUMBER_OF_RECORD_FIELDS = 10;
+export const APEX_TRUNCATION_SIZE = 25;
+export const APEX_USER = 'apex-user';
+export const APEX_TOKEN = 'apex-token';
+export const APEX_AUTH = 'apex-auth';
+export const APEX_THEME = 'apex-theme';
+export const APEX_FILES_THUMB_SIZE = '100x100';
 export const APEX_RICH_TEXT_EDITOR_DEFAULT = `
     <h2 class="text-2xl font-bold mb-2">Welcome to the Gemini Editor!</h2>
     <p>This is a demo of a TinyMCE-like editor powered by <strong>Google Gemini</strong>.</p>
@@ -18,7 +17,7 @@ export const APEX_RICH_TEXT_EDITOR_DEFAULT = `
       <li class="ml-4 list-disc">Powered by Gemini Flash and Google Search for up-to-date info.</li>
     </ul>
     <p><br></p>
-  `
+  `;
 
 export const MOCK_COLLECTIONS: Collection[] = [];
 

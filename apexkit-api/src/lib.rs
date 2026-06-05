@@ -32,6 +32,11 @@ use axum::{
 };
 use axum_extra::headers::{Authorization, HeaderMapExt, authorization::Bearer};
 use futures::stream::Stream;
+use governor::{
+    Quota, RateLimiter,
+    clock::{Clock, DefaultClock},
+    state::keyed::DefaultKeyedStateStore,
+};
 use metrics_exporter_prometheus::PrometheusHandle;
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
@@ -40,6 +45,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{RwLock, broadcast};
@@ -49,6 +55,9 @@ use utoipa::openapi::Server;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_scalar::{Scalar, Servable};
 use validator::Validate;
+
+// 1. Define the specific type for Governor's keyed rate limiter
+pub type DynRateLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 
 // --- Module Registrations ---
 pub mod ai_architect;
@@ -105,6 +114,8 @@ pub struct AppState {
     pub root_script_cache: Cache<String, String>,
     // [NEW] Track record counts per collection to trigger milestone auto-reindexing
     pub record_count_cache: Cache<String, i64>,
+    // [NEW] Stores the active GCRA RateLimiters based on the quota limit
+    pub rate_limiters: Cache<u64, Arc<DynRateLimiter>>,
 }
 
 // --- DTOs ---
@@ -1138,6 +1149,155 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
                 vec![]
             }
         })
+    }
+}
+
+// --- [NEW] DYNAMIC GCRA RATE LIMITER MIDDLEWARE ---
+pub async fn rate_limit_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // 1. Identify the Client (IP or API Key)
+    let ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let api_key = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
+    let client_id = api_key.unwrap_or(&ip).to_string();
+
+    // 2. Identify the Scope
+    let scope = req
+        .extensions()
+        .get::<EventScope>()
+        .cloned()
+        .unwrap_or(EventScope::Root);
+    let scope_str = match &scope {
+        EventScope::Root => "root",
+        EventScope::Tenant(id) => id.as_str(),
+        EventScope::Sandbox(id) => id.as_str(),
+        _ => "unknown",
+    };
+
+    let compound_key = format!("{}:{}", scope_str, client_id);
+
+    // 3. Fast Config Lookup (Cached for 60s to avoid DB hit every request)
+    let config_cache_key = "system:security_config";
+    let config: crate::settings::SecurityConfigDto =
+        if let Some(cached) = state.root_script_cache.get(config_cache_key).await {
+            serde_json::from_str(&cached).unwrap_or_default()
+        } else {
+            let sec_conf = state.db.get_config("security").await.unwrap_or_default();
+            let parsed: crate::settings::SecurityConfigDto = if let Some(val) = sec_conf {
+                serde_json::from_value(val).unwrap_or_default()
+            } else {
+                Default::default()
+            };
+            state
+                .root_script_cache
+                .insert(
+                    config_cache_key.to_string(),
+                    serde_json::to_string(&parsed).unwrap_or_default(),
+                )
+                .await;
+            parsed
+        };
+
+    // 4. Determine Dynamic Limit based on Scope & Tier
+    let mut limit = config.global_rate_limit.unwrap_or(600);
+
+    match &scope {
+        EventScope::Root => limit = config.global_rate_limit.unwrap_or(600),
+        EventScope::Sandbox(_) => limit = 60, // Stricter limit for sandboxes
+        EventScope::Tenant(tid) => {
+            let tier_cache_key = format!("tenant_tier:{}", tid);
+
+            // Check cache for tenant tier
+            let tier = if let Some(t) = state.root_script_cache.get(&tier_cache_key).await {
+                t
+            } else {
+                let mut fetched_tier = "free".to_string();
+                if let Ok(tenants) = state.db.list_tenants().await {
+                    if let Some(t) = tenants.iter().find(|t| &t.id == tid) {
+                        fetched_tier = t.tier.clone();
+                    }
+                }
+                state
+                    .root_script_cache
+                    .insert(tier_cache_key, fetched_tier.clone())
+                    .await;
+                fetched_tier
+            };
+
+            if tier == "pro" {
+                limit = config.tenant_pro_rate_limit.unwrap_or(3000);
+            } else {
+                limit = config.tenant_free_rate_limit.unwrap_or(120);
+            }
+        }
+        _ => {}
+    }
+
+    let limit_u32 = limit.max(1) as u32;
+
+    // 5. Fetch or Create GCRA Rate Limiter Instance for this specific limit
+    let limiter = if let Some(l) = state.rate_limiters.get(&limit).await {
+        l
+    } else {
+        let quota = Quota::per_minute(NonZeroU32::new(limit_u32).unwrap());
+        let new_limiter = Arc::new(RateLimiter::keyed(quota));
+        state.rate_limiters.insert(limit, new_limiter.clone()).await;
+        new_limiter
+    };
+
+    // 6. Check Token Bucket (Mathematical compliance)
+    match limiter.check_key(&compound_key) {
+        Ok(_) => {
+            // Execution allowed
+            let mut response = next.run(req).await;
+
+            // Append general rate limit headers
+            response.headers_mut().insert(
+                "X-RateLimit-Limit",
+                HeaderValue::from_str(&limit.to_string()).unwrap(),
+            );
+            Ok(response)
+        }
+        Err(negative) => {
+            // Execution Denied: Extract wait time for proper GCRA backpressure
+            let wait_time = negative.wait_time_from(DefaultClock::default().now());
+            let retry_after_secs = wait_time.as_secs().max(1); // Ensure at least 1s
+
+            tracing::warn!(
+                "Rate limit exceeded for {} in scope {}. Retry after {}s",
+                client_id,
+                scope_str,
+                retry_after_secs
+            );
+
+            let body = Json(json!({
+                "error": "too_many_requests",
+                "message": format!("Rate limit exceeded. Try again in {} seconds.", retry_after_secs),
+                "retry_after": retry_after_secs
+            }));
+
+            let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+
+            // HTTP Standard Retry-After Header
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_str(&retry_after_secs.to_string()).unwrap(),
+            );
+            response.headers_mut().insert(
+                "X-RateLimit-Limit",
+                HeaderValue::from_str(&limit.to_string()).unwrap(),
+            );
+
+            Ok(response)
+        }
     }
 }
 

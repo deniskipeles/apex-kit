@@ -7,5 +7,5 @@ export const templatesService = {
   update: (id: string, data: Partial<Template>) => apiClient.templates.update(id, data),
   delete: (id: string) => apiClient.templates.delete(id),
   export: () => apiClient.templates.export(),
-  import: (file: File) => apiClient.templates.import(file)
+  import: (file: File) => apiClient.templates.import(file),
 };

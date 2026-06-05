@@ -1,4 +1,3 @@
-
 import { useState, useRef, useEffect } from 'react';
 
 export function useOverlay() {
@@ -7,18 +6,18 @@ export function useOverlay() {
 
   const open = () => setIsOpen(true);
   const close = () => setIsOpen(false);
-  const toggle = () => setIsOpen(prev => !prev);
+  const toggle = () => setIsOpen((prev) => !prev);
 
   // Close on click outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (isOpen && triggerRef.current && !triggerRef.current.contains(event.target as Node)) {
-          // Logic handled by the Overlay component usually, but useful here too
+        // Logic handled by the Overlay component usually, but useful here too
       }
     };
-    
+
     if (isOpen) {
-        document.addEventListener('mousedown', handleClickOutside);
+      document.addEventListener('mousedown', handleClickOutside);
     }
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [isOpen]);
@@ -28,6 +27,6 @@ export function useOverlay() {
     open,
     close,
     toggle,
-    triggerRef
+    triggerRef,
   };
 }

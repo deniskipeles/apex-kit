@@ -12,15 +12,15 @@ interface OverlayProps {
   zIndex?: number;
 }
 
-export const Overlay = ({ 
-  isOpen, 
-  onClose, 
-  anchorRef, 
-  children, 
-  width = 'auto', 
+export const Overlay = ({
+  isOpen,
+  onClose,
+  anchorRef,
+  children,
+  width = 'auto',
   className = '',
   align = 'start',
-  zIndex = 100 // Default high z-index
+  zIndex = 100, // Default high z-index
 }: OverlayProps) => {
   const [style, setStyle] = useState<React.CSSProperties>({ opacity: 0 });
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -43,28 +43,28 @@ export const Overlay = ({
 
         // If not enough space below, and there is space above, flip it
         if (spaceBelow < overlayHeight && spaceAbove > overlayHeight) {
-            // Position ABOVE
-            top = triggerRect.top - overlayHeight - 8; // 8px buffer
+          // Position ABOVE
+          top = triggerRect.top - overlayHeight - 8; // 8px buffer
         } else {
-            // Position BELOW (Default)
-            top = triggerRect.bottom + 8;
+          // Position BELOW (Default)
+          top = triggerRect.bottom + 8;
         }
 
         // 2. Horizontal Positioning
         if (align === 'end') {
-            left = triggerRect.right - overlayRect.width;
+          left = triggerRect.right - overlayRect.width;
         } else if (align === 'center') {
-            left = triggerRect.left + (triggerRect.width / 2) - (overlayRect.width / 2);
+          left = triggerRect.left + triggerRect.width / 2 - overlayRect.width / 2;
         } else {
-            left = triggerRect.left;
+          left = triggerRect.left;
         }
 
         // 3. Prevent Horizontal Overflow (Keep on screen)
         if (left + overlayRect.width > viewportWidth) {
-            left = viewportWidth - overlayRect.width - 10;
+          left = viewportWidth - overlayRect.width - 10;
         }
         if (left < 0) {
-            left = 10;
+          left = 10;
         }
 
         setStyle({
@@ -76,13 +76,13 @@ export const Overlay = ({
           zIndex: zIndex,
         });
       };
-      
+
       updatePosition();
-      
+
       // Update on scroll or resize
       window.addEventListener('resize', updatePosition);
       window.addEventListener('scroll', updatePosition, true);
-      
+
       return () => {
         window.removeEventListener('resize', updatePosition);
         window.removeEventListener('scroll', updatePosition, true);
@@ -95,17 +95,17 @@ export const Overlay = ({
   return createPortal(
     <>
       {/* Backdrop to handle click-outside */}
-      <div 
-        className="fixed inset-0 bg-transparent" 
+      <div
+        className="fixed inset-0 bg-transparent"
         style={{ zIndex: zIndex - 1 }}
         onClick={(e) => {
           e.stopPropagation();
           onClose();
-        }} 
+        }}
       />
-      
+
       {/* The Overlay Content */}
-      <div 
+      <div
         ref={overlayRef}
         className={`fixed animate-in fade-in zoom-in-95 duration-100 ${className}`}
         style={style}

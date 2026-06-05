@@ -550,7 +550,7 @@ pub async fn handle_restore(file: String, force_yes: bool) -> Result<(), String>
     }
 
     // Interactive Prompt
-    let mut prompt = || -> bool {
+    let prompt = || -> bool {
         if force_yes {
             return true;
         }

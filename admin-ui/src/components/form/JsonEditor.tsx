@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from 'react';
 import { Braces, AlertCircle } from 'lucide-react';
 import { Button, Badge } from './FormPrimitives';
@@ -10,7 +9,12 @@ interface JSONEditorProps {
   height?: string;
 }
 
-export const JSONEditor = ({ value, onChange, readOnly = false, height = "400px" }: JSONEditorProps) => {
+export const JSONEditor = ({
+  value,
+  onChange,
+  readOnly = false,
+  height = '400px',
+}: JSONEditorProps) => {
   const [isValid, setIsValid] = useState(true);
   const [errorMsg, setErrorMsg] = useState('');
   const [internalValue, setInternalValue] = useState(value);
@@ -58,13 +62,23 @@ export const JSONEditor = ({ value, onChange, readOnly = false, height = "400px"
           <Braces className="h-4 w-4 text-primary" />
           <span className="text-xs font-mono text-muted-foreground">JSON Editor</span>
           {isValid ? (
-            <Badge variant="success" className="h-5 text-[10px]">Valid</Badge>
+            <Badge variant="success" className="h-5 text-[10px]">
+              Valid
+            </Badge>
           ) : (
-             <Badge variant="destructive" className="h-5 text-[10px]">Invalid</Badge>
+            <Badge variant="destructive" className="h-5 text-[10px]">
+              Invalid
+            </Badge>
           )}
         </div>
         <div className="flex gap-1">
-          <Button size="sm" variant="ghost" className="h-6 text-xs" onClick={formatJSON} disabled={readOnly || !isValid}>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 text-xs"
+            onClick={formatJSON}
+            disabled={readOnly || !isValid}
+          >
             Prettify
           </Button>
         </div>

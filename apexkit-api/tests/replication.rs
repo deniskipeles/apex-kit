@@ -19,7 +19,7 @@ async fn test_full_replication_loop() {
     std::env::set_var("APEX_FORCE_HTTP_REPLICATION", "true");
 
     // 2. Setup MASTER
-    let (sqlite_event_tx, mut sqlite_event_rx) = tokio::sync::broadcast::channel(100);
+    let (sqlite_event_tx, mut _sqlite_event_rx) = tokio::sync::broadcast::channel(100);
 
     // Initialize Master Tracker
     apexkit_api::replication::init_master_replica_tracker(sqlite_event_tx.clone()).await;

@@ -113,6 +113,7 @@ pub async fn setup_test_context_with_forwarder(
     let thumb_cache = Cache::builder().max_capacity(10).build();
     let root_script_cache = Cache::builder().max_capacity(10).build();
     let record_count_cache = Cache::builder().max_capacity(10).build();
+    let rate_limiters = Cache::builder().max_capacity(10).build();
     let embedder = Arc::new(EmbedderService::new());
 
     let dummy_schema = Schema::build("Query", None, None)
@@ -140,6 +141,7 @@ pub async fn setup_test_context_with_forwarder(
         thumb_cache,
         root_script_cache,
         record_count_cache,
+        rate_limiters,
         embedder,
         vector_provider,
         port: 0,
@@ -156,7 +158,7 @@ pub async fn setup_test_context_with_forwarder(
 
 pub async fn setup_test_app() -> Router {
     let ctx = setup_test_context_with_forwarder(None, None).await;
-    ctx.app
+    ctx.app.clone()
 }
 
 pub fn admin_token() -> String {

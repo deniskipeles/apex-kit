@@ -11,119 +11,147 @@ import { APP_CONFIG } from '../../../config/app.config';
 import { ImportExportToolbar } from '@/src/components/ImportExportToolbar';
 
 export const TemplatesPage = () => {
-    const [templates, setTemplates] = useState<Template[]>([]);
-    const [isLoading, setIsLoading] = useState(true);
-    const [editorOpen, setEditorOpen] = useState(false);
-    const [selectedTemplate, setSelectedTemplate] = useState<Template | null>(null);
-    const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [selectedTemplate, setSelectedTemplate] = useState<Template | null>(null);
+  const [deleteId, setDeleteId] = useState<string | null>(null);
 
-    const { toast } = useToast();
+  const { toast } = useToast();
 
-    const loadTemplates = async () => {
-        setIsLoading(true);
-        try {
-            const data = await templatesService.list();
-            setTemplates(data);
-        } catch (e) {
-            toast('Failed to load templates', 'error');
-        } finally {
-            setIsLoading(false);
-        }
-    };
+  const loadTemplates = async () => {
+    setIsLoading(true);
+    try {
+      const data = await templatesService.list();
+      setTemplates(data);
+    } catch (e) {
+      toast('Failed to load templates', 'error');
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
-    useEffect(() => { loadTemplates(); }, []);
+  useEffect(() => {
+    loadTemplates();
+  }, []);
 
-    const handleSave = async (data: Partial<Template>) => {
-        if (selectedTemplate) {
-            await templatesService.update(selectedTemplate.id, data);
-            toast('Template updated', 'success');
-        } else {
-            await templatesService.create(data);
-            toast('Template created', 'success');
-        }
-        loadTemplates();
-    };
+  const handleSave = async (data: Partial<Template>) => {
+    if (selectedTemplate) {
+      await templatesService.update(selectedTemplate.id, data);
+      toast('Template updated', 'success');
+    } else {
+      await templatesService.create(data);
+      toast('Template created', 'success');
+    }
+    loadTemplates();
+  };
 
-    const handleDelete = async () => {
-        if (!deleteId) return;
-        await templatesService.delete(deleteId);
-        toast('Template deleted', 'success');
-        setDeleteId(null);
-        loadTemplates();
-    };
+  const handleDelete = async () => {
+    if (!deleteId) return;
+    await templatesService.delete(deleteId);
+    toast('Template deleted', 'success');
+    setDeleteId(null);
+    loadTemplates();
+  };
 
-    const columns = [
-        {
-            field: 'slug', headerName: 'Slug',
-            renderCell: (t: Template) => (
-                <div className="flex flex-col">
-                    <span className="font-medium font-mono text-primary">{t.slug}</span>
-                </div>
-            )
-        },
-        {
-            field: 'script_id', headerName: 'Linked Script', width: '150px',
-            renderCell: (t: Template) => t.script_id ? <Badge variant="secondary">Script #{t.script_id}</Badge> : <span className="text-muted-foreground text-xs">-</span>
-        },
-        {
-            field: 'actions', headerName: '', align: 'right' as const, width: '150px',
-            renderCell: (t: Template) => (
-                <div className="flex justify-end gap-1">
-                    <a href={`${APP_CONFIG.apiBaseUrl}/render/${t.slug}`} target="_blank" rel="noreferrer">
-                        <Button size="icon" variant="ghost" title="View Rendered">
-                            <ExternalLink className="h-4 w-4 text-muted-foreground" />
-                        </Button>
-                    </a>
-                    <Button size="icon" variant="ghost" onClick={(e) => { e.stopPropagation(); setSelectedTemplate(t); setEditorOpen(true); }}>
-                        <Edit className="h-4 w-4 text-muted-foreground hover:text-primary" />
-                    </Button>
-                    <Button size="icon" variant="ghost" onClick={(e) => { e.stopPropagation(); setDeleteId(t.id); }}>
-                        <Trash2 className="h-4 w-4 text-muted-foreground hover:text-destructive" />
-                    </Button>
-                </div>
-            )
-        }
-    ];
-
-    return (
-        <div className="space-y-6">
-            <div className="flex items-center justify-between">
-                <div>
-                    <h2 className="text-3xl font-bold tracking-tight">Templates</h2>
-                    <p className="text-muted-foreground">HTML/HTMX templates for dynamic rendering.</p>
-                </div>
-                <div className="flex gap-2">
-                    <ImportExportToolbar
-                        onExport={templatesService.export}
-                        onImport={templatesService.import}
-                    />
-                    <Button onClick={() => { setSelectedTemplate(null); setEditorOpen(true); }}>
-                        <Plus className="mr-2 h-4 w-4" /> New Template
-                    </Button>
-                </div>
-            </div>
-
-            <DataGrid
-                data={templates}
-                columns={columns}
-                keyField="id"
-                isLoading={isLoading}
-            />
-
-            <TemplateEditor
-                isOpen={editorOpen}
-                onClose={() => setEditorOpen(false)}
-                onSave={handleSave}
-                initialData={selectedTemplate || undefined}
-            />
-
-            <ConfirmDialog
-                isOpen={!!deleteId}
-                title="Delete Template"
-                description="Are you sure? This page will stop rendering."
-                onConfirm={handleDelete}
-                onCancel={() => setDeleteId(null)}
-            />
+  const columns = [
+    {
+      field: 'slug',
+      headerName: 'Slug',
+      renderCell: (t: Template) => (
+        <div className="flex flex-col">
+          <span className="font-medium font-mono text-primary">{t.slug}</span>
         </div>
-    );
+      ),
+    },
+    {
+      field: 'script_id',
+      headerName: 'Linked Script',
+      width: '150px',
+      renderCell: (t: Template) =>
+        t.script_id ? (
+          <Badge variant="secondary">Script #{t.script_id}</Badge>
+        ) : (
+          <span className="text-muted-foreground text-xs">-</span>
+        ),
+    },
+    {
+      field: 'actions',
+      headerName: '',
+      align: 'right' as const,
+      width: '150px',
+      renderCell: (t: Template) => (
+        <div className="flex justify-end gap-1">
+          <a href={`${APP_CONFIG.apiBaseUrl}/render/${t.slug}`} target="_blank" rel="noreferrer">
+            <Button size="icon" variant="ghost" title="View Rendered">
+              <ExternalLink className="h-4 w-4 text-muted-foreground" />
+            </Button>
+          </a>
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={(e) => {
+              e.stopPropagation();
+              setSelectedTemplate(t);
+              setEditorOpen(true);
+            }}
+          >
+            <Edit className="h-4 w-4 text-muted-foreground hover:text-primary" />
+          </Button>
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={(e) => {
+              e.stopPropagation();
+              setDeleteId(t.id);
+            }}
+          >
+            <Trash2 className="h-4 w-4 text-muted-foreground hover:text-destructive" />
+          </Button>
+        </div>
+      ),
+    },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-3xl font-bold tracking-tight">Templates</h2>
+          <p className="text-muted-foreground">HTML/HTMX templates for dynamic rendering.</p>
+        </div>
+        <div className="flex gap-2">
+          <ImportExportToolbar
+            onExport={templatesService.export}
+            onImport={templatesService.import}
+          />
+          <Button
+            onClick={() => {
+              setSelectedTemplate(null);
+              setEditorOpen(true);
+            }}
+          >
+            <Plus className="mr-2 h-4 w-4" /> New Template
+          </Button>
+        </div>
+      </div>
+
+      <DataGrid data={templates} columns={columns} keyField="id" isLoading={isLoading} />
+
+      <TemplateEditor
+        isOpen={editorOpen}
+        onClose={() => setEditorOpen(false)}
+        onSave={handleSave}
+        initialData={selectedTemplate || undefined}
+      />
+
+      <ConfirmDialog
+        isOpen={!!deleteId}
+        title="Delete Template"
+        description="Are you sure? This page will stop rendering."
+        onConfirm={handleDelete}
+        onCancel={() => setDeleteId(null)}
+      />
+    </div>
+  );
 };

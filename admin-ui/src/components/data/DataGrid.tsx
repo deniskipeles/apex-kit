@@ -1,4 +1,3 @@
-
 import React from 'react';
 import { Checkbox } from '../form/FormPrimitives';
 
@@ -29,9 +28,8 @@ export function DataGrid<T extends { [key: string]: any }>({
   onSelectAll,
   onSelectRow,
   onRowClick,
-  isLoading
+  isLoading,
 }: DataGridProps<T>) {
-  
   const allSelected = data.length > 0 && selectedIds.length === data.length;
 
   return (
@@ -46,7 +44,11 @@ export function DataGrid<T extends { [key: string]: any }>({
                 </th>
               )}
               {columns.map((col, i) => (
-                <th key={i} className={`h-10 px-4 py-2 align-middle font-medium select-none whitespace-nowrap bg-muted/90 ${col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'}`} style={{ width: col.width, minWidth: col.width || '150px' }}>
+                <th
+                  key={i}
+                  className={`h-10 px-4 py-2 align-middle font-medium select-none whitespace-nowrap bg-muted/90 ${col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'}`}
+                  style={{ width: col.width, minWidth: col.width || '150px' }}
+                >
                   {col.headerName}
                 </th>
               ))}
@@ -55,18 +57,23 @@ export function DataGrid<T extends { [key: string]: any }>({
           <tbody className="divide-y divide-border">
             {isLoading ? (
               Array.from({ length: 10 }).map((_, i) => (
-                  <tr key={i} className="h-12 animate-pulse bg-background">
-                      <td colSpan={columns.length + (onSelectAll ? 1 : 0)} className="px-4 py-3">
-                          <div className="h-4 w-full max-w-[120px] bg-secondary rounded" />
-                      </td>
-                  </tr>
+                <tr key={i} className="h-12 animate-pulse bg-background">
+                  <td colSpan={columns.length + (onSelectAll ? 1 : 0)} className="px-4 py-3">
+                    <div className="h-4 w-full max-w-[120px] bg-secondary rounded" />
+                  </td>
+                </tr>
               ))
             ) : data.length === 0 ? (
               <tr>
-                <td colSpan={columns.length + (onSelectAll ? 1 : 0)} className="h-64 text-center text-muted-foreground">
+                <td
+                  colSpan={columns.length + (onSelectAll ? 1 : 0)}
+                  className="h-64 text-center text-muted-foreground"
+                >
                   <div className="flex flex-col items-center justify-center gap-2">
                     <span className="text-lg font-semibold">No records found</span>
-                    <span className="text-sm opacity-70">Try adjusting your filters or add a new record.</span>
+                    <span className="text-sm opacity-70">
+                      Try adjusting your filters or add a new record.
+                    </span>
                   </div>
                 </td>
               </tr>
@@ -75,8 +82,8 @@ export function DataGrid<T extends { [key: string]: any }>({
                 const id = String(row[keyField]);
                 const isSelected = selectedIds.includes(id);
                 return (
-                  <tr 
-                    key={id} 
+                  <tr
+                    key={id}
                     onClick={() => onRowClick?.(row)}
                     className={`
                       group transition-colors hover:bg-muted/50 cursor-pointer h-12 border-l-2 border-l-transparent
@@ -84,14 +91,24 @@ export function DataGrid<T extends { [key: string]: any }>({
                     `}
                   >
                     {onSelectRow && (
-                      <td className="px-4 w-[40px] sticky left-0 bg-background group-hover:bg-muted/50 z-10 border-r border-border/50 md:border-none" onClick={e => e.stopPropagation()}>
+                      <td
+                        className="px-4 w-[40px] sticky left-0 bg-background group-hover:bg-muted/50 z-10 border-r border-border/50 md:border-none"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         <Checkbox checked={isSelected} onChange={() => onSelectRow(id)} />
                       </td>
                     )}
                     {columns.map((col, i) => (
-                      <td key={i} className={`px-4 py-2 whitespace-nowrap ${col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'}`}>
-                        {col.renderCell ? col.renderCell(row) : (
-                          <span className="text-foreground/90">{String(row[col.field as string] ?? '')}</span>
+                      <td
+                        key={i}
+                        className={`px-4 py-2 whitespace-nowrap ${col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'}`}
+                      >
+                        {col.renderCell ? (
+                          col.renderCell(row)
+                        ) : (
+                          <span className="text-foreground/90">
+                            {String(row[col.field as string] ?? '')}
+                          </span>
                         )}
                       </td>
                     ))}

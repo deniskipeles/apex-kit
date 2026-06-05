@@ -1,4 +1,3 @@
-
 import { useState, useEffect, useCallback } from 'react';
 
 interface FetchState<T> {
@@ -15,7 +14,7 @@ export function useFetch<T>(fetcher: () => Promise<T>, dependencies: any[] = [])
   });
 
   const fetchData = useCallback(async () => {
-    setState(prev => ({ ...prev, isLoading: true, error: null }));
+    setState((prev) => ({ ...prev, isLoading: true, error: null }));
     try {
       const data = await fetcher();
       setState({ data, isLoading: false, error: null });

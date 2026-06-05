@@ -3,8 +3,8 @@ import { useCollectionsStore } from '../../../store/useCollectionsStore';
 import { Loader2 } from 'lucide-react';
 
 // Dynamic Import
-const CollectionForm = React.lazy(() => 
-  import('../components/CollectionCreator').then(module => ({ default: module.CollectionForm }))
+const CollectionForm = React.lazy(() =>
+  import('../components/CollectionCreator').then((module) => ({ default: module.CollectionForm }))
 );
 
 interface CollectionEditPageProps {
@@ -23,17 +23,19 @@ export const CollectionEditPage = ({ onCancel, onSuccess }: CollectionEditPagePr
   };
 
   if (!activeCollection) {
-      onCancel();
-      return null;
+    onCancel();
+    return null;
   }
 
   return (
-    <Suspense fallback={<div className="flex h-full items-center justify-center"><Loader2 className="animate-spin text-primary" /></div>}>
-        <CollectionForm 
-          initialValues={activeCollection}
-          onSave={handleSave} 
-          onCancel={onCancel} 
-        />
+    <Suspense
+      fallback={
+        <div className="flex h-full items-center justify-center">
+          <Loader2 className="animate-spin text-primary" />
+        </div>
+      }
+    >
+      <CollectionForm initialValues={activeCollection} onSave={handleSave} onCancel={onCancel} />
     </Suspense>
   );
 };

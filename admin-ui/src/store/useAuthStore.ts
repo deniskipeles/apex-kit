@@ -1,4 +1,3 @@
-
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { AuthUser } from '../types';
@@ -21,7 +20,7 @@ export const useAuthStore = create<AuthState>()(
       user: null,
       token: null,
       isLoading: false,
-      
+
       login: async (email, pass) => {
         set({ isLoading: true });
         try {
@@ -32,22 +31,22 @@ export const useAuthStore = create<AuthState>()(
           throw error;
         }
       },
-      
+
       logout: async () => {
         set({ isLoading: true });
         try {
-            await apiClient.auth.logout();
+          await apiClient.auth.logout();
         } finally {
-            set({ user: null, token: null, isLoading: false });
+          set({ user: null, token: null, isLoading: false });
         }
       },
 
       checkAuth: async () => {
         // Simplified check - in real app would verify token
-        const token = storage.get<string>('auth-storage'); 
+        const token = storage.get<string>('auth-storage');
         if (!token) return;
         // validation logic here
-      }
+      },
     }),
     {
       name: APEX_AUTH,

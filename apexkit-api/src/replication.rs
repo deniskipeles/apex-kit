@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt}; // [FIX] Trait imports now in scope
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -37,10 +37,15 @@ pub mod pb {
 }
 use pb::replication_server::Replication;
 
+// --- GLOBALS ---
 pub static DB_SYNC_TX: OnceLock<broadcast::Sender<pb::DbChangeEvent>> = OnceLock::new();
-// [FIX] Upgraded to broadcast sender so WS and gRPC can both listen dynamically
 pub static EVENT_SUB_TX: OnceLock<broadcast::Sender<pb::EventSubscription>> = OnceLock::new();
 pub static MASTER_CHANGESET_TX: OnceLock<broadcast::Sender<ChangesetEvent>> = OnceLock::new();
+
+pub static WS_OUTBOUND_TX: OnceLock<RwLock<Option<mpsc::Sender<WsReplMsg>>>> = OnceLock::new();
+pub static PENDING_WS_REQS: OnceLock<
+    Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<FallbackWriteRes>>>>,
+> = OnceLock::new();
 
 pub fn get_db_sync_tx() -> broadcast::Sender<pb::DbChangeEvent> {
     DB_SYNC_TX
@@ -57,6 +62,13 @@ pub fn get_event_sub_tx() -> broadcast::Sender<pb::EventSubscription> {
             let (tx, _) = broadcast::channel(100);
             tx
         })
+        .clone()
+}
+
+pub fn get_pending_reqs()
+-> Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<FallbackWriteRes>>>> {
+    PENDING_WS_REQS
+        .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
         .clone()
 }
 
@@ -94,7 +106,7 @@ pub fn get_db_path_from_scope(scope: &str, db_name: &str) -> String {
 pub fn client_auth_interceptor(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
     let master_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
     let token = MetadataValue::try_from(&format!("Bearer {}", master_key))
-        .map_err(|_| Status::internal("Invalid master key format for metadata"))?;
+        .map_err(|_| Status::internal("Invalid key"))?;
     req.metadata_mut().insert("authorization", token);
     Ok(req)
 }
@@ -120,11 +132,11 @@ async fn build_grpc_channel(master_url: &str) -> Result<Channel, String> {
     if master_url.starts_with("https://") {
         let mut tls_config = ClientTlsConfig::new();
         if let Ok(ca_path) = std::env::var("APEX_TLS_CA_PATH") {
-            if !ca_path.is_empty() {
-                if let Ok(ca_cert) = tokio::fs::read(&ca_path).await {
-                    let ca = Certificate::from_pem(ca_cert);
-                    tls_config = tls_config.ca_certificate(ca);
-                }
+            if !ca_path.is_empty()
+                && let Ok(ca_cert) = tokio::fs::read(&ca_path).await
+            {
+                let ca = Certificate::from_pem(ca_cert);
+                tls_config = tls_config.ca_certificate(ca);
             }
         } else {
             tls_config = tls_config.with_native_roots();
@@ -177,21 +189,15 @@ pub async fn register_replica_on_master(id: &str, scopes: &[String]) -> Result<(
     let scope_list = scopes.join(",");
     let conn = Connection::open("storage/system/system.db")
         .map_err(|e| Status::internal(e.to_string()))?;
-    conn.execute(
-        "INSERT OR REPLACE INTO _replicas (id, scopes, last_seen) VALUES (?1, ?2, CURRENT_TIMESTAMP)",
-        params![id, scope_list],
-    )
-    .map_err(|e| Status::internal(e.to_string()))?;
+    conn.execute("INSERT OR REPLACE INTO _replicas (id, scopes, last_seen) VALUES (?1, ?2, CURRENT_TIMESTAMP)", params![id, scope_list]).map_err(|e| Status::internal(e.to_string()))?;
     Ok(())
 }
 
 pub async fn init_master_replica_tracker(tx: tokio::sync::broadcast::Sender<ChangesetEvent>) {
     let _ = MASTER_CHANGESET_TX.set(tx.clone());
     let mut rx = tx.subscribe();
-
     let tracker = get_replica_tracker();
 
-    // 1. Recover from DB
     let recovered_state = tokio::task::spawn_blocking(move || {
         let conn = Connection::open("storage/system/system.db").expect("Failed to open system.db");
         let mut stmt = conn
@@ -201,23 +207,21 @@ pub async fn init_master_replica_tracker(tx: tokio::sync::broadcast::Sender<Chan
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .expect("Query execution failed");
+            .expect("Query failed");
 
         let mut initial_map = HashMap::new();
-        for row in rows {
-            if let Ok((id, scopes_str)) = row {
-                let scopes = scopes_str.split(',').map(|s| s.to_string()).collect();
-                initial_map.insert(
-                    id.clone(),
-                    ReplicaInfo {
-                        id,
-                        scopes,
-                        buffer: vec![],
-                        last_seen: Instant::now(),
-                        tx: None,
-                    },
-                );
-            }
+        for (id, scopes_str) in rows.flatten() {
+            let scopes = scopes_str.split(',').map(|s| s.to_string()).collect();
+            initial_map.insert(
+                id.clone(),
+                ReplicaInfo {
+                    id,
+                    scopes,
+                    buffer: vec![],
+                    last_seen: Instant::now(),
+                    tx: None,
+                },
+            );
         }
         initial_map
     })
@@ -229,23 +233,16 @@ pub async fn init_master_replica_tracker(tx: tokio::sync::broadcast::Sender<Chan
         *map = recovered_state;
     }
 
-    // 2. Track Changesets and Disconnections
     tokio::spawn(async move {
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             tokio::select! {
                 Ok(event) = rx.recv() => {
-                    // Prevent Logs from ever replicating over the stream
                     if event.db_name == "logs" { continue; }
-
                     let mut map = tracker.write().await;
                     for (rep_id, info) in map.iter_mut() {
                         if info.scopes.contains(&event.scope) || event.scope == "root" {
-                            let pb_event = pb::DbChangeEvent {
-                                scope: event.scope.clone(),
-                                db_name: event.db_name.clone(),
-                                changeset: event.changeset.clone(),
-                            };
+                            let pb_event = pb::DbChangeEvent { scope: event.scope.clone(), db_name: event.db_name.clone(), changeset: event.changeset.clone() };
                             if let Some(tx) = &info.tx {
                                 if tx.try_send(Ok(pb_event.clone())).is_err() {
                                     tracing::warn!("Replica {} disconnected. Buffering {} changesets.", info.id, info.buffer.len() + 1);
@@ -268,9 +265,7 @@ pub async fn init_master_replica_tracker(tx: tokio::sync::broadcast::Sender<Chan
                         if info.tx.is_none() && now.duration_since(info.last_seen) > Duration::from_secs(300) {
                             tracing::warn!("Replica {} disconnected > 5m. Dropping from master.", id);
                             false
-                        } else {
-                            true
-                        }
+                        } else { true }
                     });
                 }
             }
@@ -287,7 +282,7 @@ pub async fn process_master_write(
     params_bytes: &[u8],
 ) -> Result<(i64, String), String> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?; // [FIX] Removed unused mut
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .unwrap();
 
@@ -334,10 +329,8 @@ pub async fn process_master_write(
         }
     }
 
-    // Begin manual transaction to avoid borrow checker conflicts with active session
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| e.to_string())?;
-
     let is_insert = sql.trim().to_uppercase().starts_with("INSERT");
 
     let mut stmt = match conn.prepare(sql) {
@@ -362,11 +355,8 @@ pub async fn process_master_write(
         0
     };
 
-    // Commit Transaction
     conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
 
-    // Broadcast Changeset
-    // STRICTLY Prevent logs.db from generating changesets
     if db_name != "logs" {
         let mut changeset_bytes = Vec::new();
         if session.changeset_strm(&mut changeset_bytes).is_ok() {
@@ -385,7 +375,6 @@ pub async fn process_master_write(
             }
         }
     }
-
     Ok((insert_id, "".into()))
 }
 
@@ -408,7 +397,6 @@ pub async fn process_master_sync_file(
 
     use apexkit_core::storage::StorageBackend;
     let storage = crate::storage::ScopedDynamicStorage::new(state.clone(), scope);
-
     storage
         .save(filename, data, mime_type)
         .await
@@ -423,19 +411,15 @@ pub async fn master_auth_middleware(
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
     let expected_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
-
     if expected_key.is_empty() {
         return Err(axum::http::StatusCode::UNAUTHORIZED);
     }
-
     let auth_header = req
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    let expected = format!("Bearer {}", expected_key);
-
-    if auth_header != expected {
+    if auth_header != format!("Bearer {}", expected_key) {
         return Err(axum::http::StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
@@ -454,8 +438,22 @@ pub enum WsReplMsg {
         scope: String,
         db_name: String,
         changeset: String,
-    }, // Base64
+    },
     FullSyncRequired,
+
+    // [NEW] RPC over WebSocket for Bidirectional Database Writes
+    WriteRequest {
+        req_id: String,
+        db_path: String,
+        sql: String,
+        params: Vec<u8>,
+    },
+    WriteResponse {
+        req_id: String,
+        success: bool,
+        insert_id: i64,
+        error: String,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -482,7 +480,7 @@ pub struct FallbackSyncFileReq {
     pub filename: String,
     pub mime_type: String,
     pub data: String,
-} // Base64 data
+}
 #[derive(Deserialize, Serialize)]
 pub struct FallbackSyncFileRes {
     pub success: bool,
@@ -496,7 +494,6 @@ pub async fn fallback_write_handler(
     let event_tx = MASTER_CHANGESET_TX
         .get()
         .ok_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
     match process_master_write(event_tx, &req.db_path, &req.sql, &req.params).await {
         Ok((insert_id, error)) => Ok(axum::Json(FallbackWriteRes {
             success: true,
@@ -520,20 +517,16 @@ pub async fn fallback_snapshot_handler(
     {
         return Err(axum::http::StatusCode::FORBIDDEN);
     }
-
     if let Ok(conn) = rusqlite::Connection::open(&req.db_path) {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
     }
-
     let file = tokio::fs::File::open(&req.db_path)
         .await
         .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
     let stream = tokio_util::io::ReaderStream::new(file);
-    let body = axum::body::Body::from_stream(stream);
-
     Ok(axum::response::Response::builder()
         .header("Content-Type", "application/octet-stream")
-        .body(body)
+        .body(axum::body::Body::from_stream(stream))
         .unwrap())
 }
 
@@ -545,7 +538,6 @@ pub async fn fallback_sync_file_handler(
     let data = STANDARD
         .decode(&req.data)
         .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
-
     match process_master_sync_file(&state, &req.scope, &req.filename, &req.mime_type, &data).await {
         Ok(_) => Ok(axum::Json(FallbackSyncFileRes {
             success: true,
@@ -558,6 +550,7 @@ pub async fn fallback_sync_file_handler(
     }
 }
 
+// Master WebSocket Handler
 pub async fn ws_replication_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -610,15 +603,23 @@ async fn handle_ws_replica(mut socket: WebSocket, _state: AppState) {
                                 }
                                 let _ = socket.send(AxumWsMessage::Text(serde_json::to_string(&WsReplMsg::Pong).unwrap().into())).await;
                             }
+                            // [NEW] Master handles writes received from Replica via WS
+                            WsReplMsg::WriteRequest { req_id, db_path, sql, params } => {
+                                if let Some(event_tx) = MASTER_CHANGESET_TX.get() {
+                                    let response_msg = match process_master_write(event_tx, &db_path, &sql, &params).await {
+                                        Ok((insert_id, error)) => WsReplMsg::WriteResponse { req_id, success: true, insert_id, error },
+                                        Err(e) => WsReplMsg::WriteResponse { req_id, success: false, insert_id: 0, error: e },
+                                    };
+                                    let _ = socket.send(AxumWsMessage::Text(serde_json::to_string(&response_msg).unwrap().into())).await;
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
             }
             Some(Ok(evt)) = rx.recv() => {
-                // NEVER forward logs over WS
                 if evt.db_name == "logs" { continue; }
-
                 use base64::{Engine as _, engine::general_purpose::STANDARD};
                 let out = WsReplMsg::DbEvent { scope: evt.scope, db_name: evt.db_name, changeset: STANDARD.encode(&evt.changeset) };
                 if socket.send(AxumWsMessage::Text(serde_json::to_string(&out).unwrap().into())).await.is_err() { break; }
@@ -673,7 +674,6 @@ impl Replication for MasterReplicationService {
         req: Request<pb::SnapshotRequest>,
     ) -> Result<Response<Self::FetchDbSnapshotStream>, Status> {
         let db_path = req.into_inner().db_path;
-        // Prevent fetching logs
         if !db_path.starts_with("storage/")
             || db_path.contains("..")
             || db_path.ends_with("logs.db")
@@ -720,37 +720,24 @@ impl Replication for MasterReplicationService {
         let sub = first_msg.ok_or(Status::invalid_argument("Missing initial subscription"))?;
 
         let replica_id = sub.replica_id.clone();
-
         if let Err(e) = register_replica_on_master(&replica_id, &sub.add_scopes).await {
             tracing::error!("Failed to register replica in DB: {}", e);
         }
 
         let tracker = get_replica_tracker();
-
         let require_full_sync = {
             let mut map = tracker.write().await;
             if let Some(info) = map.get_mut(&replica_id) {
                 let buffered_count = info.buffer.len();
                 if buffered_count > 0 {
-                    tracing::info!(
-                        "🔄 Replaying {} missed changesets to Replica {}",
-                        buffered_count,
-                        replica_id
-                    );
                     for evt in info.buffer.drain(..) {
                         let _ = tx.try_send(Ok(evt));
                     }
-                } else {
-                    tracing::info!(
-                        "✅ Replica {} reconnected successfully (No missed changesets).",
-                        replica_id
-                    );
                 }
                 info.tx = Some(tx.clone());
                 info.scopes.extend(sub.add_scopes.clone());
                 false
             } else {
-                tracing::info!("🌟 New Replica connected: {}", replica_id);
                 map.insert(
                     replica_id.clone(),
                     ReplicaInfo {
@@ -851,41 +838,55 @@ impl GrpcWriteForwarder {
         Ok(ch)
     }
 
-    // Isolated HTTP write logic
-    async fn fallback_http_write(
+    // [NEW] WebSocket RPC execution
+    async fn fallback_ws_write(
         &self,
         db_path: &str,
         sql: &str,
         json_params: &Vec<serde_json::Value>,
     ) -> Result<(i64, u64), String> {
-        let url = format!(
-            "{}/replication/write",
-            self.master_url.trim_end_matches('/')
-        );
-        let master_key = std::env::var("APEXKIT_MASTER_KEY").unwrap_or_default();
-        let client = reqwest::Client::new();
+        let req_id = uuid::Uuid::new_v4().to_string();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
-        let req = FallbackWriteReq {
+        get_pending_reqs()
+            .write()
+            .await
+            .insert(req_id.clone(), reply_tx);
+
+        let msg = WsReplMsg::WriteRequest {
+            req_id: req_id.clone(),
+            db_path: db_path.to_string(),
             sql: sql.to_string(),
             params: serde_json::to_vec(json_params).unwrap(),
-            db_path: db_path.to_string(),
         };
 
-        let res: FallbackWriteRes = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", master_key))
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if res.success {
-            Ok((res.insert_id, 1))
+        let sent = if let Some(lock) = WS_OUTBOUND_TX.get() {
+            if let Some(tx) = lock.read().await.as_ref() {
+                tx.send(msg).await.is_ok()
+            } else {
+                false
+            }
         } else {
-            Err(res.error)
+            false
+        };
+
+        if !sent {
+            get_pending_reqs().write().await.remove(&req_id);
+            return Err("WS disconnected or not initialized".into());
+        }
+
+        match tokio::time::timeout(Duration::from_secs(15), reply_rx).await {
+            Ok(Ok(res)) => {
+                if res.success {
+                    Ok((res.insert_id, 1))
+                } else {
+                    Err(res.error)
+                }
+            }
+            _ => {
+                get_pending_reqs().write().await.remove(&req_id);
+                Err("WS write request timed out".into())
+            }
         }
     }
 }
@@ -914,15 +915,15 @@ impl WriteForwarder for GrpcWriteForwarder {
         }
 
         if is_http_fallback() {
-            return self.fallback_http_write(&db_path, &sql, &json_params).await;
+            return self.fallback_ws_write(&db_path, &sql, &json_params).await;
         }
 
         let channel = match self.get_channel().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("gRPC channel error: {}. Switching to HTTP.", e);
+                tracing::warn!("gRPC channel error: {}. Switching to WS.", e);
                 USE_HTTP_FALLBACK.store(true, Ordering::SeqCst);
-                return self.fallback_http_write(&db_path, &sql, &json_params).await;
+                return self.fallback_ws_write(&db_path, &sql, &json_params).await;
             }
         };
 
@@ -949,9 +950,9 @@ impl WriteForwarder for GrpcWriteForwarder {
                 }
             }
             Err(e) => {
-                tracing::warn!("gRPC Write failed ({}). Switching to HTTP fallback.", e);
+                tracing::warn!("gRPC Write failed ({}). Switching to WS fallback.", e);
                 USE_HTTP_FALLBACK.store(true, Ordering::SeqCst);
-                self.fallback_http_write(&db_path, &sql, &json_params).await
+                self.fallback_ws_write(&db_path, &sql, &json_params).await
             }
         }
     }
@@ -976,7 +977,6 @@ pub async fn forward_file_to_master(
             mime_type: mime.to_string(),
             data: STANDARD.encode(data),
         };
-
         let res: FallbackSyncFileRes = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", master_key))
@@ -1055,7 +1055,6 @@ pub async fn fetch_snapshot_from_master(master_url: &str, db_path: &str) -> Resu
                 response.status()
             ));
         }
-
         if let Some(parent) = std::path::Path::new(db_path).parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -1076,7 +1075,6 @@ pub async fn fetch_snapshot_from_master(master_url: &str, db_path: &str) -> Resu
             .map_err(|e| e.to_string())?;
         let _ = tokio::fs::remove_file(format!("{}-wal", db_path)).await;
         let _ = tokio::fs::remove_file(format!("{}-shm", db_path)).await;
-
         Ok(())
     };
 
@@ -1107,18 +1105,15 @@ pub async fn fetch_snapshot_from_master(master_url: &str, db_path: &str) -> Resu
     match client.fetch_db_snapshot(req).await {
         Ok(response) => {
             let mut stream = response.into_inner();
-
             if let Some(parent) = std::path::Path::new(db_path).parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| e.to_string())?;
             }
-
             let tmp_path = format!("{}.tmp", db_path);
             let mut file = tokio::fs::File::create(&tmp_path)
                 .await
                 .map_err(|e| e.to_string())?;
-
             let mut success = true;
             let mut total_bytes = 0;
             loop {
@@ -1129,7 +1124,7 @@ pub async fn fetch_snapshot_from_master(master_url: &str, db_path: &str) -> Resu
                             .map_err(|e| e.to_string())?;
                         total_bytes += chunk.data.len();
                     }
-                    Ok(None) => break, // Stream finished
+                    Ok(None) => break,
                     Err(e) => {
                         tracing::warn!(
                             "gRPC stream failed mid-transfer: {}. Switching to HTTP.",
@@ -1140,7 +1135,6 @@ pub async fn fetch_snapshot_from_master(master_url: &str, db_path: &str) -> Resu
                     }
                 }
             }
-
             if success && total_bytes > 0 {
                 file.sync_all().await.map_err(|e| e.to_string())?;
                 tokio::fs::rename(&tmp_path, db_path)
@@ -1172,7 +1166,6 @@ pub async fn fetch_snapshot_from_master(master_url: &str, db_path: &str) -> Resu
 pub async fn ensure_replica_env(base_path: &str) {
     do_sync_env(base_path, false).await;
 }
-
 pub async fn force_replica_sync(base_path: &str) {
     do_sync_env(base_path, true).await;
 }
@@ -1298,7 +1291,6 @@ pub async fn start_event_streamer(master_url: String, state: Option<crate::AppSt
         })
         .await;
 
-    // Listen for dynamic tenant creations
     tokio::spawn(async move {
         while let Ok(msg) = global_sub_rx.recv().await {
             if mpsc_tx.send(msg).await.is_err() {
@@ -1326,17 +1318,12 @@ pub async fn start_event_streamer(master_url: String, state: Option<crate::AppSt
                                     if let Some(s) = &state { let _ = s.db.reload_connections().await; }
                                     continue;
                                 }
-
                                 if event.db_name == "logs" { continue; }
-
-                                tracing::info!("📥 [Replica] Received DB changes for {}/{}", event.scope, event.db_name);
+                                tracing::debug!("📥 [Replica] Received DB changes for {}/{}", event.scope, event.db_name);
                                 let _ = get_db_sync_tx().send(event);
                             }
                             Ok(None) => break,
-                            Err(e) => {
-                                tracing::warn!("gRPC stream error: {}", e);
-                                break;
-                            }
+                            Err(e) => { tracing::warn!("gRPC stream error: {}", e); break; }
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {
@@ -1376,7 +1363,6 @@ pub async fn start_ws_event_streamer(
 
     loop {
         tracing::info!("📡 [WS Streamer] Connecting to {}", ws_url);
-
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let request_result = ws_url.clone().into_client_request();
 
@@ -1389,7 +1375,7 @@ pub async fn start_ws_event_streamer(
                 Ok((mut ws_stream, _)) => {
                     tracing::info!("✅ [WS Streamer] Connected successfully");
 
-                    // Initial subscription
+                    // 1. Send Initial Subscriptions
                     let sub_msg = WsReplMsg::Subscribe {
                         replica_id: replica_id.clone(),
                         add_scopes: get_local_scopes(),
@@ -1400,41 +1386,60 @@ pub async fn start_ws_event_streamer(
                         ))
                         .await;
 
+                    // 2. Setup Multiplexing Channels
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(25));
                     let mut global_sub_rx = get_event_sub_tx().subscribe();
 
+                    let (ws_out_tx, mut ws_out_rx) = mpsc::channel(1000);
+                    let lock = WS_OUTBOUND_TX.get_or_init(|| RwLock::new(None));
+                    *lock.write().await = Some(ws_out_tx);
+
+                    // 3. Multiplexing Loop
                     loop {
                         tokio::select! {
+                            // A. Ping
                             _ = ping_interval.tick() => {
                                 if ws_stream.send(tokio_tungstenite::tungstenite::protocol::Message::Text(serde_json::to_string(&WsReplMsg::Ping).unwrap().into())).await.is_err() { break; }
                             }
 
-                            // [FIX] Listen for dynamic tenant subscriptions and forward them over WS
+                            // B. Dynamic Subscriptions (New Tenants)
                             Ok(new_sub) = global_sub_rx.recv() => {
-                                let dyn_msg = WsReplMsg::Subscribe {
-                                    replica_id: new_sub.replica_id,
-                                    add_scopes: new_sub.add_scopes,
-                                };
+                                let dyn_msg = WsReplMsg::Subscribe { replica_id: new_sub.replica_id, add_scopes: new_sub.add_scopes };
                                 let _ = ws_stream.send(tokio_tungstenite::tungstenite::protocol::Message::Text(serde_json::to_string(&dyn_msg).unwrap().into())).await;
                             }
 
+                            // C. Outbound WS Requests (Database Writes from Replica -> Master)
+                            Some(out_msg) = ws_out_rx.recv() => {
+                                let _ = ws_stream.send(tokio_tungstenite::tungstenite::protocol::Message::Text(serde_json::to_string(&out_msg).unwrap().into())).await;
+                            }
+
+                            // D. Inbound WS Messages (Master -> Replica)
                             msg = ws_stream.next() => {
                                 match msg {
                                     Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Text(t))) => {
                                         if let Ok(ws_msg) = serde_json::from_str::<WsReplMsg>(&t) {
                                             match ws_msg {
+                                                // Handle DB Sync Events
                                                 WsReplMsg::DbEvent { scope, db_name, changeset } => {
                                                     if db_name == "logs" { continue; }
-
                                                     use base64::{Engine as _, engine::general_purpose::STANDARD};
                                                     if let Ok(bytes) = STANDARD.decode(&changeset) {
-                                                        tracing::info!("📥 [Replica WS] Received DB changes for {}/{}", scope, db_name);
+                                                        tracing::debug!("📥 [Replica WS] Received DB changes for {}/{}", scope, db_name);
                                                         let _ = get_db_sync_tx().send(pb::DbChangeEvent { scope, db_name, changeset: bytes });
                                                     }
                                                 }
+                                                // Handle Full Sync Requests
                                                 WsReplMsg::FullSyncRequired => {
                                                     force_replica_sync("storage/system").await;
                                                     if let Some(s) = &state { let _ = s.db.reload_connections().await; }
+                                                }
+                                                // [NEW] Handle Write Responses mapping back to the waiting HTTP thread
+                                                WsReplMsg::WriteResponse { req_id, success, insert_id, error } => {
+                                                    let pending_reqs = get_pending_reqs(); // 💡 Bind Arc first to keep it alive
+                                                    let mut pending = pending_reqs.write().await;
+                                                    if let Some(reply_tx) = pending.remove(&req_id) {
+                                                        let _ = reply_tx.send(FallbackWriteRes { success, insert_id, error });
+                                                    }
                                                 }
                                                 _ => {}
                                             }

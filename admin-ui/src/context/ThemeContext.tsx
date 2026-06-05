@@ -1,8 +1,7 @@
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import { APEX_THEME } from '../constants';
 
-import React, { createContext, useContext, useEffect, useState } from "react";
-import { APEX_THEME } from "../constants";
-
-type Theme = "dark" | "light" | "system";
+type Theme = 'dark' | 'light' | 'system';
 
 interface ThemeProviderProps {
   children?: React.ReactNode;
@@ -16,7 +15,7 @@ interface ThemeContextState {
 }
 
 const initialState: ThemeContextState = {
-  theme: "system",
+  theme: 'system',
   setTheme: () => null,
 };
 
@@ -24,7 +23,7 @@ const ThemeContext = createContext<ThemeContextState>(initialState);
 
 export function ThemeProvider({
   children,
-  defaultTheme = "system",
+  defaultTheme = 'system',
   storageKey = APEX_THEME,
   ...props
 }: ThemeProviderProps) {
@@ -35,13 +34,12 @@ export function ThemeProvider({
   useEffect(() => {
     const root = window.document.documentElement;
 
-    root.classList.remove("light", "dark");
+    root.classList.remove('light', 'dark');
 
-    if (theme === "system") {
-      const systemTheme = window.matchMedia("(prefers-color-scheme: dark)")
-        .matches
-        ? "dark"
-        : "light";
+    if (theme === 'system') {
+      const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches
+        ? 'dark'
+        : 'light';
 
       root.classList.add(systemTheme);
       return;
@@ -68,8 +66,7 @@ export function ThemeProvider({
 export const useTheme = () => {
   const context = useContext(ThemeContext);
 
-  if (context === undefined)
-    throw new Error("useTheme must be used within a ThemeProvider");
+  if (context === undefined) throw new Error('useTheme must be used within a ThemeProvider');
 
   return context;
 };

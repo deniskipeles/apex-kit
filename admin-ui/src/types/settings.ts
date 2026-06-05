@@ -1,9 +1,12 @@
-import { AiAction } from ".";
+import { AiAction } from '.';
 
 export interface SecurityConfig {
   corsAllowAll: boolean;
   corsOrigins: string;
   tenantTransparency: boolean;
+  globalRateLimit?: number; // Root API limit (reqs/min)
+  tenantFreeRateLimit?: number; // Free tenant API limit
+  tenantProRateLimit?: number; // Pro tenant API limit
 }
 
 export interface SystemLog {
@@ -14,7 +17,20 @@ export interface SystemLog {
   source: string;
 }
 
-export type ViewState =  'ai-architect' | 'ai-actions' | 'dashboard' | 'collections' | 'collections-create' | 'collections-edit' | 'records' | 'files' | 'settings' | 'logs' | 'users' | 'scripts' | 'templates';
+export type ViewState =
+  | 'ai-architect'
+  | 'ai-actions'
+  | 'dashboard'
+  | 'collections'
+  | 'collections-create'
+  | 'collections-edit'
+  | 'records'
+  | 'files'
+  | 'settings'
+  | 'logs'
+  | 'users'
+  | 'scripts'
+  | 'templates';
 
 export interface SmtpConfig {
   enabled: boolean;
@@ -48,7 +64,7 @@ export interface BackupConfig {
   schedule: string; // Cron expression
   retention: number; // Days to keep
   destination: 'local' | 's3';
-  
+
   includeDatabases?: boolean;
   includeVectors?: boolean;
   includeUploads?: boolean;
@@ -81,9 +97,8 @@ export interface ApiKey {
   created: string;
 }
 
-
-export interface AIProvider{
-  enabled: Boolean;
+export interface AIProvider {
+  enabled: boolean;
   apiKey: string;
   provider: string;
 }
@@ -93,8 +108,8 @@ export interface AppSettings {
   appUrl: string;
   allowPublicRegistration: boolean;
   theme: 'light' | 'dark' | 'system';
-  appLogo?: string;   
-  logoWidth?: string; 
+  appLogo?: string;
+  logoWidth?: string;
   logoHeight?: string;
   smtp: SmtpConfig;
   storage: StorageConfig;
@@ -104,7 +119,7 @@ export interface AppSettings {
   security: SecurityConfig;
   logRetentionDays: number;
   maxSiteSizeMb?: number;
-  ai:AIProvider;
+  ai: AIProvider;
 }
 
 export interface TenantStats {
@@ -120,7 +135,7 @@ export interface Tenant {
   id: string;
   name?: string;
   status: string; // 'active', 'suspended'
-  tier: string;   // 'free', 'pro'
+  tier: string; // 'free', 'pro'
   stats: TenantStats;
   created_at: string;
 }

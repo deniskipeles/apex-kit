@@ -1,4 +1,3 @@
-
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
@@ -19,9 +18,9 @@ export const useSettingsStore = create<SettingsState>()(
       settings: {
         appName: 'ApexKit Admin',
         appUrl: 'http://localhost:8090',
-        theme: 'system'
+        theme: 'system',
       },
-      updateSettings: (newSettings) => 
+      updateSettings: (newSettings) =>
         set((state) => ({ settings: { ...state.settings, ...newSettings } })),
     }),
     { name: 'apexkit-settings' }

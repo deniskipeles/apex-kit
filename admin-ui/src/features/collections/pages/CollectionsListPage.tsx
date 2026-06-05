@@ -1,14 +1,29 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Plus, Database, User, Edit, Trash2, Fingerprint,
-  BrainCircuit, Search, Layers, ArrowRight,
+  Plus,
+  Database,
+  User,
+  Edit,
+  Trash2,
+  Fingerprint,
+  BrainCircuit,
+  Search,
+  Layers,
+  ArrowRight,
   Download,
-  Upload
+  Upload,
 } from 'lucide-react';
 import {
-  Button, Card, CardHeader,
-  CardTitle, CardContent, Badge,
-  Skeleton, Input, Select, Label
+  Button,
+  Card,
+  CardHeader,
+  CardTitle,
+  CardContent,
+  Badge,
+  Skeleton,
+  Input,
+  Select,
+  Label,
 } from '@/src/components/ui/Elements';
 import { Dialog } from '@/src/components/ui/Dialog';
 import { collectionsService } from '../services/collectionsService';
@@ -44,7 +59,8 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
 
   const fetchCollections = () => {
     setLoading(true);
-    collectionsService.list()
+    collectionsService
+      .list()
       .then(setCollections)
       .catch(() => toast('Failed to load collections', 'error'))
       .finally(() => setLoading(false));
@@ -59,7 +75,7 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     if (!collectionToDelete) return;
     try {
       await collectionsService.delete(collectionToDelete.id);
-      setCollections(prev => prev.filter(c => c.id !== collectionToDelete.id));
+      setCollections((prev) => prev.filter((c) => c.id !== collectionToDelete.id));
       toast(`Collection "${collectionToDelete.name}" deleted`, 'success');
     } catch (e) {
       toast('Failed to delete collection', 'error');
@@ -74,7 +90,7 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     try {
       for (const col of collections) {
         // Only re-index if it has indexed fields
-        if (col.schema.some(f => f.ose_indexed)) {
+        if (col.schema.some((f) => f.ose_indexed)) {
           await apiClient.reIndex(col.id);
           count++;
         }
@@ -93,7 +109,7 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     try {
       for (const col of collections) {
         // Only vectorizable collections
-        if (col.schema.some(f => f.vectorize)) {
+        if (col.schema.some((f) => f.vectorize)) {
           await apiClient.revectorizeCollection(col.id);
           count++;
         }
@@ -106,7 +122,7 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     }
   };
 
-  const filteredCollections = collections.filter(c =>
+  const filteredCollections = collections.filter((c) =>
     c.name.toLowerCase().includes(search.toLowerCase())
   );
 
@@ -134,7 +150,10 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     setIsImporting(true);
     try {
       const res = await apiClient.collections.importSchema(file, strategy);
-      toast(`Schema Import: Created ${res.created}, Updated ${res.updated}, Skipped ${res.skipped}`, 'success');
+      toast(
+        `Schema Import: Created ${res.created}, Updated ${res.updated}, Skipped ${res.skipped}`,
+        'success'
+      );
       if (res.errors.length > 0) {
         console.warn(res.errors);
         toast('Some collections failed to import. Check console.', 'warning');
@@ -172,13 +191,28 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
             />
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" onClick={handleExportSchema} isLoading={isExporting} title="Download Schema JSON">
+            <Button
+              variant="outline"
+              onClick={handleExportSchema}
+              isLoading={isExporting}
+              title="Download Schema JSON"
+            >
               <Download className="mr-2 h-4 w-4" /> Export
             </Button>
-            <Button variant="outline" onClick={() => setIsImportModalOpen(true)} title="Upload Schema JSON">
+            <Button
+              variant="outline"
+              onClick={() => setIsImportModalOpen(true)}
+              title="Upload Schema JSON"
+            >
               <Upload className="mr-2 h-4 w-4" /> Import
             </Button>
-            <Button onClick={() => { setActiveCollection(null); onCreate(); }} className="shadow-lg hover:shadow-primary/25 transition-all">
+            <Button
+              onClick={() => {
+                setActiveCollection(null);
+                onCreate();
+              }}
+              className="shadow-lg hover:shadow-primary/25 transition-all"
+            >
               <Plus className="mr-2 h-4 w-4" /> New Collection
             </Button>
           </div>
@@ -211,7 +245,9 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
       {/* Grid */}
       {loading ? (
         <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
-          {[1, 2, 3, 4, 5, 6].map(i => <Skeleton key={i} className="h-40 w-full rounded-xl" />)}
+          {[1, 2, 3, 4, 5, 6].map((i) => (
+            <Skeleton key={i} className="h-40 w-full rounded-xl" />
+          ))}
         </div>
       ) : filteredCollections.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center border-2 border-dashed border-border rounded-xl bg-secondary/5">
@@ -220,18 +256,26 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
           </div>
           <h3 className="text-xl font-semibold mb-2">No Collections Found</h3>
           <p className="text-muted-foreground max-w-md mb-6">
-            {search ? `No matches for "${search}"` : "Get started by creating your first data collection."}
+            {search
+              ? `No matches for "${search}"`
+              : 'Get started by creating your first data collection.'}
           </p>
           {!search && (
-            <Button variant="outline" onClick={() => { setActiveCollection(null); onCreate(); }}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setActiveCollection(null);
+                onCreate();
+              }}
+            >
               Create Collection
             </Button>
           )}
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-          {filteredCollections.map(col => {
-            const hasVectors = col.schema.some(f => f.vectorize);
+          {filteredCollections.map((col) => {
+            const hasVectors = col.schema.some((f) => f.vectorize);
             const fieldCount = col.schema.length;
             const isAuth = col.type === 'auth';
 
@@ -243,7 +287,9 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
                 <CardHeader className="pb-3">
                   <div className="flex justify-between items-start">
                     <div className="flex items-center gap-3">
-                      <div className={`p-2 rounded-lg ${isAuth ? 'bg-orange-500/10 text-orange-500' : 'bg-primary/10 text-primary'}`}>
+                      <div
+                        className={`p-2 rounded-lg ${isAuth ? 'bg-orange-500/10 text-orange-500' : 'bg-primary/10 text-primary'}`}
+                      >
                         {isAuth ? <User className="h-5 w-5" /> : <Database className="h-5 w-5" />}
                       </div>
                       <div>
@@ -259,7 +305,10 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
                         variant="ghost"
                         size="icon"
                         className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                        onClick={(e) => { e.stopPropagation(); setCollectionToDelete(col); }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setCollectionToDelete(col);
+                        }}
                       >
                         <Trash2 className="h-4 w-4" />
                       </Button>
@@ -275,7 +324,10 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
                         {fieldCount} Fields
                       </Badge>
                       {hasVectors && (
-                        <Badge variant="secondary" className="text-[10px] font-mono bg-purple-500/10 text-purple-400 border-purple-500/20">
+                        <Badge
+                          variant="secondary"
+                          className="text-[10px] font-mono bg-purple-500/10 text-purple-400 border-purple-500/20"
+                        >
                           <BrainCircuit className="h-3 w-3 mr-1" /> AI Ready
                         </Badge>
                       )}
@@ -312,7 +364,8 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
       >
         <form onSubmit={handleImportSchema} className="space-y-4">
           <div className="text-sm text-muted-foreground">
-            Upload an <code>apex_schema.json</code> file to restore or migrate collections structure.
+            Upload an <code>apex_schema.json</code> file to restore or migrate collections
+            structure.
           </div>
 
           <div className="space-y-2">
@@ -328,12 +381,18 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
               <option value="error">Fail if exists</option>
             </Select>
             <p className="text-[10px] text-muted-foreground">
-              "Overwrite" will update fields/rules but preserve existing records (unless fields are removed).
+              "Overwrite" will update fields/rules but preserve existing records (unless fields are
+              removed).
             </p>
           </div>
 
           <div className="flex justify-end gap-2 pt-2 border-t border-border">
-            <Button type="button" variant="ghost" onClick={() => setIsImportModalOpen(false)} disabled={isImporting}>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setIsImportModalOpen(false)}
+              disabled={isImporting}
+            >
               Cancel
             </Button>
             <Button type="submit" isLoading={isImporting} disabled={isImporting}>

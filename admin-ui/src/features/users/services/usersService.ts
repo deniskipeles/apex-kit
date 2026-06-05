@@ -16,11 +16,11 @@ export const usersService = {
   },
   getRoles: async (): Promise<string[]> => {
     try {
-        const res = await apiClient.auth.listRoles();
-        return res.roles || ['admin', 'user'];
+      const res = await apiClient.auth.listRoles();
+      return res.roles || ['admin', 'user'];
     } catch (e) {
-        console.warn("Failed to fetch roles, using defaults.", e);
-        return ['admin', 'user'];
+      console.warn('Failed to fetch roles, using defaults.', e);
+      return ['admin', 'user'];
     }
-  }
+  },
 };

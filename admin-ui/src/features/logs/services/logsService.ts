@@ -1,10 +1,9 @@
-
 import { SystemLog } from '../../../types';
 import { apiClient } from '../../../lib/apiClient';
 import { MOCK_LOGS, CHART_DATA } from '../../../constants';
 
 // Mock delay helper
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const logsService = {
   list: async (): Promise<SystemLog[]> => {
@@ -16,10 +15,10 @@ export const logsService = {
     await delay(300);
     return CHART_DATA;
   },
-  
+
   clearLogs: async () => {
     await delay(500);
     // Mock clearing logs
     return true;
-  }
+  },
 };

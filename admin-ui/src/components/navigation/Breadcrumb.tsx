@@ -1,4 +1,3 @@
-
 import React from 'react';
 import { ChevronRight, Home } from 'lucide-react';
 import { ViewState } from '../../types';
@@ -16,7 +15,10 @@ interface BreadcrumbProps {
 export const Breadcrumb = ({ items, onNavigate }: BreadcrumbProps) => {
   return (
     <nav className="flex items-center text-sm font-medium text-muted-foreground">
-      <button onClick={() => onNavigate('dashboard')} className="flex items-center gap-1.5 hover:text-primary transition-colors">
+      <button
+        onClick={() => onNavigate('dashboard')}
+        className="flex items-center gap-1.5 hover:text-primary transition-colors"
+      >
         <Home className="h-4 w-4" />
       </button>
       {items.slice(1).map((item, index) => (

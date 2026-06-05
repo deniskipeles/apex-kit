@@ -38,6 +38,9 @@ pub async fn cors_middleware(State(state): State<AppState>, req: Request, next: 
             cors_allow_all: true,
             cors_origins: "".to_string(),
             tenant_transparency: false,
+            global_rate_limit: Some(600),
+            tenant_free_rate_limit: Some(120),
+            tenant_pro_rate_limit: Some(3000),
         }
     };
 

@@ -1,4 +1,3 @@
-
 export interface AppRecord {
   id: string;
   collectionId: string;

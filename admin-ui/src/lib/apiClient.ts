@@ -1,5 +1,19 @@
 import { APEX_TOKEN } from '../constants';
-import { Collection, AppRecord, SystemLog, AuthUser, StoredFile, InstantResult, Script, Template, AiAction, AppVersions, ApiKey, SiteFile, Tenant } from '../types';
+import {
+  Collection,
+  AppRecord,
+  SystemLog,
+  AuthUser,
+  StoredFile,
+  InstantResult,
+  Script,
+  Template,
+  AiAction,
+  AppVersions,
+  ApiKey,
+  SiteFile,
+  Tenant,
+} from '../types';
 import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
 
 // Initialize SDK
@@ -34,7 +48,7 @@ export const pb = new Proxy(basePb, {
       }
     }
     return Reflect.get(target, prop, receiver);
-  }
+  },
 });
 
 export const realtime = new ApexKitRealtime(pb.baseUrl, pb.getToken());
@@ -63,7 +77,7 @@ const rawFetch = async (path: string) => {
 
   const token = localStorage.getItem(APEX_TOKEN);
   const res = await fetch(`${baseUrl}/api/v1${path}`, {
-    headers: { 'Authorization': `Bearer ${token}` }
+    headers: { Authorization: `Bearer ${token}` },
   });
 
   if (!res.ok) {
@@ -86,8 +100,8 @@ const rawFetchWithBody = async (path: string, body: FormData) => {
   const token = localStorage.getItem(APEX_TOKEN);
   const res = await fetch(`${baseUrl}/api/v1${path}`, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}` },
-    body: body
+    headers: { Authorization: `Bearer ${token}` },
+    body: body,
   });
   if (!res.ok) throw new Error(await res.text());
   return await res.json();
@@ -125,7 +139,7 @@ const transformCollection = (col: any): Collection => {
         maxSize: def.max_size,
         dimension: def.dimension,
         relationTo: def.relation_to,
-        originalName: name
+        originalName: name,
       };
     });
   }
@@ -140,14 +154,19 @@ const transformCollection = (col: any): Collection => {
         unique: def.relation_type === 'one' ? true : false,
         originalName: name,
         position: def.position || 999,
-        uid: def.uid || "gen_rel"
+        uid: def.uid || 'gen_rel',
       });
     });
   }
 
   schemaArray.sort((a, b) => (a.position || 0) - (b.position || 0));
 
-  const rules = col.schema?.policies || { read: 'public', create: 'admin', update: 'admin', delete: 'admin' };
+  const rules = col.schema?.policies || {
+    read: 'public',
+    create: 'admin',
+    update: 'admin',
+    delete: 'admin',
+  };
   const fieldHistory = col.schema?.field_history || {};
   const compositeUnique = col.schema?.composite_unique || [];
 
@@ -160,7 +179,7 @@ const transformCollection = (col: any): Collection => {
     fieldHistory: fieldHistory,
     compositeUnique: compositeUnique,
     created: new Date().toISOString(),
-    updated: new Date().toISOString()
+    updated: new Date().toISOString(),
   };
 };
 
@@ -170,11 +189,11 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
     relations: {},
     policies: data.rules || {},
     field_history: data.fieldHistory || {},
-    composite_unique: data.compositeUnique || []
+    composite_unique: data.compositeUnique || [],
   };
 
   if (data.schema) {
-    data.schema.forEach(field => {
+    data.schema.forEach((field) => {
       const { name } = field;
       if (field.type === 'relation') {
         schema.relations[name] = {
@@ -182,7 +201,7 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
           relation_type: field.unique ? 'one' : 'many',
           position: field.position,
           required: field.required,
-          uid: field.uid
+          uid: field.uid,
         };
         return;
       }
@@ -206,12 +225,14 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
         mime_types: field.mimeTypes,
         max_size: field.maxSize,
         dimension: field.dimension,
-        relation_to: field.relationTo
+        relation_to: field.relationTo,
       };
       if (backendField.type === 'bool') {
         backendField.type = 'boolean';
       }
-      Object.keys(backendField).forEach(key => backendField[key] === undefined && delete backendField[key]);
+      Object.keys(backendField).forEach(
+        (key) => backendField[key] === undefined && delete backendField[key]
+      );
       schema.fields[name] = backendField;
     });
   }
@@ -222,15 +243,21 @@ export const apiClient = {
   getScope: () => pb.scope,
   setToken: (token: string) => basePb.setToken(token),
   apiUrl: apiUrl,
-  logoUrl: apiUrl + "/logo?thumb=100x100",
+  logoUrl: apiUrl + '/logo?thumb=100x100',
   stripHtmlTags: (html: string) => {
     // Basic shim for stripping tags if util isn't exposed yet
     if (!html) return '';
     return html.replace(/<[^>]*>?/gm, '');
   },
   getAdminDashboardStats: pb.admins.getDashboardStats,
-  searchVector: (collectionId: string | number, field: string, vector: Array<number>, limit?: number) => pb.collection(collectionId).searchVector(field, vector, limit),
-  searchTextVector: (collectionId: string | number, queryText: string, limit?: number) => pb.collection(collectionId).searchTextVector(queryText, limit),
+  searchVector: (
+    collectionId: string | number,
+    field: string,
+    vector: Array<number>,
+    limit?: number
+  ) => pb.collection(collectionId).searchVector(field, vector, limit),
+  searchTextVector: (collectionId: string | number, queryText: string, limit?: number) =>
+    pb.collection(collectionId).searchTextVector(queryText, limit),
   reIndex: async (collectionId?: string) => {
     const res = await pb.admins.reIndex(collectionId);
     return res;
@@ -242,7 +269,8 @@ export const apiClient = {
 
   system: {
     reload: async (target = null) => await pb.admins.reloadSystem(target),
-    testEmail: async (email: string, templateType?: string) => await pb.admins.testEmail(email, templateType),
+    testEmail: async (email: string, templateType?: string) =>
+      await pb.admins.testEmail(email, templateType),
     createBackup: async () => await pb.admins.createBackup(),
     listBackups: async () => await pb.admins.listBackups(),
     downloadBackup: async (filename: string) => {
@@ -263,10 +291,15 @@ export const apiClient = {
         role: k.role,
         scope: k.scope,
         bypass_cors: k.bypass_cors,
-        created: k.created_at
+        created: k.created_at,
       }));
     },
-    create: async (name: string, role = 'admin', scope = 'root', bypass_cors = true): Promise<{ key: string, info: ApiKey }> => {
+    create: async (
+      name: string,
+      role = 'admin',
+      scope = 'root',
+      bypass_cors = true
+    ): Promise<{ key: string; info: ApiKey }> => {
       const res = await pb.admins.createApiKey(name, role, scope, bypass_cors);
       return {
         key: res.key,
@@ -277,11 +310,12 @@ export const apiClient = {
           role: res.info.role,
           scope: res.info.scope,
           bypass_cors: res.info.bypass_cors,
-          created: res.info.created_at
-        }
+          created: res.info.created_at,
+        },
       };
     },
-    update: async (id: string, updates: Partial<ApiKey>) => await pb.admins.updateApiKey(id, updates),
+    update: async (id: string, updates: Partial<ApiKey>) =>
+      await pb.admins.updateApiKey(id, updates),
     delete: async (id: string) => await pb.admins.deleteApiKey(id),
   },
 
@@ -303,12 +337,13 @@ export const apiClient = {
           vector_count: 0,
           max_vectors: 0,
           ai_requests: 0,
-          max_ai_requests: 0
+          max_ai_requests: 0,
         },
-        created_at: t.created_at
+        created_at: t.created_at,
       }));
     },
-    updateStatus: async (id: string, status: 'active' | 'suspended' | 'archived') => await pb.admins.updateTenantStatus(id, status),
+    updateStatus: async (id: string, status: 'active' | 'suspended' | 'archived') =>
+      await pb.admins.updateTenantStatus(id, status),
   },
 
   auth: {
@@ -320,7 +355,7 @@ export const apiClient = {
         email: u.email,
         role: u.role,
         lastActive: new Date().toISOString(),
-        scope: u.scope
+        scope: u.scope,
       };
     },
     login: async (email: string, password: string) => {
@@ -332,7 +367,7 @@ export const apiClient = {
         role: response.user.role,
         scope: response.user.scope,
         metadata: response.user.metadata,
-        lastActive: new Date().toISOString()
+        lastActive: new Date().toISOString(),
       };
       return { token: response.token, user };
     },
@@ -346,13 +381,22 @@ export const apiClient = {
     },
     confirmPasswordReset: async (token: string, newPassword: string) => {
       return await pb.auth.confirmPasswordReset(token, newPassword);
-    }
+    },
   },
 
   users: {
-    list: async (page = 1, perPage = 20, search = ''): Promise<{ items: AuthUser[], total: number }> => {
+    list: async (
+      page = 1,
+      perPage = 20,
+      search = ''
+    ): Promise<{ items: AuthUser[]; total: number }> => {
       try {
-        const res = await pb.admins.listUsers({ page, per_page: perPage, sort: "", filter: search });
+        const res = await pb.admins.listUsers({
+          page,
+          per_page: perPage,
+          sort: '',
+          filter: search,
+        });
         const items = res.items.map((u: any) => ({
           id: u.id.toString(),
           email: u.email,
@@ -362,12 +406,17 @@ export const apiClient = {
         }));
         return { items, total: res.total };
       } catch (e) {
-        console.error("Error fetching users", e);
+        console.error('Error fetching users', e);
         return { items: [], total: 0 };
       }
     },
     create: async (data: Partial<AuthUser>): Promise<AuthUser> => {
-      const res = await pb.admins.registerUser(data.email!, data.password, data.role, data.metadata);
+      const res = await pb.admins.registerUser(
+        data.email!,
+        data.password,
+        data.role,
+        data.metadata
+      );
       return {
         id: res.user.id.toString(),
         email: res.user.email,
@@ -390,13 +439,14 @@ export const apiClient = {
     },
     delete: async (id: string): Promise<void> => {
       await pb.admins.deleteUser(id);
-    }
+    },
   },
 
   configs: {
     list: async (): Promise<any[]> => await pb.admins.listConfigs(),
-    set: async (key: string, value: string, encrypt: boolean = false) => await pb.admins.setConfig(key, value, encrypt),
-    delete: async (key: string) => await pb.admins.deleteConfig(key)
+    set: async (key: string, value: string, encrypt: boolean = false) =>
+      await pb.admins.setConfig(key, value, encrypt),
+    delete: async (key: string) => await pb.admins.deleteConfig(key),
   },
 
   sites: {
@@ -405,13 +455,13 @@ export const apiClient = {
       try {
         return await pb.sites.listFiles();
       } catch (e) {
-        console.error("Failed to list site files", e);
+        console.error('Failed to list site files', e);
         return [];
       }
     },
     delete: async (path: string): Promise<void> => {
       return await pb.sites.delete(path);
-    }
+    },
   },
 
   collections: {
@@ -459,7 +509,14 @@ export const apiClient = {
   },
 
   records: {
-    list: async (collectionId: string, page = 1, perPage = 20, expand = '', filter = {}, sort = '-id'): Promise<{ items: AppRecord[], totalItems: number }> => {
+    list: async (
+      collectionId: string,
+      page = 1,
+      perPage = 20,
+      expand = '',
+      filter = {},
+      sort = '-id'
+    ): Promise<{ items: AppRecord[]; totalItems: number }> => {
       const result = await pb.collection(collectionId).list({
         page,
         per_page: perPage,
@@ -475,24 +532,30 @@ export const apiClient = {
         created: new Date(item.created).toISOString(),
         updated: new Date(item.updated).toISOString(),
         ...item.data,
-        expand: item.expand || {}
+        expand: item.expand || {},
       }));
 
       return {
         items: formattedItems,
-        totalItems: result.total
+        totalItems: result.total,
       };
     },
-    instantSearch: async (collectionId: string | number, query: string): Promise<InstantResult[]> => {
+    instantSearch: async (
+      collectionId: string | number,
+      query: string
+    ): Promise<InstantResult[]> => {
       if (!query) return [];
       try {
         return await pb.collection(collectionId).searchRecordsInstantlyWithOSE(query);
       } catch (e) {
-        console.error("Instant search failed", e);
+        console.error('Instant search failed', e);
         return [];
       }
     },
-    recordsSearchOSE: async (collectionId: string | number, query: string): Promise<InstantResult[]> => {
+    recordsSearchOSE: async (
+      collectionId: string | number,
+      query: string
+    ): Promise<InstantResult[]> => {
       if (!query) return [];
       try {
         const result = await pb.collection(collectionId).searchRecordsWithOSE(query);
@@ -503,14 +566,17 @@ export const apiClient = {
           created: new Date(item.created).toISOString(),
           updated: new Date(item.updated).toISOString(),
           ...item.data,
-          expand: item.expand || {}
+          expand: item.expand || {},
         }));
       } catch (e) {
-        console.error("OSE Records search failed", e);
+        console.error('OSE Records search failed', e);
         return [];
       }
     },
-    recordsSearchSQL: async (collectionId: string | number, query: any): Promise<InstantResult[]> => {
+    recordsSearchSQL: async (
+      collectionId: string | number,
+      query: any
+    ): Promise<InstantResult[]> => {
       if (!query) return [];
       try {
         const result = await pb.collection(collectionId).searchRecordsWithSQL(query);
@@ -521,10 +587,10 @@ export const apiClient = {
           created: new Date(item.created).toISOString(),
           updated: new Date(item.updated).toISOString(),
           ...item.data,
-          expand: item.expand || {}
+          expand: item.expand || {},
         }));
       } catch (e) {
-        console.error("SQL Records search failed", e);
+        console.error('SQL Records search failed', e);
         return [];
       }
     },
@@ -536,7 +602,7 @@ export const apiClient = {
         collectionName: '',
         created: new Date(res.created).toISOString(),
         updated: new Date(res.updated).toISOString(),
-        ...res.data
+        ...res.data,
       };
     },
     update: async (collectionId: string, id: string, data: any): Promise<AppRecord> => {
@@ -547,7 +613,7 @@ export const apiClient = {
         collectionName: '',
         created: new Date(res.created).toISOString(),
         updated: new Date(res.updated).toISOString(),
-        ...res.data
+        ...res.data,
       };
     },
     getOne: async (collectionId: string, recordId: string, expand = ''): Promise<AppRecord> => {
@@ -559,7 +625,7 @@ export const apiClient = {
         created: new Date(res.created).toISOString(),
         updated: new Date(res.updated).toISOString(),
         ...res.data,
-        expand: res.expand || {}
+        expand: res.expand || {},
       };
     },
     delete: async (collectionId: string, recordId: string): Promise<void> => {
@@ -602,18 +668,22 @@ export const apiClient = {
       region: config.region,
       endpoint: config.endpoint,
       access_key: config.accessKey,
-      secret_key: config.secretKey
+      secret_key: config.secretKey,
     };
     return await pb.admins.testS3StorageConnection(payload);
   },
 
   migrateStorage: async (source: string, destination: string) => {
     // FIX 3: Cast arguments to specific union type as required by SDK
-    return await pb.admins.migrateStorage(source as "local" | "s3", destination as "local" | "s3");
+    return await pb.admins.migrateStorage(source as 'local' | 's3', destination as 'local' | 's3');
   },
 
   files: {
-    list: async (page = 1, perPage = 20, search = ''): Promise<{ items: StoredFile[], totalItems: number }> => {
+    list: async (
+      page = 1,
+      perPage = 20,
+      search = ''
+    ): Promise<{ items: StoredFile[]; totalItems: number }> => {
       try {
         const res = await pb.files.list(page, perPage);
         const items = res.items.map((f: any) => ({
@@ -623,11 +693,11 @@ export const apiClient = {
           mimeType: f.mime_type,
           url: pb.files.getFileUrl(f.filename),
           created: f.created_at,
-          updated: f.created_at
+          updated: f.created_at,
         }));
         return { items, totalItems: res.total || items.length };
       } catch (e) {
-        console.error("File list error", e);
+        console.error('File list error', e);
         return { items: [], totalItems: 0 };
       }
     },
@@ -640,50 +710,59 @@ export const apiClient = {
         mimeType: file.type,
         url: res.url,
         created: new Date().toISOString(),
-        updated: new Date().toISOString()
+        updated: new Date().toISOString(),
       };
     },
     delete: async (id: string): Promise<void> => {
       await pb.files.delete(id);
     },
-    getFileUrl: (filename: string) => pb.files.getFileUrl(filename)
+    getFileUrl: (filename: string) => pb.files.getFileUrl(filename),
   },
 
   scripts: {
-    list: async (): Promise<{ local: Script[], shared: Script[], root_total: Number, transparency_enabled: Boolean }> => {
+    list: async (): Promise<{
+      local: Script[];
+      shared: Script[];
+      root_total: number;
+      transparency_enabled: boolean;
+    }> => {
       const res = await pb.scripts.list();
-      
+
       // Fallback for older server versions returning array directly
       if (Array.isArray(res)) {
-          return {
-              local: res.map((s: any) => ({ ...s, id: s.id.toString(), target_collection: s.target_collection || '' })),
-              shared: [],
-              root_total: 0,
-              transparency_enabled: false
-          };
+        return {
+          local: res.map((s: any) => ({
+            ...s,
+            id: s.id.toString(),
+            target_collection: s.target_collection || '',
+          })),
+          shared: [],
+          root_total: 0,
+          transparency_enabled: false,
+        };
       }
 
       // Map new compound response
       const local = (res.local || []).map((s: any) => ({
-          ...s,
-          id: s.id.toString(),
-          target_collection: s.target_collection || ''
+        ...s,
+        id: s.id.toString(),
+        target_collection: s.target_collection || '',
       }));
 
       const shared = (res.shared || []).map((s: any) => ({
-          ...s,
-          id: s.id.toString(),
-          target_collection: s.target_collection || '',
-          isShared: true // Flag to disable editing in UI
+        ...s,
+        id: s.id.toString(),
+        target_collection: s.target_collection || '',
+        isShared: true, // Flag to disable editing in UI
       }));
 
       return {
-          local,
-          shared,
-          root_total: res.root_total || 0,
-          transparency_enabled: res.transparency_enabled || false
+        local,
+        shared,
+        root_total: res.root_total || 0,
+        transparency_enabled: res.transparency_enabled || false,
       };
-  },
+    },
     create: async (data: Partial<Script>): Promise<Script> => {
       // FIX 5: Cast Partial<Script> to any to satisfy Omit type in SDK
       const res = await pb.scripts.create(data as any);
@@ -703,7 +782,7 @@ export const apiClient = {
       const formData = new FormData();
       formData.append('file', file);
       return rawFetchWithBody('/admin/import-scripts', formData);
-    }
+    },
   },
 
   templates: {
@@ -712,7 +791,7 @@ export const apiClient = {
       return res.map((t: any) => ({
         ...t,
         id: t.id.toString(),
-        script_id: t.script_id ? t.script_id.toString() : null
+        script_id: t.script_id ? t.script_id.toString() : null,
       }));
     },
     create: async (data: Partial<Template>) => {
@@ -733,7 +812,7 @@ export const apiClient = {
       const formData = new FormData();
       formData.append('file', file);
       return rawFetchWithBody('/admin/import-templates', formData);
-    }
+    },
   },
 
   ai: {
@@ -744,7 +823,7 @@ export const apiClient = {
         ...a,
         id: a.id.toString(),
         system_prompt: a.system_prompt || '',
-        config: a.config || {}
+        config: a.config || {},
       }));
     },
     createAction: async (data: Partial<AiAction>) => {
@@ -757,7 +836,13 @@ export const apiClient = {
       return await pb.ai.run(slug, variables);
     },
     listSessions: async () => await pb.ai.listSessions(),
-    createSession: async (name: string, initialPrompt?: string, model?: string, cloneStrategy?: string, cloneRecordLimit?: number) => {
+    createSession: async (
+      name: string,
+      initialPrompt?: string,
+      model?: string,
+      cloneStrategy?: string,
+      cloneRecordLimit?: number
+    ) => {
       return await pb.ai.createSession(name, initialPrompt, model, cloneStrategy, cloneRecordLimit);
     },
     deleteSession: (id: string) => pb.ai.deleteSession(id),
@@ -784,7 +869,7 @@ export const apiClient = {
       const formData = new FormData();
       formData.append('file', file);
       return rawFetchWithBody('/admin/import-ai-actions', formData);
-    }
+    },
   },
 
   logs: {
@@ -796,12 +881,12 @@ export const apiClient = {
           level: l.level,
           message: l.message,
           source: l.source,
-          timestamp: l.timestamp
+          timestamp: l.timestamp,
         }));
       } catch {
         return [];
       }
-    }
+    },
   },
 
   getVersions: async (): Promise<AppVersions> => {

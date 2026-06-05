@@ -1,4 +1,3 @@
-
 import React, { useState, useRef } from 'react';
 import { UploadCloud } from 'lucide-react';
 import { Button } from '../form/FormPrimitives';
@@ -7,10 +6,15 @@ interface FileUploaderProps {
   onUpload: (files: FileList) => void;
   accept?: string;
   multiple?: boolean;
-  maxSize?: number; 
+  maxSize?: number;
 }
 
-export const FileUploader = ({ onUpload, accept, multiple = false, maxSize }: FileUploaderProps) => {
+export const FileUploader = ({
+  onUpload,
+  accept,
+  multiple = false,
+  maxSize,
+}: FileUploaderProps) => {
   const [isDragging, setIsDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -50,25 +54,16 @@ export const FileUploader = ({ onUpload, accept, multiple = false, maxSize }: Fi
         multiple={multiple}
         onChange={(e) => e.target.files && onUpload(e.target.files)}
       />
-      
+
       <div className="flex flex-col items-center gap-4 text-center">
         <div className="rounded-full bg-primary/10 p-4">
           <UploadCloud className="h-8 w-8 text-primary" />
         </div>
         <div className="space-y-1">
-          <h3 className="font-semibold tracking-tight">
-            Drag & drop files here
-          </h3>
-          <p className="text-sm text-muted-foreground">
-            or click to browse from your computer
-          </p>
+          <h3 className="font-semibold tracking-tight">Drag & drop files here</h3>
+          <p className="text-sm text-muted-foreground">or click to browse from your computer</p>
         </div>
-        <Button 
-            variant="outline" 
-            size="sm" 
-            onClick={() => inputRef.current?.click()}
-            type="button"
-        >
+        <Button variant="outline" size="sm" onClick={() => inputRef.current?.click()} type="button">
           Select Files
         </Button>
       </div>

@@ -25,14 +25,22 @@ export const FilePreview = ({ file, isOpen, onClose }: FilePreviewProps) => {
           </div>
           <div className="flex gap-2">
             <a href={objectUrl} download={file.name}>
-                <Button variant="outline" size="icon"><Download className="h-4 w-4" /></Button>
+              <Button variant="outline" size="icon">
+                <Download className="h-4 w-4" />
+              </Button>
             </a>
-            <Button variant="outline" size="icon" onClick={onClose}><X className="h-4 w-4" /></Button>
+            <Button variant="outline" size="icon" onClick={onClose}>
+              <X className="h-4 w-4" />
+            </Button>
           </div>
         </div>
         <div className="flex-1 flex items-center justify-center p-4">
           {file.type.startsWith('image/') ? (
-            <img src={objectUrl} alt={file.name} className="max-w-full max-h-[75vh] object-contain" />
+            <img
+              src={objectUrl}
+              alt={file.name}
+              className="max-w-full max-h-[75vh] object-contain"
+            />
           ) : (
             <div className="text-center text-white">
               <h2 className="text-2xl font-bold">Preview not available</h2>
