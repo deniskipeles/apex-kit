@@ -14,6 +14,7 @@ import { AiArchitectPage } from '../features/ai/pages/AiArchitectPage';
 import { TenantsListPage } from '../features/tenants/pages/TenantsListPage';
 import { VectorSearchPanel } from '../features/ai/components/VectorSearchPanel';
 import { Dashboard } from '../pages/Dashboard';
+import { SandboxesListPage } from '../features/sandboxes/pages/SandboxesListPage';
 
 interface RouterProps {
   view: string;
@@ -94,8 +95,10 @@ export const Router = ({ view, onChangeView }: any) => {
     // although the API would block them anyway.
     case 'tenants':
       return !contextPrefix ? <TenantsListPage /> : <Dashboard />;
+    case 'sandboxes':
+      return <SandboxesListPage onNavigate={nav} />;
     case 'ai-architect':
-      return !contextPrefix ? <AiArchitectPage /> : <Dashboard />;
+      return <AiArchitectPage />;
 
     default:
       return <Dashboard />;

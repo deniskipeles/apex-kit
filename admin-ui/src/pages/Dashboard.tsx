@@ -1,4 +1,3 @@
-// =========================== apex-kit/admin-ui/src/pages/Dashboard.tsx ===========================
 import React, { useEffect, useState } from 'react';
 import {
   RefreshCw,

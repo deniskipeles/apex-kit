@@ -197,10 +197,15 @@ pub struct TenantStats {
     pub max_ai_requests: i64,
 }
 
-#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema, Clone, Debug)]
 pub struct SandboxMetadata {
     pub id: String,
     pub name: Option<String>,
     pub status: String,
     pub expires_at: Option<String>,
+    // [NEW] Added fields
+    pub scope: String,
+    pub tenant_id: Option<String>,
+    pub current_storage_mb: f64,
+    pub max_storage_mb: i64,
 }

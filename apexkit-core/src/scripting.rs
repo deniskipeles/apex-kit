@@ -1764,7 +1764,7 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
 
                         // 2. Register Metadata
                         app.get_db()
-                            .register_sandbox(&id, owner_id, name, expires_at)
+                            .register_sandbox(&id, owner_id, name, expires_at, "root", None)
                             .await
                             .map_err(|e| e.to_string())?;
 

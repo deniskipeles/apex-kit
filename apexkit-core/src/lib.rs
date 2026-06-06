@@ -356,7 +356,16 @@ pub trait Db: Send + Sync {
         owner_id: Option<i64>,
         name: Option<String>,
         expires_at: Option<String>,
+        scope: &str,
+        tenant_id: Option<String>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_sandboxes(
+        &self,
+        tenant_id: Option<String>,
+    ) -> std::result::Result<
+        Vec<crate::models::SandboxMetadata>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
     async fn update_sandbox_full(
         &self,
         id: &str,
@@ -507,9 +516,10 @@ pub trait Db: Send + Sync {
         message: &str,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-    // [NEW] Paginated & Filterable System Logs
+    // [NEW] Dynamically query system or audit databases
     async fn list_paginated_logs(
         &self,
+        log_type: &str, // "system" or "audit"
         page: i64,
         per_page: i64,
         level: Option<String>,
@@ -3317,27 +3327,38 @@ impl Db for ApexKit {
 
     async fn list_paginated_logs(
         &self,
+        log_type: &str, // "system" or "audit"
         page: i64,
         per_page: i64,
         level: Option<String>,
         source: Option<String>,
         search: Option<String>,
-    ) -> std::result::Result<(Vec<serde_json::Value>, i64), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> std::result::Result<(Vec<serde_json::Value>, i64), Box<dyn std::error::Error + Send + Sync>>
+    {
         let conn = self.get_log_read().await;
-        
+
         let mut where_clauses = Vec::new();
         let mut params: Vec<rusqlite::types::Value> = Vec::new();
 
+        let (table_name, source_col) = if log_type == "audit" {
+            ("_audit_logs", "source")
+        } else {
+            ("_system_logs", "target")
+        };
+
         if let Some(lvl) = level {
-            where_clauses.push("level = ?");
+            where_clauses.push(format!("{}.level = ?", table_name));
             params.push(lvl.into_val());
         }
         if let Some(src) = source {
-            where_clauses.push("target LIKE ?");
+            where_clauses.push(format!("{}.{} LIKE ?", table_name, source_col));
             params.push(format!("%{}%", src).into_val());
         }
         if let Some(q) = search {
-            where_clauses.push("(message LIKE ? OR target LIKE ?)");
+            where_clauses.push(format!(
+                "({}.message LIKE ? OR {}.{} LIKE ?)",
+                table_name, table_name, source_col
+            ));
             params.push(format!("%{}%", q).into_val());
             params.push(format!("%{}%", q).into_val());
         }
@@ -3348,30 +3369,54 @@ impl Db for ApexKit {
             format!("WHERE {}", where_clauses.join(" AND "))
         };
 
-        // Get total count matching criteria
-        let count_sql = format!("SELECT COUNT(*) FROM _system_logs {}", where_sql);
+        // Get total matching
+        let count_sql = format!("SELECT COUNT(*) FROM {} {}", table_name, where_sql);
         let mut count_stmt = conn.prepare(&count_sql)?;
-        let total: i64 = count_stmt.query_row(rusqlite::params_from_iter(params.clone()), |row| row.get(0))?;
+        let total: i64 =
+            count_stmt.query_row(rusqlite::params_from_iter(params.clone()), |row| row.get(0))?;
 
-        // Fetch paginated results
         let limit = per_page;
         let offset = (page - 1) * per_page;
-        let select_sql = format!(
-            "SELECT id, level, target, message, timestamp FROM _system_logs {} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
-            where_sql, limit, offset
-        );
-        let mut stmt = conn.prepare(&select_sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-        
+
         let mut logs = Vec::new();
-        while let Some(row) = rows.next()? {
-            logs.push(serde_json::json!({
-                "id": row.get::<usize, i64>(0)?.to_string(),
-                "level": row.get::<usize, String>(1)?,
-                "source": row.get::<usize, String>(2)?,
-                "message": row.get::<usize, String>(3)?,
-                "timestamp": row.get::<usize, String>(4)?
-            }));
+
+        if log_type == "audit" {
+            let select_sql = format!(
+                "SELECT id, level, message, source, meta, timestamp FROM _audit_logs {} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
+                where_sql, limit, offset
+            );
+            let mut stmt = conn.prepare(&select_sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+            while let Some(row) = rows.next()? {
+                let meta_str: Option<String> = row.get(4)?;
+                let meta =
+                    meta_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+                logs.push(serde_json::json!({
+                    "id": row.get::<usize, i64>(0)?.to_string(),
+                    "level": row.get::<usize, String>(1)?,
+                    "message": row.get::<usize, String>(2)?,
+                    "source": row.get::<usize, String>(3)?,
+                    "meta": meta,
+                    "timestamp": row.get::<usize, String>(5)?
+                }));
+            }
+        } else {
+            let select_sql = format!(
+                "SELECT id, level, target, message, timestamp FROM _system_logs {} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
+                where_sql, limit, offset
+            );
+            let mut stmt = conn.prepare(&select_sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+            while let Some(row) = rows.next()? {
+                logs.push(serde_json::json!({
+                    "id": row.get::<usize, i64>(0)?.to_string(),
+                    "level": row.get::<usize, String>(1)?,
+                    "source": row.get::<usize, String>(2)?,
+                    "message": row.get::<usize, String>(3)?,
+                    "timestamp": row.get::<usize, String>(4)?
+                }));
+            }
         }
 
         Ok((logs, total))
@@ -4002,25 +4047,69 @@ impl Db for ApexKit {
         owner_id: Option<i64>,
         name: Option<String>,
         expires_at: Option<String>,
+        scope: &str,
+        tenant_id: Option<String>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.core_batcher
             .execute(
-                "INSERT INTO _sandboxes (id, owner_id, name, expires_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET 
-                owner_id=excluded.owner_id, 
-                name=excluded.name, 
-                expires_at=excluded.expires_at"
+                "INSERT INTO _sandboxes (id, owner_id, name, expires_at, scope, tenant_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET 
+                    owner_id=excluded.owner_id, 
+                    name=excluded.name, 
+                    expires_at=excluded.expires_at,
+                    scope=excluded.scope,
+                    tenant_id=excluded.tenant_id"
                     .into(),
                 vec![
                     id.into_val(),
                     owner_id.into_val(),
                     name.into_val(),
                     expires_at.into_val(),
+                    scope.into_val(),
+                    tenant_id.into_val(),
                 ],
             )
             .await
             .map_err(|e| Box::new(std::io::Error::other(e)))?;
         Ok(())
+    }
+
+    async fn list_sandboxes(
+        &self,
+        tenant_id: Option<String>,
+    ) -> std::result::Result<
+        Vec<crate::models::SandboxMetadata>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let conn = self.get_core_read().await;
+        let mut sql = "SELECT id, name, status, expires_at, scope, tenant_id, current_storage_mb, max_storage_mb FROM _sandboxes".to_string();
+        let mut params: Vec<rusqlite::types::Value> = vec![];
+
+        if let Some(tid) = tenant_id {
+            sql.push_str(" WHERE tenant_id = ?1");
+            params.push(tid.into_val());
+        } else {
+            // If root, get all (no filter)
+            sql.push_str(" ORDER BY created_at DESC");
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        let mut res = vec![];
+
+        while let Some(row) = rows.next()? {
+            res.push(crate::models::SandboxMetadata {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                status: row.get(2)?,
+                expires_at: row.get(3)?,
+                scope: row.get(4).unwrap_or("root".to_string()),
+                tenant_id: row.get(5).unwrap_or(None),
+                current_storage_mb: row.get(6).unwrap_or(0.0),
+                max_storage_mb: row.get(7).unwrap_or(100),
+            });
+        }
+        Ok(res)
     }
 
     async fn update_sandbox_full(
@@ -4504,6 +4593,12 @@ fn setup_core(conn: &Connection) -> Result<()> {
     )",
         [],
     )?;
+    // [NEW] Apply schema modifications safely
+    let _ = conn.execute(
+        "ALTER TABLE _sandboxes ADD COLUMN scope TEXT DEFAULT 'root'",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE _sandboxes ADD COLUMN tenant_id TEXT", []);
 
     Ok(())
 }

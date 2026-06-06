@@ -50,6 +50,38 @@ export interface AiAction {
   config?: any;
 }
 
+export interface AiSession {
+  id: string;
+  name: string;
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+  current_manifest?: any;
+  pending_manifest?: any;
+  diff_summary?: string | null;
+  last_error?: string;
+  created_at: string;
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface AppManifest {
+  app_name: string;
+  collections: Array<any>;
+  scripts: Array<any>;
+  templates: Array<any>;
+}
+
+export interface Plugin {
+  id: string;
+  name: string;
+  version: string;
+  description?: string;
+  manifest: any;
+  created_at: string;
+}
+
 export interface SiteFile {
   path: string;
   size: number;

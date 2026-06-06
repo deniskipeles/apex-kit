@@ -61,13 +61,17 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
     { icon: BrainCircuit, label: 'Vector Search', page: 'vector-search' },
     { icon: Activity, label: 'Logs', page: 'logs' },
     { icon: Settings, label: 'Settings', page: 'settings' },
+    { icon: Sparkles, label: 'AI Architect', page: 'ai-architect' },
   ];
 
   // Root Only Links
   if (contextType === 'root') {
     // Insert Tenants after Dashboard
     links.splice(1, 0, { icon: Server, label: 'Tenants', page: 'tenants' });
-    links.splice(2, 0, { icon: BoxIcon, label: 'Sandboxes', page: 'ai-architect' });
+  }
+  // Root/Tenants Only Links
+  if (contextType === 'root' || contextType === 'tenant') {
+    links.splice(2, 0, { icon: BoxIcon, label: 'Sandboxes', page: 'sandboxes' });
   }
 
   // Helper: Construct target view string based on context

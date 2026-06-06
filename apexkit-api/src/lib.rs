@@ -79,6 +79,7 @@ pub mod logging;
 pub mod renderer;
 pub mod replication;
 pub mod sandbox_manager;
+pub mod sandbox_routes;
 pub mod scheduler;
 pub mod script_routes;
 pub mod settings;
@@ -1810,6 +1811,7 @@ pub struct LogsQuery {
     pub level: Option<String>,
     pub source: Option<String>,
     pub search: Option<String>,
+    pub r#type: Option<String>, // [NEW] "system" or "audit"
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1821,11 +1823,11 @@ pub struct LogsResponse {
 }
 
 #[utoipa::path(
-    get,
-    path = "/api/v1/admin/logs",
-    params(LogsQuery),
-    responses((status = 200, body = LogsResponse))
-)]
+        get,
+        path = "/api/v1/admin/logs",
+        params(LogsQuery),
+        responses((status = 200, body = LogsResponse))
+    )]
 pub async fn list_audit_logs(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection,
@@ -1837,9 +1839,10 @@ pub async fn list_audit_logs(
 
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(50).clamp(10, 200);
+    let log_type = q.r#type.unwrap_or_else(|| "system".to_string());
 
     let (items, total) = db
-        .list_paginated_logs(page, per_page, q.level, q.source, q.search)
+        .list_paginated_logs(&log_type, page, per_page, q.level, q.source, q.search)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
@@ -2399,20 +2402,25 @@ fn make_api_router() -> Router<AppState> {
         )
         .route("/ai/run/{slug}", post(ai_routes::run_action))
         .route("/admin/ai/edit-code", post(ai_routes::edit_code))
+        // Admin Sandbox Management (Parent Context)
         .route(
-            "/admin/ai/sessions/{id}/chat",
-            post(ai_architect::continue_chat),
+            "/admin/sandboxes",
+            get(sandbox_routes::list_sandboxes_handler)
+                .post(sandbox_routes::create_sandbox_handler),
         )
         .route(
-            "/admin/ai/sessions/{id}/apply",
-            post(ai_architect::apply_changes),
+            "/admin/sandboxes/{id}",
+            axum::routing::delete(sandbox_routes::delete_sandbox_handler),
         )
         .route(
-            "/admin/ai/sessions/{id}/publish",
-            post(ai_architect::publish_plugin),
+            "/admin/sandboxes/{id}/publish",
+            post(sandbox_routes::publish_sandbox_handler),
         )
+        // Scoped AI Chat Actions (Child Context)
+        .route("/admin/ai/session", get(ai_architect::get_session))
+        .route("/admin/ai/chat", post(ai_architect::chat_handler_api))
+        .route("/admin/ai/apply", post(ai_architect::apply_changes))
         .route("/admin/ai/plugins", get(ai_architect::list_plugins))
-        // .route("/admin/ai/sessions/{id}", axum::routing::delete(ai_architect::delete_session))
         .route(
             "/admin/scripts",
             get(script_routes::list_scripts).post(script_routes::create_script),
@@ -2559,22 +2567,6 @@ pub fn app_router(state: AppState) -> Router {
                 middleware::from_fn_with_state(state.clone(), auth_middleware),
             ),
         )
-        .route(
-            "/api/v1/admin/ai/sessions",
-            get(ai_architect::list_sessions)
-                .post(ai_architect::start_session)
-                .layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    auth_middleware,
-                )),
-        )
-        .route(
-            "/api/v1/admin/ai/sessions/{id}",
-            axum::routing::delete(ai_routes::delete_session).layer(middleware::from_fn_with_state(
-                state.clone(),
-                auth_middleware,
-            )),
-        )
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(health_check))
         .route("/version", get(get_versions_handler))
@@ -2615,7 +2607,6 @@ pub fn app_router(state: AppState) -> Router {
         ai_routes::list_actions, ai_routes::create_action, ai_routes::delete_action, ai_routes::run_action, ai_routes::edit_code,
         script_routes::list_scripts, script_routes::create_script, script_routes::delete_script, script_routes::run_script,
         template_routes::list_templates, template_routes::create_template, template_routes::update_template, template_routes::delete_template,
-        ai_architect::start_session, ai_architect::continue_chat, ai_architect::publish_plugin, ai_architect::list_sessions,
         import_data_routes::import_data_handler,
         export_data_routes::export_data_handler,
         import_data_routes::import_schema_handler,
@@ -2627,7 +2618,15 @@ pub fn app_router(state: AppState) -> Router {
         vector_routes::get_record_vector,
         serve_styles,
         tenant_routes::create_tenant_handler,
-        sse_handler
+        sse_handler,
+        sandbox_routes::list_sandboxes_handler,
+        sandbox_routes::create_sandbox_handler,
+        sandbox_routes::delete_sandbox_handler,
+        sandbox_routes::publish_sandbox_handler,
+        ai_architect::get_session,
+        ai_architect::chat_handler_api,
+        ai_architect::apply_changes,
+        ai_architect::list_plugins
     ),
     components(schemas(
         CollectionResponse, AuthRequest, AuthResponse, RecordResponse, ProblemDetail, UserDto,

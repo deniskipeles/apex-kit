@@ -13,6 +13,7 @@ import {
   ApiKey,
   SiteFile,
   Tenant,
+  SandboxMetadata,
 } from '../types';
 import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
 
@@ -263,7 +264,7 @@ export const apiClient = {
     return res;
   },
   revectorizeCollection: async (collectionId?: string) => {
-    const res = await pb.admins.revectorizeCollection(collectionId);
+    const res = await pb.admins.revectorizeCollection(collectionId as any);
     return res;
   },
 
@@ -324,13 +325,12 @@ export const apiClient = {
     deleteTenant: (id: string) => pb.admins.deleteTenant(id),
     updateTenant: (id: string, data: any) => pb.admins.updateTenant(id, data),
     listTenants: async (): Promise<Tenant[]> => {
-      // FIX 1: Map SDK result (any[]) to local Tenant type, providing defaults for missing fields
       const res = await basePb.admins.listTenants();
       return (res || []).map((t: any) => ({
         id: t.id,
         name: t.name,
         status: t.status,
-        tier: t.tier || 'free', // Default tier
+        tier: t.tier || 'free',
         stats: t.stats || {
           storage_mb: 0,
           max_storage_mb: 0,
@@ -344,6 +344,40 @@ export const apiClient = {
     },
     updateStatus: async (id: string, status: 'active' | 'suspended' | 'archived') =>
       await pb.admins.updateTenantStatus(id, status),
+
+    // [NEW] Scoped Sandbox Management (Parent Context)
+    listSandboxes: async () => await pb.admins.listSandboxes(),
+    createSandbox: async (data: any) =>
+      await pb.admins.createSandbox(
+        data.name,
+        data.clone_strategy,
+        data.clone_record_limit,
+        data.model,
+        data.initial_prompt
+      ),
+    deleteSandbox: async (id: string): Promise<void> => {
+      let baseUrl = apiUrl;
+      if (typeof window !== 'undefined') {
+        const pathName = window.location.pathname;
+        const tenantMatch = pathName.match(/^\/_dashboard\/tenant\/([^/]+)/);
+        const sandboxMatch = pathName.match(/^\/_dashboard\/sandbox\/([^/]+)/);
+
+        if (tenantMatch) baseUrl += `/tenant/${tenantMatch[1]}`;
+        else if (sandboxMatch) baseUrl += `/sandbox/${sandboxMatch[1]}`;
+      }
+
+      const token = localStorage.getItem(APEX_TOKEN);
+      const res = await fetch(`${baseUrl}/api/v1/admin/sandboxes/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (res.status !== 204) {
+        const txt = await res.text();
+        throw new Error(txt || 'Failed to delete sandbox');
+      }
+    },
+    publishSandbox: async (id: string) => await pb.admins.publishSandbox(id),
   },
 
   auth: {
@@ -479,7 +513,7 @@ export const apiClient = {
       if (data.compositeUnique) backendSchema.composite_unique = data.compositeUnique;
       if (data.fieldHistory) backendSchema.field_history = data.fieldHistory;
 
-      const res = await pb.admins.createCollection(data.name, backendSchema);
+      const res = await pb.admins.createCollection(data.name as string, backendSchema);
       return transformCollection(res);
     },
     update: async (id: string, data: Partial<Collection>): Promise<Collection> => {
@@ -799,7 +833,7 @@ export const apiClient = {
       await pb.templates.create(data as any);
     },
     update: async (id: string, data: Partial<Template>) => {
-      await pb.templates.update(id, data);
+      await pb.templates.update(id, data as any);
     },
     delete: async (id: string) => {
       await pb.templates.delete(id);
@@ -818,7 +852,6 @@ export const apiClient = {
   ai: {
     getActions: async (): Promise<AiAction[]> => {
       const res = await pb.ai.getActions();
-      // FIX 7: Map ID to string
       return res.map((a: any) => ({
         ...a,
         id: a.id.toString(),
@@ -835,26 +868,12 @@ export const apiClient = {
     run: async (slug: string, variables: Record<string, string>) => {
       return await pb.ai.run(slug, variables);
     },
-    listSessions: async () => await pb.ai.listSessions(),
-    createSession: async (
-      name: string,
-      initialPrompt?: string,
-      model?: string,
-      cloneStrategy?: string,
-      cloneRecordLimit?: number
-    ) => {
-      return await pb.ai.createSession(name, initialPrompt, model, cloneStrategy, cloneRecordLimit);
-    },
-    deleteSession: (id: string) => pb.ai.deleteSession(id),
-    chat: async (id: string, prompt: string, model: string) => {
-      return await pb.ai.chat(id, prompt, model);
-    },
-    applySessionChanges: async (id: string) => {
-      return await pb.ai.applySessionChanges(id);
-    },
-    publishSession: async (id: string) => {
-      return await pb.ai.publishSession(id);
-    },
+
+    // [NEW] Scoped AI Architect Session Calls (Child Context - routed automatically to the Sandbox)
+    getSession: async () => await pb.ai.getSession(),
+    chat: async (prompt: string, model: string) => await pb.ai.chat(prompt, model),
+    applySessionChanges: async () => await pb.ai.applySessionChanges(),
+
     listPlugins: async () => {
       return await pb.ai.listPlugins();
     },
@@ -862,13 +881,11 @@ export const apiClient = {
       return await pb.ai.editCode(prompt, currentCode, contextType, model);
     },
     exportActions: async () => {
-      const res = await rawFetch('/admin/export-ai-actions');
-      downloadBlob(await res.blob(), 'ai_actions.json');
+      const res = await pb.ai.exportActions();
+      downloadBlob(res, 'ai_actions.json');
     },
     importActions: async (file: File) => {
-      const formData = new FormData();
-      formData.append('file', file);
-      return rawFetchWithBody('/admin/import-ai-actions', formData);
+      return await pb.ai.importActions(file);
     },
   },
 
@@ -878,10 +895,11 @@ export const apiClient = {
       perPage = 50,
       level = '',
       source = '',
-      search = ''
+      search = '',
+      type = 'system'
     ): Promise<{ items: SystemLog[]; total: number }> => {
       try {
-        const res = await pb.logs.list(page, perPage, level, source, search);
+        const res = await pb.logs.list(page, perPage, level, source, search, type);
         return {
           items: res.items.map((l: any) => ({
             id: l.id.toString(),
@@ -889,6 +907,7 @@ export const apiClient = {
             message: l.message,
             source: l.source,
             timestamp: l.timestamp,
+            meta: l.meta || null, // [NEW] Pass down JSON meta payload
           })),
           total: res.total,
         };

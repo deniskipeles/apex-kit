@@ -107,6 +107,17 @@ export interface Template {
   script_id?: string;
 }
 
+export interface SandboxMetadata {
+  id: string;
+  name: string | null;
+  status: string;
+  expires_at: string | null;
+  scope: string;
+  tenant_id: string | null;
+  current_storage_mb: number;
+  max_storage_mb: number;
+}
+
 export interface AiAction {
   id: string;
   slug: string;
@@ -584,9 +595,33 @@ export class ApexKit {
       listTenants: () => this._request<any[]>('/admin/tenants', { method: 'GET' }),
       updateTenantStatus: (id: string, status: 'active' | 'suspended' | 'archived') =>
         this._request(`/admin/tenants/${id}/status`, { method: 'PATCH', body: { status } }),
+
+      // [NEW] Scoped Sandbox Management (Parent Context)
+      listSandboxes: () => this._request<SandboxMetadata[]>('/admin/sandboxes', { method: 'GET' }),
+      createSandbox: (
+        name: string,
+        cloneStrategy: string,
+        cloneRecordLimit?: number,
+        model?: string,
+        initialPrompt?: string
+      ) =>
+        this._request<SandboxMetadata>('/admin/sandboxes', {
+          method: 'POST',
+          body: {
+            name,
+            clone_strategy: cloneStrategy,
+            clone_record_limit: cloneRecordLimit,
+            model,
+            initial_prompt: initialPrompt,
+          },
+        }),
+      deleteSandbox: (id: string) => this._request(`/admin/sandboxes/${id}`, { method: 'DELETE' }),
+      publishSandbox: (id: string) =>
+        this._request<Plugin>(`/admin/sandboxes/${id}/publish`, { method: 'POST' }),
     };
   }
 
+  // --- REPLACED AI INTERFACE ---
   get ai() {
     return {
       getActions: () => this._request<AiAction[]>('/admin/ai/actions'),
@@ -600,38 +635,13 @@ export class ApexKit {
           body: { variables },
         }),
 
-      // Architect
-      listSessions: () => this._request<AiSession[]>('/admin/ai/sessions'),
-      createSession: (
-        name: string,
-        initialPrompt?: string,
-        model?: string,
-        cloneStrategy?: string,
-        cloneRecordLimit?: number
-      ) =>
-        this._request<AiSession>('/admin/ai/sessions', {
-          method: 'POST',
-          body: {
-            name,
-            initial_prompt: initialPrompt,
-            model,
-            clone_strategy: cloneStrategy,
-            clone_record_limit: cloneRecordLimit,
-          },
-        }),
-      deleteSession: (id: string) =>
-        this._request(`/admin/ai/sessions/${id}`, { method: 'DELETE' }),
-      chat: (sessionId: string, prompt: string, model: string) =>
-        this._request<AiSession>(`/admin/ai/sessions/${sessionId}/chat`, {
-          method: 'POST',
-          body: { prompt, model },
-        }),
-      applySessionChanges: (sessionId: string) =>
-        this._request<AiSession>(`/admin/ai/sessions/${sessionId}/apply`, { method: 'POST' }),
-      publishSession: (sessionId: string) =>
-        this._request<Plugin>(`/admin/ai/sessions/${sessionId}/publish`, { method: 'POST' }),
+      // Architect (Child Context - Executed inside Sandbox scope)
+      getSession: () => this._request<AiSession>('/admin/ai/session', { method: 'GET' }),
+      chat: (prompt: string, model: string) =>
+        this._request<AiSession>('/admin/ai/chat', { method: 'POST', body: { prompt, model } }),
+      applySessionChanges: () => this._request<AiSession>('/admin/ai/apply', { method: 'POST' }),
 
-      listPlugins: () => this._request<Plugin[]>('/ai/plugins'),
+      listPlugins: () => this._request<Plugin[]>('/admin/ai/plugins'),
 
       editCode: (prompt: string, currentCode: string, contextType: string, model: string) =>
         this._request<{ code: string }>('/admin/ai/edit-code', {
@@ -837,7 +847,7 @@ export class ApexKit {
 
   get logs() {
     return {
-      list: (page = 1, perPage = 50, level = '', source = '', search = '') =>
+      list: (page = 1, perPage = 50, level = '', source = '', search = '', type = 'system') =>
         this._request<any>('/admin/logs', {
           method: 'GET',
           params: {
@@ -846,6 +856,7 @@ export class ApexKit {
             level: level || undefined,
             source: source || undefined,
             search: search || undefined,
+            type,
           },
         }),
     };

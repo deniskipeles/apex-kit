@@ -1,5 +1,13 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { RefreshCw, Search, SlidersHorizontal, Terminal, Activity } from 'lucide-react';
+import {
+  RefreshCw,
+  Search,
+  SlidersHorizontal,
+  Terminal,
+  Activity,
+  Layers,
+  ShieldAlert,
+} from 'lucide-react';
 import { Button, Input, Select, Label, Badge } from '../../../components/ui/Elements';
 import { LogsChart } from '../components/LogsChart';
 import { LogsTable } from '../components/LogsTable';
@@ -15,6 +23,9 @@ export const LogsDashboardPage = () => {
   const [loading, setLoading] = useState(true);
   const { toast } = useToast();
 
+  // Active Stream Toggle
+  const [logType, setLogType] = useState<'system' | 'audit'>('system');
+
   // Query Filter States
   const [searchQuery, setSearchQuery] = useState('');
   const [levelFilter, setLevelFilter] = useState('');
@@ -27,7 +38,14 @@ export const LogsDashboardPage = () => {
   const fetchLogs = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await logsService.list(page, perPage, levelFilter, sourceFilter, searchQuery);
+      const res = await logsService.list(
+        page,
+        perPage,
+        levelFilter,
+        sourceFilter,
+        searchQuery,
+        logType
+      );
       setLogs(res.items);
       setTotalLogs(res.total);
 
@@ -65,7 +83,7 @@ export const LogsDashboardPage = () => {
     } finally {
       setLoading(false);
     }
-  }, [page, perPage, levelFilter, sourceFilter, searchQuery, toast]);
+  }, [page, perPage, levelFilter, sourceFilter, searchQuery, logType, toast]);
 
   useEffect(() => {
     fetchLogs();
@@ -73,7 +91,15 @@ export const LogsDashboardPage = () => {
 
   const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setSearchQuery(e.target.value);
-    setPage(1); // Reset to page 1 on active typing search
+    setPage(1); // Reset to page 1 on active search
+  };
+
+  const handleTypeChange = (nextType: 'system' | 'audit') => {
+    setLogType(nextType);
+    setPage(1);
+    setSearchQuery('');
+    setLevelFilter('');
+    setSourceFilter('');
   };
 
   return (
@@ -98,17 +124,37 @@ export const LogsDashboardPage = () => {
       {/* Aggregate Graph visualization */}
       <LogsChart data={stats} isLoading={loading && logs.length === 0} />
 
+      {/* Dual Stream Navigation Tabs */}
+      <div className="flex border-b border-border">
+        <button
+          onClick={() => handleTypeChange('system')}
+          className={`px-5 py-3 text-sm font-semibold border-b-2 flex items-center gap-2 transition-all ${logType === 'system' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+        >
+          <Layers className="h-4 w-4" /> System Traces
+        </button>
+        <button
+          onClick={() => handleTypeChange('audit')}
+          className={`px-5 py-3 text-sm font-semibold border-b-2 flex items-center gap-2 transition-all ${logType === 'audit' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+        >
+          <ShieldAlert className="h-4 w-4" /> API Audit Trail
+        </button>
+      </div>
+
       {/* Dynamic Filters */}
       <div className="space-y-3">
         <h3 className="text-lg font-bold flex items-center gap-2">
-          <SlidersHorizontal className="h-4 w-4 text-primary" /> Active Logs Stream
+          <SlidersHorizontal className="h-4 w-4 text-primary" /> Active Filters
         </h3>
 
         <div className="grid grid-cols-1 md:grid-cols-12 gap-3 bg-secondary/10 p-3 rounded-lg border border-border/50">
           <div className="md:col-span-6 relative">
             <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
             <Input
-              placeholder="Search log messages or exceptions..."
+              placeholder={
+                logType === 'system'
+                  ? 'Search log messages...'
+                  : 'Search API actions, paths, or response payloads...'
+              }
               className="pl-9 bg-background"
               value={searchQuery}
               onChange={handleSearchChange}
@@ -132,7 +178,11 @@ export const LogsDashboardPage = () => {
           </div>
           <div className="md:col-span-3">
             <Input
-              placeholder="Filter by Source (e.g. ai, api)..."
+              placeholder={
+                logType === 'system'
+                  ? 'Filter by target module (e.g. libsql)...'
+                  : 'Filter by API source (e.g. auth)...'
+              }
               value={sourceFilter}
               onChange={(e: any) => {
                 setSourceFilter(e.target.value);

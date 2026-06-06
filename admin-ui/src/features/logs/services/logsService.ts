@@ -7,8 +7,9 @@ export const logsService = {
     perPage = 50,
     level = '',
     source = '',
-    search = ''
+    search = '',
+    type = 'system'
   ): Promise<{ items: SystemLog[]; total: number }> => {
-    return apiClient.logs.list(page, perPage, level, source, search);
+    return apiClient.logs.list(page, perPage, level, source, search, type);
   },
 };

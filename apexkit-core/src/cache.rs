@@ -361,10 +361,22 @@ impl Db for CachedDb {
         owner_id: Option<i64>,
         name: Option<String>,
         expires_at: Option<String>,
+        scope: &str,
+        tenant_id: Option<String>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner
-            .register_sandbox(id, owner_id, name, expires_at)
+            .register_sandbox(id, owner_id, name, expires_at, scope, tenant_id)
             .await
+    }
+
+    async fn list_sandboxes(
+        &self,
+        tenant_id: Option<String>,
+    ) -> std::result::Result<
+        Vec<crate::models::SandboxMetadata>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.list_sandboxes(tenant_id).await
     }
 
     async fn update_sandbox_full(
@@ -687,13 +699,17 @@ impl Db for CachedDb {
 
     async fn list_paginated_logs(
         &self,
+        log_type: &str,
         page: i64,
         per_page: i64,
         level: Option<String>,
         source: Option<String>,
         search: Option<String>,
-    ) -> std::result::Result<(Vec<serde_json::Value>, i64), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.list_paginated_logs(page, per_page, level, source, search).await
+    ) -> std::result::Result<(Vec<serde_json::Value>, i64), Box<dyn std::error::Error + Send + Sync>>
+    {
+        self.inner
+            .list_paginated_logs(log_type, page, per_page, level, source, search)
+            .await
     }
 
     // --- AI Actions ---

@@ -1,94 +1,61 @@
 import { apiClient } from '../../../lib/apiClient';
-
-export interface ChatMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-export interface AppManifest {
-  app_name: string;
-  collections: Array<any>;
-  scripts: Array<any>;
-  templates: Array<any>;
-}
-
-export interface AiSession {
-  id: string;
-  name: string;
-  messages: ChatMessage[];
-  current_manifest: AppManifest | null;
-  diff_summary: string;
-  last_error: string;
-  created_at: string;
-}
-
-export interface Plugin {
-  id: string;
-  name: string;
-  version: string;
-  description: string;
-  created_at: string;
-}
+import { AiSession, Plugin } from '../../../types';
 
 export const architectService = {
-  // List all past sessions
   listSessions: async (): Promise<AiSession[]> => {
-    const res = await apiClient.ai.listSessions();
-    return res as AiSession[];
+    try {
+      const list = await apiClient.root.listSandboxes();
+
+      // [FIXED] Defensive Array Guard
+      if (!Array.isArray(list)) {
+        console.warn('apiClient.root.listSandboxes did not return an array:', list);
+        return [];
+      }
+
+      return list.map((s: any) => ({
+        id: s.id,
+        name: s.name || s.id,
+        messages: [],
+        current_manifest: s.current_manifest || null,
+        created_at: s.expires_at || new Date().toISOString(),
+      })) as any;
+    } catch (e) {
+      console.error('Failed to load listSessions:', e);
+      return [];
+    }
   },
 
-  // Start a new project
+  // Provision sandbox directly
   createSession: async (
     name: string,
     initialPrompt?: string,
     model?: string,
     cloneStrategy?: string,
     cloneRecordLimit?: number
-  ): Promise<AiSession> => {
-    const res = await apiClient.ai.createSession(
-      name,
-      initialPrompt,
-      model,
-      cloneStrategy,
-      cloneRecordLimit
-    );
-    // SDK returns the object directly, or throws.
-    // If your SDK returns {id: ...}, this check is valid.
-    if (!(res as any)?.id) throw new Error((res as any)?.message || 'Failed to create session');
-    return res as AiSession;
-  },
-
-  // Continue conversation
-  chat: async (id: string, prompt: string, model: string): Promise<AiSession> => {
-    const res = await apiClient.ai.chat(id, prompt, model);
-    return res as AiSession;
-  },
-
-  // Code assistant edit AI
-  codeEdit: async (
-    prompt: string,
-    currentCode: string,
-    contextType: string,
-    model: string
   ): Promise<any> => {
-    const res = await apiClient.ai.codeEdit(prompt, currentCode, contextType, model);
-    return res;
+    return await apiClient.root.createSandbox({
+      name,
+      clone_strategy: cloneStrategy,
+      clone_record_limit: cloneRecordLimit,
+      model,
+      initial_prompt: initialPrompt,
+    });
   },
 
-  // Publish as Plugin
-  publish: async (id: string): Promise<any> => {
-    const res = await apiClient.ai.publishSession(id);
-    return res;
+  // Scoped chat methods (executed inside Sandbox context)
+  chat: async (prompt: string, model: string): Promise<AiSession> => {
+    return await apiClient.ai.chat(prompt, model);
   },
 
-  // List published plugins
+  applySessionChanges: async (): Promise<AiSession> => {
+    return await apiClient.ai.applySessionChanges();
+  },
+
+  publish: async (id: string): Promise<Plugin> => {
+    return await apiClient.root.publishSandbox(id);
+  },
+
   listPlugins: async (): Promise<Plugin[]> => {
-    const res = await apiClient.ai.listPlugins();
-    return res as Plugin[];
-  },
-
-  // Apply Changes
-  applySessionChanges: async (id: string): Promise<any> => {
-    return await apiClient.ai.applySessionChanges(id);
+    return await apiClient.ai.listPlugins();
   },
 };

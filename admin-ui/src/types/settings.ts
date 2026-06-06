@@ -15,6 +15,7 @@ export interface SystemLog {
   message: string;
   timestamp: string;
   source: string;
+  meta?: Record<string, any>; // [NEW] Optional JSON metadata (IP, User Agent, Payload)
 }
 
 export type ViewState =
@@ -138,4 +139,15 @@ export interface Tenant {
   tier: string; // 'free', 'pro'
   stats: TenantStats;
   created_at: string;
+}
+
+export interface SandboxMetadata {
+  id: string;
+  name: string | null;
+  status: string;
+  expires_at: string | null;
+  scope: string;
+  tenant_id: string | null;
+  current_storage_mb: number;
+  max_storage_mb: number;
 }
