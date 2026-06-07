@@ -25,7 +25,6 @@ export const Router = ({ view, onChangeView }: any) => {
   let contextPrefix = '';
   let activeView = view;
 
-  // FIX: Match the double underscore logic
   if (view.startsWith('tenant__')) {
     const parts = view.split('__');
     if (parts.length >= 3) {
@@ -43,10 +42,8 @@ export const Router = ({ view, onChangeView }: any) => {
   const nav = (target: string) => onChangeView(contextPrefix + target);
 
   switch (activeView) {
-    // --- Shared Views (Available in Root, Tenant, Sandbox) ---
     case 'dashboard':
       return <Dashboard />;
-
     case 'collections':
       return (
         <CollectionsListPage
@@ -68,7 +65,6 @@ export const Router = ({ view, onChangeView }: any) => {
           onSuccess={() => nav('collections')}
         />
       );
-
     case 'records':
       return <RecordsListPage />;
     case 'files':
@@ -77,8 +73,6 @@ export const Router = ({ view, onChangeView }: any) => {
       return <SettingsPage />;
     case 'logs':
       return <LogsDashboardPage />;
-
-    // Note: In Tenant/Sandbox mode, this lists *that instance's* users/auth
     case 'users':
       return <UsersListPage />;
     case 'scripts':
@@ -90,13 +84,15 @@ export const Router = ({ view, onChangeView }: any) => {
     case 'vector-search':
       return <VectorSearchPanel />;
 
-    // --- Root Only Views ---
-    // We hide these if in a specific context to prevent confusion,
-    // although the API would block them anyway.
+    // Root/Tenant shared
     case 'tenants':
       return !contextPrefix ? <TenantsListPage /> : <Dashboard />;
+
+    // [FIXED] Pass top-level onChangeView to escape tenant scope when launching a sandbox
     case 'sandboxes':
-      return <SandboxesListPage onNavigate={nav} />;
+      return <SandboxesListPage onNavigate={onChangeView} />;
+
+    // Sandbox specific
     case 'ai-architect':
       return <AiArchitectPage />;
 

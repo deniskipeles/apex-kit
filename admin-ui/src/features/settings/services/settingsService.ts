@@ -1,11 +1,10 @@
 import { AppSettings } from '../../../types';
-import { apiClient, pb } from '../../../lib/apiClient'; // Import pb
+import { apiClient, pb } from '../../../lib/apiClient';
 
-// We map the API response (snake_case keys from Rust) to Frontend (camelCase)
 const mapToFrontend = (apiData: any): AppSettings => {
   return {
     appName: apiData.app_name || 'ApexKit',
-    appUrl: apiData.app_url || 'http://localhost:3000',
+    appUrl: apiData.app_url || 'http://localhost:5000',
     allowPublicRegistration: apiData.allow_public_registration || false,
     theme: apiData.theme || 'system',
     appLogo: apiData.app_logo || '',
@@ -15,10 +14,11 @@ const mapToFrontend = (apiData: any): AppSettings => {
     maxSiteSizeMb: apiData.max_site_size_mb || 5,
     smtp: {
       enabled: apiData.smtp?.enabled || false,
+      blockSmtp: apiData.smtp?.block_smtp || false, // <--- NEW MAPPING
       host: apiData.smtp?.host || '',
       port: apiData.smtp?.port || 587,
       username: apiData.smtp?.username || '',
-      password: apiData.smtp?.password || '', // Will be ******
+      password: apiData.smtp?.password || '',
       fromEmail: apiData.smtp?.from_email || '',
       template_welcome: apiData.smtp?.template_welcome || '',
       template_reset: apiData.smtp?.template_reset || '',
@@ -33,7 +33,7 @@ const mapToFrontend = (apiData: any): AppSettings => {
         region: apiData.storage?.s3?.region || '',
         endpoint: apiData.storage?.s3?.endpoint || '',
         accessKey: apiData.storage?.s3?.access_key || '',
-        secretKey: apiData.storage?.s3?.secret_key || '', // Will be ******
+        secretKey: apiData.storage?.s3?.secret_key || '',
       },
     },
     backups: {
@@ -50,7 +50,7 @@ const mapToFrontend = (apiData: any): AppSettings => {
     cronJobs: apiData.cron_jobs || [],
     apiTokens: [],
     security: {
-      corsAllowAll: apiData.security?.cors_allow_all ?? true, // Default to true if missing
+      corsAllowAll: apiData.security?.cors_allow_all ?? true,
       corsOrigins: apiData.security?.cors_origins || '',
       tenantTransparency: apiData.security?.tenant_transparency ?? false,
       globalRateLimit: apiData.security?.global_rate_limit ?? 600,
@@ -72,7 +72,7 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
   if (settings.allowPublicRegistration !== undefined)
     payload.allow_public_registration = settings.allowPublicRegistration;
   if (settings.theme) payload.theme = settings.theme;
-  // Map Logo Fields back to API
+
   if (settings.appLogo !== undefined) payload.app_logo = settings.appLogo;
   if (settings.logoWidth !== undefined) payload.logo_width = settings.logoWidth;
   if (settings.logoHeight !== undefined) payload.logo_height = settings.logoHeight;
@@ -84,11 +84,15 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
   if (settings.smtp) {
     payload.smtp = {
       enabled: settings.smtp.enabled,
+      block_smtp: settings.smtp.blockSmtp, // <--- NEW MAPPING
       host: settings.smtp.host,
       port: settings.smtp.port,
       username: settings.smtp.username,
-      password: settings.smtp.password, // API handles masking
+      password: settings.smtp.password,
       from_email: settings.smtp.fromEmail,
+      template_welcome: settings.smtp.template_welcome,
+      template_reset: settings.smtp.template_reset,
+      template_verify: settings.smtp.template_verify,
     };
   }
 
@@ -152,7 +156,6 @@ export const settingsService = {
       return mapToFrontend(res);
     } catch (e) {
       console.error('Failed to load settings', e);
-      // Return default on failure to not crash UI
       return mapToFrontend({});
     }
   },
@@ -163,17 +166,14 @@ export const settingsService = {
     return mapToFrontend(res);
   },
 
-  // Keep mocks for untethered features
   testEmail: async (email: string) => true,
   generateToken: async (name: string, role: string = 'admin') => {
-    // Use the new apiClient method
     const res = await apiClient.keys.create(name, role);
-    // Map to frontend structure
     return {
       token: {
         id: res.info.id,
         name: res.info.name,
-        key: res.key.substring(0, 8) + '...', // Masked prefix
+        key: res.key.substring(0, 8) + '...',
         created: res.info.created,
       },
       rawKey: res.key,

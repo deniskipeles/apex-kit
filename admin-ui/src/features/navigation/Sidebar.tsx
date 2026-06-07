@@ -35,11 +35,9 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
   const showSidebar = isOpen !== undefined ? isOpen : storeIsOpen;
   const handleClose = onClose || storeClose;
 
-  // 1. Detect Context (Root vs Tenant vs Sandbox)
   let contextType: 'root' | 'tenant' | 'sandbox' = 'root';
   let contextId = '';
 
-  // FIX: Match double underscore logic
   if (currentView.startsWith('tenant__')) {
     contextType = 'tenant';
     contextId = currentView.split('__')[1];
@@ -48,7 +46,6 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
     contextId = currentView.split('__')[1];
   }
 
-  // 2. Define Links
   const links = [
     { icon: LayoutDashboard, label: 'Dashboard', page: 'dashboard' },
     { icon: Database, label: 'Collections', page: 'collections' },
@@ -61,20 +58,27 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
     { icon: BrainCircuit, label: 'Vector Search', page: 'vector-search' },
     { icon: Activity, label: 'Logs', page: 'logs' },
     { icon: Settings, label: 'Settings', page: 'settings' },
-    { icon: Sparkles, label: 'AI Architect', page: 'ai-architect' },
   ];
 
   // Root Only Links
   if (contextType === 'root') {
-    // Insert Tenants after Dashboard
     links.splice(1, 0, { icon: Server, label: 'Tenants', page: 'tenants' });
   }
-  // Root/Tenants Only Links
+
+  // Root AND Tenant Links
   if (contextType === 'root' || contextType === 'tenant') {
-    links.splice(2, 0, { icon: BoxIcon, label: 'Sandboxes', page: 'sandboxes' });
+    links.splice(contextType === 'root' ? 2 : 1, 0, {
+      icon: BoxIcon,
+      label: 'Sandboxes',
+      page: 'sandboxes',
+    });
   }
 
-  // Helper: Construct target view string based on context
+  // Sandbox Only Links
+  if (contextType === 'sandbox') {
+    links.push({ icon: Sparkles, label: 'AI Architect IDE', page: 'ai-architect' });
+  }
+
   const getTargetView = (page: string) => {
     if (contextType === 'tenant') return `tenant__${contextId}__${page}`;
     if (contextType === 'sandbox') return `sandbox__${contextId}__${page}`;
@@ -89,7 +93,6 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
       <div
         className={`fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-border bg-background transition-transform duration-300 md:static md:translate-x-0 ${showSidebar ? 'translate-x-0' : '-translate-x-full'}`}
       >
-        {/* Header Section */}
         <div className="flex h-16 shrink-0 items-center px-6 border-b">
           {contextType === 'root' ? (
             <div className="flex items-center gap-2">
@@ -105,7 +108,7 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
               </div>
               <div className="flex items-center gap-2 overflow-hidden">
                 <div
-                  className={`w-2 h-2 rounded-full shrink-0 ${contextType === 'sandbox' ? 'bg-amber-500' : 'bg-blue-500'}`}
+                  className={`w-2 h-2 rounded-full shrink-0 ${contextType === 'sandbox' ? 'bg-amber-500 animate-pulse' : 'bg-blue-500'}`}
                 ></div>
                 <span
                   className={`font-mono text-xs truncate w-full font-medium ${contextType === 'sandbox' ? 'text-amber-500' : 'text-blue-500'}`}
@@ -117,9 +120,7 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
           )}
         </div>
 
-        {/* Navigation Links */}
         <div className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
-          {/* Exit Context Button */}
           {contextType !== 'root' && (
             <button
               onClick={() => {
@@ -134,7 +135,6 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
 
           {links.map((link) => {
             const targetView = getTargetView(link.page);
-            // Active state check handles nested views (e.g. collections-create)
             const isActive = currentView === targetView || currentView.startsWith(targetView + '-');
 
             return (
@@ -157,7 +157,6 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
           })}
         </div>
 
-        {/* Footer */}
         <div className="p-4 border-t border-border">
           <Button
             variant="ghost"

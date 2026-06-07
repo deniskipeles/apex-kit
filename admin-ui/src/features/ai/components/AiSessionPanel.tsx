@@ -9,20 +9,19 @@ import {
   UploadCloud,
   X,
   History,
-  Box,
   Calendar,
   FileJson,
 } from 'lucide-react';
-import { Button, Input, Textarea, Badge } from '../../../components/ui/Elements';
+import { Button, Textarea, Badge } from '../../../components/ui/Elements';
 import { PreviewPanel } from '../../../components/preview/PreviewPanel';
 import { Overlay } from '../../../components/overlay/Overlay';
-import { Dialog } from '../../../components/ui/Dialog'; // Import Dialog for centered views
-import { architectService, AiSession, Plugin } from '../services/architectService';
+import { Dialog } from '../../../components/ui/Dialog';
+import { architectService } from '../services/architectService';
 import { useToast } from '../../../components/feedback/Toast';
 import { APP_CONFIG } from '../../../config/app.config';
-
 import { AI_MODELS, DEFAULT_AI_MODEL } from '../../../config/ai-models';
 import { Select } from '../../../components/ui/Elements';
+import { AiSession } from '@/src/types';
 
 interface AiSessionPanelProps {
   session: AiSession | null;
@@ -37,16 +36,13 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
   const scrollRef = useRef<HTMLDivElement>(null);
   const { toast } = useToast();
 
-  // Manifest Overlay State (Anchored to button)
   const [showManifest, setShowManifest] = useState(false);
   const manifestBtnRef = useRef<HTMLButtonElement>(null);
 
-  // Versions Modal State (Centered)
   const [showVersions, setShowVersions] = useState(false);
   const [versions, setVersions] = useState<Plugin[]>([]);
   const [isLoadingVersions, setIsLoadingVersions] = useState(false);
 
-  // Version Preview State (Stacked on top of Versions)
   const [viewVersion, setViewVersion] = useState<Plugin | null>(null);
 
   useEffect(() => {
@@ -63,12 +59,12 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
 
     const optimisticSession = {
       ...session,
-      messages: [...session.messages, { role: 'user' as const, content: prompt }],
+      messages: [...(session.messages || []), { role: 'user' as const, content: prompt }],
     };
     onUpdate(optimisticSession);
 
     try {
-      const updated = await architectService.chat(session.id, prompt, model);
+      const updated = await architectService.chat(prompt, model);
       onUpdate(updated);
       toast('Architect has applied changes.', 'success');
     } catch (e: any) {
@@ -124,7 +120,6 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
       title={session.name}
       actions={
         <div className="flex gap-2 w-full">
-          {/* View Current Schema (Anchored Overlay) */}
           <Button
             ref={manifestBtnRef}
             variant="outline"
@@ -138,7 +133,6 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
             <Code className="mr-2 h-4 w-4" /> Schema
           </Button>
 
-          {/* View History (Centered Dialog) */}
           <Button
             variant="outline"
             onClick={toggleVersions}
@@ -155,7 +149,6 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
       }
     >
       <div className="flex flex-col h-[calc(100vh-200px)]">
-        {/* Chat Stream */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4" ref={scrollRef}>
           <div className="flex gap-3 text-sm text-muted-foreground p-4 bg-secondary/10 rounded-lg border border-border border-dashed">
             <Bot className="h-5 w-5 shrink-0" />
@@ -176,7 +169,7 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
             </div>
           </div>
 
-          {session.messages.map((msg, idx) => (
+          {(session.messages || []).map((msg, idx) => (
             <div
               key={idx}
               className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}
@@ -195,21 +188,19 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
           ))}
 
           {isThinking && (
-            <div className="flex gap-3">
-              <div className="h-8 w-8 rounded-full bg-secondary flex items-center justify-center shrink-0 animate-pulse">
+            <div className="flex gap-3 animate-pulse">
+              <div className="h-8 w-8 rounded-full bg-secondary flex items-center justify-center shrink-0">
                 <Bot className="h-4 w-4" />
               </div>
-              <div className="flex items-center gap-2 text-xs text-muted-foreground animate-pulse mt-2">
+              <div className="flex items-center gap-2 text-xs text-muted-foreground mt-2">
                 <RefreshCw className="h-3 w-3 animate-spin" /> Thinking...
               </div>
             </div>
           )}
         </div>
 
-        {/* Input Area */}
         <div className="p-4 border-t border-border mt-auto bg-background/50 backdrop-blur-sm">
-          {/* Model Selector Bar */}
-          <div className="flex justify-between items-center px-1">
+          <div className="flex justify-between items-center px-1 mb-2">
             <span className="text-[10px] font-bold uppercase text-muted-foreground tracking-wider">
               AI Model
             </span>
@@ -252,7 +243,6 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
           </div>
         </div>
 
-        {/* --- OVERLAY 1: CURRENT MANIFEST (Anchored to button) --- */}
         <Overlay
           isOpen={showManifest}
           onClose={() => setShowManifest(false)}
@@ -267,7 +257,7 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
             </h4>
             <button
               onClick={() => setShowManifest(false)}
-              className="hover:bg-secondary rounded p-1"
+              className="hover:bg-secondary rounded p-1 text-muted-foreground hover:text-foreground"
             >
               <X className="h-4 w-4" />
             </button>
@@ -281,13 +271,12 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
           </div>
         </Overlay>
 
-        {/* --- DIALOG 1: VERSIONS LIST (Centered) --- */}
         <Dialog
           isOpen={showVersions}
           onClose={() => setShowVersions(false)}
           title="Published Versions"
           size="md"
-          zIndex={70} // Higher than panel
+          zIndex={70}
         >
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">
@@ -336,13 +325,12 @@ export const AiSessionPanel = ({ session, onClose, onUpdate }: AiSessionPanelPro
           </div>
         </Dialog>
 
-        {/* --- DIALOG 2: VERSION CODE PREVIEW (Centered, Stacked) --- */}
         <Dialog
           isOpen={!!viewVersion}
           onClose={() => setViewVersion(null)}
           title={`Manifest: ${viewVersion?.name} (v${viewVersion?.version})`}
           size="lg"
-          zIndex={80} // Stacked on top of Versions list
+          zIndex={80}
         >
           <div className="flex flex-col h-[60vh]">
             <div className="flex-1 bg-[#1e1e1e] rounded-md border border-border overflow-hidden flex flex-col">

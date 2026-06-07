@@ -4086,11 +4086,12 @@ impl Db for ApexKit {
         let mut params: Vec<rusqlite::types::Value> = vec![];
 
         if let Some(tid) = tenant_id {
-            sql.push_str(" WHERE tenant_id = ?1");
+            // Tenant sees ONLY their own sandboxes
+            sql.push_str(" WHERE tenant_id = ?1 ORDER BY created_at DESC");
             params.push(tid.into_val());
         } else {
-            // If root, get all (no filter)
-            sql.push_str(" ORDER BY created_at DESC");
+            // Root sees ONLY root sandboxes (tenant_id IS NULL)
+            sql.push_str(" WHERE tenant_id IS NULL ORDER BY created_at DESC");
         }
 
         let mut stmt = conn.prepare(&sql)?;

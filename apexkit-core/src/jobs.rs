@@ -366,6 +366,8 @@ struct SmtpSettings {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
+    block_smtp: bool, // <--- NEW: Root override to block emails entirely
+    #[serde(default)]
     host: String,
     #[serde(default)]
     port: u16,
@@ -394,6 +396,12 @@ pub async fn send_email(
     } else {
         SmtpSettings::default()
     };
+
+    // --- ENFORCE BLOCK ---
+    if settings.block_smtp {
+        eprintln!("[SMTP] BLOCKED: Outbound email blocked by global 'block_smtp' policy.");
+        return Err("Outbound email is currently blocked by system policy.".to_string());
+    }
 
     // Safer From Address Construction
     let from_address = if settings.from_email.is_empty() {

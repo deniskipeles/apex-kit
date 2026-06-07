@@ -9,7 +9,7 @@ use apexkit_core::{
 use axum::{Extension, Json, extract::State};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tracing::{info};
+use tracing::info;
 
 // --- SYSTEM PROMPT ---
 const APEXKIT_DOCS_CORE: &str = r#"

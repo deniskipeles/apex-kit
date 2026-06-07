@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Loader2, Braces, CornerDownRight } from 'lucide-react';
-import { Button, Input, Label } from '../../../components/ui/Elements';
+import { Play, Loader2, Braces } from 'lucide-react';
+import { Button, Label } from '../../../components/ui/Elements';
 import { Dialog } from '../../../components/ui/Dialog';
 import { AiAction } from '../../../types';
 import { aiService } from '../services/aiService';
@@ -17,7 +17,6 @@ export const AiActionTester = ({ action, isOpen, onClose }: AiActionTesterProps)
   const [isLoading, setIsLoading] = useState(false);
   const [fields, setFields] = useState<string[]>([]);
 
-  // Parse template for {{vars}}
   useEffect(() => {
     if (action) {
       const regex = /\{\{(\w+)\}\}/g;
@@ -25,7 +24,6 @@ export const AiActionTester = ({ action, isOpen, onClose }: AiActionTesterProps)
       const uniqueFields = [...new Set(matches)];
       setFields(uniqueFields);
 
-      // Init state
       const initial: Record<string, string> = {};
       uniqueFields.forEach((f) => (initial[f] = ''));
       setVariables(initial);
@@ -51,7 +49,6 @@ export const AiActionTester = ({ action, isOpen, onClose }: AiActionTesterProps)
   return (
     <Dialog isOpen={isOpen} onClose={onClose} title={`Test: ${action.name}`} size="lg">
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 min-h-[400px]">
-        {/* Inputs */}
         <div className="space-y-4">
           <div className="text-xs font-bold uppercase text-muted-foreground tracking-wider mb-2">
             Input Variables
@@ -81,12 +78,11 @@ export const AiActionTester = ({ action, isOpen, onClose }: AiActionTesterProps)
           </div>
         </div>
 
-        {/* Output */}
         <div className="flex flex-col h-full">
           <div className="text-xs font-bold uppercase text-muted-foreground tracking-wider mb-2">
             Output
           </div>
-          <div className="flex-1 bg-[#1e1e1e] rounded-lg border border-border p-4 font-mono text-sm text-[#d4d4d4] overflow-auto shadow-inner">
+          <div className="flex-1 bg-[#1e1e1e] rounded-lg border border-border p-4 font-mono text-sm text-[#d4d4d4] overflow-auto shadow-inner min-h-[300px]">
             {isLoading ? (
               <div className="flex items-center justify-center h-full text-primary gap-2">
                 <Loader2 className="animate-spin h-5 w-5" /> Generating...
@@ -94,7 +90,7 @@ export const AiActionTester = ({ action, isOpen, onClose }: AiActionTesterProps)
             ) : result ? (
               <div className="whitespace-pre-wrap animate-in fade-in">{result}</div>
             ) : (
-              <div className="flex flex-col items-center justify-center h-full text-muted-foreground/30 gap-2">
+              <div className="flex flex-col items-center justify-center h-full text-muted-foreground/30 gap-2 py-20">
                 <Braces className="h-8 w-8" />
                 <span>Results will appear here</span>
               </div>

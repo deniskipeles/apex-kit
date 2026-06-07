@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sparkles, ArrowRight, Loader2, X } from 'lucide-react';
+import { Sparkles, Loader2, X } from 'lucide-react';
 import { Button, Input } from '../../../components/ui/Elements';
 import { useToast } from '../../../components/feedback/Toast';
 import { AI_MODELS, DEFAULT_AI_MODEL } from '../../../config/ai-models';
@@ -65,7 +65,7 @@ export const AiCodeAssistant = ({ currentCode, contextType, onApply }: AiCodeAss
           disabled={isLoading}
         />
         <button onClick={() => setIsOpen(false)}>
-          <X className="h-3.5 w-3.5" />
+          <X className="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" />
         </button>
       </div>
 
@@ -84,7 +84,7 @@ export const AiCodeAssistant = ({ currentCode, contextType, onApply }: AiCodeAss
 
         <Button
           size="sm"
-          className="h-6 text-xs bg-purple-600"
+          className="h-6 text-xs bg-purple-600 hover:bg-purple-700"
           onClick={handleGenerate}
           disabled={isLoading}
         >

@@ -33,6 +33,7 @@ pub struct AppSettingsDto {
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
 pub struct SmtpConfigDto {
     pub enabled: bool,
+    pub block_smtp: Option<bool>, // <--- NEW
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
@@ -243,6 +244,7 @@ pub async fn get_settings(
         let mut s: SmtpConfigDto =
             serde_json::from_value(smtp_val).unwrap_or_else(|_| SmtpConfigDto {
                 enabled: false,
+                block_smtp: Some(false),
                 host: "".into(),
                 port: 587,
                 username: None,

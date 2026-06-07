@@ -540,60 +540,63 @@ async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // 1. Determine Scope
     let current_request_scope = req
         .extensions()
         .get::<EventScope>()
         .cloned()
         .unwrap_or(EventScope::Root);
 
-    // 2. [GATEKEEPER] Check Suspension
-    // We use the Manager to get the context. This uses the Cache.
     let mut tenant_is_suspended = false;
 
     if let EventScope::Tenant(ref tenant_id) = current_request_scope {
-        // Try to get context (Fast path via cache)
         if let Ok(ctx) = state.tenant_manager.get_tenant_context(tenant_id).await {
-            // Check the status stored in memory
             if ctx.status == "suspended" || ctx.status == "archived" {
                 tenant_is_suspended = true;
             }
         } else {
-            // If we can't load the tenant (e.g. disk error or deleted), deny access
             return Err(StatusCode::NOT_FOUND);
         }
     }
 
-    // 3. Resolve DB to Check for Keys
-    // If we are in a tenant, we check the tenant's DB first
     let db_to_check: Arc<dyn Db> = if let Some(db) = req.extensions().get::<Arc<dyn Db>>() {
         db.clone()
     } else {
         state.db.clone()
     };
 
-    // 4. Validate JWT (Bearer)
     if let Some(auth_header) = req.headers().typed_get::<Authorization<Bearer>>() {
         if let Ok(claims) = auth::decode_jwt(auth_header.token()) {
-            // Check Scope Matches URL
+            // [FIXED] Smart JWT Scope Verification:
+            // Allows access if user is Root, or exact match, or a Tenant Admin who owns the target Sandbox.
             let is_authorized = match claims.scope.as_str() {
-                "root" => true, // Root Admin can access everything
+                "root" => true,
                 scope_str => {
-                    let expected = match &current_request_scope {
-                        EventScope::Root => "root".to_string(),
-                        EventScope::Tenant(id) => format!("tenant:{}", id),
-                        EventScope::Sandbox(id) => format!("sandbox:{}", id),
-                        _ => "root".to_string(),
-                    };
-                    scope_str == expected
+                    match &current_request_scope {
+                        EventScope::Root => scope_str == "root",
+                        EventScope::Tenant(id) => scope_str == &format!("tenant:{}", id),
+                        EventScope::Sandbox(sandbox_id) => {
+                            if scope_str == &format!("sandbox:{}", sandbox_id) {
+                                true
+                            } else if scope_str.starts_with("tenant:") {
+                                let user_tenant_id = scope_str.strip_prefix("tenant:").unwrap();
+                                // Query Root DB registry to verify this tenant owns the sandbox
+                                if let Ok(sandboxes) = state
+                                    .db
+                                    .list_sandboxes(Some(user_tenant_id.to_string()))
+                                    .await
+                                {
+                                    sandboxes.iter().any(|s| &s.id == sandbox_id)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    }
                 }
             };
-
-            // [ENFORCEMENT]
-            // If User is NOT Root (i.e. is_authorized via scope match, but not "root" scope explicitly)
-            // AND Tenant is suspended -> BLOCK
-            // However, the logic above sets is_authorized=true for tenants matching their own scope.
-            // We need to differentiate Root Admin vs Tenant User.
 
             let is_root_user = claims.scope == "root";
 
@@ -602,7 +605,7 @@ async fn auth_middleware(
             }
 
             if tenant_is_suspended && !is_root_user {
-                return Err(StatusCode::FORBIDDEN); // "Account Suspended"
+                return Err(StatusCode::FORBIDDEN);
             }
 
             req.extensions_mut().insert(claims);
@@ -610,17 +613,13 @@ async fn auth_middleware(
         }
     }
 
-    // 5. Validate API Key (x-api-key)
     if let Some(key_header) = req.headers().get("x-api-key") {
         if let Ok(key) = key_header.to_str() {
-            // A. Check Local DB
             let local_verification = db_to_check.verify_api_key(key).await;
 
-            // B. Resolve Key Origin
             let api_key_opt = if let Ok(Some(k)) = local_verification {
-                Some((k, true)) // Found in Local DB (Tenant Created)
+                Some((k, true))
             } else if !matches!(current_request_scope, EventScope::Root) {
-                // Fallback: Check Root DB
                 state
                     .db
                     .verify_api_key(key)
@@ -633,21 +632,16 @@ async fn auth_middleware(
             };
 
             if let Some((api_key, is_local_key)) = api_key_opt {
-                // [ENFORCEMENT]
                 if tenant_is_suspended {
                     if is_local_key {
-                        // Local key usage blocked on suspended tenant
                         tracing::warn!("Blocked suspended tenant key");
                         return Err(StatusCode::FORBIDDEN);
                     }
-                    // Root keys allowed (to manage/fix tenant)
                 }
 
-                // [SCOPE CHECK]
                 let is_allowed = if is_local_key {
-                    true // Local key implies access to current DB
+                    true
                 } else {
-                    // Root key must have correct scope
                     if api_key.scope == "root" || api_key.scope == "*" {
                         true
                     } else if api_key.scope.starts_with("tenant:") {

@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Mail, Send, Save, FileText, Code, Info } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Mail, Send, Save, FileText, Code, Info, ShieldAlert } from 'lucide-react';
 import {
   Card,
   CardHeader,
@@ -15,7 +15,7 @@ import { Dialog } from '../../../components/ui/Dialog';
 import { AppSettings } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
 import { PasswordInput } from '../../../components/form/PasswordInput';
-import { apiClient } from '@/src/lib/apiClient';
+import { apiClient } from '../../../lib/apiClient';
 
 interface SmtpSettingsProps {
   settings: AppSettings;
@@ -29,7 +29,12 @@ export const SmtpSettings = ({ settings, onChange, onSave }: SmtpSettingsProps) 
   const [testEmail, setTestEmail] = useState('');
   const [testTemplate, setTestTemplate] = useState('generic');
   const [isDocsOpen, setIsDocsOpen] = useState(false);
+  const [isRoot, setIsRoot] = useState(false);
   const { toast } = useToast();
+
+  useEffect(() => {
+    setIsRoot(apiClient.getScope().type === 'root');
+  }, []);
 
   const updateSmtp = (key: string, value: any) => {
     onChange({ smtp: { ...settings.smtp, [key]: value } });
@@ -62,6 +67,34 @@ export const SmtpSettings = ({ settings, onChange, onSave }: SmtpSettingsProps) 
 
   return (
     <div className="space-y-6">
+      {/* NEW: ROOT MAIL POLICY CARD */}
+      {isRoot && (
+        <Card className="border-destructive/20 bg-destructive/5 mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-destructive">
+              <ShieldAlert className="h-4 w-4" /> Root Mail Policy
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label>Block All Outbound SMTP Traffic</Label>
+                <p className="text-xs text-muted-foreground">
+                  If enabled, strictly blocks ALL outgoing emails from this node (including tenant
+                  emails, password resets, and{' '}
+                  <code className="bg-background px-1 rounded">$mail.send</code>). Use this to
+                  prevent spam abuse in shared cloud environments.
+                </p>
+              </div>
+              <Switch
+                checked={settings.smtp.blockSmtp}
+                onCheckedChange={(c: boolean) => updateSmtp('blockSmtp', c)}
+              />
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
@@ -199,7 +232,7 @@ export const SmtpSettings = ({ settings, onChange, onSave }: SmtpSettingsProps) 
               variant="outline"
               onClick={handleTestEmail}
               isLoading={isTestingEmail}
-              disabled={!settings.smtp.enabled || !testEmail}
+              disabled={!settings.smtp.enabled || !testEmail || settings.smtp.blockSmtp}
               className="w-full md:w-auto"
             >
               <Send className="mr-2 h-3 w-3" /> Send Test

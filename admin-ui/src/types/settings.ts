@@ -1,5 +1,3 @@
-import { AiAction } from '.';
-
 export interface SecurityConfig {
   corsAllowAll: boolean;
   corsOrigins: string;
@@ -35,6 +33,7 @@ export type ViewState =
 
 export interface SmtpConfig {
   enabled: boolean;
+  blockSmtp: boolean; // <--- NEW
   host: string;
   port: number;
   username?: string;

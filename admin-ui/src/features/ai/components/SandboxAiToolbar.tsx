@@ -4,22 +4,22 @@ import {
   Play,
   Database,
   RefreshCw,
-  Maximize2,
   X,
   Send,
-  ChevronDown,
   LayoutTemplate,
   Terminal,
   Zap,
   ExternalLink,
   Paperclip,
   FileCode,
-  FileJson,
   Check,
   AlertTriangle,
+  MessageSquare,
+  Rocket,
+  Maximize2,
 } from 'lucide-react';
-import { Button, Input, Select, Badge, Card } from '../../../components/ui/Elements';
-import { architectService, AiSession, ChatMessage } from '../services/architectService';
+import { Button, Input, Select, Badge, Textarea } from '../../../components/ui/Elements';
+import { architectService } from '../services/architectService';
 import { templatesService } from '../../templates/services/templatesService';
 import { collectionsService } from '../../collections/services/collectionsService';
 import { scriptsService } from '../../scripts/services/scriptsService';
@@ -27,36 +27,38 @@ import { useToast } from '../../../components/feedback/Toast';
 import { APP_CONFIG } from '../../../config/app.config';
 import { AI_MODELS, DEFAULT_AI_MODEL } from '../../../config/ai-models';
 import { Overlay } from '../../../components/overlay/Overlay';
+import { apiClient } from '../../../lib/apiClient';
+import { AiSession, ChatMessage, Script } from '@/src/types';
 
 interface SandboxAiToolbarProps {
   sessionId: string;
 }
 
 export const SandboxAiToolbar = ({ sessionId }: SandboxAiToolbarProps) => {
-  const [isOpen, setIsOpen] = useState(true);
-  const [activeTab, setActiveTab] = useState<'chat' | 'preview' | 'tools' | null>(null);
+  const [isOpen, setIsOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<'chat' | 'preview' | 'tools'>('chat');
   const [session, setSession] = useState<AiSession | null>(null);
   const [input, setInput] = useState('');
   const [isThinking, setIsThinking] = useState(false);
   const [isApplying, setIsApplying] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
-  // Resource Lists for Attachments
   const [templates, setTemplates] = useState<any[]>([]);
   const [collections, setCollections] = useState<any[]>([]);
-  const [scripts, setScripts] = useState<any[]>([]);
+  const [scripts, setScripts] = useState<{
+    local: Script[];
+    shared: Script[];
+    root_total: number;
+    transparency_enabled: boolean;
+  }>({ local: [], root_total: 0, shared: [], transparency_enabled: false });
 
-  // Attachment Menu State
   const [isAttachOpen, setIsAttachOpen] = useState(false);
   const attachBtnRef = useRef<HTMLButtonElement>(null);
-
-  // Model State
   const [selectedModel, setSelectedModel] = useState(DEFAULT_AI_MODEL);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const { toast } = useToast();
 
-  // Helper to refresh resources
   const refreshResources = async () => {
     try {
       const [tmpls, cols, scrs] = await Promise.all([
@@ -74,26 +76,22 @@ export const SandboxAiToolbar = ({ sessionId }: SandboxAiToolbarProps) => {
     }
   };
 
-  // Initial Load
   useEffect(() => {
     if (!sessionId) return;
-
-    architectService.listSessions().then((sessions) => {
-      const current = sessions.find((s) => s.id === sessionId);
-      if (current) setSession(current);
-    });
-
+    apiClient.ai
+      .getSession()
+      .then((currentSession) => {
+        setSession(currentSession);
+      })
+      .catch((err) => console.error('Failed to load session:', err));
     refreshResources();
   }, [sessionId]);
 
-  // Scroll chat
   useEffect(() => {
-    if (activeTab === 'chat') {
+    if (activeTab === 'chat' && isOpen) {
       chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [session?.messages, activeTab, session?.diff_summary]);
-
-  // --- ACTIONS ---
+  }, [session?.messages, activeTab, session?.diff_summary, isOpen]);
 
   const handleSend = async () => {
     if (!input.trim() || !session) return;
@@ -101,12 +99,11 @@ export const SandboxAiToolbar = ({ sessionId }: SandboxAiToolbarProps) => {
     setInput('');
     setIsThinking(true);
 
-    // Optimistic UI
     const newMsg: ChatMessage = { role: 'user', content: userMsg };
-    setSession((prev) => (prev ? { ...prev, messages: [...prev.messages, newMsg] } : null));
+    setSession((prev) => (prev ? { ...prev, messages: [...(prev.messages || []), newMsg] } : null));
 
     try {
-      const updated = await architectService.chat(session.id, userMsg, selectedModel);
+      const updated = await architectService.chat(userMsg, selectedModel);
       setSession(updated);
 
       if (updated.diff_summary) {
@@ -125,20 +122,25 @@ export const SandboxAiToolbar = ({ sessionId }: SandboxAiToolbarProps) => {
     if (!session) return;
     setIsApplying(true);
     try {
-      // Need to add this method to architectService if not present, assume it maps to /apply
-      // Using raw fetch here if service update isn't propagated yet, or service method
-      const res = await architectService.applySessionChanges(session.id);
-
-      if (!res.ok) throw new Error('Failed to apply');
-
-      const updatedSession = await res.json();
-      setSession(updatedSession);
+      const updated = await architectService.applySessionChanges();
+      setSession(updated);
       toast('Changes applied to Sandbox!', 'success');
-
-      // Refresh local resources to match new state
       await refreshResources();
     } catch (e) {
       toast('Failed to apply changes', 'error');
+    } finally {
+      setIsApplying(false);
+    }
+  };
+
+  const handlePublish = async () => {
+    setIsApplying(true);
+    try {
+      await apiClient.root.publishSandbox(sessionId);
+      toast('Sandbox successfully merged into Production!', 'success');
+      window.location.href = '/_dashboard/sandboxes';
+    } catch (e: any) {
+      toast('Failed to publish sandbox', 'error');
     } finally {
       setIsApplying(false);
     }
@@ -148,41 +150,34 @@ export const SandboxAiToolbar = ({ sessionId }: SandboxAiToolbarProps) => {
     setIsAttachOpen(false);
     let contentToAttach = '';
     let name = '';
-
     try {
       if (type === 'collection') {
         const col = collections.find((c) => c.id === id);
         if (col) {
           name = col.name;
-          // Transform to backend schema format
           contentToAttach = JSON.stringify(
-            {
-              name: col.name,
-              schema: col.schema, // Already in correct format from service
-              type: col.type,
-            },
+            { name: col.name, schema: col.schema, type: col.type },
             null,
             2
           );
         }
       } else if (type === 'script') {
-        const scr = scripts.find((s) => s.id === id);
+        const scr = scripts.local.find((s) => s.id === id);
         if (scr) {
           name = scr.name;
-          contentToAttach = `// Script: ${scr.name}\n// Trigger: ${scr.trigger_type}\n${scr.code}`;
+          contentToAttach = `// Script: ${scr.name}\\n// Trigger: ${scr.trigger_type}\\n${scr.code}`;
         }
       } else if (type === 'template') {
         const t = templates.find((t) => t.id === id);
         if (t) {
           name = t.slug;
-          contentToAttach = `<!-- Template: ${t.slug} -->\n${t.content}`;
+          contentToAttach = `<!-- Template: ${t.slug} -->\\n${t.content}`;
         }
       }
-
       if (contentToAttach) {
         setInput(
           (prev) =>
-            `${prev}\n\n[Attached ${type}: ${name}]\n\`\`\`json\n${contentToAttach}\n\`\`\`\n\n`
+            `${prev}\\n\\n[Attached ${type}: ${name}]\\n\`\`\`json\\n${contentToAttach}\\n\`\`\`\\n\\n`
         );
         toast(`Attached ${name}`, 'success');
       }
@@ -191,360 +186,454 @@ export const SandboxAiToolbar = ({ sessionId }: SandboxAiToolbarProps) => {
     }
   };
 
-  const toggleTab = async (tab: 'chat' | 'preview' | 'tools') => {
-    if (activeTab === tab) {
-      setActiveTab(null);
-    } else {
-      setActiveTab(tab);
-      if (tab === 'preview') {
-        const latestTemplates = await refreshResources();
-        if (!previewUrl && latestTemplates.length > 0) {
-          const home =
-            latestTemplates.find((t) => t.slug.includes('index') || t.slug.includes('home')) ||
-            latestTemplates[0];
-          setPreviewUrl(`/sandbox/${session.id}/render/${home.slug}`);
-        }
-      }
-    }
+  const renderDiffLine = (line: string, i: number) => {
+    if (line.startsWith('+'))
+      return (
+        <div
+          key={i}
+          className="text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded my-0.5 border border-emerald-500/20"
+        >
+          {line}
+        </div>
+      );
+    if (line.startsWith('~'))
+      return (
+        <div
+          key={i}
+          className="text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded my-0.5 border border-amber-500/20"
+        >
+          {line}
+        </div>
+      );
+    if (line.startsWith('-'))
+      return (
+        <div
+          key={i}
+          className="text-red-400 bg-red-500/10 px-2 py-0.5 rounded my-0.5 border border-red-500/20"
+        >
+          {line}
+        </div>
+      );
+    return (
+      <div key={i} className="px-2 py-0.5 opacity-70">
+        {line}
+      </div>
+    );
   };
 
   if (!sessionId) return null;
 
   return (
-    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[100] flex flex-col items-center gap-4 w-full max-w-3xl pointer-events-none">
-      {/* 1. CHAT PANEL */}
-      {activeTab === 'chat' && (
-        <div className="w-full h-[600px] bg-background/95 backdrop-blur-md border border-primary/20 rounded-xl shadow-2xl flex flex-col pointer-events-auto overflow-hidden animate-in slide-in-from-bottom-5 zoom-in-95">
-          <div className="p-3 border-b border-border flex justify-between items-center bg-primary/5">
-            <div className="flex items-center gap-2 font-semibold text-primary">
-              <Sparkles className="h-4 w-4" />
-              <span className="hidden sm:inline">Architect Chat</span>
+    <>
+      {/* Floating Action Button when closed */}
+      {!isOpen && (
+        <button
+          onClick={() => setIsOpen(true)}
+          className="fixed bottom-6 right-6 z-[90] w-14 h-14 rounded-full bg-primary text-white shadow-2xl flex items-center justify-center hover:scale-110 transition-transform duration-300 group ring-4 ring-primary/20"
+        >
+          <Sparkles className="h-6 w-6 group-hover:animate-pulse" />
+          {session?.diff_summary && (
+            <div className="absolute -top-1 -right-1 w-4 h-4 bg-amber-500 rounded-full border-2 border-background"></div>
+          )}
+        </button>
+      )}
+
+      {/* Slide-out Right Panel */}
+      <div
+        className={`fixed inset-y-0 right-0 z-[100] flex flex-col bg-background/95 supports-[backdrop-filter]:bg-background/80 backdrop-blur-2xl border-l border-border/50 shadow-2xl transition-transform duration-300 w-full sm:w-[450px] lg:w-[500px] ${isOpen ? 'translate-x-0' : 'translate-x-full'}`}
+      >
+        {/* Header */}
+        <div className="flex flex-col shrink-0 border-b border-border bg-secondary/10">
+          <div className="flex items-center justify-between p-4">
+            <div className="flex items-center gap-2 font-bold text-foreground">
+              <Sparkles className="h-5 w-5 text-primary" /> Copilot
+              <Badge
+                variant="outline"
+                className="text-[10px] uppercase ml-2 bg-background shadow-sm text-muted-foreground font-mono"
+              >
+                {sessionId.substring(0, 8)}
+              </Badge>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 text-xs font-semibold bg-background"
+                onClick={handlePublish}
+                disabled={isApplying}
+              >
+                <Rocket className="h-3 w-3 mr-1.5 text-primary" /> Publish
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                onClick={() => setIsOpen(false)}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+          {/* Tabs */}
+          <div className="flex px-4 gap-4 text-sm font-medium border-t border-border/50">
+            <button
+              onClick={() => setActiveTab('chat')}
+              className={`py-2.5 border-b-2 transition-colors flex items-center gap-1.5 ${activeTab === 'chat' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+            >
+              <MessageSquare className="h-3.5 w-3.5" /> Chat
+            </button>
+            <button
+              onClick={() => {
+                setActiveTab('preview');
+                if (!previewUrl && templates.length > 0) {
+                  const home =
+                    templates.find((t) => t.slug.includes('index') || t.slug.includes('home')) ||
+                    templates[0];
+                  setPreviewUrl(`/sandbox/${sessionId}/render/${home.slug}`);
+                }
+              }}
+              className={`py-2.5 border-b-2 transition-colors flex items-center gap-1.5 ${activeTab === 'preview' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+            >
+              <LayoutTemplate className="h-3.5 w-3.5" /> Preview
+            </button>
+            <button
+              onClick={() => setActiveTab('tools')}
+              className={`py-2.5 border-b-2 transition-colors flex items-center gap-1.5 ${activeTab === 'tools' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+            >
+              <Terminal className="h-3.5 w-3.5" /> API & Tools
+            </button>
+          </div>
+        </div>
+
+        {/* --- CHAT TAB --- */}
+        {activeTab === 'chat' && (
+          <>
+            <div className="flex-1 overflow-y-auto p-4 space-y-5 custom-scrollbar">
+              {(session?.messages || []).map((msg, i) => (
+                <div
+                  key={i}
+                  className={`flex gap-3 w-full ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  {msg.role !== 'user' && (
+                    <div className="h-7 w-7 rounded-full bg-primary/10 flex items-center justify-center shrink-0 border border-primary/20">
+                      <Sparkles className="h-3.5 w-3.5 text-primary" />
+                    </div>
+                  )}
+                  <div
+                    className={`p-3 text-sm whitespace-pre-wrap leading-relaxed shadow-sm max-w-[85%] ${msg.role === 'user' ? 'bg-primary text-primary-foreground rounded-2xl rounded-tr-sm' : 'bg-card border border-border text-foreground rounded-2xl rounded-tl-sm'} ${msg.role === 'error' ? 'bg-destructive/10 text-destructive border-destructive/20' : ''}`}
+                  >
+                    {msg.content}
+                  </div>
+                </div>
+              ))}
+
+              {/* Pending Diff Box */}
+              {session?.diff_summary && (
+                <div className="border border-amber-500/30 bg-[#0d1117] rounded-xl overflow-hidden animate-in fade-in slide-in-from-bottom-2 shadow-lg">
+                  <div className="bg-amber-500/10 px-3 py-2 border-b border-amber-500/20 flex justify-between items-center">
+                    <span className="text-xs font-bold text-amber-500 flex items-center gap-2">
+                      <AlertTriangle className="h-3 w-3" /> Draft Changes Generated
+                    </span>
+                  </div>
+                  <div className="p-3 font-mono text-[10px] sm:text-xs">
+                    <div className="space-y-0.5">
+                      {session.diff_summary.split('\\n').map((line, i) => renderDiffLine(line, i))}
+                    </div>
+                  </div>
+                  <div className="p-2 bg-background flex gap-2 justify-end border-t border-border">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() =>
+                        setSession({ ...session, diff_summary: null, pending_manifest: null })
+                      }
+                      className="h-7 text-xs"
+                    >
+                      Discard
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={handleApply}
+                      isLoading={isApplying}
+                      className="h-7 text-xs bg-amber-500 hover:bg-amber-600 text-black font-semibold"
+                    >
+                      <Check className="h-3 w-3 mr-1" /> Apply to Sandbox
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {isThinking && (
+                <div className="flex w-full justify-start animate-in fade-in slide-in-from-bottom-2">
+                  <div className="flex gap-3 max-w-[85%]">
+                    <div className="h-7 w-7 rounded-full bg-secondary border border-border flex items-center justify-center shrink-0">
+                      <Sparkles className="h-3.5 w-3.5 text-primary animate-pulse" />
+                    </div>
+                    <div className="p-3 bg-card border border-border rounded-2xl rounded-tl-sm flex items-center gap-2 shadow-sm">
+                      <div className="flex gap-1">
+                        <span
+                          className="w-1.5 h-1.5 bg-primary/60 rounded-full animate-bounce"
+                          style={{ animationDelay: '0ms' }}
+                        ></span>
+                        <span
+                          className="w-1.5 h-1.5 bg-primary/60 rounded-full animate-bounce"
+                          style={{ animationDelay: '150ms' }}
+                        ></span>
+                        <span
+                          className="w-1.5 h-1.5 bg-primary/60 rounded-full animate-bounce"
+                          style={{ animationDelay: '300ms' }}
+                        ></span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
             </div>
 
-            <div className="flex items-center gap-2">
-              <div className="w-40">
+            {/* Input Area */}
+            <div className="p-4 bg-background border-t border-border shrink-0">
+              <div className="flex justify-between items-center mb-2 px-1">
+                <span className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider">
+                  Model
+                </span>
                 <Select
                   value={selectedModel}
                   onChange={(e: any) => setSelectedModel(e.target.value)}
-                  className="h-7 text-xs py-0 bg-background/50 border-transparent hover:border-border transition-colors focus:ring-0 shadow-none"
+                  className="h-6 text-[10px] py-0 w-32 border-transparent bg-secondary/50 focus:ring-0"
                 >
-                  {AI_MODELS.map((m) => (
+                  {AI_MODELS?.map((m) => (
                     <option key={m.value} value={m.value}>
                       {m.label}
                     </option>
                   ))}
                 </Select>
               </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-6 w-6"
-                onClick={() => setActiveTab(null)}
-              >
-                <X className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-
-          <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gradient-to-b from-transparent to-black/5">
-            {session?.messages.map((msg, i) => (
-              <div
-                key={i}
-                className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}
-              >
-                <div
-                  className={`max-w-[85%] rounded-lg p-3 text-sm whitespace-pre-wrap shadow-sm ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : 'bg-card border border-border text-foreground'} ${msg.role === 'error' ? 'bg-destructive/10 text-destructive border-destructive/20' : ''}`}
+              <div className="relative flex items-end gap-2 bg-secondary/10 border border-input rounded-xl p-2 focus-within:ring-1 focus-within:ring-primary focus-within:border-primary transition-all">
+                <Button
+                  ref={attachBtnRef}
+                  variant="ghost"
+                  size="icon"
+                  className="shrink-0 h-8 w-8 text-muted-foreground hover:text-primary mb-0.5"
+                  onClick={() => setIsAttachOpen(!isAttachOpen)}
+                  title="Attach Context"
                 >
-                  {msg.content}
-                </div>
-              </div>
-            ))}
+                  <Paperclip className="h-4 w-4" />
+                </Button>
+                <Textarea
+                  value={input}
+                  onChange={(e: any) => setInput(e.target.value)}
+                  onKeyDown={(e: any) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      handleSend();
+                    }
+                  }}
+                  placeholder="Describe a feature, schema change, or UI..."
+                  className="flex-1 bg-transparent border-0 focus-visible:ring-0 resize-none min-h-[40px] max-h-[150px] py-2 text-sm custom-scrollbar"
+                  disabled={isThinking}
+                />
+                <Button
+                  size="icon"
+                  className="h-8 w-8 shrink-0 rounded-lg mb-0.5"
+                  onClick={handleSend}
+                  disabled={!input.trim() || isThinking || isApplying}
+                >
+                  <Send className="h-3.5 w-3.5" />
+                </Button>
 
-            {/* PENDING CHANGES DIFF VIEW */}
-            {session?.diff_summary && (
-              <div className="mx-4 my-2 border border-amber-500/30 bg-amber-500/5 rounded-lg overflow-hidden animate-in fade-in slide-in-from-bottom-2">
-                <div className="bg-amber-500/10 px-3 py-2 border-b border-amber-500/20 flex justify-between items-center">
-                  <span className="text-xs font-bold text-amber-500 flex items-center gap-2">
-                    <AlertTriangle className="h-3 w-3" /> Pending Changes
-                  </span>
-                </div>
-                <div className="p-3">
-                  <pre className="text-xs font-mono text-foreground/80 whitespace-pre-wrap">
-                    {session.diff_summary}
-                  </pre>
-                </div>
-                <div className="p-2 bg-background/50 flex gap-2 justify-end border-t border-amber-500/10">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      /* Logic to discard? */
-                    }}
-                    className="h-7 text-xs"
-                  >
-                    Refine
-                  </Button>
-                  <Button
-                    size="sm"
-                    onClick={handleApply}
-                    isLoading={isApplying}
-                    className="h-7 text-xs bg-amber-500 hover:bg-amber-600 text-black"
-                  >
-                    <Check className="h-3 w-3 mr-1" /> Apply Changes
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            {isThinking && (
-              <div className="flex items-center gap-2 text-xs text-muted-foreground animate-pulse p-2">
-                <RefreshCw className="h-3 w-3 animate-spin" /> Architect is building...
-              </div>
-            )}
-            <div ref={chatEndRef} />
-          </div>
-
-          <div className="p-3 border-t border-border bg-background">
-            <div className="relative flex items-center gap-2">
-              {/* Attach Button */}
-              <Button
-                ref={attachBtnRef}
-                variant="ghost"
-                size="icon"
-                className="shrink-0 h-9 w-9 text-muted-foreground hover:text-primary"
-                onClick={() => setIsAttachOpen(!isAttachOpen)}
-                title="Attach Context"
-              >
-                <Paperclip className="h-4 w-4" />
-              </Button>
-
-              <Input
-                value={input}
-                onChange={(e: any) => setInput(e.target.value)}
-                onKeyDown={(e: any) => e.key === 'Enter' && !e.shiftKey && handleSend()}
-                placeholder={
-                  session?.diff_summary
-                    ? 'Refine these changes or describe new ones...'
-                    : 'Describe a feature, schema change, or UI tweak...'
-                }
-                className="shadow-inner bg-secondary/30 border-transparent focus:border-primary"
-                autoFocus
-              />
-              <Button
-                size="icon"
-                className="h-9 w-9 shrink-0"
-                onClick={handleSend}
-                disabled={!input.trim() || isThinking || isApplying}
-              >
-                <Send className="h-4 w-4" />
-              </Button>
-
-              {/* Attachments Overlay */}
-              <Overlay
-                isOpen={isAttachOpen}
-                onClose={() => setIsAttachOpen(false)}
-                anchorRef={attachBtnRef}
-                align="start"
-                className="mb-2"
-              >
-                <div className="w-64 bg-popover border border-border rounded-lg shadow-xl overflow-hidden flex flex-col max-h-[300px]">
-                  <div className="p-2 bg-secondary/20 text-[10px] font-bold text-muted-foreground uppercase tracking-wider border-b border-border">
-                    Attach Context
+                {/* Attachment Overlay */}
+                <Overlay
+                  isOpen={isAttachOpen}
+                  onClose={() => setIsAttachOpen(false)}
+                  anchorRef={attachBtnRef}
+                  align="start"
+                  className="mb-2 z-[110]"
+                >
+                  <div className="w-64 bg-popover border border-border rounded-xl shadow-xl overflow-hidden flex flex-col max-h-[300px]">
+                    <div className="p-2 bg-secondary/20 text-[10px] font-bold text-muted-foreground uppercase tracking-wider border-b border-border">
+                      Attach Context
+                    </div>
+                    <div className="overflow-y-auto flex-1 p-1 custom-scrollbar">
+                      <div className="px-2 py-1 text-[10px] text-muted-foreground font-semibold">
+                        Collections
+                      </div>
+                      {(collections || [])?.map((c) => (
+                        <button
+                          key={c.id}
+                          onClick={() => handleAttach('collection', c.id)}
+                          className="w-full text-left px-2 py-1.5 text-xs hover:bg-accent rounded flex items-center gap-2"
+                        >
+                          <Database className="h-3 w-3 text-blue-500" /> {c.name}
+                        </button>
+                      ))}
+                      <div className="px-2 py-1 text-[10px] text-muted-foreground font-semibold mt-1">
+                        Templates
+                      </div>
+                      {(templates || [])?.map((t) => (
+                        <button
+                          key={t.id}
+                          onClick={() => handleAttach('template', t.id)}
+                          className="w-full text-left px-2 py-1.5 text-xs hover:bg-accent rounded flex items-center gap-2"
+                        >
+                          <LayoutTemplate className="h-3 w-3 text-purple-500" /> {t.slug}
+                        </button>
+                      ))}
+                      <div className="px-2 py-1 text-[10px] text-muted-foreground font-semibold mt-1">
+                        Scripts
+                      </div>
+                      {(scripts.local || [])?.map((s) => (
+                        <button
+                          key={s.id}
+                          onClick={() => handleAttach('script', s.id)}
+                          className="w-full text-left px-2 py-1.5 text-xs hover:bg-accent rounded flex items-center gap-2"
+                        >
+                          <FileCode className="h-3 w-3 text-yellow-500" /> {s.name}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                  <div className="overflow-y-auto flex-1 p-1">
-                    {/* Collections */}
-                    <div className="px-2 py-1 text-[10px] text-muted-foreground font-semibold">
-                      Collections
-                    </div>
-                    {collections.map((c) => (
-                      <button
-                        key={c.id}
-                        onClick={() => handleAttach('collection', c.id)}
-                        className="w-full text-left px-2 py-1.5 text-xs hover:bg-accent rounded flex items-center gap-2"
-                      >
-                        <Database className="h-3 w-3 text-blue-500" /> {c.name}
-                      </button>
-                    ))}
-
-                    {/* Templates */}
-                    <div className="px-2 py-1 text-[10px] text-muted-foreground font-semibold mt-1">
-                      Templates
-                    </div>
-                    {templates.map((t) => (
-                      <button
-                        key={t.id}
-                        onClick={() => handleAttach('template', t.id)}
-                        className="w-full text-left px-2 py-1.5 text-xs hover:bg-accent rounded flex items-center gap-2"
-                      >
-                        <LayoutTemplate className="h-3 w-3 text-purple-500" /> {t.slug}
-                      </button>
-                    ))}
-
-                    {/* Scripts */}
-                    <div className="px-2 py-1 text-[10px] text-muted-foreground font-semibold mt-1">
-                      Scripts
-                    </div>
-                    {scripts.map((s) => (
-                      <button
-                        key={s.id}
-                        onClick={() => handleAttach('script', s.id)}
-                        className="w-full text-left px-2 py-1.5 text-xs hover:bg-accent rounded flex items-center gap-2"
-                      >
-                        <FileCode className="h-3 w-3 text-yellow-500" /> {s.name}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </Overlay>
+                </Overlay>
+              </div>
             </div>
-          </div>
-        </div>
-      )}
+          </>
+        )}
 
-      {/* 2. PREVIEW PANEL */}
-      {activeTab === 'preview' && (
-        <div className="w-full h-[600px] bg-background border border-border rounded-xl shadow-2xl flex flex-col pointer-events-auto overflow-hidden animate-in slide-in-from-bottom-5">
-          <div className="p-2 border-b border-border flex gap-2 items-center bg-secondary/20">
-            {/* Templates List */}
-            <div className="flex-1 flex gap-2 overflow-x-auto no-scrollbar items-center px-1">
-              {templates.length === 0 ? (
-                <span className="text-xs text-muted-foreground italic flex items-center gap-2">
-                  <Terminal className="h-3 w-3" /> No templates yet. Ask Architect to build one.
-                </span>
+        {/* --- PREVIEW TAB --- */}
+        {activeTab === 'preview' && (
+          <div className="flex-1 flex flex-col overflow-hidden bg-background">
+            <div className="p-2 border-b border-border flex gap-2 items-center bg-secondary/10 shrink-0">
+              <div className="flex-1 flex gap-2 overflow-x-auto no-scrollbar items-center px-1">
+                {templates.length === 0 ? (
+                  <span className="text-xs text-muted-foreground italic flex items-center gap-2">
+                    <Terminal className="h-3 w-3" /> No templates available.
+                  </span>
+                ) : (
+                  templates.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => setPreviewUrl(`/sandbox/${sessionId}/render/${t.slug}`)}
+                      className={`px-3 py-1 text-xs rounded-full whitespace-nowrap transition-colors flex items-center gap-1.5 ${previewUrl?.endsWith(t.slug) ? 'bg-primary text-primary-foreground shadow-sm' : 'bg-background hover:bg-secondary border border-border text-muted-foreground'}`}
+                    >
+                      <LayoutTemplate className="h-3 w-3 opacity-70" /> {t.slug}
+                    </button>
+                  ))
+                )}
+              </div>
+              <div className="flex gap-1 border-l border-border/50 pl-2">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  onClick={() => refreshResources()}
+                  title="Refresh Templates"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  onClick={() => window.open(previewUrl || '', '_blank')}
+                  disabled={!previewUrl}
+                  title="Open in New Tab"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 hidden sm:flex"
+                  onClick={() => {
+                    window.location.href = `/_dashboard/sandbox/${sessionId}/ai-architect`;
+                    setIsOpen(false);
+                  }}
+                  title="Expand IDE"
+                >
+                  <Maximize2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+            <div className="flex-1 bg-white relative">
+              {previewUrl ? (
+                <iframe
+                  src={previewUrl}
+                  className="w-full h-full border-none bg-white"
+                  title="Preview"
+                />
               ) : (
-                templates.map((t) => (
-                  <button
-                    key={t.id}
-                    onClick={() => setPreviewUrl(`/sandbox/${session.id}/render/${t.slug}`)}
-                    className={`px-3 py-1 text-xs rounded-full whitespace-nowrap transition-colors flex items-center gap-1.5 ${previewUrl?.endsWith(t.slug) ? 'bg-primary text-primary-foreground shadow-sm' : 'bg-background hover:bg-secondary border border-border text-muted-foreground'}`}
-                  >
-                    <LayoutTemplate className="h-3 w-3 opacity-70" />
-                    {t.slug}
-                  </button>
-                ))
+                <div className="flex flex-col h-full items-center justify-center text-gray-400 gap-2">
+                  <LayoutTemplate className="h-10 w-10 opacity-20" />
+                  <span className="text-sm">Select a template to preview</span>
+                </div>
               )}
             </div>
-
-            <div className="flex gap-1 border-l border-border/50 pl-2">
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => refreshResources()}
-                title="Refresh Templates"
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => window.open(previewUrl || '', '_blank')}
-                disabled={!previewUrl}
-                title="Open in New Tab"
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => setActiveTab(null)}
-              >
-                <X className="h-4 w-4" />
-              </Button>
-            </div>
           </div>
-          <div className="flex-1 bg-white relative">
-            {previewUrl ? (
-              <iframe src={previewUrl} className="w-full h-full border-none" title="Preview" />
-            ) : (
-              <div className="flex flex-col h-full items-center justify-center text-gray-400 gap-2">
-                <LayoutTemplate className="h-10 w-10 opacity-20" />
-                <span className="text-sm">Select a template to preview</span>
+        )}
+
+        {/* --- TOOLS TAB --- */}
+        {activeTab === 'tools' && (
+          <div className="flex-1 p-6 space-y-4">
+            <Button
+              variant="outline"
+              className="w-full justify-start gap-3 h-12"
+              onClick={() =>
+                window.open(`${APP_CONFIG.apiBaseUrl}/sandbox/${sessionId}/scalar`, '_blank')
+              }
+            >
+              <div className="p-2 bg-blue-500/10 rounded text-blue-500">
+                <Terminal className="h-4 w-4" />
               </div>
-            )}
+              <div className="text-left">
+                <div className="font-bold">API Documentation</div>
+                <div className="text-[10px] text-muted-foreground">
+                  Interactive Swagger/Scalar API Reference
+                </div>
+              </div>
+            </Button>
+            <Button
+              variant="outline"
+              className="w-full justify-start gap-3 h-12"
+              onClick={async () => {
+                try {
+                  await apiClient.reIndex();
+                  toast('Search index re-generation started', 'success');
+                } catch {
+                  toast('Failed to trigger re-index', 'error');
+                }
+              }}
+            >
+              <div className="p-2 bg-amber-500/10 rounded text-amber-500">
+                <Zap className="h-4 w-4" />
+              </div>
+              <div className="text-left">
+                <div className="font-bold">Rebuild Search Index</div>
+                <div className="text-[10px] text-muted-foreground">
+                  Fix missing records in OSE/Tantivy search
+                </div>
+              </div>
+            </Button>
+            <Button
+              variant="outline"
+              className="w-full justify-start gap-3 h-12"
+              onClick={() => {
+                window.location.href = `/_dashboard/sandbox/${sessionId}/ai-architect`;
+                setIsOpen(false);
+              }}
+            >
+              <div className="p-2 bg-purple-500/10 rounded text-purple-500">
+                <Maximize2 className="h-4 w-4" />
+              </div>
+              <div className="text-left">
+                <div className="font-bold">Open Full IDE</div>
+                <div className="text-[10px] text-muted-foreground">
+                  Expand Architect into full-screen mode
+                </div>
+              </div>
+            </Button>
           </div>
-        </div>
-      )}
-
-      {/* 3. TOOLS PANEL */}
-      {activeTab === 'tools' && (
-        <div className="bg-popover border border-border rounded-xl shadow-xl p-2 mb-2 grid grid-cols-2 gap-2 w-64 pointer-events-auto animate-in zoom-in-95 slide-in-from-bottom-2">
-          <Button
-            variant="ghost"
-            className="justify-start gap-2 h-9 text-xs"
-            onClick={() =>
-              window.open(`${APP_CONFIG.apiBaseUrl}/sandbox/${sessionId}/scalar`, '_blank')
-            }
-          >
-            <Terminal className="h-3.5 w-3.5 text-blue-500" /> API Docs
-          </Button>
-          <Button
-            variant="ghost"
-            className="justify-start gap-2 h-9 text-xs"
-            onClick={() => {
-              /* Trigger re-index */
-            }}
-          >
-            <Zap className="h-3.5 w-3.5 text-amber-500" /> Re-index Search
-          </Button>
-        </div>
-      )}
-
-      {/* --- MAIN TOOLBAR --- */}
-      <div className="flex items-center gap-2 p-1.5 bg-foreground/90 backdrop-blur-md text-background rounded-full shadow-2xl border border-white/10 pointer-events-auto hover:scale-[1.01] transition-transform duration-200">
-        <div className="flex items-center gap-2 pl-3 pr-2 border-r border-white/20">
-          <div className="w-2 h-2 bg-amber-400 rounded-full animate-pulse shadow-[0_0_8px_rgba(251,191,36,0.8)]" />
-          <span className="text-xs font-bold font-mono tracking-tight">SANDBOX</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <ToolbarButton
-            icon={<Sparkles className="h-4 w-4" />}
-            label="Architect"
-            active={activeTab === 'chat'}
-            onClick={() => toggleTab('chat')}
-          />
-          <ToolbarButton
-            icon={<Play className="h-4 w-4" />}
-            label="Preview"
-            active={activeTab === 'preview'}
-            onClick={() => toggleTab('preview')}
-          />
-          <ToolbarButton
-            icon={<LayoutTemplate className="h-4 w-4" />}
-            label="Tools"
-            active={activeTab === 'tools'}
-            onClick={() => toggleTab('tools')}
-          />
-        </div>
-        <div className="pl-2 pr-1 border-l border-white/20">
-          <button
-            onClick={() => setIsOpen(false)}
-            className="p-1.5 rounded-full hover:bg-white/20 text-white/70 hover:text-white transition-colors"
-          >
-            <ChevronDown className="h-3.5 w-3.5" />
-          </button>
-        </div>
+        )}
       </div>
-
-      {!isOpen && (
-        <Button
-          className="absolute bottom-4 right-4 rounded-full h-12 w-12 shadow-xl pointer-events-auto"
-          onClick={() => setIsOpen(true)}
-        >
-          <Sparkles className="h-5 w-5" />
-        </Button>
-      )}
-    </div>
+    </>
   );
 };
-
-const ToolbarButton = ({ icon, label, active, onClick }: any) => (
-  <button
-    onClick={onClick}
-    className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${active ? 'bg-white text-black shadow-md scale-105' : 'hover:bg-white/10 text-white/90 hover:text-white'}`}
-  >
-    {icon} <span>{label}</span>
-  </button>
-);

@@ -2,22 +2,26 @@ import { apiClient } from '../../../lib/apiClient';
 import { AiSession, Plugin } from '../../../types';
 
 export const architectService = {
-  listSessions: async (): Promise<AiSession[]> => {
+  listSessions: async (): Promise<any[]> => {
     try {
       const list = await apiClient.root.listSandboxes();
 
-      // [FIXED] Defensive Array Guard
       if (!Array.isArray(list)) {
         console.warn('apiClient.root.listSandboxes did not return an array:', list);
         return [];
       }
 
+      // [FIXED] Pass down container metadata from the DB metrics
       return list.map((s: any) => ({
         id: s.id,
         name: s.name || s.id,
         messages: [],
-        current_manifest: s.current_manifest || null,
-        created_at: s.expires_at || new Date().toISOString(),
+        current_manifest: null, // Kept secure inside isolated sandbox DB
+        created_at: s.created_at || new Date().toISOString(),
+        status: s.status,
+        expires_at: s.expires_at,
+        current_storage_mb: s.current_storage_mb,
+        max_storage_mb: s.max_storage_mb,
       })) as any;
     } catch (e) {
       console.error('Failed to load listSessions:', e);
@@ -25,7 +29,6 @@ export const architectService = {
     }
   },
 
-  // Provision sandbox directly
   createSession: async (
     name: string,
     initialPrompt?: string,
@@ -42,7 +45,6 @@ export const architectService = {
     });
   },
 
-  // Scoped chat methods (executed inside Sandbox context)
   chat: async (prompt: string, model: string): Promise<AiSession> => {
     return await apiClient.ai.chat(prompt, model);
   },
@@ -57,5 +59,9 @@ export const architectService = {
 
   listPlugins: async (): Promise<Plugin[]> => {
     return await apiClient.ai.listPlugins();
+  },
+
+  codeEdit: async (prompt: string, currentCode: string, contextType: string, model: string) => {
+    return await apiClient.ai.codeEdit(prompt, currentCode, contextType, model);
   },
 };

@@ -24,7 +24,7 @@ import {
 import { collectionsService } from '../../collections/services/collectionsService';
 import { Collection, AppRecord } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
-import { apiClient } from '@/src/lib/apiClient';
+import { apiClient } from '../../../lib/apiClient';
 
 interface VectorSearchResult extends AppRecord {
   _score?: number;
@@ -44,10 +44,8 @@ export const VectorSearchPanel = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
-  // 1. Load Collections
   useEffect(() => {
     collectionsService.list().then((cols) => {
-      // Filter only collections that have at least one vector field
       const vectorCols = cols.filter((c) => c.schema.some((f) => f.vectorize));
       setCollections(vectorCols);
       if (vectorCols.length > 0) setSelectedColId(vectorCols[0].id);
@@ -56,7 +54,6 @@ export const VectorSearchPanel = () => {
 
   const selectedCollection = collections.find((c) => c.id === selectedColId);
 
-  // Handle Image Upload
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -68,7 +65,6 @@ export const VectorSearchPanel = () => {
     reader.readAsDataURL(file);
   };
 
-  // 2. Handle Search
   const handleSearch = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!selectedColId) return;
@@ -93,7 +89,6 @@ export const VectorSearchPanel = () => {
     }
   };
 
-  // 3. Handle Re-Vectorize
   const handleRevectorize = async () => {
     if (!selectedColId) return;
     setIsReindexing(true);
@@ -114,7 +109,6 @@ export const VectorSearchPanel = () => {
   return (
     <div className="space-y-6 max-w-5xl mx-auto">
       <div className="flex flex-col md:flex-row gap-6">
-        {/* CONTROL PANEL */}
         <div className="w-full md:w-1/3 space-y-6">
           <Card className="border-primary/20 bg-gradient-to-b from-primary/5 to-transparent">
             <CardHeader>
@@ -225,9 +219,6 @@ export const VectorSearchPanel = () => {
                         />
                       </div>
                     )}
-                    <p className="text-[10px] text-muted-foreground text-center">
-                      Requires a visual embedding model (e.g. CLIP).
-                    </p>
                   </div>
                 )}
 
@@ -257,15 +248,11 @@ export const VectorSearchPanel = () => {
                 >
                   <RefreshCw className="mr-2 h-3 w-3" /> Re-generate Embeddings
                 </Button>
-                <p className="text-[10px] text-muted-foreground mt-2 text-center">
-                  Run this if you added data before enabling vectors.
-                </p>
               </div>
             </CardContent>
           </Card>
         </div>
 
-        {/* RESULTS PANEL */}
         <div className="flex-1">
           <div className="flex items-center justify-between mb-4">
             <h3 className="font-semibold text-lg">Results ({results.length})</h3>
@@ -288,7 +275,6 @@ export const VectorSearchPanel = () => {
               </div>
             ) : (
               results.map((record, i) => {
-                // Try to find an image field to display in the result if it was an image search
                 const imageFieldKey = Object.keys(record.data).find(
                   (k) =>
                     typeof record.data[k] === 'string' &&
@@ -303,7 +289,6 @@ export const VectorSearchPanel = () => {
                     key={record.id}
                     className="bg-card border border-border rounded-lg p-4 transition-all hover:border-primary/50 hover:shadow-md group flex gap-4"
                   >
-                    {/* Optional Image Thumbnail for Visual Search Results */}
                     {imageUrl && (
                       <div className="h-16 w-16 shrink-0 rounded-md overflow-hidden bg-black/10 border border-border">
                         <img
@@ -321,7 +306,6 @@ export const VectorSearchPanel = () => {
                             #{record.id}
                           </span>
                           <span className="font-medium truncate max-w-[200px]">
-                            {/* Try to find a sensible title field */}
                             {record.data.title ||
                               record.data.name ||
                               record.data.email ||
@@ -336,7 +320,6 @@ export const VectorSearchPanel = () => {
                         </Badge>
                       </div>
 
-                      {/* Snippet / Content Preview */}
                       <div className="text-sm text-muted-foreground line-clamp-2 mb-3">
                         {Object.entries(record.data)
                           .filter(
