@@ -1,14 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Save, 
-  Code, 
-  Database, 
-  Globe, 
-  Lock, 
-  ShieldCheck, 
-  HelpCircle, 
-  Play 
-} from 'lucide-react';
+import { Save, Code, Database, Globe, Lock, ShieldCheck, HelpCircle, Play } from 'lucide-react';
 import { Button, Input, Label, Select, Switch, Separator } from '../../../components/ui/Elements';
 import { Dialog } from '../../../components/ui/Dialog';
 import { Script, Collection } from '../../../types';
@@ -39,8 +30,16 @@ const TRIGGER_TYPES = [
   { value: 'after_delete_record', label: 'After Delete Record', group: 'Record Write' },
 
   // --- Data Records (Read/Filter) ---
-  { value: 'before_list_records', label: 'Before List Records (Filter Query)', group: 'Record Read' },
-  { value: 'after_list_records', label: 'After List Records (Filter Output)', group: 'Record Read' },
+  {
+    value: 'before_list_records',
+    label: 'Before List Records (Filter Query)',
+    group: 'Record Read',
+  },
+  {
+    value: 'after_list_records',
+    label: 'After List Records (Filter Output)',
+    group: 'Record Read',
+  },
   { value: 'before_get_record', label: 'Before Get Record', group: 'Record Read' },
   { value: 'after_get_record', label: 'After Get Record (Filter Output)', group: 'Record Read' },
 
@@ -86,15 +85,18 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(req: Request): Promise<Response | object>',
     payload: `// Input Payload: e.g. POST to /api/v1/run/my-script\n{\n  "amount": 1500,\n  "currency": "USD"\n}`,
     template: `export default async function(req) {\n  const body = await req.json();\n  log("Processing payment: " + body.amount);\n  \n  // Return a standard HTTP Response\n  return new Response({ success: true, message: "Processed" });\n}`,
-    returns: 'Must return a standard `Response` object or a plain JSON object (which is automatically wrapped in a 200 OK response).'
+    returns:
+      'Must return a standard `Response` object or a plain JSON object (which is automatically wrapped in a 200 OK response).',
   },
   graphql: {
     name: 'GraphQL Resolver',
     desc: 'Binds a custom fields resolver to any existing GraphQL type (e.g. Query, Mutation, or User) using in-memory schema declarations.',
-    signature: 'export const graphql = { parent: string, name: string, args: object, returnType: string };\nexport default async function(req: Request): Promise<any>',
+    signature:
+      'export const graphql = { parent: string, name: string, args: object, returnType: string };\nexport default async function(req: Request): Promise<any>',
     payload: `// Input arguments passed from GraphQL query:\n{\n  "id": "123",\n  "parent": { "id": 1, "email": "test@test.com" }\n}`,
     template: `export const graphql = {\n  "parent": "Query",\n  "name": "customField",\n  "args": { "id": "String" },\n  "returnType": "JSON"\n};\n\nexport default async function(req) {\n  const args = await req.json();\n  const post = await $db.records.get('posts', args.id);\n  return new Response(post);\n}`,
-    returns: 'Must return the value matching your declared `returnType` (e.g., String, Int, JSON, or custom Object).'
+    returns:
+      'Must return the value matching your declared `returnType` (e.g., String, Int, JSON, or custom Object).',
   },
   cron: {
     name: 'Scheduled Job (Cron)',
@@ -102,7 +104,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(): Promise<void>',
     payload: `// No payload is passed.\n// Access system globals like $db, $http, $mail, and $ai.`,
     template: `export default async function() {\n  log("Running nightly database cleanup...");\n  const limitDate = new Date(Date.now() - 30 * 86400000).toISOString();\n  \n  // Prune historical log entries\n  // await $db.query(...) ...\n}`,
-    returns: 'Void. Returning a value has no effect.'
+    returns: 'Void. Returning a value has no effect.',
   },
 
   // Record Write
@@ -112,7 +114,8 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<RecordData | false>',
     payload: `{\n  "record": { "id": null, "data": { "title": "My Post" } },\n  "collection": { "id": 1, "name": "posts", "schema": {...} },\n  "auth": { "id": 1, "email": "admin@apexkit.io", "role": "admin" },\n  "trigger": "before_create_record"\n}`,
     template: `export default async function(e) {\n  // Compute a clean slug automatically\n  e.record.data.slug = e.record.data.title.toLowerCase().replace(/\\s+/g, '-');\n  \n  // Return the modified record data object\n  return e.record.data;\n}`,
-    returns: 'Return the modified record data object. Throw an error or return `false` to abort the transaction.'
+    returns:
+      'Return the modified record data object. Throw an error or return `false` to abort the transaction.',
   },
   after_create_record: {
     name: 'After Create Record',
@@ -120,7 +123,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<void>',
     payload: `{\n  "record": { "id": 42, "data": { "title": "My Post", "slug": "my-post" } },\n  "collection": { "id": 1, "name": "posts" },\n  "auth": { "id": 1, "email": "admin@apexkit.io", "role": "admin" }\n}`,
     template: `export default async function(e) {\n  log("Record #" + e.record.id + " was written. Sending webhook...");\n  await $http.post("https://discord.com/api/webhooks/...", {\n    content: "New Post Published: " + e.record.data.title\n  });\n}`,
-    returns: 'Void. Returning a value has no effect.'
+    returns: 'Void. Returning a value has no effect.',
   },
   before_update_record: {
     name: 'Before Update Record',
@@ -128,7 +131,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<RecordData | false>',
     payload: `{\n  "record": { "id": 42, "data": { "title": "Updated Title" } },\n  "collection": { "id": 1, "name": "posts" },\n  "auth": { "id": 1, "email": "admin@apexkit.io", "role": "admin" }\n}`,
     template: `export default async function(e) {\n  // Block edits if post status is "locked"\n  if (e.record.data.locked) {\n    throw "Cannot edit locked document";\n  }\n  return e.record.data;\n}`,
-    returns: 'Return the modified data payload, or throw/return `false` to roll back.'
+    returns: 'Return the modified data payload, or throw/return `false` to roll back.',
   },
   after_update_record: {
     name: 'After Update Record',
@@ -136,7 +139,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<void>',
     payload: `{\n  "record": { "id": 42, "data": { "title": "Updated Title" } },\n  "collection": { "id": 1, "name": "posts" },\n  "auth": { "id": 1, "email": "admin@apexkit.io", "role": "admin" }\n}`,
     template: `export default async function(e) {\n  log("Record updated successfully: " + e.record.id);\n}`,
-    returns: 'Void.'
+    returns: 'Void.',
   },
   before_delete_record: {
     name: 'Before Delete Record',
@@ -144,7 +147,8 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<boolean>',
     payload: `{\n  "record": { "id": 42, "data": { "title": "Post To Delete" } },\n  "collection": { "id": 1, "name": "posts" },\n  "auth": { "id": 1, "email": "admin@apexkit.io", "role": "admin" }\n}`,
     template: `export default async function(e) {\n  if (e.record.data.is_protected) {\n    throw "This system record is protected and cannot be deleted.";\n  }\n  return true;\n}`,
-    returns: 'Return `true` to allow deletion. Throw an error or return `false` to abort the transaction.'
+    returns:
+      'Return `true` to allow deletion. Throw an error or return `false` to abort the transaction.',
   },
   after_delete_record: {
     name: 'After Delete Record',
@@ -152,7 +156,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<void>',
     payload: `{\n  "record": { "id": 42, "data": { "title": "Post To Delete" } },\n  "collection": { "id": 1, "name": "posts" }\n}`,
     template: `export default async function(e) {\n  log("Record deleted. Purging files associated with ID: " + e.record.id);\n}`,
-    returns: 'Void.'
+    returns: 'Void.',
   },
 
   // Record Read
@@ -162,7 +166,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<QueryOptions>',
     payload: `{\n  "data": { "limit": 20, "page": 1, "filter": "status = 'active'" },\n  "collection": { "id": 1, "name": "posts" },\n  "auth": { "id": 1, "email": "admin@apexkit.io", "role": "admin" }\n}`,
     template: `export default async function(e) {\n  // Force filter on active user scope\n  e.data.filter = e.data.filter ? e.data.filter + " AND owner_id = " + e.auth.id : "owner_id = " + e.auth.id;\n  return e.data;\n}`,
-    returns: 'Must return the modified `QueryOptions` JSON object.'
+    returns: 'Must return the modified `QueryOptions` JSON object.',
   },
   after_list_records: {
     name: 'After List Records (Filter Output)',
@@ -170,7 +174,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<RecordListResponse>',
     payload: `{\n  "data": { "items": [{ "id": 1, "data": { "email": "hidden@test.com" } }], "total": 1 },\n  "collection": { "id": 1, "name": "posts" }\n}`,
     template: `export default async function(e) {\n  // Redact emails if requester is not admin\n  if (e.auth?.role !== "admin") {\n    e.data.items.forEach(item => {\n      item.data.email = "******";\n    });\n  }\n  return e.data;\n}`,
-    returns: 'Must return the modified record list payload.'
+    returns: 'Must return the modified record list payload.',
   },
   before_get_record: {
     name: 'Before Get Record',
@@ -178,7 +182,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<void>',
     payload: `{\n  "data": { "id": 42 },\n  "collection": { "id": 1, "name": "posts" }\n}`,
     template: `export default async function(e) {\n  log("Fired before loading record #" + e.data.id);\n}`,
-    returns: 'Void.'
+    returns: 'Void.',
   },
   after_get_record: {
     name: 'After Get Record (Filter Output)',
@@ -186,7 +190,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<RecordResponse>',
     payload: `{\n  "data": { "id": 42, "data": { "ssn": "encrypted_value" } },\n  "collection": { "id": 1, "name": "posts" }\n}`,
     template: `export default async function(e) {\n  // Perform decryption if authorized\n  if (e.auth?.role === "admin") {\n    // e.data.data.ssn = decrypt(e.data.data.ssn)\n  }\n  return e.data;\n}`,
-    returns: 'Must return the modified record response.'
+    returns: 'Must return the modified record response.',
   },
 
   // Schema
@@ -196,7 +200,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<CollectionData | false>',
     payload: `{\n  "data": { "name": "new_table", "schema": { "fields": {} } },\n  "auth": { "id": 1, "role": "admin" }\n}`,
     template: `export default async function(e) {\n  if (!e.data.name.startsWith("prefix_")) {\n    throw "All collections must start with 'prefix_'";\n  }\n  return e.data;\n}`,
-    returns: 'Return the modified collection object, or throw an error to abort.'
+    returns: 'Return the modified collection object, or throw an error to abort.',
   },
   after_collection_create: {
     name: 'After Create Collection',
@@ -204,7 +208,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<void>',
     payload: `{\n  "data": { "id": 10, "name": "new_table" }\n}`,
     template: `export default async function(e) {\n  log("Collection created: " + e.data.name);\n}`,
-    returns: 'Void.'
+    returns: 'Void.',
   },
   before_collection_update: {
     name: 'Before Update Collection',
@@ -212,7 +216,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<CollectionUpdate | false>',
     payload: `{\n  "data": { "id": 10, "updates": { "name": "new_name" } },\n  "auth": { "id": 1, "role": "admin" }\n}`,
     template: `export default async function(e) {\n  // Example: Prevent renaming\n  if (e.data.updates.name) {\n    throw "Renaming collections is disabled by policy.";\n  }\n  return e.data.updates;\n}`,
-    returns: 'Return the modified update payload, or throw an error to block.'
+    returns: 'Return the modified update payload, or throw an error to block.',
   },
   after_collection_update: {
     name: 'After Update Collection',
@@ -220,7 +224,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<void>',
     payload: `{\n  "data": { "id": 10 }\n}`,
     template: `export default async function(e) {\n  log("Collection updated: " + e.data.id);\n}`,
-    returns: 'Void.'
+    returns: 'Void.',
   },
   before_collection_delete: {
     name: 'Before Delete Collection',
@@ -228,7 +232,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<boolean>',
     payload: `{\n  "data": { "id": 10 },\n  "auth": { "role": "admin" }\n}`,
     template: `export default async function(e) {\n  throw "Collection deletion is disabled in production.";\n}`,
-    returns: 'Return `true` to allow, throw an error to block.'
+    returns: 'Return `true` to allow, throw an error to block.',
   },
 
   // Traffic
@@ -238,7 +242,8 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<boolean>',
     payload: `{\n  "data": {\n    "tenant_id": "app-1",\n    "path": "/api/v1/collections",\n    "method": "GET",\n    "ip": "192.168.1.1",\n    "ingress": 1024,\n    "egress": 0\n  }\n}`,
     template: `export default async function(e) {\n  // Block a specific IP\n  if (e.data.ip === "10.0.0.1") {\n    throw "IP Blocked by WAF";\n  }\n  return true;\n}`,
-    returns: 'Return `true` to allow the request to proceed. Throw an error to return a 429/403 HTTP response.'
+    returns:
+      'Return `true` to allow the request to proceed. Throw an error to return a 429/403 HTTP response.',
   },
   after_tenant_request: {
     name: 'After Tenant Request',
@@ -246,7 +251,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<void>',
     payload: `{\n  "data": {\n    "tenant_id": "app-1",\n    "path": "/api/v1/collections",\n    "status": 200,\n    "ingress": 1024,\n    "egress": 4096\n  }\n}`,
     template: `export default async function(e) {\n  // Use $cache.incr to aggregate bandwidth usage for billing\n  await $cache.incr("bandwidth_" + e.data.tenant_id, e.data.egress);\n}`,
-    returns: 'Void.'
+    returns: 'Void.',
   },
   before_sandbox_request: {
     name: 'Before Sandbox Request',
@@ -254,7 +259,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<boolean>',
     payload: `{\n  "data": { "sandbox_id": "abc-123", "path": "/", "method": "GET", "ip": "...", "ingress": 0 }\n}`,
     template: `export default async function(e) {\n  return true;\n}`,
-    returns: 'Return `true` to allow, throw an error to block.'
+    returns: 'Return `true` to allow, throw an error to block.',
   },
   after_sandbox_request: {
     name: 'After Sandbox Request',
@@ -262,8 +267,8 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<void>',
     payload: `{\n  "data": { "sandbox_id": "abc-123", "path": "/", "status": 200, "ingress": 0, "egress": 1024 }\n}`,
     template: `export default async function(e) {\n  // log sandbox traffic\n}`,
-    returns: 'Void.'
-  }
+    returns: 'Void.',
+  },
 };
 
 export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEditorProps) => {
@@ -361,10 +366,8 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
     >
       <div className="flex flex-col h-[85vh]">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6 h-full overflow-hidden">
-          
           {/* Sidebar Settings */}
           <div className="space-y-5 overflow-y-auto pr-2 custom-scrollbar">
-            
             {/* Script Name */}
             <div className="space-y-2">
               <Label required>Script Name / ID</Label>
