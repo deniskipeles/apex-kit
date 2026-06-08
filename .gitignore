@@ -64,4 +64,4 @@ admin-ui/public
 static/dashboard/assets
 
 # Skip
-!admin-ui/src/features/sandboxes
+!admin-ui/src/features/sandboxes/pages/SandboxesListPage.tsx
