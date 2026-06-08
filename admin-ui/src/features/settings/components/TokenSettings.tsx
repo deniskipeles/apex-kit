@@ -173,52 +173,80 @@ export const TokenSettings = ({ settings, onChange }: TokenSettingsProps) => {
                 No active tokens found. Generate one to access the API programmatically.
               </div>
             ) : (
-              <div className="divide-y divide-border border border-border rounded-md overflow-hidden bg-card">
+              <div className="divide-y divide-border border border-border rounded-xl overflow-hidden bg-card shadow-sm">
                 {tokens.map((token) => (
                   <div
                     key={token.id}
-                    className="flex items-center justify-between p-4 hover:bg-secondary/20 transition-colors"
+                    className="flex flex-col sm:flex-row sm:items-center sm:justify-between p-4 gap-4 hover:bg-secondary/10 transition-colors"
                   >
-                    <div className="space-y-1">
-                      <div className="font-medium flex items-center gap-2">
-                        {token.name}
+                    <div className="space-y-2 min-w-0 flex-1">
+                      {/* Name & Badges */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className="font-bold text-foreground truncate max-w-[200px]"
+                          title={token.name}
+                        >
+                          {token.name}
+                        </span>
                         <Badge
                           variant={token.role === 'admin' ? 'primary' : 'secondary'}
-                          className="text-[10px] capitalize"
+                          className="text-[9px] px-2 py-0.5 capitalize shrink-0"
                         >
                           {token.role}
                         </Badge>
-                      </div>
-                      <div className="font-medium flex items-center gap-2">
-                        SCOPE : {token.scope ? token.scope : 'root'}
                         <Badge
                           variant={token.bypass_cors === true ? 'primary' : 'secondary'}
-                          className="text-[10px] capitalize"
+                          className="text-[9px] px-2 py-0.5 capitalize shrink-0"
                         >
-                          {token.bypass_cors ? 'Bypass CORS' : 'Blocked by CORS'}
+                          {token.bypass_cors ? 'Bypass CORS' : 'CORS Blocked'}
                         </Badge>
                       </div>
-                      <div className="text-xs text-muted-foreground font-mono flex items-center gap-2">
-                        <span className="bg-secondary/50 px-1.5 py-0.5 rounded">
-                          {token.prefix}****************
-                        </span>
-                        <span>• Created {new Date(token.created).toLocaleDateString()}</span>
+
+                      {/* Scope & Key Info */}
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground font-mono">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[10px] text-muted-foreground font-sans uppercase font-bold tracking-wider">
+                            Scope:
+                          </span>
+                          <code className="bg-secondary/50 px-1.5 py-0.5 rounded text-[11px] font-semibold text-foreground">
+                            {token.scope ? token.scope : 'root'}
+                          </code>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="bg-secondary/40 px-2 py-0.5 rounded text-[11px] tracking-wider text-muted-foreground/80">
+                            {token.prefix}****************
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Timestamp */}
+                      <div className="text-[10px] text-muted-foreground font-sans">
+                        Created {new Date(token.created).toLocaleDateString()}
                       </div>
                     </div>
-                    <div className="flex gap-1">
-                      {/* Edit Button */}
-                      <Button size="icon" variant="ghost" onClick={() => openEditModal(token)}>
-                        <Edit2 className="h-4 w-4" />
-                      </Button>
 
-                      <Button
-                        size="icon"
-                        variant="ghost"
-                        className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                        onClick={() => handleDelete(token.id)}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
+                    {/* Action Buttons */}
+                    <div className="flex sm:flex-col justify-end gap-1.5 border-t border-border/40 sm:border-0 pt-3 sm:pt-0 shrink-0">
+                      <div className="flex gap-1 justify-end">
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          className="h-8 w-8 hover:bg-secondary"
+                          onClick={() => openEditModal(token)}
+                          title="Edit Token"
+                        >
+                          <Edit2 className="h-4 w-4" />
+                        </Button>
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                          onClick={() => handleDelete(token.id)}
+                          title="Revoke Token"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -262,7 +290,10 @@ export const TokenSettings = ({ settings, onChange }: TokenSettingsProps) => {
             </div>
 
             {newScope === 'tenant:' && (
-              <Input placeholder="Tenant ID" onChange={(e) => setNewTargetScope(e.target.value)} />
+              <Input
+                placeholder="Tenant ID"
+                onChange={(e: any) => setNewTargetScope(e.target.value)}
+              />
             )}
 
             <div className="flex items-center justify-between p-3 border border-border rounded bg-secondary/5">

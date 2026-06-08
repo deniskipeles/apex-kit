@@ -2221,11 +2221,37 @@ fn register_env(ctx: &mut Context) -> Result<(), String> {
         .with(|c| c.borrow().as_ref().and_then(|t| t.2.clone()))
         .unwrap_or_default();
 
+    // [NEW] Resolve the SMTP block policy dynamically from the database
+    // for the active Tenant/Sandbox/Root scope.
+    let smtp_blocked = ACTIVE_CONTEXT.with(|c| {
+        if let Some((app, handle, _, _, _)) = &*c.borrow() {
+            handle.block_on(async {
+                if let Ok(db) = crate::scripting_db::resolve_db(None, app.clone()).await {
+                    if let Ok(Some(smtp_val)) = db.get_config("smtp").await {
+                        return smtp_val
+                            .get("block_smtp")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                    }
+                }
+                false
+            })
+        } else {
+            false
+        }
+    });
+
     let obj = ObjectInitializer::new(ctx)
         .function(get, JsString::from("get"), 1)
         .property(
             JsString::from("APP_URL"),
             JsString::from(app_url),
+            Attribute::all(),
+        )
+        // [NEW] Expose SMTP_BLOCKED property globally
+        .property(
+            JsString::from("SMTP_BLOCKED"),
+            JsValue::from(smtp_blocked),
             Attribute::all(),
         )
         .build();

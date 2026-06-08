@@ -152,73 +152,145 @@ export const ConfigSettings = () => {
         </CardHeader>
 
         <CardContent>
-          {/* ... Table ... */}
-          <div className="rounded-md border border-border bg-card overflow-hidden">
-            {configs.length === 0 ? (
-              <div className="p-8 text-center text-muted-foreground text-sm">
-                No custom configurations found.
-              </div>
-            ) : (
-              <table className="w-full text-sm text-left">
-                <thead className="bg-secondary/30 text-xs uppercase font-semibold text-muted-foreground">
-                  <tr>
-                    <th className="px-4 py-3">Key</th>
-                    <th className="px-4 py-3">Value</th>
-                    <th className="px-4 py-3 w-[100px]">Status</th>
-                    <th className="px-4 py-3 w-[120px] text-right">Updated</th>
-                    <th className="px-4 py-3 w-[100px]"></th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border">
-                  {configs.map((item) => (
-                    <tr key={item.key} className="hover:bg-secondary/10 transition-colors group">
-                      <td className="px-4 py-3 font-mono font-medium text-primary">{item.key}</td>
-                      <td className="px-4 py-3 font-mono text-muted-foreground truncate max-w-[200px]">
-                        {item.encrypted ? '******' : item.value}
-                      </td>
-                      <td className="px-4 py-3">
+          {configs.length === 0 ? (
+            <div className="rounded-md border border-border bg-card p-8 text-center text-muted-foreground text-sm">
+              No custom configurations found.
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {/* 1. Mobile & Tablet Card View (Visible below 768px) */}
+              <div className="grid grid-cols-1 gap-4 md:hidden">
+                {configs.map((item) => (
+                  <div
+                    key={item.key}
+                    className="bg-card border border-border rounded-xl p-4 space-y-3 relative group"
+                  >
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="min-w-0 flex-1">
+                        <div
+                          className="font-mono font-bold text-sm text-primary truncate"
+                          title={item.key}
+                        >
+                          {item.key}
+                        </div>
+                        <div className="text-[10px] text-muted-foreground mt-1">
+                          Updated {new Date(item.updated_at).toLocaleDateString()}
+                        </div>
+                      </div>
+
+                      <div className="shrink-0">
                         {item.encrypted ? (
                           <Badge
                             variant="outline"
-                            className="text-[10px] gap-1 border-emerald-500/20 text-emerald-500 bg-emerald-500/10"
+                            className="text-[9px] gap-1 border-emerald-500/20 text-emerald-500 bg-emerald-500/10 py-0.5 px-2"
                           >
                             <Lock className="h-3 w-3" /> Encrypted
                           </Badge>
                         ) : (
-                          <Badge variant="secondary" className="text-[10px]">
+                          <Badge variant="secondary" className="text-[9px] py-0.5 px-2">
                             Plain
                           </Badge>
                         )}
-                      </td>
-                      <td className="px-4 py-3 text-right text-xs text-muted-foreground">
-                        {new Date(item.updated_at).toLocaleDateString()}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <div className="flex justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => handleOpenModal(item)}
-                          >
-                            <Edit2 className="h-4 w-4" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 text-destructive hover:bg-destructive/10"
-                            onClick={() => handleDelete(item.key)}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
-                        </div>
-                      </td>
+                      </div>
+                    </div>
+
+                    {/* Value Area */}
+                    <div className="font-mono text-xs text-muted-foreground bg-secondary/10 p-2.5 rounded border border-border/50 break-all truncate">
+                      {item.encrypted
+                        ? '••••••'
+                        : item.value || (
+                            <span className="text-muted-foreground/30 italic">No value</span>
+                          )}
+                    </div>
+
+                    {/* Action Row */}
+                    <div className="flex justify-end gap-2 pt-3 border-t border-border/40">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs px-3"
+                        onClick={() => handleOpenModal(item)}
+                      >
+                        <Edit2 className="h-3.5 w-3.5 mr-1.5" /> Edit
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs px-3 text-destructive hover:bg-destructive/10"
+                        onClick={() => handleDelete(item.key)}
+                      >
+                        <Trash2 className="h-3.5 w-3.5 mr-1.5" /> Delete
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* 2. Desktop Table View (Visible at 768px and above) */}
+              <div className="hidden md:block rounded-md border border-border bg-card overflow-hidden">
+                <table className="w-full text-sm text-left">
+                  <thead className="bg-secondary/30 text-xs uppercase font-semibold text-muted-foreground">
+                    <tr>
+                      <th className="px-4 py-3">Key</th>
+                      <th className="px-4 py-3">Value</th>
+                      <th className="px-4 py-3 w-[100px]">Status</th>
+                      <th className="px-4 py-3 w-[120px] text-right">Updated</th>
+                      <th className="px-4 py-3 w-[100px]"></th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {configs.map((item) => (
+                      <tr key={item.key} className="hover:bg-secondary/10 transition-colors group">
+                        <td className="px-4 py-3 font-mono font-medium text-primary max-w-[220px] truncate">
+                          {item.key}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-muted-foreground truncate max-w-[200px]">
+                          {item.encrypted ? '******' : item.value}
+                        </td>
+                        <td className="px-4 py-3">
+                          {item.encrypted ? (
+                            <Badge
+                              variant="outline"
+                              className="text-[10px] gap-1 border-emerald-500/20 text-emerald-500 bg-emerald-500/10"
+                            >
+                              <Lock className="h-3 w-3" /> Encrypted
+                            </Badge>
+                          ) : (
+                            <Badge variant="secondary" className="text-[10px]">
+                              Plain
+                            </Badge>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-right text-xs text-muted-foreground">
+                          {new Date(item.updated_at).toLocaleDateString()}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <div className="flex justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8"
+                              onClick={() => handleOpenModal(item)}
+                            >
+                              <Edit2 className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-destructive hover:bg-destructive/10"
+                              onClick={() => handleDelete(item.key)}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 

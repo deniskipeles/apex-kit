@@ -607,13 +607,14 @@ export const apiClient = {
         return [];
       }
     },
-    recordsSearchSQL: async (
+    // [RENAMED] Matches the new SDK dynamic query engine
+    searchRecordsWithSQLQueryEngine: async (
       collectionId: string | number,
       query: any
     ): Promise<InstantResult[]> => {
       if (!query) return [];
       try {
-        const result = await pb.collection(collectionId).searchRecordsWithSQL(query);
+        const result = await pb.collection(collectionId).searchRecordsWithSQLQueryEngine(query);
         return result.map((item: any) => ({
           id: item.id.toString(),
           collectionId,
@@ -624,7 +625,7 @@ export const apiClient = {
           expand: item.expand || {},
         }));
       } catch (e) {
-        console.error('SQL Records search failed', e);
+        console.error('SQL Query Engine search failed', e);
         return [];
       }
     },

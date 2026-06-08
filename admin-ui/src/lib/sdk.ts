@@ -723,7 +723,8 @@ export class ApexKit {
           params: options,
         }),
 
-      searchRecordsWithSQL: (query: any) =>
+      // [RENAMED] Fully mapped to the unified query engine
+      searchRecordsWithSQLQueryEngine: (query: any) =>
         this._request<BaseRecord[]>(`/collections/${collectionId}/query`, {
           method: 'POST',
           body: { query },

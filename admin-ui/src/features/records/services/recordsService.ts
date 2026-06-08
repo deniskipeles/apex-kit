@@ -20,8 +20,9 @@ export const recordsService = {
   searchRecords: (collectionId: string, query: string) => {
     return apiClient.records.recordsSearchOSE(collectionId, query);
   },
-  searchRecordsSQL: (collectionId: string, query: any) => {
-    return apiClient.records.recordsSearchSQL(collectionId, query);
+  // [RENAMED] Complete alignment with the new engine signature
+  searchRecordsWithSQLQueryEngine: (collectionId: string, query: any) => {
+    return apiClient.records.searchRecordsWithSQLQueryEngine(collectionId, query);
   },
   getOne: async (collectionId: string, recordId: string, expand = '') => {
     return await apiClient.records.getOne(collectionId, recordId, expand);

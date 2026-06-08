@@ -62,3 +62,6 @@ admin-ui/public
 # Static Files
 /static/dashboard/assets
 static/dashboard/assets
+
+# Skip
+!admin-ui/src/features/sandboxes

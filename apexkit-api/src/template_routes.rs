@@ -122,16 +122,15 @@ pub async fn update_template(
 )]
 pub async fn delete_template(
     Extension(claims): Extension<Claims>,
-    DatabaseConnection(db): DatabaseConnection, // [FIX] Use contextual DB
+    DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(path): Path<IdPath>,
 ) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" {
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // [FIX] Use db
-    db.delete_template(id)
+    db.delete_template(path.id)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 

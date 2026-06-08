@@ -564,47 +564,48 @@ async fn auth_middleware(
         state.db.clone()
     };
 
+    // [FIX] Track if the requester is an authorized root admin to bypass suspension
+    let mut is_root_admin = false;
+
     if let Some(auth_header) = req.headers().typed_get::<Authorization<Bearer>>() {
         if let Ok(claims) = auth::decode_jwt(auth_header.token()) {
-            // [FIXED] Smart JWT Scope Verification:
-            // Allows access if user is Root, or exact match, or a Tenant Admin who owns the target Sandbox.
             let is_authorized = match claims.scope.as_str() {
                 "root" => true,
-                scope_str => {
-                    match &current_request_scope {
-                        EventScope::Root => scope_str == "root",
-                        EventScope::Tenant(id) => scope_str == &format!("tenant:{}", id),
-                        EventScope::Sandbox(sandbox_id) => {
-                            if scope_str == &format!("sandbox:{}", sandbox_id) {
-                                true
-                            } else if scope_str.starts_with("tenant:") {
-                                let user_tenant_id = scope_str.strip_prefix("tenant:").unwrap();
-                                // Query Root DB registry to verify this tenant owns the sandbox
-                                if let Ok(sandboxes) = state
-                                    .db
-                                    .list_sandboxes(Some(user_tenant_id.to_string()))
-                                    .await
-                                {
-                                    sandboxes.iter().any(|s| &s.id == sandbox_id)
-                                } else {
-                                    false
-                                }
+                scope_str => match &current_request_scope {
+                    EventScope::Root => scope_str == "root",
+                    EventScope::Tenant(id) => scope_str == &format!("tenant:{}", id),
+                    EventScope::Sandbox(sandbox_id) => {
+                        if scope_str == &format!("sandbox:{}", sandbox_id) {
+                            true
+                        } else if scope_str.starts_with("tenant:") {
+                            let user_tenant_id = scope_str.strip_prefix("tenant:").unwrap();
+                            if let Ok(sandboxes) = state
+                                .db
+                                .list_sandboxes(Some(user_tenant_id.to_string()))
+                                .await
+                            {
+                                sandboxes.iter().any(|s| &s.id == sandbox_id)
                             } else {
                                 false
                             }
+                        } else {
+                            false
                         }
-                        _ => false,
                     }
-                }
+                    _ => false,
+                },
             };
 
             let is_root_user = claims.scope == "root";
+            if is_root_user && claims.role == "admin" {
+                is_root_admin = true;
+            }
 
             if !is_authorized {
                 return Err(StatusCode::FORBIDDEN);
             }
 
-            if tenant_is_suspended && !is_root_user {
+            if tenant_is_suspended && !is_root_admin {
                 return Err(StatusCode::FORBIDDEN);
             }
 
@@ -632,11 +633,13 @@ async fn auth_middleware(
             };
 
             if let Some((api_key, is_local_key)) = api_key_opt {
-                if tenant_is_suspended {
-                    if is_local_key {
-                        tracing::warn!("Blocked suspended tenant key");
-                        return Err(StatusCode::FORBIDDEN);
-                    }
+                let is_root_key = api_key.scope == "root" || api_key.scope == "*";
+                if is_root_key && api_key.role == "admin" {
+                    is_root_admin = true;
+                }
+
+                if tenant_is_suspended && !is_root_admin {
+                    return Err(StatusCode::FORBIDDEN);
                 }
 
                 let is_allowed = if is_local_key {
@@ -681,8 +684,14 @@ async fn auth_middleware(
                     },
                 };
                 req.extensions_mut().insert(claims);
+                return Ok(next.run(req).await);
             }
         }
+    }
+
+    // [FIX] Block unauthenticated requests to suspended/archived tenants strictly
+    if tenant_is_suspended && !is_root_admin {
+        return Err(StatusCode::FORBIDDEN);
     }
 
     Ok(next.run(req).await)
@@ -1454,7 +1463,6 @@ async fn tenant_resolver_middleware(
             }
         }
 
-        // [CRITICAL FIX] Axum nested router path extraction fallback
         if tenant_id.is_empty() {
             let path = req.uri().path();
             if path.starts_with("/tenant/") {
@@ -1581,19 +1589,19 @@ async fn tenant_resolver_middleware(
             Ok(response)
         }
         Err(e) => {
-            // [CRITICAL FIX] Log the error so we know WHY it failed instead of silently failing back to root!
             tracing::error!(
                 "❌ [TenantResolver] Failed to load tenant '{}': {}",
                 tenant_id,
                 e
             );
 
-            req.extensions_mut().insert(EventScope::Root);
-            let mut response = next.run(req).await;
-            response
-                .headers_mut()
-                .insert("X-Apex-Scope", HeaderValue::from_static("root"));
-            Ok(response)
+            // [FIXED] Block access and prevent silent fallback to Root scope
+            let body = Json(serde_json::json!({
+                "error": "not_found",
+                "message": "Tenant not found or inactive",
+                "status": 404
+            }));
+            Ok((StatusCode::NOT_FOUND, body).into_response())
         }
     }
 }

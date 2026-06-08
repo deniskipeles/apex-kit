@@ -1,9 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Plus,
-  Edit,
   Trash2,
-  FileText,
   Link as LinkIcon,
   Check,
   X as XIcon,
@@ -17,7 +15,7 @@ import {
   Download,
   Zap,
   MoreHorizontal,
-  ArrowRight,
+  RefreshCw,
 } from 'lucide-react';
 import { Button, Badge, Skeleton } from '../../../components/ui/Elements';
 import { DataGrid } from '../../../components/data/DataGrid';
@@ -684,11 +682,23 @@ export const RecordsListPage = () => {
                 <InstantSearchInput
                   collectionId={collection.id}
                   onSelect={handleInstantSelect}
-                  onSearch={handleDeepSearch} // Connect Deep Search
+                  onSearch={handleDeepSearch}
                   placeholder="Search records..."
                 />
               </div>
             )}
+
+            {/* [ADDED] REFRESH BUTTON */}
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              onClick={loadData}
+              disabled={isLoading}
+              title="Refresh Records"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+            </Button>
 
             {selectedRecordIds.length > 0 && (
               <Button
@@ -701,7 +711,7 @@ export const RecordsListPage = () => {
               </Button>
             )}
 
-            <div className="hidden xl:flex gap-2">
+            <div className="xl:hidden gap-2">
               <Button
                 variant="outline"
                 size="sm"
@@ -709,28 +719,6 @@ export const RecordsListPage = () => {
                 onClick={() => setIsFilterOpen(true)}
               >
                 <Filter className="mr-2 h-3 w-3" /> Filter
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-8 text-xs"
-                onClick={() => setIsImportOpen(true)}
-              >
-                <Upload className="mr-2 h-3 w-3" /> Import
-              </Button>
-              <Button variant="outline" size="sm" className="h-8 text-xs" onClick={handleExport}>
-                <Download className="mr-2 h-3 w-3" /> Export
-              </Button>
-            </div>
-
-            <div className="xl:hidden">
-              <Button
-                variant="outline"
-                size="icon"
-                className="h-8 w-8"
-                onClick={() => setIsFilterOpen(true)}
-              >
-                <Filter className="h-3.5 w-3.5" />
               </Button>
             </div>
 

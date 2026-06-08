@@ -29,7 +29,7 @@ interface SidebarProps {
 }
 
 export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarProps) => {
-  const { logout } = useAuth();
+  const { user, logout } = useAuth(); // [UPDATED] Added user destructuring
   const { isSidebarOpen: storeIsOpen, closeSidebar: storeClose } = useUiStore();
 
   const showSidebar = isOpen !== undefined ? isOpen : storeIsOpen;
@@ -85,6 +85,31 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
     return page;
   };
 
+  // [ADDED] Dynamic visibility check for the context exit button
+  const showExitButton = () => {
+    if (contextType === 'root') return false;
+    if (contextType === 'tenant') {
+      // Only root admins can exit a tenant back to the main dashboard
+      return user?.scope === 'root';
+    }
+    return true; // Always allow exiting from a sandbox
+  };
+
+  // [ADDED] Dynamic redirection logic for sandbox vs tenant
+  const handleExitContext = () => {
+    if (contextType === 'sandbox') {
+      if (user?.scope && user.scope.startsWith('tenant:')) {
+        const tenantId = user.scope.replace('tenant:', '');
+        window.location.href = `/_dashboard/tenant/${tenantId}`;
+      } else {
+        window.location.href = '/_dashboard';
+      }
+    } else {
+      // contextType === 'tenant'
+      window.location.href = '/_dashboard';
+    }
+  };
+
   return (
     <>
       {showSidebar && (
@@ -121,11 +146,10 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
         </div>
 
         <div className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
-          {contextType !== 'root' && (
+          {/* [UPDATED] Conditional rendering based on user scope and context rules */}
+          {showExitButton() && (
             <button
-              onClick={() => {
-                window.location.href = '/_dashboard';
-              }}
+              onClick={handleExitContext}
               className="w-full flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-destructive/10 hover:text-destructive mb-6 border border-dashed border-border transition-colors group"
             >
               <ArrowLeft className="h-4 w-4 group-hover:-translate-x-1 transition-transform" />

@@ -3,5 +3,6 @@ export interface AuthUser {
   email: string;
   role: string;
   password?: string;
+  scope?: string;
   metadata?: object;
 }
