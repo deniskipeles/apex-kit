@@ -531,16 +531,18 @@ pub trait Db: Send + Sync {
     async fn create_api_key(
         &self,
         name: &str,
-        role: &str,
-        scope: &str,
+        tenant_id: &str,
+        issuer: &str,
+        env_type: &str,
+        roles: Vec<String>,
         bypass_cors: bool,
     ) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>>;
     async fn update_api_key(
         &self,
         id: i64,
         name: Option<String>,
-        role: Option<String>,
-        scope: Option<String>,
+        status: Option<String>,
+        roles: Option<Vec<String>>,
         bypass_cors: Option<bool>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn list_api_keys(
@@ -552,7 +554,9 @@ pub trait Db: Send + Sync {
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn verify_api_key(
         &self,
-        key: &str,
+        tenant_id: &str,
+        key_id: &str,
+        secret: &str,
     ) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>>;
 
     // --- AI Actions ---
@@ -1941,26 +1945,37 @@ impl Db for ApexKit {
     async fn create_api_key(
         &self,
         name: &str,
-        role: &str,
-        scope: &str,
+        tenant_id: &str,
+        issuer: &str,
+        env_type: &str,
+        roles: Vec<String>,
         bypass_cors: bool,
     ) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
-        let raw_key = format!("ak_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
-        let prefix = raw_key[0..8].to_string();
-        let hash = crate::auth::hash_password(&raw_key)?;
+        let key_env = match env_type {
+            "sys" => crate::security::KeyEnv::Sys,
+            "tnnt" => crate::security::KeyEnv::Tnnt,
+            "sk" => crate::security::KeyEnv::Sk,
+            "pk" => crate::security::KeyEnv::Pk,
+            _ => crate::security::KeyEnv::Sys,
+        };
+
+        let (raw_key, secret_hash, key_id) = crate::security::generate_api_key(tenant_id, key_env);
+        let roles_json = serde_json::to_string(&roles)?;
 
         let id = self.core_batcher.insert(
-            "INSERT INTO _api_keys (name, prefix, hash, role, scope, bypass_cors) VALUES (?1, ?2, ?3, ?4, ?5, ?6)".into(), 
-            vec![name.into_val(), prefix.clone().into_val(), hash.into_val(), role.into_val(), scope.into_val(), bypass_cors.into_val()]
+            "INSERT INTO _api_keys_v2 (name, tenant_id, key_id, secret_hash, issuer, env_type, roles, status, bypass_cors) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)".into(), 
+            vec![name.into_val(), tenant_id.into_val(), key_id.clone().into_val(), secret_hash.into_val(), issuer.into_val(), env_type.into_val(), roles_json.into_val(), bypass_cors.into_val()]
         ).await.map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let key_obj = ApiKey {
             id,
             name: name.to_string(),
-            prefix,
-            hash: String::new(),
-            role: role.to_string(),
-            scope: scope.to_string(),
+            tenant_id: tenant_id.to_string(),
+            key_id,
+            issuer: issuer.to_string(),
+            env_type: env_type.to_string(),
+            roles,
+            status: "active".to_string(),
             bypass_cors,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1972,8 +1987,8 @@ impl Db for ApexKit {
         &self,
         id: i64,
         name: Option<String>,
-        role: Option<String>,
-        scope: Option<String>,
+        status: Option<String>,
+        roles: Option<Vec<String>>,
         bypass_cors: Option<bool>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut sets = Vec::new();
@@ -1983,13 +1998,14 @@ impl Db for ApexKit {
             sets.push("name = ?");
             params.push(n.into_val());
         }
-        if let Some(r) = role {
-            sets.push("role = ?");
-            params.push(r.into_val());
-        }
-        if let Some(s) = scope {
-            sets.push("scope = ?");
+        if let Some(s) = status {
+            sets.push("status = ?");
             params.push(s.into_val());
+        }
+        if let Some(r) = roles {
+            let r_str = serde_json::to_string(&r)?;
+            sets.push("roles = ?");
+            params.push(r_str.into_val());
         }
         if let Some(b) = bypass_cors {
             sets.push("bypass_cors = ?");
@@ -1999,11 +2015,9 @@ impl Db for ApexKit {
         if sets.is_empty() {
             return Ok(());
         }
-
         params.push(id.into_val());
 
-        let sql = format!("UPDATE _api_keys SET {} WHERE id = ?", sets.join(", "));
-
+        let sql = format!("UPDATE _api_keys_v2 SET {} WHERE id = ?", sets.join(", "));
         self.core_batcher.execute(sql, params).await.map_err(|e| {
             Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
         })?;
@@ -2015,19 +2029,22 @@ impl Db for ApexKit {
         &self,
     ) -> std::result::Result<Vec<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core_read().await;
-        let mut stmt = conn.prepare("SELECT id, name, prefix, hash, role, created_at, scope, bypass_cors FROM _api_keys ORDER BY created_at DESC")?;
+        let mut stmt = conn.prepare("SELECT id, name, tenant_id, key_id, issuer, env_type, roles, status, bypass_cors, created_at FROM _api_keys_v2 ORDER BY created_at DESC")?;
         let mut rows = stmt.query([])?;
         let mut keys = Vec::new();
         while let Some(row) = rows.next()? {
+            let roles_str: String = row.get(6)?;
             keys.push(ApiKey {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                prefix: row.get(2)?,
-                hash: String::new(),
-                role: row.get(4)?,
-                created_at: row.get(5)?,
-                scope: row.get(6).unwrap_or("root".to_string()),
-                bypass_cors: row.get(7).unwrap_or(false),
+                tenant_id: row.get(2)?,
+                key_id: row.get(3)?,
+                issuer: row.get(4)?,
+                env_type: row.get(5)?,
+                roles: serde_json::from_str(&roles_str).unwrap_or_default(),
+                status: row.get(7)?,
+                bypass_cors: row.get(8).unwrap_or(false),
+                created_at: row.get(9)?,
             });
         }
         Ok(keys)
@@ -2039,7 +2056,7 @@ impl Db for ApexKit {
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.core_batcher
             .execute(
-                "DELETE FROM _api_keys WHERE id = ?1".into(),
+                "DELETE FROM _api_keys_v2 WHERE id = ?1".into(),
                 vec![id.into_val()],
             )
             .await
@@ -2051,28 +2068,36 @@ impl Db for ApexKit {
 
     async fn verify_api_key(
         &self,
-        key: &str,
+        tenant_id: &str,
+        key_id: &str,
+        secret: &str,
     ) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
+        let expected_hash = crate::utils::sha256(secret);
         let conn = self.get_core_read().await;
-        let prefix = if key.len() > 8 { &key[0..8] } else { key };
 
-        let mut stmt = conn.prepare("SELECT id, name, prefix, hash, role, created_at, scope, bypass_cors FROM _api_keys WHERE prefix = ?1")?;
-        let mut rows = stmt.query(params![prefix])?;
+        let mut stmt = conn.prepare("SELECT id, name, tenant_id, key_id, issuer, env_type, roles, status, bypass_cors, created_at FROM _api_keys_v2 WHERE tenant_id = ?1 AND key_id = ?2 AND secret_hash = ?3")?;
+        let mut rows = stmt.query(params![tenant_id, key_id, expected_hash])?;
 
-        while let Some(row) = rows.next()? {
-            let hash: String = row.get(3)?;
-            if crate::auth::verify_password(key, &hash) {
-                return Ok(Some(ApiKey {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    prefix: row.get(2)?,
-                    hash: String::new(),
-                    role: row.get(4)?,
-                    created_at: row.get(5)?,
-                    scope: row.get(6).unwrap_or("root".to_string()),
-                    bypass_cors: row.get(7).unwrap_or(false),
-                }));
+        if let Some(row) = rows.next()? {
+            let status: String = row.get(7)?;
+            if status != "active" {
+                return Ok(None);
             }
+
+            let roles_str: String = row.get(6)?;
+
+            return Ok(Some(ApiKey {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                tenant_id: row.get(2)?,
+                key_id: row.get(3)?,
+                issuer: row.get(4)?,
+                env_type: row.get(5)?,
+                roles: serde_json::from_str(&roles_str).unwrap_or_default(),
+                status,
+                bypass_cors: row.get(8).unwrap_or(false),
+                created_at: row.get(9)?,
+            }));
         }
         Ok(None)
     }
@@ -4539,28 +4564,27 @@ fn setup_core(conn: &Connection) -> Result<()> {
     conn.execute("CREATE TABLE IF NOT EXISTS auth_identities (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, provider TEXT NOT NULL, provider_id TEXT NOT NULL)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS auth_tokens (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, type TEXT NOT NULL, expires_at DATETIME NOT NULL)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS _system_config_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, encrypted BOOLEAN DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
+    let _ = conn.execute("DROP TABLE IF EXISTS _api_keys", []); // Clean transition
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS _api_keys (
+        "CREATE TABLE IF NOT EXISTS _api_keys_v2 (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         name TEXT NOT NULL, 
-        prefix TEXT NOT NULL, 
-        hash TEXT NOT NULL, 
-        role TEXT NOT NULL DEFAULT 'admin',
-        scope TEXT DEFAULT 'root', 
+        tenant_id TEXT NOT NULL, 
+        key_id TEXT NOT NULL, 
+        secret_hash TEXT NOT NULL, 
+        issuer TEXT NOT NULL,
+        env_type TEXT NOT NULL,
+        roles JSON DEFAULT '[]', 
+        status TEXT DEFAULT 'active', 
         bypass_cors BOOLEAN DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )",
         [],
     )?;
-
-    let _ = conn.execute(
-        "ALTER TABLE _api_keys ADD COLUMN scope TEXT DEFAULT 'root'",
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_api_keys_lookup ON _api_keys_v2(tenant_id, key_id)",
         [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE _api_keys ADD COLUMN bypass_cors BOOLEAN DEFAULT 0",
-        [],
-    );
+    )?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS _tenants (

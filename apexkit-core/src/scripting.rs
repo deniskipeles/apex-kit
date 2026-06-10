@@ -1785,30 +1785,49 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
                 .to_std_string_escaped();
             let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
 
-            let (role, scope, bypass) = if let Some(serde_json::Value::Object(map)) = config_val {
-                (
-                    map.get("role")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("admin")
-                        .to_string(),
-                    map.get("scope")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("root")
-                        .to_string(),
-                    map.get("bypass_cors")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                )
-            } else {
-                ("admin".to_string(), "root".to_string(), false)
-            };
+            let (tenant_id, issuer, env_type, roles, bypass) =
+                if let Some(serde_json::Value::Object(map)) = config_val {
+                    (
+                        map.get("tenant_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("root")
+                            .to_string(),
+                        map.get("issuer")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("root")
+                            .to_string(),
+                        map.get("env_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("sys")
+                            .to_string(),
+                        map.get("roles")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<String>>()
+                            })
+                            .unwrap_or_else(|| vec!["admin".to_string()]),
+                        map.get("bypass_cors")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    )
+                } else {
+                    (
+                        "root".to_string(),
+                        "root".to_string(),
+                        "sys".to_string(),
+                        vec!["admin".to_string()],
+                        false,
+                    )
+                };
 
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         let (raw_key, info) = app
                             .get_db()
-                            .create_api_key(&name, &role, &scope, bypass)
+                            .create_api_key(&name, &tenant_id, &issuer, &env_type, roles, bypass)
                             .await
                             .map_err(|e| e.to_string())?;
                         Ok(json!({
@@ -1828,12 +1847,16 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
             let id = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as i64;
             let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
 
-            let (name, role, scope, bypass) =
+            let (name, status, roles, bypass) =
                 if let Some(serde_json::Value::Object(map)) = config_val {
                     (
                         map.get("name").and_then(|v| v.as_str()).map(String::from),
-                        map.get("role").and_then(|v| v.as_str()).map(String::from),
-                        map.get("scope").and_then(|v| v.as_str()).map(String::from),
+                        map.get("status").and_then(|v| v.as_str()).map(String::from),
+                        map.get("roles").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect::<Vec<String>>()
+                        }),
                         map.get("bypass_cors").and_then(|v| v.as_bool()),
                     )
                 } else {
@@ -1844,7 +1867,7 @@ fn register_root(ctx: &mut Context) -> Result<(), String> {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
                         app.get_db()
-                            .update_api_key(id, name, role, scope, bypass)
+                            .update_api_key(id, name, status, roles, bypass)
                             .await
                             .map_err(|e| e.to_string())?;
                         Ok(serde_json::Value::Bool(true))

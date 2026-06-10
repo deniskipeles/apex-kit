@@ -41,7 +41,7 @@ impl SchedulerService {
             self.scheduler.add(j).await.ok();
         }
 
-        // Root User Defined Jobs
+        // Root User Defined Jobs & Backups
         let state_root = state.clone();
         let root_ticker = Job::new_async("0 * * * * *", move |_uuid, _l| {
             let s = state_root.clone();
@@ -81,9 +81,7 @@ impl SchedulerService {
         }
 
         // ---------------------------------------------------------
-        // 3. SANDBOX TICKER (Iterates active memory cache only?)
-        //    Sandboxes on disk but not in memory are "frozen" usually.
-        //    But for consistency, we should list disk too.
+        // 3. SANDBOX TICKER (Iterates active memory cache only)
         // ---------------------------------------------------------
         let state_sandbox = state.clone();
         let sandbox_ticker = Job::new_async("0 * * * * *", move |_uuid, _l| {
@@ -96,8 +94,6 @@ impl SchedulerService {
                                 let session_id =
                                     fname.strip_prefix("session_").unwrap().to_string();
 
-                                // [FIX] Only process if Active in Cache
-                                // This prevents waking up cold sandboxes every minute.
                                 if s.sandbox_manager.is_active(&session_id) {
                                     let s_inner = s.clone();
                                     tokio::spawn(async move {
@@ -138,13 +134,48 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
         _ => return,
     };
 
-    // 2. Get Jobs Config
+    let now = Utc::now();
+    let minute_stamp = now.format("%Y%m%d%H%M").to_string(); // Format down to the minute: e.g. 202606101038
+
+    // --- 2. AUTOMATED BACKUPS (With Fast-Fail Lock) ---
+    let backup_setting = db.get_config("backups").await.unwrap_or(None);
+    if let Some(val) = backup_setting {
+        if let Ok(config) = serde_json::from_value::<crate::settings::BackupConfigDto>(val) {
+            if config.enabled {
+                if let Ok(schedule) = Schedule::from_str(&config.schedule) {
+                    let one_min_ago = now - chrono::Duration::seconds(60);
+                    if let Some(next_run) = schedule.after(&one_min_ago).next() {
+                        if next_run <= now {
+                            // Check lock before triggering backup
+                            let lock_key = format!("backup_lock:{}:{}:{}", context_id, config.schedule, minute_stamp);
+                            if state.root_script_cache.get(&lock_key).await.is_none() {
+                                state.root_script_cache.insert(lock_key, "1".to_string()).await;
+
+                                tracing::info!("[Scheduler] Triggering scheduled backup for {:?}", scope);
+                                let db_clone = db.clone();
+                                let vault_clone = state.vault.clone();
+                                let scope_clone = scope.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = crate::backup::perform_backup(db_clone, vault_clone, config, scope_clone).await {
+                                        tracing::error!("[Scheduler] Backup failed: {}", e);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    tracing::warn!("[Scheduler] Invalid backup cron schedule: {}", config.schedule);
+                }
+            }
+        }
+    }
+
+    // --- 3. CUSTOM SCRIPT CRON JOBS (With Fast-Fail Lock) ---
     let cron_setting = db.get_config("cron_jobs").await.unwrap_or(None);
 
     if let Some(val) = cron_setting {
         if let Ok(jobs) = serde_json::from_value::<Vec<CronJob>>(val) {
-            let now = Utc::now();
-
+            
             // --- RATE LIMIT CHECK (Tenants/Sandboxes Only) ---
             if !matches!(scope, EventScope::Root) {
                 let max_crons = std::env::var("TENANT_MAX_CRONS")
@@ -157,7 +188,6 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(5); // Default 5 minutes window
 
-                // Calculate current window key
                 let current_minute = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -166,8 +196,6 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
                 let window_key = current_minute / interval_mins;
                 let cache_key = format!("cron_limit:{}:{}", context_id, window_key);
 
-                // Check current count
-                // We use the root_script_cache for system-level rate limiting
                 let current_count = state
                     .root_script_cache
                     .get(&cache_key)
@@ -184,7 +212,7 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
                 }
             }
 
-            // 3. Iterate Jobs
+            // Iterate Jobs
             let mut jobs_run = 0;
             for job in jobs {
                 if !job.active {
@@ -195,15 +223,21 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
                     let one_min_ago = now - chrono::Duration::seconds(60);
                     if let Some(next_run) = schedule.after(&one_min_ago).next() {
                         if next_run <= now {
-                            // Execute
-                            execute_job(&state, db.clone(), &context_id, &job, scope.clone()).await;
-                            jobs_run += 1;
+                            // Check lock before executing script
+                            let lock_key = format!("cron_lock:{}:{}:{}", context_id, job.id, minute_stamp);
+                            if state.root_script_cache.get(&lock_key).await.is_none() {
+                                state.root_script_cache.insert(lock_key, "1".to_string()).await;
+
+                                // Execute
+                                execute_job(&state, db.clone(), &context_id, &job, scope.clone()).await;
+                                jobs_run += 1;
+                            }
                         }
                     }
                 }
             }
 
-            // 4. Increment Counter if jobs ran
+            // Increment Counter if jobs ran
             if jobs_run > 0 && !matches!(scope, EventScope::Root) {
                 let interval_mins = std::env::var("TENANT_CRON_INTERVAL")
                     .ok()
@@ -242,7 +276,6 @@ async fn execute_job(
 ) {
     tracing::info!("[Scheduler] Executing {} in scope {:?}", job.name, scope);
 
-    // [FIX] Removed 'db' field. ScopedScriptContext resolves DB dynamically via resolve_db in scripting.rs
     let context = Arc::new(crate::ScopedScriptContext {
         state: state.clone(),
         scope: scope.clone(),
@@ -257,7 +290,6 @@ async fn execute_job(
             _ => return,
         };
 
-        // Generate Token
         let admin_email = "scheduler@system.internal";
         let token =
             apexkit_core::auth::create_jwt(0, admin_email, "admin", "root").unwrap_or_default();
@@ -284,18 +316,15 @@ async fn execute_job(
             Err(e) => tracing::error!("[Scheduler] Network error: {}", e),
         }
     } else {
-        // Script Logic
         tracing::info!("[Scheduler] Executing script {} in scope", job.payload);
 
-        // We use the passed-in 'db' here just to fetch the script definition.
-        // The script engine will resolve the DB internally using context.
         if let Ok(Some(script)) = db.get_script_by_name(&job.payload).await {
             let _ = state
                 .script_engine
                 .run_script(
                     &script.code,
                     serde_json::json!({ "trigger": "cron", "job": job.name }),
-                    context, // Context without explicit DB
+                    context,
                     None,
                     None,
                 )

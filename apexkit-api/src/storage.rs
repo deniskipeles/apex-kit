@@ -1062,6 +1062,17 @@ pub async fn delete_file(
         .log_audit_event("warning", "File Deleted", "storage", Some(meta))
         .await;
 
+    // [ADDED] Asynchronously trigger the after-delete hook
+    let _ = trigger_void_hook(
+        &state,
+        "after_file_delete",
+        serde_json::json!({ "id": path.id, "filename": file.filename }),
+        claims.as_ref(),
+        Some(&event_scope.clone()),
+        Some(base_url.clone()),
+    )
+    .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 

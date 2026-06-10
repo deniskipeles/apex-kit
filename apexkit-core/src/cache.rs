@@ -255,12 +255,14 @@ impl Db for CachedDb {
     async fn create_api_key(
         &self,
         name: &str,
-        role: &str,
-        scope: &str,
+        tenant_id: &str,
+        issuer: &str,
+        env_type: &str,
+        roles: Vec<String>,
         bypass_cors: bool,
     ) -> std::result::Result<(String, ApiKey), Box<dyn std::error::Error + Send + Sync>> {
         self.inner
-            .create_api_key(name, role, scope, bypass_cors)
+            .create_api_key(name, tenant_id, issuer, env_type, roles, bypass_cors)
             .await
     }
 
@@ -268,12 +270,12 @@ impl Db for CachedDb {
         &self,
         id: i64,
         name: Option<String>,
-        role: Option<String>,
-        scope: Option<String>,
+        status: Option<String>,
+        roles: Option<Vec<String>>,
         bypass_cors: Option<bool>,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         self.inner
-            .update_api_key(id, name, role, scope, bypass_cors)
+            .update_api_key(id, name, status, roles, bypass_cors)
             .await
     }
 
@@ -292,9 +294,11 @@ impl Db for CachedDb {
 
     async fn verify_api_key(
         &self,
-        key: &str,
+        tenant_id: &str,
+        key_id: &str,
+        secret: &str,
     ) -> std::result::Result<Option<ApiKey>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.verify_api_key(key).await
+        self.inner.verify_api_key(tenant_id, key_id, secret).await
     }
 
     // --- Tenants ---

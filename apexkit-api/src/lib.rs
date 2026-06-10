@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{RwLock, broadcast};
 use tower_http::compression::CompressionLayer;
-use tracing::{debug, info};
+use tracing::info;
 use utoipa::openapi::Server;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_scalar::{Scalar, Servable};
@@ -564,9 +564,9 @@ async fn auth_middleware(
         state.db.clone()
     };
 
-    // [FIX] Track if the requester is an authorized root admin to bypass suspension
     let mut is_root_admin = false;
 
+    // 1. Check Standard JWT Bearer
     if let Some(auth_header) = req.headers().typed_get::<Authorization<Bearer>>() {
         if let Ok(claims) = auth::decode_jwt(auth_header.token()) {
             let is_authorized = match claims.scope.as_str() {
@@ -614,82 +614,77 @@ async fn auth_middleware(
         }
     }
 
+    // 2. [FIXED] API Key Integration
     if let Some(key_header) = req.headers().get("x-api-key") {
         if let Ok(key) = key_header.to_str() {
-            let local_verification = db_to_check.verify_api_key(key).await;
+            // Fast-Fail parsing
+            if let Some(parsed) = apexkit_core::security::parse_and_validate_key(key) {
+                // Verify against Local DB OR fallback to Root DB
+                let local_verification = db_to_check
+                    .verify_api_key(&parsed.tenant_id, &parsed.key_id, &parsed.secret)
+                    .await;
 
-            let api_key_opt = if let Ok(Some(k)) = local_verification {
-                Some((k, true))
-            } else if !matches!(current_request_scope, EventScope::Root) {
-                state
-                    .db
-                    .verify_api_key(key)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|k| (k, false))
-            } else {
-                None
-            };
-
-            if let Some((api_key, is_local_key)) = api_key_opt {
-                let is_root_key = api_key.scope == "root" || api_key.scope == "*";
-                if is_root_key && api_key.role == "admin" {
-                    is_root_admin = true;
-                }
-
-                if tenant_is_suspended && !is_root_admin {
-                    return Err(StatusCode::FORBIDDEN);
-                }
-
-                let is_allowed = if is_local_key {
-                    true
+                let api_key_opt = if let Ok(Some(k)) = local_verification {
+                    Some((k, true))
+                } else if !matches!(current_request_scope, EventScope::Root) {
+                    state
+                        .db
+                        .verify_api_key(&parsed.tenant_id, &parsed.key_id, &parsed.secret)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|k| (k, false))
                 } else {
-                    if api_key.scope == "root" || api_key.scope == "*" {
-                        true
-                    } else if api_key.scope.starts_with("tenant:") {
-                        if let EventScope::Tenant(tid) = &current_request_scope {
-                            api_key.scope == format!("tenant:{}", tid)
-                        } else {
-                            false
-                        }
-                    } else if api_key.scope.starts_with("sandbox:") {
-                        if let EventScope::Sandbox(sid) = &current_request_scope {
-                            api_key.scope == format!("sandbox:{}", sid)
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
+                    None
+                };
+
+                if let Some((api_key, is_local_key)) = api_key_opt {
+                    let is_root_key = api_key.env_type == "sys";
+                    if is_root_key && api_key.roles.contains(&"admin".to_string()) {
+                        is_root_admin = true;
                     }
-                };
 
-                if !is_allowed {
-                    return Err(StatusCode::FORBIDDEN);
-                }
+                    if tenant_is_suspended && !is_root_admin {
+                        return Err(StatusCode::FORBIDDEN);
+                    }
 
-                let claims = Claims {
-                    sub: format!("apikey:{}", api_key.id),
-                    uid: 0,
-                    role: api_key.role,
-                    exp: 9999999999,
-                    scope: if is_local_key {
-                        match current_request_scope {
-                            EventScope::Tenant(ref id) => format!("tenant:{}", id),
-                            EventScope::Sandbox(ref id) => format!("sandbox:{}", id),
-                            _ => "root".to_string(),
-                        }
+                    let scope = if api_key.env_type == "sys" {
+                        "root".to_string()
                     } else {
-                        api_key.scope
-                    },
-                };
-                req.extensions_mut().insert(claims);
-                return Ok(next.run(req).await);
+                        format!("tenant:{}", api_key.tenant_id)
+                    };
+
+                    let is_allowed = if is_local_key {
+                        true
+                    } else {
+                        match &current_request_scope {
+                            EventScope::Root => scope == "root",
+                            EventScope::Tenant(tid) => scope == format!("tenant:{}", tid),
+                            EventScope::Sandbox(sid) => scope == format!("sandbox:{}", sid),
+                            _ => false,
+                        }
+                    };
+
+                    if !is_allowed {
+                        return Err(StatusCode::FORBIDDEN);
+                    }
+
+                    let role = api_key.roles.first().cloned().unwrap_or("user".to_string());
+
+                    let claims = Claims {
+                        sub: format!("apikey:{}", api_key.id),
+                        uid: 0,
+                        role,
+                        exp: 9999999999,
+                        scope,
+                    };
+                    req.extensions_mut().insert(claims);
+                    return Ok(next.run(req).await);
+                }
             }
         }
     }
 
-    // [FIX] Block unauthenticated requests to suspended/archived tenants strictly
     if tenant_is_suspended && !is_root_admin {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -1162,7 +1157,6 @@ pub async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // 1. Identify the Client (IP or API Key)
     let ip = req
         .headers()
         .get("x-forwarded-for")
@@ -1173,7 +1167,6 @@ pub async fn rate_limit_middleware(
     let api_key = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
     let client_id = api_key.unwrap_or(&ip).to_string();
 
-    // 2. Identify the Scope
     let scope = req
         .extensions()
         .get::<EventScope>()
@@ -1187,8 +1180,6 @@ pub async fn rate_limit_middleware(
     };
 
     let compound_key = format!("{}:{}", scope_str, client_id);
-
-    // 3. Fast Config Lookup (Cached for 60s to avoid DB hit every request)
     let config_cache_key = "system:security_config";
     let config: crate::settings::SecurityConfigDto =
         if let Some(cached) = state.root_script_cache.get(config_cache_key).await {
@@ -1210,16 +1201,13 @@ pub async fn rate_limit_middleware(
             parsed
         };
 
-    // 4. Determine Dynamic Limit based on Scope & Tier
     let mut limit = config.global_rate_limit.unwrap_or(600);
 
     match &scope {
         EventScope::Root => limit = config.global_rate_limit.unwrap_or(600),
-        EventScope::Sandbox(_) => limit = 60, // Stricter limit for sandboxes
+        EventScope::Sandbox(_) => limit = 60,
         EventScope::Tenant(tid) => {
             let tier_cache_key = format!("tenant_tier:{}", tid);
-
-            // Check cache for tenant tier
             let tier = if let Some(t) = state.root_script_cache.get(&tier_cache_key).await {
                 t
             } else {
@@ -1247,7 +1235,6 @@ pub async fn rate_limit_middleware(
 
     let limit_u32 = limit.max(1) as u32;
 
-    // 5. Fetch or Create GCRA Rate Limiter Instance for this specific limit
     let limiter = if let Some(l) = state.rate_limiters.get(&limit).await {
         l
     } else {
@@ -1257,13 +1244,9 @@ pub async fn rate_limit_middleware(
         new_limiter
     };
 
-    // 6. Check Token Bucket (Mathematical compliance)
     match limiter.check_key(&compound_key) {
         Ok(_) => {
-            // Execution allowed
             let mut response = next.run(req).await;
-
-            // Append general rate limit headers
             response.headers_mut().insert(
                 "X-RateLimit-Limit",
                 HeaderValue::from_str(&limit.to_string()).unwrap(),
@@ -1271,10 +1254,8 @@ pub async fn rate_limit_middleware(
             Ok(response)
         }
         Err(negative) => {
-            // Execution Denied: Extract wait time for proper GCRA backpressure
             let wait_time = negative.wait_time_from(DefaultClock::default().now());
-            let retry_after_secs = wait_time.as_secs().max(1); // Ensure at least 1s
-
+            let retry_after_secs = wait_time.as_secs().max(1);
             tracing::warn!(
                 "Rate limit exceeded for {} in scope {}. Retry after {}s",
                 client_id,
@@ -1289,8 +1270,6 @@ pub async fn rate_limit_middleware(
             }));
 
             let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
-
-            // HTTP Standard Retry-After Header
             response.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 HeaderValue::from_str(&retry_after_secs.to_string()).unwrap(),
@@ -1299,7 +1278,6 @@ pub async fn rate_limit_middleware(
                 "X-RateLimit-Limit",
                 HeaderValue::from_str(&limit.to_string()).unwrap(),
             );
-
             Ok(response)
         }
     }
@@ -1420,21 +1398,30 @@ async fn tenant_resolver_middleware(
     mut req: Request,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
-    // 1. Check for API Key override (Smart Key)
     let mut key_scope_override: Option<String> = None;
 
+    // [FIXED] Use fast fail key parser for Smart Key Overrides
     if let Some(key_header) = req.headers().get("x-api-key") {
         if let Ok(key) = key_header.to_str() {
-            if let Ok(Some(api_key)) = state.db.verify_api_key(key).await {
-                key_scope_override = Some(api_key.scope.clone());
-                req.extensions_mut().insert(api_key);
+            if let Some(parsed) = apexkit_core::security::parse_and_validate_key(key) {
+                if let Ok(Some(api_key)) = state
+                    .db
+                    .verify_api_key(&parsed.tenant_id, &parsed.key_id, &parsed.secret)
+                    .await
+                {
+                    let scope = if api_key.env_type == "sys" {
+                        "root".to_string()
+                    } else {
+                        format!("tenant:{}", api_key.tenant_id)
+                    };
+                    key_scope_override = Some(scope);
+                }
             }
         }
     }
 
     let mut tenant_id = String::new();
 
-    // 2. Logic: If Key Scope is specific (e.g. "tenant:xyz"), force that tenant context.
     if let Some(scope) = key_scope_override {
         if scope.starts_with("tenant:") {
             let target = scope.strip_prefix("tenant:").unwrap();
@@ -1444,7 +1431,6 @@ async fn tenant_resolver_middleware(
         }
     }
 
-    // 3. Fallback: URL routing with Root Domain Protection
     if tenant_id.is_empty() {
         let root_domain = std::env::var("APEX_ROOT_DOMAIN").unwrap_or_default();
         let host = req
@@ -1456,7 +1442,6 @@ async fn tenant_resolver_middleware(
             .next()
             .unwrap_or("");
 
-        // PRIORITY 1: Explicit Path (/tenant/app-1/...)
         if let Some(Path(params)) = &path_params {
             if let Some(id) = params.get("tenant_id") {
                 tenant_id = id.clone();
@@ -1473,12 +1458,10 @@ async fn tenant_resolver_middleware(
             }
         }
 
-        // PRIORITY 2: Check against ROOT_DOMAIN
         if tenant_id.is_empty() {
             if !root_domain.is_empty() && host == root_domain {
                 tenant_id = String::new();
             } else {
-                // PRIORITY 3: Subdomain Extraction
                 let parts: Vec<&str> = host.split('.').collect();
                 if parts.len() >= 2 {
                     let sub = parts[0];
@@ -1533,7 +1516,6 @@ async fn tenant_resolver_middleware(
         return Ok(response);
     }
 
-    // 4. Resolve Context
     match state.tenant_manager.get_tenant(tenant_id.clone()).await {
         Ok(tenant_db) => {
             req.extensions_mut().insert(tenant_db.clone());
@@ -1594,8 +1576,6 @@ async fn tenant_resolver_middleware(
                 tenant_id,
                 e
             );
-
-            // [FIXED] Block access and prevent silent fallback to Root scope
             let body = Json(serde_json::json!({
                 "error": "not_found",
                 "message": "Tenant not found or inactive",
@@ -1934,6 +1914,7 @@ pub async fn serve_styles(
 pub struct SseQuery {
     pub channel: Option<String>,
     pub event: Option<String>,
+    pub token: Option<String>,
 }
 
 // Helper to namespace channels (Same logic as websocket.rs to ensure security)
@@ -1951,7 +1932,8 @@ fn namespaced_channel_sse(scope: &EventScope, channel: &str) -> String {
     path = "/sse",
     params(
         ("channel" = Option<String>, Query, description = "Specific channel to listen to"),
-        ("event" = Option<String>, Query, description = "Specific event name to filter")
+        ("event" = Option<String>, Query, description = "Specific event name to filter"),
+        ("token" = Option<String>, Query, description = "JWT Auth Token")
     ),
     responses((status = 200, description = "SSE Stream"))
 )]
@@ -1969,11 +1951,14 @@ pub async fn sse_handler(
         .map(|c| namespaced_channel_sse(&client_scope, &c));
     let target_event = params.event.clone();
 
-    // Changed to DEBUG to reduce noise in production logs
-    debug!(
-        "[SSE] Connected. Scope: {:?}, Channel: {:?}",
-        client_scope, params.channel
-    );
+    // [ADDED] Verify identity for stream authorization
+    let claims = if let Some(token) = &params.token {
+        apexkit_core::auth::decode_jwt(token).ok()
+    } else {
+        None
+    };
+
+    let db = state.db.clone();
 
     let stream = async_stream::stream! {
         while let Ok(msg) = rx.recv().await {
@@ -2001,9 +1986,28 @@ pub async fn sse_handler(
             };
 
             if should_yield {
-                if let Ok(json_data) = serde_json::to_string(&msg) {
-                    // Removed per-message info! log
-                    yield Ok(Event::default().data(json_data));
+                // [ADDED] Row-Level Security checks for Streaming SSE Broadcasts
+                let mut allowed = true;
+                match &msg {
+                    DbEvent::Insert { collection_id, data, .. } | DbEvent::Update { collection_id, data, .. } => {
+                        if let Ok(Some(col)) = db.get_collection(*collection_id).await {
+                            let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+                            allowed = apexkit_core::policies::check_access(policy, claims.as_ref(), Some(data));
+                        }
+                    }
+                    DbEvent::Delete { collection_id, .. } => {
+                        if let Ok(Some(col)) = db.get_collection(*collection_id).await {
+                            let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+                            allowed = apexkit_core::policies::check_access(policy, claims.as_ref(), None);
+                        }
+                    }
+                    _ => {}
+                }
+
+                if allowed {
+                    if let Ok(json_data) = serde_json::to_string(&msg) {
+                        yield Ok(Event::default().data(json_data));
+                    }
                 }
             }
         }

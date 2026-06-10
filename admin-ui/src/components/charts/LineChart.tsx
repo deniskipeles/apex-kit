@@ -39,8 +39,9 @@ export const LineChart = ({ data, lines, title, isLoading }: LineChartProps) => 
         <CardTitle>{title}</CardTitle>
       </CardHeader>
       <CardContent className="pl-2">
-        <div className="h-[300px] w-full">
-          <ResponsiveContainer width="100%" height="100%">
+        {/* Set explicit min-height on wrapper element to ensure Recharts can read dimensions on-mount */}
+        <div className="h-[300px] min-h-[300px] w-full min-w-0">
+          <ResponsiveContainer width="99%" height="100%">
             <AreaChart data={data}>
               <defs>
                 {lines.map((line) => (

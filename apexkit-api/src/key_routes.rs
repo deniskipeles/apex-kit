@@ -1,4 +1,3 @@
-// apexkit-api/src/key_routes.rs
 use crate::{AppError, DatabaseConnection};
 use apexkit_core::{auth::Claims, models::ApiKey, realtime::EventScope};
 use axum::{
@@ -13,19 +12,26 @@ use utoipa::ToSchema;
 #[derive(Deserialize, ToSchema)]
 pub struct CreateKeyReq {
     pub name: String,
-    #[serde(default = "default_role")]
-    pub role: String,
-    #[serde(default = "default_scope")]
-    pub scope: String, // "root", "tenant:id", "*"
+
+    // --- Backward Compatibility Fields ---
+    pub role: Option<String>,  // Legacy field (e.g. "admin", "user")
+    pub scope: Option<String>, // Legacy field (e.g. "root", "tenant:id")
+
+    // --- Scoped, Composite Fields ---
+    pub target_tenant: Option<String>,
+    #[serde(default = "default_env_type")]
+    pub env_type: String, // 'sys', 'tnnt', 'sk', 'pk'
+    #[serde(default = "default_roles")]
+    pub roles: Vec<String>,
     #[serde(default)]
     pub bypass_cors: bool,
 }
 
-fn default_scope() -> String {
-    "root".to_string()
+fn default_env_type() -> String {
+    "sys".to_string()
 }
-fn default_role() -> String {
-    "admin".to_string()
+fn default_roles() -> Vec<String> {
+    vec!["admin".to_string()]
 }
 
 #[derive(Serialize, ToSchema)]
@@ -37,8 +43,8 @@ pub struct CreateKeyResponse {
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateKeyReq {
     pub name: Option<String>,
-    pub role: Option<String>,
-    pub scope: Option<String>,
+    pub status: Option<String>,
+    pub roles: Option<Vec<String>>,
     pub bypass_cors: Option<bool>,
 }
 
@@ -74,7 +80,7 @@ pub async fn list_keys(
 )]
 pub async fn create_key(
     Extension(claims): Extension<Claims>,
-    scope: Option<Extension<EventScope>>, // [ADDED] Extract the active request scope
+    scope: Option<Extension<EventScope>>,
     DatabaseConnection(db): DatabaseConnection,
     Json(payload): Json<CreateKeyReq>,
 ) -> Result<Json<CreateKeyResponse>, AppError> {
@@ -82,19 +88,67 @@ pub async fn create_key(
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // [FIXED] Override the scope dynamically if requested under a Tenant or Sandbox context
     let event_scope = scope.map(|Extension(s)| s).unwrap_or(EventScope::Root);
-    let final_scope = match event_scope {
-        EventScope::Tenant(id) => format!("tenant:{}", id),
-        EventScope::Sandbox(id) => format!("sandbox:{}", id),
-        _ => payload.scope.clone(), // Allow Root Admins to specify the scope explicitly
+
+    // 1. Resolve Roles (Map legacy 'role' if 'roles' is empty)
+    let mut final_roles = payload.roles.clone();
+    if final_roles.is_empty() {
+        if let Some(r) = &payload.role {
+            final_roles.push(r.clone());
+        } else {
+            final_roles.push("admin".to_string());
+        }
+    }
+
+    // 2. Resolve Scope (Map legacy 'scope' if 'target_tenant' or 'env_type' is default/empty)
+    let mut resolved_env = payload.env_type.clone();
+    let mut resolved_tenant = payload
+        .target_tenant
+        .clone()
+        .unwrap_or_else(|| "root".to_string());
+
+    if let Some(legacy_scope) = &payload.scope {
+        if legacy_scope == "root" {
+            resolved_env = "sys".to_string();
+            resolved_tenant = "root".to_string();
+        } else if let Some(tid) = legacy_scope.strip_prefix("tenant:") {
+            resolved_env = "sk".to_string();
+            resolved_tenant = tid.to_string();
+        } else if legacy_scope == "*" {
+            resolved_env = "sys".to_string();
+            resolved_tenant = "root".to_string();
+        }
+    }
+
+    // 3. Bind to Active Context Boundaries
+    let (issuer, final_tenant, final_env) = match event_scope {
+        EventScope::Root => {
+            if resolved_env == "tnnt" || resolved_env == "sk" || resolved_env == "pk" {
+                ("root".to_string(), resolved_tenant, resolved_env)
+            } else if resolved_tenant != "root" {
+                ("root".to_string(), resolved_tenant, "tnnt".to_string())
+            } else {
+                ("root".to_string(), "root".to_string(), "sys".to_string())
+            }
+        }
+        EventScope::Tenant(id) => {
+            let env = if resolved_env == "pk" {
+                "pk".to_string()
+            } else {
+                "sk".to_string()
+            };
+            ("tnt".to_string(), id, env)
+        }
+        _ => return Err(AppError::Forbidden("Scope not supported for keys".into())),
     };
 
     let (key, info) = db
         .create_api_key(
             &payload.name,
-            &payload.role,
-            &final_scope, // [FIXED]
+            &final_tenant,
+            &issuer,
+            &final_env,
+            final_roles,
             payload.bypass_cors,
         )
         .await
@@ -111,7 +165,6 @@ pub async fn create_key(
 )]
 pub async fn update_key(
     Extension(claims): Extension<Claims>,
-    scope: Option<Extension<EventScope>>, // [ADDED] Extract the active request scope
     DatabaseConnection(db): DatabaseConnection,
     Path(params): Path<KeyPath>,
     Json(payload): Json<UpdateKeyReq>,
@@ -120,19 +173,11 @@ pub async fn update_key(
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // [FIXED] Force-override the scope update if requested under a Tenant or Sandbox context
-    let event_scope = scope.map(|Extension(s)| s).unwrap_or(EventScope::Root);
-    let final_scope = match event_scope {
-        EventScope::Tenant(id) => Some(format!("tenant:{}", id)),
-        EventScope::Sandbox(id) => Some(format!("sandbox:{}", id)),
-        _ => payload.scope.clone(), // Allow Root Admins to update the scope explicitly
-    };
-
     db.update_api_key(
         params.id,
         payload.name,
-        payload.role,
-        final_scope, // [FIXED]
+        payload.status,
+        payload.roles,
         payload.bypass_cors,
     )
     .await
@@ -149,7 +194,7 @@ pub async fn update_key(
 pub async fn delete_key(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection,
-    Path(params): Path<KeyPath>, // [FIXED] Switched from scalar Path<i64> to struct Path<KeyPath>
+    Path(params): Path<KeyPath>,
 ) -> Result<StatusCode, AppError> {
     if claims.role != "admin" {
         return Err(AppError::Forbidden("Admins only".into()));

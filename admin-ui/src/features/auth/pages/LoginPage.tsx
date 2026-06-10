@@ -13,14 +13,12 @@ export const LoginPage = () => {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
-  // Auto-detect secure reset token on mount from email click redirection
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const tokenParam = params.get('token');
     if (tokenParam) {
       setToken(tokenParam);
       setMode('reset');
-      // Clear query params to clean up address bar beautifully
       window.history.replaceState({}, document.title, window.location.pathname);
     }
   }, []);
@@ -33,7 +31,7 @@ export const LoginPage = () => {
       const form = e.target as HTMLFormElement;
       await login(form.email.value, form.password.value);
     } catch (err) {
-      setError('Invalid email or password (try: admin@apexkit.io / password)');
+      setError('Invalid email or password');
     } finally {
       setIsLoading(false);
     }
@@ -84,7 +82,7 @@ export const LoginPage = () => {
       setSuccess('Password updated successfully! You can now sign in.');
       setMode('login');
     } catch (err: any) {
-      setError(err.message || 'Failed to reset password. The link may be expired or invalid.');
+      setError(err.message || 'Failed to reset password.');
     } finally {
       setIsLoading(false);
     }
@@ -93,7 +91,6 @@ export const LoginPage = () => {
   return (
     <div className="flex h-screen items-center justify-center bg-[#0f172a]">
       <div className="w-full max-w-sm space-y-6 p-6 animate-in fade-in zoom-in-95 duration-300">
-        {/* Header Branding */}
         <div className="flex flex-col items-center gap-2 text-center">
           <div className="rounded-lg bg-primary/20 p-3">
             <img
@@ -114,7 +111,6 @@ export const LoginPage = () => {
           </p>
         </div>
 
-        {/* Success Alert */}
         {success && (
           <Alert
             variant="success"
@@ -125,10 +121,8 @@ export const LoginPage = () => {
           </Alert>
         )}
 
-        {/* Error Alert */}
         {error && <Alert variant="destructive">{error}</Alert>}
 
-        {/* --- SIGN IN MODE --- */}
         {mode === 'login' && (
           <form onSubmit={handleLoginSubmit} className="space-y-4">
             <div className="space-y-2">
@@ -136,6 +130,7 @@ export const LoginPage = () => {
               <Input
                 name="email"
                 type="email"
+                autoComplete="username"
                 placeholder="admin@apexkit.io"
                 defaultValue="admin@apexkit.io"
                 required
@@ -160,6 +155,7 @@ export const LoginPage = () => {
               <Input
                 name="password"
                 type="password"
+                autoComplete="current-password"
                 placeholder="••••••••"
                 defaultValue="password"
                 required
@@ -172,7 +168,6 @@ export const LoginPage = () => {
           </form>
         )}
 
-        {/* --- FORGOT PASSWORD MODE --- */}
         {mode === 'forgot' && (
           <form onSubmit={handleForgotSubmit} className="space-y-4">
             <div className="space-y-2">
@@ -180,6 +175,7 @@ export const LoginPage = () => {
               <Input
                 name="email"
                 type="email"
+                autoComplete="username"
                 placeholder="admin@apexkit.io"
                 required
                 className="bg-slate-800/50 border-slate-700 text-white"
@@ -202,7 +198,6 @@ export const LoginPage = () => {
           </form>
         )}
 
-        {/* --- CONFIRM RESET MODE --- */}
         {mode === 'reset' && (
           <form onSubmit={handleResetSubmit} className="space-y-4">
             <div className="space-y-2">
@@ -210,6 +205,7 @@ export const LoginPage = () => {
               <Input
                 name="password"
                 type="password"
+                autoComplete="new-password"
                 placeholder="••••••••"
                 required
                 className="bg-slate-800/50 border-slate-700 text-white"
@@ -220,6 +216,7 @@ export const LoginPage = () => {
               <Input
                 name="confirmPassword"
                 type="password"
+                autoComplete="new-password"
                 placeholder="••••••••"
                 required
                 className="bg-slate-800/50 border-slate-700 text-white"

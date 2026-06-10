@@ -288,10 +288,19 @@ export const apiClient = {
       return res.map((k: any) => ({
         id: k.id.toString(),
         name: k.name,
-        prefix: k.prefix,
-        role: k.role,
-        scope: k.scope,
+        tenant_id: k.tenant_id || 'root',
+        key_id: k.key_id || '',
+        issuer: k.issuer || 'root',
+        env_type: k.env_type || 'sys',
+        roles: k.roles || [],
+        status: k.status || 'active',
         bypass_cors: k.bypass_cors,
+        created_at: k.created_at,
+
+        // Legacy Fallbacks
+        prefix: k.key_id || '',
+        role: k.roles && k.roles.length > 0 ? k.roles[0] : 'user',
+        scope: k.tenant_id === 'root' ? 'root' : `tenant:${k.tenant_id}`,
         created: k.created_at,
       }));
     },
@@ -299,18 +308,38 @@ export const apiClient = {
       name: string,
       role = 'admin',
       scope = 'root',
-      bypass_cors = true
+      bypass_cors = true,
+      env_type = 'sys',
+      roles: string[] = ['admin'],
+      target_tenant?: string
     ): Promise<{ key: string; info: ApiKey }> => {
-      const res = await pb.admins.createApiKey(name, role, scope, bypass_cors);
+      const res = await pb.admins.createApiKey(
+        name,
+        role,
+        scope,
+        bypass_cors,
+        env_type,
+        roles,
+        target_tenant
+      );
       return {
         key: res.key,
         info: {
           id: res.info.id.toString(),
           name: res.info.name,
-          prefix: res.info.prefix,
-          role: res.info.role,
-          scope: res.info.scope,
+          tenant_id: res.info.tenant_id || 'root',
+          key_id: res.info.key_id || '',
+          issuer: res.info.issuer || 'root',
+          env_type: res.info.env_type || 'sys',
+          roles: res.info.roles || [],
+          status: res.info.status || 'active',
           bypass_cors: res.info.bypass_cors,
+          created_at: res.info.created_at,
+
+          // Legacy Fallbacks
+          prefix: res.info.key_id || '',
+          role: res.info.roles && res.info.roles.length > 0 ? res.info.roles[0] : 'user',
+          scope: res.info.tenant_id === 'root' ? 'root' : `tenant:${res.info.tenant_id}`,
           created: res.info.created_at,
         },
       };

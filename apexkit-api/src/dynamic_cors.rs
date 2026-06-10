@@ -10,20 +10,16 @@ pub async fn cors_middleware(State(state): State<AppState>, req: Request, next: 
     let origin_header = req.headers().get(header::ORIGIN).cloned();
     let method = req.method().clone();
 
-    // [UPDATED] Capture Host AND Forwarded Host (for Cloud Environments)
     let host_header = req
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-
     let forwarded_host = req
         .headers()
         .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-
-    // Capture requested headers
     let request_headers = req
         .headers()
         .get("access-control-request-headers")
@@ -34,33 +30,21 @@ pub async fn cors_middleware(State(state): State<AppState>, req: Request, next: 
     let config: SecurityConfigDto = if let Some(val) = security_setting {
         serde_json::from_value(val).unwrap_or_default()
     } else {
-        SecurityConfigDto {
-            cors_allow_all: true,
-            cors_origins: "".to_string(),
-            tenant_transparency: false,
-            global_rate_limit: Some(600),
-            tenant_free_rate_limit: Some(120),
-            tenant_pro_rate_limit: Some(3000),
-        }
+        SecurityConfigDto::default()
     };
 
     let mut allow_origin_val: Option<HeaderValue> = None;
     let mut allow_credentials = false;
-    let mut blocked = false; // Track if we should strictly block execution
+    let mut blocked = false;
 
     if let Some(origin) = origin_header {
         if let Ok(origin_str) = origin.to_str() {
-            // if config.cors_allow_all {
-            //     allow_origin_val = Some(HeaderValue::from_static("*"));
             if config.cors_allow_all {
                 allow_origin_val = Some(origin.clone());
                 allow_credentials = true;
             } else {
                 let allowed_list: Vec<&str> =
                     config.cors_origins.split(',').map(|s| s.trim()).collect();
-
-                // [UPDATED] Robust Same-Origin Check
-                // Strips http:// or https:// to compare just the domain/port
                 let clean_origin = origin_str.replace("https://", "").replace("http://", "");
 
                 let matches_host = host_header
@@ -72,17 +56,20 @@ pub async fn cors_middleware(State(state): State<AppState>, req: Request, next: 
                     .map(|h| clean_origin.contains(h))
                     .unwrap_or(false);
 
-                // [NEW] Smart Key Check for CORS Bypass
-                // We check headers for x-api-key. If valid AND bypass_cors=true, we skip origin checks.
+                // [NEW] Strict API Key Processing
                 let mut bypass_cors = false;
-
                 if let Some(key_header) = req.headers().get("x-api-key") {
                     if let Ok(key) = key_header.to_str() {
-                        // Verification is async.
-                        // Note: In middleware, we clone db ref.
-                        if let Ok(Some(api_key)) = state.db.verify_api_key(key).await {
-                            if api_key.bypass_cors {
-                                bypass_cors = true;
+                        if let Some(parsed) = apexkit_core::security::parse_and_validate_key(key) {
+                            if let Ok(Some(api_key)) = state
+                                .db
+                                .verify_api_key(&parsed.tenant_id, &parsed.key_id, &parsed.secret)
+                                .await
+                            {
+                                // Strictly prevent public/frontend keys from bypassing CORS restrictions
+                                if api_key.bypass_cors && api_key.env_type != "pk" {
+                                    bypass_cors = true;
+                                }
                             }
                         }
                     }
@@ -96,19 +83,13 @@ pub async fn cors_middleware(State(state): State<AppState>, req: Request, next: 
                     allow_origin_val = Some(origin);
                     allow_credentials = true;
                 } else {
-                    tracing::warn!(
-                        "CORS Blocked: Origin '{}' not allowed. Hosts checked: {:?}/{:?}",
-                        origin_str,
-                        host_header,
-                        forwarded_host
-                    );
-                    blocked = true; // Mark as blocked
+                    tracing::warn!("CORS Blocked: Origin '{}' not allowed.", origin_str);
+                    blocked = true;
                 }
             }
         }
     }
 
-    // --- PREFLIGHT (OPTIONS) HANDLER ---
     if method == Method::OPTIONS {
         let mut response = StatusCode::NO_CONTENT.into_response();
         let headers = response.headers_mut();
@@ -145,14 +126,10 @@ pub async fn cors_middleware(State(state): State<AppState>, req: Request, next: 
         return response;
     }
 
-    // --- [CRITICAL FIX] STRICT BLOCKING ---
-    // If we determined this is a blocked Origin, STOP execution here.
-    // Do not call next.run(req), or the DB operation will happen anyway.
     if blocked {
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // --- ACTUAL REQUEST HANDLER ---
     let mut response = next.run(req).await;
 
     if let Some(val) = allow_origin_val {

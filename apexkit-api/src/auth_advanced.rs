@@ -724,17 +724,31 @@ pub async fn update_user_handler(
 )]
 pub async fn login(
     DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>, // [ADDED] Extract global AppState for scripting engine
+    BaseUrl(base_url): BaseUrl,    // [ADDED] Extract dynamic base URL for script context
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    scope: Option<Extension<EventScope>>, // [NEW] Capture current scope
+    scope: Option<Extension<EventScope>>,
     headers: HeaderMap,
     Json(p): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    let scope_str = match event_scope {
+    let event_scope = scope.clone().map(|e| e.0).unwrap_or(EventScope::Root);
+    let scope_str = match &event_scope {
         EventScope::Tenant(id) => format!("tenant:{}", id),
         EventScope::Sandbox(id) => format!("sandbox:{}", id),
         _ => "root".to_string(),
     };
+
+    // [TRIGGER] before_user_login (Allows custom rate-limiting or domain/IP blacklisting)
+    let input_data = json!({ "email": p.email, "ip": addr.ip().to_string() });
+    trigger_void_hook(
+        &state,
+        "before_user_login",
+        input_data,
+        None,
+        Some(&event_scope.clone()),
+        Some(base_url.clone()),
+    )
+    .await?;
 
     let base_meta = json!({ "email": p.email });
 
@@ -779,6 +793,23 @@ pub async fn login(
     let _ = db
         .log_audit_event("info", "Login Success", "auth", Some(meta))
         .await;
+
+    // [TRIGGER] after_user_login (Asynchronous logging, activity tracking, or metric updates)
+    let user_json = json!({
+        "id": u.id,
+        "email": u.email,
+        "role": u.role,
+        "scope": scope_str
+    });
+    let _ = trigger_void_hook(
+        &state,
+        "after_user_login",
+        user_json,
+        None,
+        Some(&event_scope.clone()),
+        Some(base_url),
+    )
+    .await;
 
     Ok(Json(AuthResponse {
         token,

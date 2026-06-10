@@ -21,6 +21,10 @@ const TRIGGER_TYPES = [
   { value: 'graphql', label: 'GraphQL Resolver', group: 'API' },
   { value: 'cron', label: 'Scheduled Job (Cron)', group: 'System' },
 
+  // --- AI Engine ---
+  { value: 'before_ai_run', label: 'Before AI Action Run', group: 'AI Engine' },
+  { value: 'after_ai_run', label: 'After AI Action Run', group: 'AI Engine' },
+
   // --- Data Records (Write) ---
   { value: 'before_create_record', label: 'Before Create Record', group: 'Record Write' },
   { value: 'after_create_record', label: 'After Create Record', group: 'Record Write' },
@@ -55,6 +59,20 @@ const TRIGGER_TYPES = [
   { value: 'after_tenant_request', label: 'After Tenant Request', group: 'Traffic' },
   { value: 'before_sandbox_request', label: 'Before Sandbox Request', group: 'Traffic' },
   { value: 'after_sandbox_request', label: 'After Sandbox Request', group: 'Traffic' },
+
+  // --- Files (Storage) ---
+  { value: 'before_file_upload', label: 'Before File Upload', group: 'Files' },
+  { value: 'after_file_upload', label: 'After File Upload', group: 'Files' },
+  { value: 'before_file_delete', label: 'Before File Delete', group: 'Files' },
+  { value: 'after_file_delete', label: 'After File Delete', group: 'Files' },
+
+  // --- Users (Auth) ---
+  { value: 'before_user_create', label: 'Before User Create (Register)', group: 'Users' },
+  { value: 'after_user_create', label: 'After User Create (Register)', group: 'Users' },
+  { value: 'before_user_delete', label: 'Before User Delete', group: 'Users' },
+  { value: 'after_user_delete', label: 'After User Delete', group: 'Users' },
+  { value: 'before_user_login', label: 'Before User Login', group: 'Users' },
+  { value: 'after_user_login', label: 'After User Login', group: 'Users' },
 ];
 
 const DEFAULT_CODE = {
@@ -65,6 +83,7 @@ const DEFAULT_CODE = {
   system: `export default async function(e) {\n    log("Event Triggered: " + e.trigger);\n}`,
   graphql: `export const graphql = {\n  "parent": "Query",\n  "name": "customField",\n  "args": {},\n  "returnType": "JSON"\n};\n\nexport default async function(req) {\n    return new Response({ success: true });\n}`,
   traffic: `export default async function(e) {\n    log(e.trigger + " " + e.data.path);\n}`,
+  ai_hook: `export default async function(e) {\n    // Context: e.trigger, e.data.slug, e.data.vars, e.data.result, e.auth\n    log("AI Run Event Triggered: " + e.data.slug);\n}`,
 };
 
 // --- DOCUMENTATION REGISTRY ---
@@ -269,6 +288,108 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     template: `export default async function(e) {\n  // log sandbox traffic\n}`,
     returns: 'Void.',
   },
+  // Files (Storage)
+  before_file_upload: {
+    name: 'Before File Upload',
+    desc: 'Fires inside the transaction before a file is written to physical storage. Use this to enforce user upload quotas, validate file names, or restrict uploads to specific MIME types.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `// Fired on upload ingress.\n// Access acting user credentials inside e.auth.\n{\n  "trigger": "before_file_upload"\n}`,
+    template: `export default async function(e) {\n  log("Intercepting file upload from: " + e.auth?.email);\n  // e.g. verify total S3 usage in $cache before writing\n}`,
+    returns:
+      'Void. Throwing an error will cancel the upload and return an HTTP 422 Unprocessable Entity error to the client.',
+  },
+  after_file_upload: {
+    name: 'After File Upload',
+    desc: 'Fires asynchronously after a file is successfully written to storage and registered in metadata. Ideal for processing tasks, image transcoding, or pushing system notifications.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "id": 12,\n  "filename": "uuid_filename.png",\n  "trigger": "after_file_upload"\n}`,
+    template: `export default async function(e) {\n  log("File saved successfully with ID #" + e.data.id);\n  // e.g. send audit log entry\n}`,
+    returns: 'Void. Returning a value has no effect.',
+  },
+  before_file_delete: {
+    name: 'Before File Delete',
+    desc: 'Fires inside the transaction before deleting a file from metadata and storage. Use this to verify file ownership or protect system-critical assets.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "id": 12,\n  "trigger": "before_file_delete"\n}`,
+    template: `export default async function(e) {\n  log("Checking delete permission for file ID: " + e.data.id);\n  // e.g. block delete if file owner !== e.auth.id\n}`,
+    returns: 'Void. Throw an error to block the file deletion.',
+  },
+  after_file_delete: {
+    name: 'After File Delete',
+    desc: 'Fires asynchronously after a file is successfully purged from storage.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "id": 12,\n  "filename": "uuid_filename.png",\n  "trigger": "after_file_delete"\n}`,
+    template: `export default async function(e) {\n  log("File successfully purged from storage: " + e.data.filename);\n}`,
+    returns: 'Void.',
+  },
+
+  // Users (Auth)
+  before_user_create: {
+    name: 'Before User Create (Register)',
+    desc: 'Intercepts a new user registration before writing to the database. Use to validate emails against domains, restrict roles, or sanitize custom metadata.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "email": "user@example.com",\n  "role": "user",\n  "metadata": {},\n  "trigger": "before_user_create"\n}`,
+    template: `export default async function(e) {\n  if (!e.data.email.endsWith("@company.com")) {\n    throw "Only corporate email domains are allowed to register.";\n  }\n}`,
+    returns: 'Void. Throwing an error blocks registration and returns a 422 validation error.',
+  },
+  after_user_create: {
+    name: 'After User Create (Register)',
+    desc: 'Fires asynchronously after registration. Ideal for initializing user settings tables or sending custom transactional emails.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "id": 5,\n  "email": "user@example.com",\n  "role": "user",\n  "trigger": "after_user_create"\n}`,
+    template: `export default async function(e) {\n  log("New user registered: " + e.data.email);\n}`,
+    returns: 'Void. Returning a value has no effect.',
+  },
+  before_user_delete: {
+    name: 'Before User Delete',
+    desc: 'Intercepts account deletions. Prevents users from deleting critical accounts or admins.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "id": "5",\n  "trigger": "before_user_delete"\n}`,
+    template: `export default async function(e) {\n  if (e.data.id === "1") {\n    throw "Cannot delete the default root admin account.";\n  }\n}`,
+    returns: 'Void. Throw an error to block deletion.',
+  },
+  after_user_delete: {
+    name: 'After User Delete',
+    desc: 'Fires asynchronously after an account is purged.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "id": "5",\n  "trigger": "after_user_delete"\n}`,
+    template: `export default async function(e) {\n  log("User account #" + e.data.id + " was deleted.");\n}`,
+    returns: 'Void.',
+  },
+  before_user_login: {
+    name: 'Before User Login',
+    desc: 'Intercepts an authentication attempt before the password hash is verified. Ideal for restricting logins to corporate IP ranges, geoblocking, or implementing global IP blocklists.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "email": "user@example.com",\n  "ip": "192.168.1.50",\n  "trigger": "before_user_login"\n}`,
+    template: `export default async function(e) {\n  log("Login attempt for email: " + e.data.email);\n  \n  // Example: Block login attempts from outside local subnet\n  if (e.data.ip.startsWith("10.0.")) {\n    throw "Logins from private subnets are blocked.";\n  }\n}`,
+    returns:
+      'Void. Throwing an error blocks the authentication process and returns a 422 validation error.',
+  },
+  after_user_login: {
+    name: 'After User Login',
+    desc: 'Fires asynchronously after a user successfully logs in and a JWT has been generated. Use this to track active sessions, update last-login metadata, or audit security events.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "id": 42,\n  "email": "user@example.com",\n  "role": "user",\n  "scope": "root",\n  "trigger": "after_user_login"\n}`,
+    template: `export default async function(e) {\n  log("Successful login: " + e.data.email);\n  // e.g., update login counter using $cache\n  await $cache.incr("logins_" + e.data.id, 1);\n}`,
+    returns: 'Void. Returning a value has no effect.',
+  },
+  before_ai_run: {
+    name: 'Before AI Action Run',
+    desc: 'Intercepts an AI Action execution request before forwarding the variables and template payload to Google Gemini. Perfect for sanitizing incoming prompts, injecting system context, or blocking malicious prompts.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "data": {\n    "slug": "summarize-text",\n    "vars": { "text": "Raw user prompt..." }\n  },\n  "auth": { "id": 42, "role": "user" },\n  "trigger": "before_ai_run"\n}`,
+    template: `export default async function(e) {\n  log("Verifying prompt for action: " + e.data.slug);\n  if (e.data.vars.text.includes("restricted term")) {\n    throw "Prompt blocked due to system policy restrictions.";\n  }\n}`,
+    returns:
+      'Void. Throwing an error will immediately abort the run and return a 422 error response to the client.',
+  },
+  after_ai_run: {
+    name: 'After AI Action Run',
+    desc: 'Fires asynchronously after an AI Action has completed its run and successfully returned a response from the LLM. Ideal for usage auditing, storing historical results, or alerting.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "data": {\n    "slug": "summarize-text",\n    "result": "Response payload...",\n    "metadata": { "groundingChunks": [] }\n  },\n  "auth": { "id": 42, "role": "user" },\n  "trigger": "after_ai_run"\n}`,
+    template: `export default async function(e) {\n  log("Post-processing AI action: " + e.data.slug);\n  // e.g. Track tokens/runs in cache\n  await $cache.incr("ai_usage_" + e.auth.id, 1);\n}`,
+    returns: 'Void. Returning a value has no effect.',
+  },
 };
 
 export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEditorProps) => {
@@ -322,7 +443,7 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
           ? formData.target_collection
           : null,
       };
-      await onSave(cleanData);
+      await onSave(cleanData as any);
       onClose();
     } finally {
       setIsSaving(false);
@@ -350,7 +471,9 @@ export const ScriptEditor = ({ isOpen, onClose, onSave, initialData }: ScriptEdi
       else if (type.includes('_create') || type.includes('_update')) newCode = DEFAULT_CODE.hook;
       else if (type.includes('_list_') || type.includes('_get_')) newCode = DEFAULT_CODE.filter;
       else if (type.includes('_request')) newCode = DEFAULT_CODE.traffic;
-      else newCode = DEFAULT_CODE.system;
+      else if (type.includes('_ai_run'))
+        newCode = DEFAULT_CODE.ai_hook; // Bind template
+      else newCode = TRIGGER_DOCS[type]?.template || DEFAULT_CODE.system;
     }
     setFormData({ ...formData, trigger_type: type, code: newCode });
   };

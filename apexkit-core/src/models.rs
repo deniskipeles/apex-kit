@@ -3,17 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 
-// --- ADD NEW MODELS ---
-
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DashboardStats {
-    pub total_requests: i64, // Based on audit logs count
+    pub total_requests: i64,
     pub db_size_mb: f64,
     pub collections_count: i64,
     pub total_records: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)] // Added Clone
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 pub struct ChartPoint {
     pub name: String,
     pub requests: i64,
@@ -27,15 +25,12 @@ pub struct DashboardData {
     pub recent_logs: Vec<serde_json::Value>,
 }
 
-/// Represents a generic Data Record (JSON document)
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct Record {
-    #[serde(skip_deserializing)] // ID is handled by DB on create
+    #[serde(skip_deserializing)]
     pub id: i64,
     #[schema(value_type = Object)]
     pub data: Value,
-    // Skip deserializing timestamps (Client doesn't send them)
-    // Use default value ("") when reading from JSON payload
     #[serde(skip_deserializing)]
     #[serde(default)]
     pub created: String,
@@ -46,14 +41,12 @@ pub struct Record {
     pub expand: Option<Value>,
 }
 
-/// Represents a Collection definition
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct Collection {
     #[serde(skip_deserializing)]
     pub id: i64,
     pub name: String,
     pub schema: Option<CollectionSchema>,
-    // Stable unique identifier for schema portability
     #[serde(default)]
     pub index: Option<String>,
 }
@@ -71,7 +64,6 @@ pub struct ChangesetEvent {
     pub changeset: Vec<u8>,
 }
 
-/// Represents a File uploaded to Storage
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct StoredFile {
     pub id: i64,
@@ -82,32 +74,29 @@ pub struct StoredFile {
     pub created_at: String,
 }
 
-/// Represents a Scheduled Background Task
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct CronJob {
     pub id: String,
     pub name: String,
-    pub schedule: String, // e.g. "0 0 * * *"
-    pub payload: String,  // URL path or command identifier
+    pub schedule: String,
+    pub payload: String,
     pub active: bool,
 }
 
-/// Represents a lightweight search hit (from Tantivy Index)
 #[derive(Serialize, ToSchema, Clone, Debug)]
 pub struct InstantResult {
     pub id: i64,
-    pub score: f32, // Relevance score
+    pub score: f32,
     #[schema(value_type = Object)]
-    pub snippet: serde_json::Value, // Stored fields only (Title, Name, etc.)
+    pub snippet: serde_json::Value,
 }
 
-// Templates
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct Template {
     pub id: i64,
-    pub slug: String,           // e.g. "chat-room" or "components/like-button"
-    pub content: String,        // The HTML/Tera code
-    pub script_id: Option<i64>, // The script that provides data for this template
+    pub slug: String,
+    pub content: String,
+    pub script_id: Option<i64>,
     pub created_at: String,
 }
 
@@ -117,8 +106,6 @@ pub struct CreateTemplateReq {
     pub content: String,
     pub script_id: Option<i64>,
 }
-
-// --- APP MANIFEST (AI Architect) ---
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct AppManifest {
@@ -136,27 +123,26 @@ pub struct ManifestCollection {
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ManifestScript {
-    pub name: String,         // e.g. "create-task"
-    pub trigger_type: String, // "manual", "before_create", etc.
-    pub code: String,         // JS Code
+    pub name: String,
+    pub trigger_type: String,
+    pub code: String,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ManifestTemplate {
-    pub slug: String,                  // e.g. "dashboard/tasks"
-    pub content: String,               // HTML + Tera
-    pub loader_script: Option<String>, // Name of script to run before rendering
+    pub slug: String,
+    pub content: String,
+    pub loader_script: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 pub struct ConfigItem {
     pub key: String,
-    pub value: Option<String>, // Masked if encrypted, otherwise the raw string
+    pub value: Option<String>,
     pub encrypted: bool,
     pub updated_at: String,
 }
 
-// Struct for returning raw vectors
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct VectorRecord {
     pub field_name: String,
@@ -164,15 +150,17 @@ pub struct VectorRecord {
     pub model: String,
 }
 
+// --- NEW COMPOSITE API KEY MODEL ---
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ApiKey {
     pub id: i64,
     pub name: String,
-    pub prefix: String, // First 8 chars for display
-    #[serde(skip_serializing)]
-    pub hash: String, // Hashed full key
-    pub role: String,   // Usually 'admin' or 'user'
-    pub scope: String,
+    pub tenant_id: String,
+    pub key_id: String,
+    pub issuer: String,
+    pub env_type: String, // 'sys', 'tnnt', 'sk', 'pk'
+    pub roles: Vec<String>,
+    pub status: String,
     pub bypass_cors: bool,
     pub created_at: String,
 }
@@ -203,7 +191,6 @@ pub struct SandboxMetadata {
     pub name: Option<String>,
     pub status: String,
     pub expires_at: Option<String>,
-    // [NEW] Added fields
     pub scope: String,
     pub tenant_id: Option<String>,
     pub current_storage_mb: f64,

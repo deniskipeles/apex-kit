@@ -88,13 +88,25 @@ export interface ApiToken {
 }
 
 export interface ApiKey {
+  // Common Identifier & Metadata
   id: string;
   name: string;
-  prefix: string;
-  role: string;
-  scope: string;
-  bypass_cors: string | boolean;
-  created: string;
+  created_at: string;
+
+  // New Scoped & Composite Fields
+  tenant_id: string;
+  key_id: string;
+  issuer: 'root' | 'tnt' | string;
+  env_type: 'sys' | 'tnnt' | 'sk' | 'pk' | string;
+  roles: string[];
+  status: 'active' | 'revoked' | string;
+  bypass_cors: boolean;
+
+  // Legacy Compatibility Fields
+  prefix?: string;
+  role?: string;
+  scope?: string;
+  created?: string;
 }
 
 export interface AIProvider {

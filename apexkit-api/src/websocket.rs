@@ -12,8 +12,8 @@ use axum::{
     response::IntoResponse,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
-use serde::Deserialize; // Removed unused Serialize
-use tracing::warn; // Removed debug
+use serde::Deserialize;
+use tracing::warn;
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct SubscriptionFilter {
@@ -41,6 +41,11 @@ pub struct SignalRequest {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct AuthRequest {
+    pub token: String,
+}
+
+#[derive(Deserialize, Debug)]
 #[serde(tag = "type", content = "payload")]
 pub enum ClientMessage {
     Subscribe(SubscriptionFilter),
@@ -48,6 +53,7 @@ pub enum ClientMessage {
     Ping,
     Search(SearchRequest),
     Signal(SignalRequest),
+    Auth(AuthRequest),
 }
 
 pub async fn websocket_handler(
@@ -76,6 +82,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
     let mut current_filter_node = FilterNode::Empty;
     let mut active_namespaced_channel: Option<String> = None;
 
+    // [ADDED] Hold authenticated claims in memory for this connection
+    let mut current_claims: Option<apexkit_core::auth::Claims> = None;
+
     loop {
         tokio::select! {
             client_msg = receiver.next() => {
@@ -84,8 +93,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                         match msg {
                             Message::Text(text) => {
                                 match serde_json::from_str::<ClientMessage>(&text) {
+                                    Ok(ClientMessage::Auth(req)) => {
+                                        // [ADDED] Decode and save the token
+                                        if let Ok(claims) = apexkit_core::auth::decode_jwt(&req.token) {
+                                            current_claims = Some(claims);
+                                            let _ = sender.send(Message::Text(serde_json::json!({ "type": "AuthSuccess" }).to_string().into())).await;
+                                        } else {
+                                            let _ = sender.send(Message::Text(serde_json::json!({ "type": "Error", "message": "Invalid token" }).to_string().into())).await;
+                                        }
+                                    },
                                     Ok(ClientMessage::Subscribe(filter)) => {
-                                        // Removed `mut` here since we don't modify filter
                                         if let Some(json) = &filter.filter {
                                             current_filter_node = FilterNode::parse(json);
                                         } else {
@@ -119,6 +136,20 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                     },
                                     Ok(ClientMessage::Search(req)) => {
                                         let limit = req.limit.unwrap_or(10).min(50);
+
+                                        // [ADDED] Check Access Control before executing search over WS
+                                        let mut allowed = false;
+                                        if let Ok(Some(col)) = state.db.get_collection(req.collection_id).await {
+                                            let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+                                            allowed = apexkit_core::policies::check_access(policy, current_claims.as_ref(), None);
+                                        }
+
+                                        if !allowed {
+                                            let err_resp = serde_json::json!({ "type": "Error", "request_id": req.request_id, "message": "Access denied" });
+                                            let _ = sender.send(Message::Text(err_resp.to_string().into())).await;
+                                            continue;
+                                        }
+
                                         match state.db.instant_search(req.collection_id, &req.query, limit).await {
                                             Ok(results) => {
                                                 let response = serde_json::json!({
@@ -147,9 +178,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
             }
             Ok(event) = rx.recv() => {
                 if matches_scope(&event, &client_scope, &active_namespaced_channel) && matches_filter(&event, &current_filter, &current_filter_node) {
-                    if let Ok(json_msg) = serde_json::to_string(&event) {
-                        if sender.send(Message::Text(json_msg.into())).await.is_err() {
-                            break;
+
+                    // [ADDED] Row-Level Security checks for Streaming Realtime Broadcasts
+                    let mut allowed = true;
+                    match &event {
+                        DbEvent::Insert { collection_id, data, .. } | DbEvent::Update { collection_id, data, .. } => {
+                            if let Ok(Some(col)) = state.db.get_collection(*collection_id).await {
+                                let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+                                allowed = apexkit_core::policies::check_access(policy, current_claims.as_ref(), Some(data));
+                            }
+                        }
+                        DbEvent::Delete { collection_id, .. } => {
+                            // On delete, we no longer have row data, check table-level base access
+                            if let Ok(Some(col)) = state.db.get_collection(*collection_id).await {
+                                let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+                                allowed = apexkit_core::policies::check_access(policy, current_claims.as_ref(), None);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    if allowed {
+                        if let Ok(json_msg) = serde_json::to_string(&event) {
+                            if sender.send(Message::Text(json_msg.into())).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
