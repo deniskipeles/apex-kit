@@ -3,8 +3,7 @@
  * Automatically handles Scope Routing (Tenant/Sandbox) and JWT Auth Injection.
  */
 (function() {
-    // [NEW] Prevent double initialization if injected multiple times
-    if (window.$apex) return;
+    if (window.$apex && window.$apex.collection) return;
 
     // 1. DYNAMIC SCOPE DETECTOR
     function getScopePrefix() {
@@ -21,12 +20,10 @@
         let resource = args[0];
         let config = args[1] || {};
 
-        // Auto-prefix URL
         if (typeof resource === 'string' && resource.startsWith('/') && !resource.startsWith(SCOPE_PREFIX)) {
             args[0] = SCOPE_PREFIX + resource;
         }
 
-        // Auto-inject Token
         const token = localStorage.getItem('apex_token');
         if (token) {
             config.headers = config.headers || {};
@@ -47,13 +44,11 @@
 
     // 3. HTMX INTERCEPTOR
     document.addEventListener('htmx:configRequest', function(evt) {
-        // A. Auto-inject the Token
         const token = localStorage.getItem('apex_token');
         if (token) {
             evt.detail.headers['Authorization'] = 'Bearer ' + token;
         }
 
-        // B. Auto-prefix the URL
         let path = evt.detail.path;
         if (path.startsWith('/') && !path.startsWith(SCOPE_PREFIX)) {
             evt.detail.path = SCOPE_PREFIX + path;
@@ -80,22 +75,126 @@
         logout: function(redirectPath = '/render/login') {
             localStorage.removeItem('apex_token');
             if (redirectPath) {
-                window.location.href = SCOPE_PREFIX + redirectPath;
+                this.redirect(redirectPath);
             }
         },
 
         getToken: () => localStorage.getItem('apex_token'),
         setToken: (t) => localStorage.setItem('apex_token', t),
+
+        // --- SMART REDIRECT ---
+        redirect: function(path) {
+            if (typeof path !== 'string') return;
+            if (path.startsWith('/') && !path.startsWith(this.scope)) {
+                window.location.href = this.scope + path;
+            } else {
+                window.location.href = path;
+            }
+        },
+
+        // --- DATA COLLECTIONS SDK ---
+        collection: function(collectionId) {
+            return {
+                list: async (options = {}) => {
+                    const params = new URLSearchParams(options);
+                    const res = await fetch(`/api/v1/collections/${collectionId}/records?${params.toString()}`);
+                    return res.json();
+                },
+                get: async (recordId, options = {}) => {
+                    const params = new URLSearchParams(options);
+                    const res = await fetch(`/api/v1/collections/${collectionId}/records/${recordId}?${params.toString()}`);
+                    return res.json();
+                },
+                create: async (data) => {
+                    const res = await fetch(`/api/v1/collections/${collectionId}/records`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ data })
+                    });
+                    return res.json();
+                },
+                update: async (recordId, data) => {
+                    const res = await fetch(`/api/v1/collections/${collectionId}/records/${recordId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ data })
+                    });
+                    return res.json();
+                },
+                delete: async (recordId) => {
+                    const res = await fetch(`/api/v1/collections/${collectionId}/records/${recordId}`, {
+                        method: 'DELETE'
+                    });
+                    return res.status === 204;
+                },
+                searchVector: async (field, vector, limit = 10) => {
+                    const res = await fetch(`/api/v1/collections/${collectionId}/search-vector`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ field, vector, limit })
+                    });
+                    return res.json();
+                },
+                getVector: async (recordId) => {
+                    const res = await fetch(`/api/v1/collections/${collectionId}/get-vector/${recordId}`);
+                    return res.json();
+                }
+            };
+        },
+
+        // --- FILES / STORAGE SDK ---
+        get files() {
+            const self = this;
+            return {
+                list: async (page = 1, perPage = 20) => {
+                    const res = await fetch(`/api/v1/storage/files?page=${page}&per_page=${perPage}`);
+                    return res.json();
+                },
+                upload: async (file) => {
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    const res = await fetch(`/api/v1/storage/upload`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    return res.json();
+                },
+                delete: async (id) => {
+                    const res = await fetch(`/api/v1/storage/files/${id}`, {
+                        method: 'DELETE'
+                    });
+                    return res.status === 204;
+                },
+                getFileUrl: (filename) => {
+                    if (filename.startsWith('http://') || filename.startsWith('https://')) {
+                        return filename;
+                    }
+                    const cleanName = filename.replace(/^\//, '');
+                    return `${window.location.origin}${self.scope}/api/v1/storage/file/${cleanName}`;
+                }
+            };
+        },
+
+        // --- AI ACTIONS RUNNER ---
+        get ai() {
+            return {
+                run: async (slug, variables) => {
+                    const res = await fetch(`/api/v1/ai/run/${slug}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ variables })
+                    });
+                    return res.json();
+                }
+            };
+        }
     };
 
-    // 5. AUTO-REDIRECT ON UNAUTHORIZED (Optional but recommended)
-    // Listens for HTMX auth failures.
+    // 5. AUTO-REDIRECT ON UNAUTHORIZED
     document.addEventListener('htmx:responseError', function(evt) {
         if (evt.detail.xhr.status === 401) {
-            console.warn("[ApexKit] Unauthorized. Clearing token.");
-            localStorage.removeItem('apex_token');
-            // Trigger an event so the app can show a modal, or redirect automatically
-            window.dispatchEvent(new CustomEvent('apex:unauthorized'));
+            console.warn("[ApexKit] Session expired or unauthorized. Cleared token.");
+            window.$apex.logout('/render/login');
         }
     });
 })();

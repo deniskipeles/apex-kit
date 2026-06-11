@@ -210,7 +210,14 @@ pub enum AppError {
     InputValidation(validator::ValidationErrors),
     Unauthorized(String),
     Forbidden(String),
+    // --- NEW: DETAILED TEMPLATE RENDER ERROR ---
+    RenderError {
+        template: String,
+        error: String,
+        details: serde_json::Value,
+    },
 }
+
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
@@ -238,6 +245,16 @@ impl IntoResponse for AppError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Database Error: {}", e),
                 None,
+            ),
+            // Map the detailed RenderError to internal server error with JSON details
+            AppError::RenderError {
+                template,
+                error,
+                details,
+            } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Template Compilation Error on '{}': {}", template, error),
+                Some(details),
             ),
             AppError::UnknownError(m) => (StatusCode::INTERNAL_SERVER_ERROR, m, None),
         };

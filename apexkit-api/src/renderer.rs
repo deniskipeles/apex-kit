@@ -76,7 +76,7 @@ async fn render_view_core(
     source_label: &str,
     _base_url: Option<String>,
     scope: EventScope,
-    auth: Option<Claims>, // [NEW] Accept Auth Claims
+    auth: Option<Claims>,
 ) -> Result<Response, AppError> {
     info!(
         "[Renderer] Serving '{}' from source: {}",
@@ -95,7 +95,6 @@ async fn render_view_core(
 
     let is_htmx = headers.contains_key("HX-Request");
 
-    // [NEW] Inject Auth object into the JSON payload accessible by the SSR script
     let mut context_data = json!({
         "params": params,
         "headers": headers_to_map(&headers),
@@ -142,7 +141,6 @@ async fn render_view_core(
                 .await
                 .map_err(|e| AppError::UnknownError(format!("Linked Script Error: {}", e)))?;
 
-            // If the script returns an error response object (e.g. { error: "unauthorized" }), forward it
             if let Some(obj) = script_res.as_object() {
                 if obj.contains_key("error") && obj.contains_key("status") {
                     let status = StatusCode::from_u16(
@@ -171,7 +169,6 @@ async fn render_view_core(
             .await
             .map_err(|e| AppError::UnknownError(format!("Template JS Error: {}", e)))?;
 
-        // Handle explicit Responses (e.g. redirect or unauthorized)
         if let Some(obj) = script_res.as_object() {
             if obj.contains_key("error") && obj.contains_key("status") {
                 let status =
@@ -192,7 +189,6 @@ async fn render_view_core(
     };
     register_helpers(&mut tera);
 
-    // 4. STRIP SSR AND LOAD TERA
     let template_vec: Vec<(String, String)> = all_templates
         .iter()
         .map(|t| {
@@ -201,6 +197,9 @@ async fn render_view_core(
         })
         .collect();
 
+    // Replace the rendering and fallback compilation blocks inside render_view_core:
+
+    // A. RESILIENT FALLBACK COMPILATION ERROR HANDLING
     if let Err(e) = tera.add_raw_templates(template_vec.clone()) {
         warn!(
             "Batch template load failed: {}. Switching to resilient loading.",
@@ -233,26 +232,50 @@ async fn render_view_core(
         if pending.iter().any(|(s, _)| s == &slug) {
             if let Some((_, content)) = pending.iter().find(|(s, _)| s == &slug) {
                 if let Err(err) = tera.add_raw_template(&slug, content) {
-                    return Err(AppError::UnknownError(format!(
-                        "Template Compilation Error ('{}'): {}",
-                        slug, err
-                    )));
+                    // Extract compilation errors
+                    let mut chain = vec![err.to_string()];
+                    let mut current: &dyn std::error::Error = &err;
+                    while let Some(source) = current.source() {
+                        chain.push(source.to_string());
+                        current = source;
+                    }
+                    return Err(AppError::RenderError {
+                        template: slug.clone(),
+                        error: err.to_string(),
+                        details: serde_json::json!(chain),
+                    });
                 }
             }
         }
     }
 
-    // 5. RENDER HTML
+    // B. RUNTIME RENDERING ERROR HANDLING
     let context = tera::Context::from_value(context_data)
         .map_err(|e| AppError::UnknownError(format!("Context Error: {}", e)))?;
 
-    let mut rendered = tera
-        .render(&slug, &context)
-        .map_err(|e| AppError::UnknownError(format!("Render Error: {}", e)))?;
+    let mut rendered = tera.render(&slug, &context).map_err(|e| {
+        // Recursively extract the exact stack trace and line numbers
+        let mut chain = vec![e.to_string()];
+        let mut current: &dyn std::error::Error = &e;
+        while let Some(source) = current.source() {
+            chain.push(source.to_string());
+            current = source;
+        }
+        AppError::RenderError {
+            template: slug.clone(),
+            error: e.to_string(),
+            details: serde_json::json!(chain),
+        }
+    })?;
 
-    // --- [NEW] AUTO-INJECT APEX.JS ---
-    // We only inject if it's a full HTML document (contains </head> or </body>).
-    // This prevents injecting it multiple times into small HTMX partials.
+    // // 4. RENDER HTML
+    // let context = tera::Context::from_value(context_data)
+    //     .map_err(|e| AppError::UnknownError(format!("Context Error: {}", e)))?;
+
+    // let mut rendered = tera
+    //     .render(&slug, &context)
+    //     .map_err(|e| AppError::UnknownError(format!("Render Error: {}", e)))?;
+
     if !rendered.contains("apex.js") {
         let script_tag = "\n    <script src=\"/static/js/apex.js\"></script>";
         if rendered.contains("</head>") {
@@ -262,6 +285,45 @@ async fn render_view_core(
         } else if rendered.to_lowercase().contains("<html") {
             rendered.push_str(script_tag);
         }
+    }
+
+    // --- NEW: DYNAMIC PATH-BASED SCOPE REWRITING ---
+    let mut scope_prefix = String::new();
+    let root_domain = std::env::var("APEX_ROOT_DOMAIN").unwrap_or_default();
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    // Path-based routing is required if Host matches the Root Domain
+    let is_path_routing = match &scope {
+        EventScope::Tenant(_) | EventScope::Sandbox(_) => {
+            root_domain.is_empty() || host.contains(&root_domain)
+        }
+        _ => false,
+    };
+
+    if is_path_routing {
+        scope_prefix = match &scope {
+            EventScope::Tenant(id) => format!("/tenant/{}", id),
+            EventScope::Sandbox(id) => format!("/sandbox/{}", id),
+            _ => "".to_string(),
+        };
+    }
+
+    if !scope_prefix.is_empty() {
+        // Rewrite "/render/" links recursively to prepends scope prefix
+        let re_links = Regex::new(
+            r#"(href|action|hx-get|hx-post|hx-put|hx-patch|hx-delete)="(/render/[^"]*)""#,
+        )
+        .unwrap();
+        rendered = re_links
+            .replace_all(&rendered, |caps: &regex::Captures| {
+                let attr = &caps[1];
+                let path = &caps[2];
+                format!("{}=\"{}{}\"", attr, scope_prefix, path)
+            })
+            .to_string();
     }
 
     Ok(Html(rendered).into_response())

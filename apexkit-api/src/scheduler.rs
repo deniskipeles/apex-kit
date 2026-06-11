@@ -147,16 +147,32 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
                     if let Some(next_run) = schedule.after(&one_min_ago).next() {
                         if next_run <= now {
                             // Check lock before triggering backup
-                            let lock_key = format!("backup_lock:{}:{}:{}", context_id, config.schedule, minute_stamp);
+                            let lock_key = format!(
+                                "backup_lock:{}:{}:{}",
+                                context_id, config.schedule, minute_stamp
+                            );
                             if state.root_script_cache.get(&lock_key).await.is_none() {
-                                state.root_script_cache.insert(lock_key, "1".to_string()).await;
+                                state
+                                    .root_script_cache
+                                    .insert(lock_key, "1".to_string())
+                                    .await;
 
-                                tracing::info!("[Scheduler] Triggering scheduled backup for {:?}", scope);
+                                tracing::info!(
+                                    "[Scheduler] Triggering scheduled backup for {:?}",
+                                    scope
+                                );
                                 let db_clone = db.clone();
                                 let vault_clone = state.vault.clone();
                                 let scope_clone = scope.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = crate::backup::perform_backup(db_clone, vault_clone, config, scope_clone).await {
+                                    if let Err(e) = crate::backup::perform_backup(
+                                        db_clone,
+                                        vault_clone,
+                                        config,
+                                        scope_clone,
+                                    )
+                                    .await
+                                    {
                                         tracing::error!("[Scheduler] Backup failed: {}", e);
                                     }
                                 });
@@ -164,7 +180,10 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
                         }
                     }
                 } else {
-                    tracing::warn!("[Scheduler] Invalid backup cron schedule: {}", config.schedule);
+                    tracing::warn!(
+                        "[Scheduler] Invalid backup cron schedule: {}",
+                        config.schedule
+                    );
                 }
             }
         }
@@ -175,7 +194,6 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
 
     if let Some(val) = cron_setting {
         if let Ok(jobs) = serde_json::from_value::<Vec<CronJob>>(val) {
-            
             // --- RATE LIMIT CHECK (Tenants/Sandboxes Only) ---
             if !matches!(scope, EventScope::Root) {
                 let max_crons = std::env::var("TENANT_MAX_CRONS")
@@ -224,12 +242,17 @@ async fn process_context_crons(state: AppState, context_id: String, scope: Event
                     if let Some(next_run) = schedule.after(&one_min_ago).next() {
                         if next_run <= now {
                             // Check lock before executing script
-                            let lock_key = format!("cron_lock:{}:{}:{}", context_id, job.id, minute_stamp);
+                            let lock_key =
+                                format!("cron_lock:{}:{}:{}", context_id, job.id, minute_stamp);
                             if state.root_script_cache.get(&lock_key).await.is_none() {
-                                state.root_script_cache.insert(lock_key, "1".to_string()).await;
+                                state
+                                    .root_script_cache
+                                    .insert(lock_key, "1".to_string())
+                                    .await;
 
                                 // Execute
-                                execute_job(&state, db.clone(), &context_id, &job, scope.clone()).await;
+                                execute_job(&state, db.clone(), &context_id, &job, scope.clone())
+                                    .await;
                                 jobs_run += 1;
                             }
                         }

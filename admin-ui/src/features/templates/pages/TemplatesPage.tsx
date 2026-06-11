@@ -54,6 +54,20 @@ export const TemplatesPage = () => {
     loadTemplates();
   };
 
+  // --- DYNAMIC RENDERING PATH RESOLVER ---
+  const getRenderUrl = (slug: string) => {
+    const path = window.location.pathname;
+    const tenantMatch = path.match(/^\/_dashboard\/tenant\/([^/]+)/);
+    if (tenantMatch) {
+        return `${APP_CONFIG.apiBaseUrl}/tenant/${tenantMatch[1]}/render/${slug}`;
+    }
+    const sandboxMatch = path.match(/^\/_dashboard\/sandbox\/([^/]+)/);
+    if (sandboxMatch) {
+        return `${APP_CONFIG.apiBaseUrl}/sandbox/${sandboxMatch[1]}/render/${slug}`;
+    }
+    return `${APP_CONFIG.apiBaseUrl}/render/${slug}`;
+  };
+
   const columns = [
     {
       field: 'slug',
@@ -82,7 +96,7 @@ export const TemplatesPage = () => {
       width: '150px',
       renderCell: (t: Template) => (
         <div className="flex justify-end gap-1">
-          <a href={`${APP_CONFIG.apiBaseUrl}/render/${t.slug}`} target="_blank" rel="noreferrer">
+          <a href={getRenderUrl(t.slug)} target="_blank" rel="noreferrer">
             <Button size="icon" variant="ghost" title="View Rendered">
               <ExternalLink className="h-4 w-4 text-muted-foreground" />
             </Button>
@@ -90,7 +104,7 @@ export const TemplatesPage = () => {
           <Button
             size="icon"
             variant="ghost"
-            onClick={(e) => {
+            onClick={(e:any) => {
               e.stopPropagation();
               setSelectedTemplate(t);
               setEditorOpen(true);
@@ -101,7 +115,7 @@ export const TemplatesPage = () => {
           <Button
             size="icon"
             variant="ghost"
-            onClick={(e) => {
+            onClick={(e:any) => {
               e.stopPropagation();
               setDeleteId(t.id);
             }}
