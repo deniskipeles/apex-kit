@@ -1,7 +1,9 @@
 use apex_vector::{CandleEmbedder, VectorIndex};
 use apexkit_core::batching::WriteForwarder;
 use apexkit_core::cache::CachedDb;
-use apexkit_core::models::ChangesetEvent;
+use apexkit_core::models::{self, ChangesetEvent};
+use apexkit_core::realtime::EventScope;
+use apexkit_core::script_models;
 use apexkit_core::search::SearchManager;
 use apexkit_core::{ApexKit, Db, VectorProvider, query::QueryOptions, schema::FieldType};
 use moka::future::Cache;
@@ -20,7 +22,13 @@ pub enum CloneStrategy {
     None,           // Spin up empty
     SchemaOnly,     // Clone collections and schema, no data
     Partial(usize), // Clone schema and N records per collection
-    Full,           // Clone schema and all records
+    Full,           // Clone schema and all records via direct DB file copy
+    Selected {
+        collections: Vec<String>,
+        scripts: Vec<String>,
+        templates: Vec<String>,
+        record_limit: Option<usize>,
+    },
 }
 
 // --- 1. Context Container ---
@@ -97,6 +105,21 @@ pub struct SandboxManager {
     event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>,
 }
 
+// Helper function to recursively copy files & folders
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 impl SandboxManager {
     pub fn new(
         shared_embedder: Option<Arc<CandleEmbedder>>,
@@ -128,7 +151,8 @@ impl SandboxManager {
         &self,
         session_id: &str,
         strategy: CloneStrategy,
-        source_db: Arc<dyn Db>,
+        parent_db: Arc<dyn Db>,
+        parent_scope: EventScope,
     ) -> Result<Arc<dyn Db>, String> {
         let sandbox_dir = format!("storage/sandboxes/session_{}", session_id);
 
@@ -137,19 +161,56 @@ impl SandboxManager {
         }
         fs::create_dir_all(&sandbox_dir).map_err(|e| e.to_string())?;
 
-        // 1. Always start with a fresh, empty set of DB files for the sandbox.
-        // We will programmatically copy data instead of filesystem copy.
+        // Determine parent directory path based on scope
+        let parent_dir = match &parent_scope {
+            EventScope::Root => "storage/system".to_string(),
+            EventScope::Tenant(id) => format!("storage/tenants/{}", id),
+            EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}", id),
+            _ => "storage/system".to_string(),
+        };
+
+        // --- 1. FULL CLONE: FAST PHYSICAL FILE COPY (Excluding logs and vectors) ---
+        if let CloneStrategy::Full = strategy {
+            info!(
+                "Performing fast physical Full Clone for sandbox '{}'...",
+                session_id
+            );
+            let dbs_to_copy = vec!["core.db", "data.db", "system.db"];
+            for db_file in dbs_to_copy {
+                let src_path = Path::new(&parent_dir).join(db_file);
+                let dest_path = Path::new(&sandbox_dir).join(db_file);
+                if src_path.exists() {
+                    fs::copy(&src_path, &dest_path)
+                        .map_err(|e| format!("Failed to copy {}: {}", db_file, e))?;
+                }
+            }
+
+            // Copy uploads and public directories if they exist
+            let dirs_to_copy = vec!["uploads", "public"];
+            for dir in dirs_to_copy {
+                let src_path = Path::new(&parent_dir).join(dir);
+                let dest_path = Path::new(&sandbox_dir).join(dir);
+                if src_path.exists() {
+                    let _ = copy_dir_recursive(&src_path, &dest_path);
+                }
+            }
+
+            // Return the database immediately (HNSW vector index starts empty)
+            return self.get_sandbox(session_id).await;
+        }
+
+        // --- 2. OTHER CLONE STRATEGIES: PROVISION EMPTY & CLONE PROGRAMMATICALLY ---
         let sandbox_db = self.init_empty_sandbox_db(session_id).await?;
 
-        // 2. Based on strategy, spawn a background task to clone data.
-        // This makes the UI responsive immediately.
         let session_id_clone = session_id.to_string();
+        let strategy_clone = strategy.clone();
         tokio::spawn(async move {
             info!(
-                "Spawning background clone task for sandbox '{}' with strategy: {:?}",
-                session_id_clone, strategy
+                "Spawning background clone task for sandbox '{}'...",
+                session_id_clone
             );
-            if let Err(e) = Self::clone_data_to_sandbox(source_db, sandbox_db, strategy).await {
+            if let Err(e) = Self::clone_data_to_sandbox(parent_db, sandbox_db, strategy_clone).await
+            {
                 warn!(
                     "Sandbox clone task for '{}' failed: {}",
                     session_id_clone, e
@@ -162,7 +223,6 @@ impl SandboxManager {
             }
         });
 
-        // 3. Return the (initially empty) sandbox DB handle immediately.
         self.get_sandbox(session_id).await
     }
 
@@ -198,84 +258,130 @@ impl SandboxManager {
         sandbox_db: Arc<dyn Db>,
         strategy: CloneStrategy,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        match strategy {
-            CloneStrategy::None => Ok(()),
-            CloneStrategy::SchemaOnly | CloneStrategy::Partial(_) | CloneStrategy::Full => {
-                // 1. Clone Schema
+        let (target_collections, target_scripts, target_templates, record_limit) = match strategy {
+            CloneStrategy::None | CloneStrategy::Full => return Ok(()),
+            CloneStrategy::SchemaOnly => {
                 let collections = source_db.list_collections().await?;
-                // Map Name -> ID for quick lookup during dependency resolution
-                let mut col_name_map = std::collections::HashMap::new();
+                (collections, vec![], vec![], Some(0))
+            }
+            CloneStrategy::Partial(limit) => {
+                let collections = source_db.list_collections().await?;
+                let scripts = source_db.list_scripts().await?;
+                let templates = source_db.list_templates().await?;
+                (collections, scripts, templates, Some(limit))
+            }
+            CloneStrategy::Selected {
+                collections: sel_cols,
+                scripts: sel_scrs,
+                templates: sel_tmpls,
+                record_limit,
+            } => {
+                let collections = source_db.list_collections().await?;
+                let scripts = source_db.list_scripts().await?;
+                let templates = source_db.list_templates().await?;
 
-                for col in &collections {
-                    let new_id = sandbox_db
-                        .create_collection(&col.name, &col.schema, col.index.clone())
-                        .await?;
-                    col_name_map.insert(col.name.clone(), new_id);
-                }
+                let filtered_cols = collections
+                    .into_iter()
+                    .filter(|c| sel_cols.contains(&c.name) || sel_cols.contains(&c.id.to_string()))
+                    .collect();
+                let filtered_scrs = scripts
+                    .into_iter()
+                    .filter(|s| sel_scrs.contains(&s.name) || sel_scrs.contains(&s.id.to_string()))
+                    .collect();
+                let filtered_tmpls = templates
+                    .into_iter()
+                    .filter(|t| {
+                        sel_tmpls.contains(&t.slug) || sel_tmpls.contains(&t.id.to_string())
+                    })
+                    .collect();
+                (filtered_cols, filtered_scrs, filtered_tmpls, record_limit)
+            }
+        };
 
-                if let CloneStrategy::SchemaOnly = strategy {
-                    return Ok(());
-                }
+        // Map Name -> ID for quick lookup during dependency resolution
+        let mut col_name_map = std::collections::HashMap::new();
 
-                // 2. Clone Records
-                let record_limit = if let CloneStrategy::Partial(limit) = strategy {
-                    Some(limit as u64)
-                } else {
-                    None
+        // 1. Create Collections & Schemas
+        for col in &target_collections {
+            let new_id = sandbox_db
+                .create_collection(&col.name, &col.schema, col.index.clone())
+                .await?;
+            col_name_map.insert(col.name.clone(), new_id);
+        }
+
+        // 2. Deploy selected Scripts
+        for script in target_scripts {
+            let _ = sandbox_db
+                .create_script(script_models::CreateScriptReq {
+                    name: script.name,
+                    trigger_type: script.trigger_type,
+                    target_collection: script.target_collection,
+                    code: script.code,
+                    active: script.active,
+                    visibility: script.visibility,
+                })
+                .await?;
+        }
+
+        // 3. Deploy selected Templates
+        for tmpl in target_templates {
+            let _ = sandbox_db
+                .create_template(models::CreateTemplateReq {
+                    slug: tmpl.slug,
+                    content: tmpl.content,
+                    script_id: tmpl.script_id,
+                })
+                .await?;
+        }
+
+        // 4. Clone Records if needed
+        if let Some(limit) = record_limit {
+            if limit == 0 {
+                return Ok(());
+            }
+
+            let copied_tracker = Arc::new(Mutex::new(HashSet::new()));
+
+            for col in &target_collections {
+                let opts = QueryOptions {
+                    limit: Some(limit as u64),
+                    per_page: Some(limit as u64),
+                    ..Default::default()
                 };
 
-                // Track copied IDs to prevent duplicates and circular loops
-                // Key: "collection_id:record_id" or "user:id"
-                let copied_tracker = Arc::new(Mutex::new(HashSet::new()));
+                let result = source_db.list_records(col.id, opts).await?;
 
-                for col in &collections {
-                    let opts = QueryOptions {
-                        limit: record_limit,
-                        per_page: record_limit,
-                        ..Default::default()
-                    };
+                for record in result.items {
+                    let target_col_id = *col_name_map.get(&col.name).unwrap_or(&col.id);
+                    let track_key = format!("{}:{}", target_col_id, record.id);
+                    let tracker = copied_tracker.lock().await;
 
-                    let result = source_db.list_records(col.id, opts).await?;
+                    if !tracker.contains(&track_key) {
+                        drop(tracker);
 
-                    for record in result.items {
-                        // A. Insert the main record
-                        let target_col_id = *col_name_map.get(&col.name).unwrap_or(&col.id);
+                        // Resolve Dependencies recursively
+                        Self::resolve_dependencies(
+                            source_db.clone(),
+                            sandbox_db.clone(),
+                            &record.data,
+                            &col.schema.as_ref().unwrap(),
+                            &col_name_map,
+                            copied_tracker.clone(),
+                        )
+                        .await?;
 
-                        let track_key = format!("{}:{}", target_col_id, record.id);
-                        let tracker = copied_tracker.lock().await;
-
-                        if !tracker.contains(&track_key) {
-                            drop(tracker);
-
-                            // 1. Resolve Dependencies recursively
-                            Self::resolve_dependencies(
-                                source_db.clone(),
-                                sandbox_db.clone(),
-                                &record.data,
-                                &col.schema.as_ref().unwrap(),
-                                &col_name_map,
-                                copied_tracker.clone(),
-                            )
+                        // Insert record preserving ID
+                        let _ = sandbox_db
+                            .import_record(target_col_id, record.id, &record.data)
                             .await?;
 
-                            // 2. Insert record WITH ID PRESERVED
-                            // [UPDATED] Use import_record
-                            let _ = sandbox_db
-                                .import_record(
-                                    target_col_id,
-                                    record.id, // Explicit ID
-                                    &record.data,
-                                )
-                                .await?;
-
-                            let mut t = copied_tracker.lock().await;
-                            t.insert(track_key);
-                        }
+                        let mut t = copied_tracker.lock().await;
+                        t.insert(track_key);
                     }
                 }
-                Ok(())
             }
         }
+        Ok(())
     }
 
     // [NEW] Helper to scan a record and pull in its dependencies

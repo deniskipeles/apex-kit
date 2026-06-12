@@ -931,9 +931,10 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
         let sm = self.state.sandbox_manager.clone();
         let db = self.state.db.clone();
+        let scope = self.scope.clone();
         Box::pin(async move {
             // Default strategy for script creation
-            sm.create_sandbox(&id, sandbox_manager::CloneStrategy::None, db)
+            sm.create_sandbox(&id, sandbox_manager::CloneStrategy::None, db, scope)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())

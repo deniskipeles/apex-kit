@@ -376,13 +376,25 @@ export const apiClient = {
 
     // [NEW] Scoped Sandbox Management (Parent Context)
     listSandboxes: async () => await pb.admins.listSandboxes(),
-    createSandbox: async (data: any) =>
-      await pb.admins.createSandbox(
+    createSandbox: (data: {
+      name: string;
+      clone_strategy: string;
+      clone_record_limit?: number;
+      model?: string;
+      initial_prompt?: string;
+      collections?: string[];
+      scripts?: string[];
+      templates?: string[];
+    }) =>
+      pb.admins.createSandbox(
         data.name,
         data.clone_strategy,
         data.clone_record_limit,
         data.model,
-        data.initial_prompt
+        data.initial_prompt,
+        data.collections,
+        data.scripts,
+        data.templates
       ),
     deleteSandbox: async (id: string): Promise<void> => {
       let baseUrl = apiUrl;

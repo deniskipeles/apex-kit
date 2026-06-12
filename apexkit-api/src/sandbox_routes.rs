@@ -16,6 +16,9 @@ pub struct CreateSandboxReq {
     pub clone_record_limit: Option<usize>,
     pub model: Option<String>,
     pub initial_prompt: Option<String>,
+    pub collections: Option<Vec<String>>,
+    pub scripts: Option<Vec<String>>,
+    pub templates: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema, utoipa::IntoParams)]
@@ -33,14 +36,13 @@ pub struct SandboxPathParams {
 pub async fn create_sandbox_handler(
     Extension(claims): Extension<Claims>,
     State(state): State<AppState>,
-    scope: Option<Extension<EventScope>>, // [RESTORED] Determine workspace context from URL path
+    scope: Option<Extension<EventScope>>,
     Json(req): Json<CreateSandboxReq>,
 ) -> Result<Json<SandboxMetadata>, AppError> {
     if claims.role != "admin" {
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // 1. Assign ownership based on the active workspace (Tenant vs Root)
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     let tenant_id = crate::get_tenant_id_from_scope(Some(&event_scope));
     let scope_str = if tenant_id.is_some() {
@@ -49,7 +51,6 @@ pub async fn create_sandbox_handler(
         "root"
     };
 
-    // 2. Resolve the PARENT Database
     let parent_db = if let Some(tid) = &tenant_id {
         state
             .tenant_manager
@@ -66,10 +67,15 @@ pub async fn create_sandbox_handler(
         "schema" => CloneStrategy::SchemaOnly,
         "partial" => CloneStrategy::Partial(req.clone_record_limit.unwrap_or(100)),
         "full" => CloneStrategy::Full,
+        "selected" => CloneStrategy::Selected {
+            collections: req.collections.unwrap_or_default(),
+            scripts: req.scripts.unwrap_or_default(),
+            templates: req.templates.unwrap_or_default(),
+            record_limit: req.clone_record_limit,
+        },
         _ => CloneStrategy::None,
     };
 
-    // 3. Enforce Quotas
     let existing = state
         .db
         .list_sandboxes(tenant_id.clone())
@@ -86,7 +92,7 @@ pub async fn create_sandbox_handler(
 
     state
         .sandbox_manager
-        .create_sandbox(&id, strategy, parent_db)
+        .create_sandbox(&id, strategy, parent_db, event_scope.clone())
         .await
         .map_err(|e| AppError::UnknownError(e))?;
 

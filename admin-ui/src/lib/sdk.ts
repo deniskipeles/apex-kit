@@ -631,7 +631,10 @@ export class ApexKit {
         cloneStrategy: string,
         cloneRecordLimit?: number,
         model?: string,
-        initialPrompt?: string
+        initialPrompt?: string,
+        collections?: string[],
+        scripts?: string[],
+        templates?: string[]
       ) =>
         this._request<SandboxMetadata>('/admin/sandboxes', {
           method: 'POST',
@@ -641,6 +644,9 @@ export class ApexKit {
             clone_record_limit: cloneRecordLimit,
             model,
             initial_prompt: initialPrompt,
+            collections,
+            scripts,
+            templates,
           },
         }),
       deleteSandbox: (id: string) => this._request(`/admin/sandboxes/${id}`, { method: 'DELETE' }),

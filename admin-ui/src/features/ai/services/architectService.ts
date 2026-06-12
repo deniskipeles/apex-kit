@@ -34,14 +34,20 @@ export const architectService = {
     initialPrompt?: string,
     model?: string,
     cloneStrategy?: string,
-    cloneRecordLimit?: number
+    cloneRecordLimit?: number,
+    collections?: string[],
+    scripts?: string[],
+    templates?: string[]
   ): Promise<any> => {
     return await apiClient.root.createSandbox({
       name,
-      clone_strategy: cloneStrategy,
+      clone_strategy: cloneStrategy || 'none',
       clone_record_limit: cloneRecordLimit,
       model,
       initial_prompt: initialPrompt,
+      collections,
+      scripts,
+      templates,
     });
   },
 

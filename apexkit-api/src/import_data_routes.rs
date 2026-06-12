@@ -70,6 +70,11 @@ fn infer_schema(data: &[Value]) -> CollectionSchema {
         // Scan up to 100 records for better type detection
         if let Some(obj) = record.as_object() {
             for (key, val) in obj {
+                // Ignore system keys to prevent creating custom fields named id or _id
+                if key == "id" || key == "_id" {
+                    continue;
+                }
+
                 let current_type = field_types.get(key);
 
                 let inferred_type = match val {
@@ -80,11 +85,9 @@ fn infer_schema(data: &[Value]) -> CollectionSchema {
                     Value::Null => continue, // Skip nulls, can't infer type
                 };
 
-                // Conflict resolution: If we thought it was String but see JSON, upgrade to JSON.
-                // If we thought it was Number but see String, upgrade to String.
+                // Conflict resolution: upgrade types based on observed data
                 if let Some(existing) = current_type {
                     if existing != &inferred_type {
-                        // Simple upgrade path: Number -> String -> Json
                         if *existing == FieldType::Number && inferred_type == FieldType::String {
                             field_types.insert(key.clone(), FieldType::String);
                         } else if *existing != FieldType::Json && inferred_type == FieldType::Json {
@@ -105,7 +108,7 @@ fn infer_schema(data: &[Value]) -> CollectionSchema {
             name.clone(),
             FieldDefinition {
                 r#type: r#type_clone.clone(),
-                required: false, // Imported data might be sparse
+                required: false,
                 ose_indexed: matches!(r#type_clone, FieldType::String | FieldType::Text),
                 sql_indexed: false,
                 auto: false,
@@ -328,9 +331,9 @@ pub async fn import_data_handler(
         id
     };
 
-    // 5. Bulk Insert via `create_record` (High Concurrency Stress Test)
     // We execute 500 insertions in parallel. This fills the WriteManager buffer,
     // forcing it to commit batches instead of individual rows.
+    // 5. Bulk Insert via create_record / import_record (High Concurrency)
     let start_time = std::time::Instant::now();
 
     let records_imported = stream::iter(parsed_records)
@@ -338,13 +341,38 @@ pub async fn import_data_handler(
             let db = db.clone();
             async move {
                 if record_data.is_object() {
-                    // Standard API call
-                    match db.create_record(collection_id, &record_data).await {
-                        Ok(_) => 1,
-                        Err(e) => {
-                            error!("Insert failed: {}", e);
-                            0
+                    let mut data_to_save = record_data.clone();
+                    let mut explicit_id = None;
+
+                    // Safely extract and strip "id" or "_id" to treat as the primary key
+                    if let Some(obj) = data_to_save.as_object_mut() {
+                        if let Some(id_val) = obj.remove("id").or_else(|| obj.remove("_id")) {
+                            if let Some(id_num) = id_val
+                                .as_i64()
+                                .or_else(|| id_val.as_str().and_then(|s| s.parse::<i64>().ok()))
+                            {
+                                explicit_id = Some(id_num);
+                            }
                         }
+                    }
+
+                    match explicit_id {
+                        Some(rid) => {
+                            match db.import_record(collection_id, rid, &data_to_save).await {
+                                Ok(_) => 1,
+                                Err(e) => {
+                                    error!("Import failed for record ID {}: {}", rid, e);
+                                    0
+                                }
+                            }
+                        }
+                        None => match db.create_record(collection_id, &data_to_save).await {
+                            Ok(_) => 1,
+                            Err(e) => {
+                                error!("Insert failed: {}", e);
+                                0
+                            }
+                        },
                     }
                 } else {
                     0

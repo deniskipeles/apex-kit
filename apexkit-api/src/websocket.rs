@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::{resolve_collection_by_id_or_name, resolve_db_from_scope};
 use apexkit_core::{
     filter::FilterNode,
     realtime::{DbEvent, EventScope},
@@ -17,7 +18,7 @@ use tracing::warn;
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct SubscriptionFilter {
-    pub collection_id: Option<i64>,
+    pub collection_id: Option<serde_json::Value>, // Accepts String (Name/ID) or Number (ID)
     pub record_id: Option<i64>,
     pub event_type: Option<String>,
     pub filter: Option<serde_json::Value>,
@@ -27,7 +28,7 @@ pub struct SubscriptionFilter {
 
 #[derive(Deserialize, Debug)]
 pub struct SearchRequest {
-    pub collection_id: i64,
+    pub collection_id: serde_json::Value, // Accepts String (Name/ID) or Number (ID)
     pub query: String,
     pub limit: Option<usize>,
     pub request_id: Option<String>,
@@ -81,8 +82,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
     let mut current_filter = SubscriptionFilter::default();
     let mut current_filter_node = FilterNode::Empty;
     let mut active_namespaced_channel: Option<String> = None;
+    let mut current_resolved_col_id: Option<i64> = None;
 
-    // [ADDED] Hold authenticated claims in memory for this connection
+    // Hold authenticated claims in memory for this connection
     let mut current_claims: Option<apexkit_core::auth::Claims> = None;
 
     loop {
@@ -94,7 +96,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                             Message::Text(text) => {
                                 match serde_json::from_str::<ClientMessage>(&text) {
                                     Ok(ClientMessage::Auth(req)) => {
-                                        // [ADDED] Decode and save the token
                                         if let Ok(claims) = apexkit_core::auth::decode_jwt(&req.token) {
                                             current_claims = Some(claims);
                                             let _ = sender.send(Message::Text(serde_json::json!({ "type": "AuthSuccess" }).to_string().into())).await;
@@ -115,6 +116,23 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                             active_namespaced_channel = None;
                                         }
 
+                                        // Resolve collection name or ID upon subscribing to optimize throughput
+                                        current_resolved_col_id = None;
+                                        if let Some(ref col_val) = filter.collection_id {
+                                            if let Ok(db) = resolve_db_from_scope(&state, &client_scope).await {
+                                                let identifier = match col_val {
+                                                    serde_json::Value::String(s) => s.clone(),
+                                                    serde_json::Value::Number(n) => n.to_string(),
+                                                    _ => "".to_string(),
+                                                };
+                                                if !identifier.is_empty() {
+                                                    if let Ok(col) = resolve_collection_by_id_or_name(&db, &identifier).await {
+                                                        current_resolved_col_id = Some(col.id);
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         current_filter = filter;
                                     },
                                     Ok(ClientMessage::Signal(req)) => {
@@ -130,6 +148,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                         current_filter = SubscriptionFilter::default();
                                         current_filter_node = FilterNode::Empty;
                                         active_namespaced_channel = None;
+                                        current_resolved_col_id = None;
                                     },
                                     Ok(ClientMessage::Ping) => {
                                         let _ = sender.send(Message::Text("Pong".into())).await;
@@ -137,20 +156,36 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                     Ok(ClientMessage::Search(req)) => {
                                         let limit = req.limit.unwrap_or(10).min(50);
 
-                                        // [ADDED] Check Access Control before executing search over WS
-                                        let mut allowed = false;
-                                        if let Ok(Some(col)) = state.db.get_collection(req.collection_id).await {
-                                            let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-                                            allowed = apexkit_core::policies::check_access(policy, current_claims.as_ref(), None);
+                                        let mut resolved_search_id = None;
+                                        if let Ok(db) = resolve_db_from_scope(&state, &client_scope).await {
+                                            let identifier = match &req.collection_id {
+                                                serde_json::Value::String(s) => s.clone(),
+                                                serde_json::Value::Number(n) => n.to_string(),
+                                                _ => "".to_string(),
+                                            };
+                                            if !identifier.is_empty() {
+                                                if let Ok(col) = resolve_collection_by_id_or_name(&db, &identifier).await {
+                                                    resolved_search_id = Some(col.id);
+                                                }
+                                            }
                                         }
 
-                                        if !allowed {
+                                        let mut allowed = false;
+                                        if let Some(col_id) = resolved_search_id {
+                                            if let Ok(Some(col)) = state.db.get_collection(col_id).await {
+                                                let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
+                                                allowed = apexkit_core::policies::check_access(policy, current_claims.as_ref(), None);
+                                            }
+                                        }
+
+                                        if !allowed || resolved_search_id.is_none() {
                                             let err_resp = serde_json::json!({ "type": "Error", "request_id": req.request_id, "message": "Access denied" });
                                             let _ = sender.send(Message::Text(err_resp.to_string().into())).await;
                                             continue;
                                         }
 
-                                        match state.db.instant_search(req.collection_id, &req.query, limit).await {
+                                        let col_id = resolved_search_id.unwrap();
+                                        match state.db.instant_search(col_id, &req.query, limit).await {
                                             Ok(results) => {
                                                 let response = serde_json::json!({
                                                     "type": "SearchResult",
@@ -177,9 +212,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                 }
             }
             Ok(event) = rx.recv() => {
-                if matches_scope(&event, &client_scope, &active_namespaced_channel) && matches_filter(&event, &current_filter, &current_filter_node) {
+                if matches_scope(&event, &client_scope, &active_namespaced_channel) && matches_filter(&event, &current_filter, &current_filter_node, current_resolved_col_id) {
 
-                    // [ADDED] Row-Level Security checks for Streaming Realtime Broadcasts
+                    // Row-Level Security checks for Streaming Realtime Broadcasts
                     let mut allowed = true;
                     match &event {
                         DbEvent::Insert { collection_id, data, .. } | DbEvent::Update { collection_id, data, .. } => {
@@ -189,7 +224,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                             }
                         }
                         DbEvent::Delete { collection_id, .. } => {
-                            // On delete, we no longer have row data, check table-level base access
                             if let Ok(Some(col)) = state.db.get_collection(*collection_id).await {
                                 let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
                                 allowed = apexkit_core::policies::check_access(policy, current_claims.as_ref(), None);
@@ -232,7 +266,12 @@ fn matches_scope(
     }
 }
 
-fn matches_filter(event: &DbEvent, filter: &SubscriptionFilter, filter_node: &FilterNode) -> bool {
+fn matches_filter(
+    event: &DbEvent,
+    filter: &SubscriptionFilter,
+    filter_node: &FilterNode,
+    resolved_col_id: Option<i64>,
+) -> bool {
     match event {
         DbEvent::Custom {
             event: evt_name,
@@ -261,6 +300,7 @@ fn matches_filter(event: &DbEvent, filter: &SubscriptionFilter, filter_node: &Fi
             Some(data),
             filter,
             filter_node,
+            resolved_col_id,
         ),
         DbEvent::Update {
             collection_id,
@@ -274,6 +314,7 @@ fn matches_filter(event: &DbEvent, filter: &SubscriptionFilter, filter_node: &Fi
             Some(data),
             filter,
             filter_node,
+            resolved_col_id,
         ),
         DbEvent::Delete {
             collection_id,
@@ -286,6 +327,7 @@ fn matches_filter(event: &DbEvent, filter: &SubscriptionFilter, filter_node: &Fi
             None,
             filter,
             filter_node,
+            resolved_col_id,
         ),
     }
 }
@@ -297,9 +339,10 @@ fn check_db_event(
     data: Option<&serde_json::Value>,
     filter: &SubscriptionFilter,
     node: &FilterNode,
+    resolved_col_id: Option<i64>,
 ) -> bool {
-    if let Some(req_col) = filter.collection_id {
-        if req_col != col_id {
+    if let Some(req_col_id) = resolved_col_id {
+        if req_col_id != col_id {
             return false;
         }
     }

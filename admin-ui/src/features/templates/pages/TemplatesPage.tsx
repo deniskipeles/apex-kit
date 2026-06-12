@@ -59,11 +59,11 @@ export const TemplatesPage = () => {
     const path = window.location.pathname;
     const tenantMatch = path.match(/^\/_dashboard\/tenant\/([^/]+)/);
     if (tenantMatch) {
-        return `${APP_CONFIG.apiBaseUrl}/tenant/${tenantMatch[1]}/render/${slug}`;
+      return `${APP_CONFIG.apiBaseUrl}/tenant/${tenantMatch[1]}/render/${slug}`;
     }
     const sandboxMatch = path.match(/^\/_dashboard\/sandbox\/([^/]+)/);
     if (sandboxMatch) {
-        return `${APP_CONFIG.apiBaseUrl}/sandbox/${sandboxMatch[1]}/render/${slug}`;
+      return `${APP_CONFIG.apiBaseUrl}/sandbox/${sandboxMatch[1]}/render/${slug}`;
     }
     return `${APP_CONFIG.apiBaseUrl}/render/${slug}`;
   };
@@ -104,7 +104,7 @@ export const TemplatesPage = () => {
           <Button
             size="icon"
             variant="ghost"
-            onClick={(e:any) => {
+            onClick={(e: any) => {
               e.stopPropagation();
               setSelectedTemplate(t);
               setEditorOpen(true);
@@ -115,7 +115,7 @@ export const TemplatesPage = () => {
           <Button
             size="icon"
             variant="ghost"
-            onClick={(e:any) => {
+            onClick={(e: any) => {
               e.stopPropagation();
               setDeleteId(t.id);
             }}

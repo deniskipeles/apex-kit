@@ -1544,9 +1544,10 @@ impl ApexKit {
 
         let mut final_data = data.clone();
 
-        // [FIX] Strip reserved frontend/framework fields to prevent double nesting inside 'data'
+        // Strip reserved frontend/framework fields to prevent double nesting inside 'data'
         if let Some(obj) = final_data.as_object_mut() {
             obj.remove("id");
+            obj.remove("_id"); // Strips legacy and migrated mongo-style keys securely
             obj.remove("created");
             obj.remove("updated");
             obj.remove("expand");
@@ -2165,6 +2166,130 @@ impl Db for ApexKit {
                 .map_err(|e| {
                     Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
                 })?;
+
+            // --- EFFICIENT SQL MIGRATION FOR RENAMED & DELETED FIELDS ---
+            if let Some(old_s) = &old_schema {
+                // 1. Handle standard field renames within the JSON blob
+                for (new_name, new_def) in &s.fields {
+                    if let Some((old_name, _)) = old_s
+                        .fields
+                        .iter()
+                        .find(|(_, old_def)| old_def.uid == new_def.uid)
+                    {
+                        if old_name != new_name {
+                            let sql = format!(
+                                "UPDATE records SET data = json_remove(json_set(data, '$.{}', json_extract(data, '$.{}')), '$.{}') WHERE collection_id = ? AND json_type(data, '$.{}') IS NOT NULL",
+                                new_name, old_name, old_name, old_name
+                            );
+                            self.data_batcher
+                                .execute(sql, vec![id.into_val()])
+                                .await
+                                .map_err(|e| {
+                                    Box::new(std::io::Error::other(e))
+                                        as Box<dyn std::error::Error + Send + Sync>
+                                })?;
+                        }
+                    }
+                }
+
+                // 2. Handle relational field renames within the JSON blob AND linking table
+                for (new_name, new_def) in &s.relations {
+                    if let Some((old_name, _)) = old_s
+                        .relations
+                        .iter()
+                        .find(|(_, old_def)| old_def.uid == new_def.uid)
+                    {
+                        if old_name != new_name {
+                            // Update internal JSON record data
+                            let sql = format!(
+                                "UPDATE records SET data = json_remove(json_set(data, '$.{}', json_extract(data, '$.{}')), '$.{}') WHERE collection_id = ? AND json_type(data, '$.{}') IS NOT NULL",
+                                new_name, old_name, old_name, old_name
+                            );
+                            self.data_batcher
+                                .execute(sql, vec![id.into_val()])
+                                .await
+                                .map_err(|e| {
+                                    Box::new(std::io::Error::other(e))
+                                        as Box<dyn std::error::Error + Send + Sync>
+                                })?;
+
+                            // Update _relations SQL lookup table to maintain constraint mappings
+                            let rel_sql = format!(
+                                "UPDATE _relations SET rel_name = ? WHERE origin_col_id = ? AND rel_name = ?"
+                            );
+                            self.data_batcher
+                                .execute(
+                                    rel_sql,
+                                    vec![
+                                        new_name.clone().into_val(),
+                                        id.into_val(),
+                                        old_name.clone().into_val(),
+                                    ],
+                                )
+                                .await
+                                .map_err(|e| {
+                                    Box::new(std::io::Error::other(e))
+                                        as Box<dyn std::error::Error + Send + Sync>
+                                })?;
+                        }
+                    }
+                }
+
+                // 3. Handle Deleted Standard Fields (Remove from JSON)
+                for (old_name, old_def) in &old_s.fields {
+                    let still_exists = s.fields.values().any(|new_def| new_def.uid == old_def.uid);
+                    if !still_exists {
+                        let sql = format!(
+                            "UPDATE records SET data = json_remove(data, '$.{}') WHERE collection_id = ? AND json_type(data, '$.{}') IS NOT NULL",
+                            old_name, old_name
+                        );
+                        self.data_batcher
+                            .execute(sql, vec![id.into_val()])
+                            .await
+                            .map_err(|e| {
+                                Box::new(std::io::Error::other(e))
+                                    as Box<dyn std::error::Error + Send + Sync>
+                            })?;
+                    }
+                }
+
+                // 4. Handle Deleted Relations (Remove from JSON AND _relations linking table)
+                for (old_name, old_def) in &old_s.relations {
+                    let still_exists = s
+                        .relations
+                        .values()
+                        .any(|new_def| new_def.uid == old_def.uid);
+                    if !still_exists {
+                        // Remove from JSON
+                        let sql = format!(
+                            "UPDATE records SET data = json_remove(data, '$.{}') WHERE collection_id = ? AND json_type(data, '$.{}') IS NOT NULL",
+                            old_name, old_name
+                        );
+                        self.data_batcher
+                            .execute(sql, vec![id.into_val()])
+                            .await
+                            .map_err(|e| {
+                                Box::new(std::io::Error::other(e))
+                                    as Box<dyn std::error::Error + Send + Sync>
+                            })?;
+
+                        // Delete orphaned links in the relations table
+                        let rel_sql =
+                            "DELETE FROM _relations WHERE origin_col_id = ? AND rel_name = ?";
+                        self.data_batcher
+                            .execute(
+                                rel_sql.to_string(),
+                                vec![id.into_val(), old_name.clone().into_val()],
+                            )
+                            .await
+                            .map_err(|e| {
+                                Box::new(std::io::Error::other(e))
+                                    as Box<dyn std::error::Error + Send + Sync>
+                            })?;
+                    }
+                }
+            }
+            // --------------------------------------------------------------
 
             reconcile_sql_indexes(&self.data_batcher, id, s, old_schema.as_ref()).await?;
 
