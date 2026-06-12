@@ -23,4 +23,4 @@ dist-ssr
 *.sln
 *.sw?
 
-!src/features/sandboxes/components/CreateSandboxModal.tsx
+# !src/features/sandboxes/components/CreateSandboxModal.tsx
