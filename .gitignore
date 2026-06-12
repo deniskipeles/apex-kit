@@ -64,5 +64,6 @@ admin-ui/public
 static/dashboard/assets
 
 # Skip
+!admin-ui/src/features/sandboxes
+!admin-ui/src/features/sandboxes/components/CreateSandboxModal.tsx
 !admin-ui/src/features/sandboxes/pages/SandboxesListPage.tsx
-! admin-ui/src/features/sandboxes/components/CreateSandboxModal.tsx
