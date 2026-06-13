@@ -2413,7 +2413,7 @@ impl Db for ApexKit {
 
             let existing = {
                 // Keep json(data) on read to let SQLite's C-engine handle formatting
-                let mut stmt = conn.prepare("SELECT id, data, NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2")?;
+                let mut stmt = conn.prepare("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2")?;
                 let mut rows = stmt.query(rusqlite::params![collection_id, record_id])?;
                 if let Some(row) = rows.next()? { Some(row_to_record(row)?) } else { None }
             }.ok_or("Rec not found")?;
@@ -2621,7 +2621,7 @@ impl Db for ApexKit {
             let conn = self.get_data_read().await;
 
             if expand.is_none() || expand.as_ref().unwrap().trim().is_empty() {
-                let mut stmt = conn.prepare("SELECT id, data, NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2")?;
+                let mut stmt = conn.prepare("SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1 AND id = ?2")?;
                 let mut rows = stmt.query(rusqlite::params![collection_id, record_id])?;
                 match rows.next()? {
                     Some(row) => Some(row_to_record(row)?),
@@ -2673,7 +2673,7 @@ impl Db for ApexKit {
                 );
 
                 let sql = format!(
-                    "SELECT id, data, {}, created, updated FROM records WHERE collection_id = ?1 AND id = ?2",
+                    "SELECT id, json(data), {}, created, updated FROM records WHERE collection_id = ?1 AND id = ?2",
                     expand_json_sql
                 );
 
@@ -2714,7 +2714,7 @@ impl Db for ApexKit {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT id, data, NULL, created, updated FROM records WHERE id IN ({})",
+            "SELECT id, json(data), NULL, created, updated FROM records WHERE id IN ({})",
             id_list
         );
         let conn = self.get_data_read().await;
@@ -2845,7 +2845,7 @@ impl Db for ApexKit {
         let conn = self.get_data_read().await;
         let mut stmt = conn
             .prepare(
-                "SELECT id, data, NULL, created, updated FROM records WHERE collection_id = ?1",
+                "SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ?1",
             )
             .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
         let mut rows = stmt
@@ -4016,7 +4016,7 @@ impl Db for ApexKit {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT id, data, NULL, created, updated FROM records WHERE collection_id = ? AND id IN ({})",
+            "SELECT id, json(data), NULL, created, updated FROM records WHERE collection_id = ? AND id IN ({})",
             id_list
         );
         let conn = self.get_data_read().await;
