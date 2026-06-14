@@ -3622,16 +3622,18 @@ impl Db for ApexKit {
     }
     async fn create_ai_action(
         &self,
-        req: ai_models::CreateActionReq,
+        action: ai_models::CreateActionReq,
     ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let config_str = serde_json::to_string(&action.config.unwrap_or(serde_json::json!({})))?;
         let id = self.sys_batcher.insert(
-            "INSERT INTO _ai_actions (slug, name, model, system_prompt, template, config) VALUES (?1, ?2, ?3, ?4, ?5, '{}')".into(),
+            "INSERT INTO _ai_actions (slug, name, model, system_prompt, template, config) VALUES (?1, ?2, ?3, ?4, ?5, ?6)".into(),
             vec![
-                req.slug.into_val(), 
-                req.name.into_val(), 
-                req.model.into_val(), 
-                req.system_prompt.into_val(), 
-                req.template.into_val()
+                action.slug.into_val(), 
+                action.name.into_val(), 
+                action.model.into_val(), 
+                action.system_prompt.into_val(), 
+                action.template.into_val(),
+                config_str.into_val()
             ]
         ).await.map_err(|e| Box::new(std::io::Error::other(e)))?;
         Ok(id)
@@ -4336,6 +4338,7 @@ impl Db for ApexKit {
         let data_conn = self.get_data_read().await;
         let log_conn = self.get_log_read().await;
         let sys_conn = self.get_sys_read().await;
+        let vec_conn = self.get_vector_read().await;
 
         let mut stmt1 = data_conn.prepare("SELECT COUNT(*) FROM collections")?;
         let mut row1 = stmt1.query([])?;
@@ -4353,9 +4356,17 @@ impl Db for ApexKit {
             0
         };
 
+        let mut stmt3 = vec_conn.prepare("SELECT COUNT(*) FROM vectors")?;
+        let mut row3 = stmt3.query([])?;
+        let total_vectors: i64 = if let Some(r) = row3.next()? {
+            r.get(0)?
+        } else {
+            0
+        };
+
         let mut total_bytes: i64 = 0;
 
-        for conn in [&data_conn, &log_conn, &sys_conn] {
+        for conn in [&data_conn, &log_conn, &sys_conn, &vec_conn] {
             let mut stmt_c = conn.prepare("PRAGMA page_count")?;
             let mut p_count = stmt_c.query([])?;
             let count: i64 = if let Some(r) = p_count.next()? {
@@ -4376,6 +4387,15 @@ impl Db for ApexKit {
         }
 
         let db_size_mb = (total_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
+
+        let indexes_size_mb =
+            (calculate_dir_size(std::path::Path::new(&format!("{}/indexes", self.base_path)))
+                .unwrap_or(0) as f64
+                / 1024.0
+                / 1024.0
+                * 100.0)
+                .round()
+                / 100.0;
 
         let sql_chart = "
             SELECT 
@@ -4434,6 +4454,8 @@ impl Db for ApexKit {
                 db_size_mb,
                 collections_count,
                 total_records,
+                total_vectors,
+                indexes_size_mb,
             },
             chart: chart_data,
             recent_logs,

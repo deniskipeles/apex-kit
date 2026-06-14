@@ -9,7 +9,7 @@ use apexkit_core::{
 use axum::{Extension, Json, extract::State};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 
 // --- SYSTEM PROMPT ---
 const APEXKIT_DOCS_CORE: &str = r#"
@@ -68,6 +68,35 @@ RULES:
     `<script src="/static/js/alpine.js" defer></script>`
     `<script src="/static/js/apex.js"></script>`
     `<link rel="stylesheet" href="/styles.css">`
+
+JSON MANIFEST FORMAT:
+{
+  "app_name": "My App",
+  "collections": [
+    {
+      "name": "posts",
+      "schema": {
+        "fields": {
+          "title": { "type": "string", "required": true },
+          "content": { "type": "text", "required": false }
+        }
+      }
+    }
+  ],
+  "scripts": [
+    {
+      "name": "create-post",
+      "trigger_type": "manual",
+      "code": "export default async function(req) { ... }"
+    }
+  ],
+  "templates": [
+    {
+      "slug": "index.html",
+      "content": "<h1>Hello World</h1>"
+    }
+  ]
+}
 "#;
 
 // --- API HANDLERS ---
@@ -159,7 +188,8 @@ pub async fn apply_changes(
             content: "Changes applied to database.".into(),
         });
 
-        db.create_ai_session(&session)
+        // [FIXED]: Call update_ai_session instead of create_ai_session to prevent UNIQUE constraint errors
+        db.update_ai_session(&session)
             .await
             .map_err(|e| AppError::UnknownError(e.to_string()))?;
         Ok(Json(session))
@@ -196,20 +226,23 @@ pub async fn process_ai_chat(
     user_prompt: String,
     model: String,
 ) -> Result<Json<AiSession>, AppError> {
-    let mut session = sandbox_db
+    let existing_session = sandbox_db
         .get_ai_session(session_id)
         .await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?
-        .unwrap_or_else(|| AiSession {
-            id: session_id.into(),
-            name: "Architect".into(),
-            messages: vec![],
-            current_manifest: None,
-            pending_manifest: None,
-            diff_summary: None,
-            last_error: None,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        });
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    let is_new_session = existing_session.is_none();
+
+    let mut session = existing_session.unwrap_or_else(|| AiSession {
+        id: session_id.into(),
+        name: "Architect".into(),
+        messages: vec![],
+        current_manifest: None,
+        pending_manifest: None,
+        diff_summary: None,
+        last_error: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    });
 
     let base_manifest = session
         .pending_manifest
@@ -227,8 +260,14 @@ pub async fn process_ai_chat(
         ARCHITECT_SYSTEM_PROMPT, docs, current_state_str, user_prompt
     );
 
-    let api_key = get_api_key(&state).await?;
+    let api_key = get_api_key(sandbox_db.clone(), &state).await?;
     let response_text = call_llm(api_key, &model, &full_prompt).await?;
+
+    // --- DEBUG LOG FOR RAW LLM OUTPUT ---
+    info!(
+        "AI Architect: Raw LLM Response received:\n{}",
+        response_text
+    );
 
     match parse_manifest(&response_text) {
         Ok(new_manifest) => {
@@ -258,11 +297,198 @@ pub async fn process_ai_chat(
         }
     }
 
-    sandbox_db
-        .create_ai_session(&session)
-        .await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    if is_new_session {
+        sandbox_db
+            .create_ai_session(&session)
+            .await
+            .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    } else {
+        sandbox_db
+            .update_ai_session(&session)
+            .await
+            .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    }
+
     Ok(Json(session))
+}
+
+fn sanitize_json_control_chars(input: &str) -> String {
+    let mut output = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for c in input.chars() {
+        if in_string {
+            if escaped {
+                output.push(c);
+                escaped = false;
+            } else if c == '\\' {
+                output.push(c);
+                escaped = true;
+            } else if c == '"' {
+                output.push(c);
+                in_string = false;
+            } else if c == '\n' {
+                output.push_str("\\n");
+            } else if c == '\r' {
+                output.push_str("\\r");
+            } else if c == '\t' {
+                output.push_str("\\t");
+            } else if c.is_control() {
+                // Skip other non-printable control characters
+            } else {
+                output.push(c);
+            }
+        } else {
+            if c == '"' {
+                in_string = true;
+            }
+            output.push(c);
+        }
+    }
+    output
+}
+
+fn normalize_manifest_value(val: &mut Value) {
+    if let Some(obj) = val.as_object_mut() {
+        // 1. Ensure app_name exists
+        if !obj.contains_key("app_name") {
+            obj.insert("app_name".to_string(), json!("AI Architect App"));
+        }
+
+        // 2. Normalize Collections (fields array -> schema fields map)
+        if let Some(cols) = obj.get_mut("collections").and_then(|v| v.as_array_mut()) {
+            for col_val in cols {
+                if let Some(col_obj) = col_val.as_object_mut() {
+                    if !col_obj.contains_key("schema") {
+                        let mut fields_map = serde_json::Map::new();
+
+                        // Parse fields list if defined as array
+                        if let Some(fields_arr) = col_obj.get("fields").and_then(|v| v.as_array()) {
+                            for f in fields_arr {
+                                if let Some(f_obj) = f.as_object() {
+                                    if let Some(f_name) = f_obj.get("name").and_then(|v| v.as_str())
+                                    {
+                                        let mut f_def = f_obj.clone();
+                                        f_def.remove("name"); // Remove name from within details
+
+                                        if !f_def.contains_key("required") {
+                                            f_def.insert("required".to_string(), json!(false));
+                                        }
+                                        if !f_def.contains_key("uid") {
+                                            // Generate an 8-character hex uid from a random UUID v4
+                                            let uid_str =
+                                                uuid::Uuid::new_v4().to_string()[0..8].to_string();
+                                            f_def.insert("uid".to_string(), json!(uid_str));
+                                        }
+
+                                        fields_map.insert(f_name.to_string(), Value::Object(f_def));
+                                    }
+                                }
+                            }
+                        }
+                        // Fallback: If fields is already a map
+                        else if let Some(fields_json_map) =
+                            col_obj.get("fields").and_then(|v| v.as_object())
+                        {
+                            fields_map = fields_json_map.clone();
+                        }
+
+                        let schema_obj = json!({
+                            "fields": fields_map,
+                            "policies": {
+                                "read": "public",
+                                "create": "auth",
+                                "update": "admin",
+                                "delete": "admin"
+                            }
+                        });
+                        col_obj.insert("schema".to_string(), schema_obj);
+                        col_obj.remove("fields");
+                    }
+                }
+            }
+        }
+
+        // 3. Normalize Scripts (path -> name, deduce trigger_type)
+        if let Some(scripts) = obj.get_mut("scripts").and_then(|v| v.as_array_mut()) {
+            for scr_val in scripts {
+                if let Some(scr_obj) = scr_val.as_object_mut() {
+                    let path_str = scr_obj
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if !scr_obj.contains_key("name") {
+                        let clean_name = path_str
+                            .replace("api/", "")
+                            .replace("/", "_")
+                            .replace(".js", "")
+                            .replace("{", "")
+                            .replace("}", "");
+                        scr_obj.insert("name".to_string(), json!(clean_name));
+                    }
+                    if !scr_obj.contains_key("trigger_type") {
+                        let trigger = if path_str.starts_with("api/") {
+                            "manual".to_string()
+                        } else {
+                            "before_create_record".to_string()
+                        };
+                        scr_obj.insert("trigger_type".to_string(), json!(trigger));
+                    }
+                }
+            }
+        }
+
+        // 4. Normalize Templates (path -> slug, code -> content)
+        if let Some(templates) = obj.get_mut("templates").and_then(|v| v.as_array_mut()) {
+            for tmpl_val in templates {
+                if let Some(tmpl_obj) = tmpl_val.as_object_mut() {
+                    if !tmpl_obj.contains_key("slug") {
+                        if let Some(path) = tmpl_obj.get("path") {
+                            tmpl_obj.insert("slug".to_string(), path.clone());
+                        }
+                    }
+                    if !tmpl_obj.contains_key("content") {
+                        if let Some(code) = tmpl_obj.get("code") {
+                            tmpl_obj.insert("content".to_string(), code.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_manifest(llm_response: &str) -> Result<AppManifest, String> {
+    let mut clean_json = llm_response
+        .trim()
+        .replace("```json", "")
+        .replace("```", "")
+        .trim()
+        .to_string();
+
+    // Sanitize unescaped Control characters inside string values
+    clean_json = sanitize_json_control_chars(&clean_json);
+
+    // Parse into intermediate JSON Value to perform normalizations
+    let mut raw_val: Value = serde_json::from_str(&clean_json).map_err(|e| {
+        error!(
+            "AI Architect: JSON Deserialization failed: {}. Cleaned JSON was:\n{}",
+            e, clean_json
+        );
+        format!("JSON parsing failed: {}", e)
+    })?;
+
+    // Perform Schema Self-Healing
+    normalize_manifest_value(&mut raw_val);
+
+    // Map normalized value to AppManifest target struct
+    serde_json::from_value(raw_val).map_err(|e| {
+        error!("AI Architect: Schema Mapping from JSON failed: {}", e);
+        format!("Manifest schema mapping failed: {}", e)
+    })
 }
 
 pub async fn deploy_manifest(db: Arc<dyn Db>, manifest: &AppManifest) -> Result<(), AppError> {
@@ -317,20 +543,38 @@ pub async fn deploy_manifest(db: Arc<dyn Db>, manifest: &AppManifest) -> Result<
     Ok(())
 }
 
-async fn get_api_key(state: &AppState) -> Result<String, AppError> {
-    let ai_settings_json = state
-        .db
+async fn get_api_key(db: Arc<dyn Db>, state: &AppState) -> Result<String, AppError> {
+    let mut settings_json = db
         .get_config("ai")
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    match ai_settings_json {
+    let mut use_root = false;
+    if let Some(val) = &settings_json {
+        let conf: crate::settings::AiConfigDto =
+            serde_json::from_value(val.clone()).unwrap_or_default();
+        if !conf.enabled || conf.api_key.is_none() {
+            use_root = true;
+        }
+    } else {
+        use_root = true;
+    }
+
+    if use_root {
+        settings_json = state
+            .db
+            .get_config("ai")
+            .await
+            .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    }
+
+    match settings_json {
         Some(val) => {
             let conf: crate::settings::AiConfigDto =
                 serde_json::from_value(val).unwrap_or_default();
             if !conf.enabled {
                 return Err(AppError::Forbidden(
-                    "AI features are disabled in global settings".into(),
+                    "AI features are disabled in settings".into(),
                 ));
             }
 
@@ -386,16 +630,6 @@ async fn call_llm(api_key: String, model: &str, prompt: &str) -> Result<String, 
         .as_str()
         .unwrap_or("{}")
         .to_string())
-}
-
-fn parse_manifest(llm_response: &str) -> Result<AppManifest, String> {
-    let clean_json = llm_response
-        .trim()
-        .replace("```json", "")
-        .replace("```", "")
-        .trim()
-        .to_string();
-    serde_json::from_str(&clean_json).map_err(|e| format!("JSON parsing failed: {}", e))
 }
 
 fn generate_diff(current: Option<&AppManifest>, new: &AppManifest) -> String {

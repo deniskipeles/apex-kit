@@ -731,6 +731,7 @@ pub async fn import_ai_actions_handler(
             model: item.model,
             system_prompt: item.system_prompt,
             template: item.template,
+            config: item.config,
         };
 
         // Assuming create handles upsert on slug, or we manually check

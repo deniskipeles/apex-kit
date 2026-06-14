@@ -121,7 +121,7 @@ pub async fn create_sandbox_handler(
     tokio::spawn(async move {
         if let Ok(sandbox_db) = state_clone.sandbox_manager.get_sandbox(&sid).await {
             let session = apexkit_core::ai_models::AiSession {
-                id: "default".into(),
+                id: "default".into(), // Base session uses ID "default" internally inside the isolated DB
                 name: "Architect".into(),
                 messages: vec![],
                 current_manifest: None,
@@ -133,8 +133,10 @@ pub async fn create_sandbox_handler(
             let _ = sandbox_db.create_ai_session(&session).await;
 
             if let Some(prompt) = prompt_opt {
+                // [FIXED] Use "default" as the session ID instead of the Sandbox UUID, because this function
+                // expects the internal SQLite Row ID of the session record, which is "default".
                 let _ = crate::ai_architect::process_ai_chat(
-                    &sid,
+                    "default",
                     sandbox_db,
                     state_clone,
                     prompt,
@@ -165,13 +167,12 @@ pub async fn create_sandbox_handler(
 pub async fn list_sandboxes_handler(
     Extension(claims): Extension<Claims>,
     State(state): State<AppState>,
-    scope: Option<Extension<EventScope>>, // [RESTORED] Use active workspace context
+    scope: Option<Extension<EventScope>>,
 ) -> Result<Json<Vec<SandboxMetadata>>, AppError> {
     if claims.role != "admin" {
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // [FIXED] List sandboxes belonging to the active Tenant/Root workspace being viewed
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     let tenant_id = crate::get_tenant_id_from_scope(Some(&event_scope));
 

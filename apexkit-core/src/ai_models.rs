@@ -10,7 +10,7 @@ pub struct AiAction {
     pub system_prompt: Option<String>,
     pub template: String,
     #[schema(value_type = Object)]
-    pub config: serde_json::Value, // For temp, top_k, etc.
+    pub config: Option<serde_json::Value>, // For temp, top_k, etc.
 }
 
 #[derive(Deserialize, ToSchema, Clone)]
@@ -20,6 +20,7 @@ pub struct CreateActionReq {
     pub model: String,
     pub system_prompt: Option<String>,
     pub template: String,
+    pub config: Option<serde_json::Value>, // Added config support
 }
 
 use crate::models::AppManifest;

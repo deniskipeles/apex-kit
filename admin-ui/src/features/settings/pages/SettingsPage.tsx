@@ -23,10 +23,12 @@ import { SiteSettings } from '../components/SiteSettings';
 import { settingsService } from '../services/settingsService';
 import { AppSettings } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
+import { OauthSettings } from '../components/OauthSettings';
 
 type Tab =
   | 'general'
   | 'security'
+  | 'oauth'
   | 'smtp'
   | 'storage'
   | 'backups'
@@ -82,6 +84,7 @@ export const SettingsPage = () => {
   const tabs: { id: Tab; label: string; icon: any; desc: string }[] = [
     { id: 'general', label: 'General', icon: SettingsIcon, desc: 'App identity and branding' },
     { id: 'security', label: 'Security', icon: Shield, desc: 'Access control and CORS' },
+    { id: 'oauth', label: 'OAuth2 Login', icon: Key, desc: 'GitHub & Google credentials' },
     { id: 'smtp', label: 'Email (SMTP)', icon: Mail, desc: 'Email delivery settings' },
     { id: 'storage', label: 'Storage', icon: HardDrive, desc: 'File uploads and S3' },
     { id: 'ai', label: 'AI Engine', icon: BrainCircuit, desc: 'LLM providers and keys' },
@@ -180,6 +183,8 @@ export const SettingsPage = () => {
                 onSave={handleSaveSection}
               />
             )}
+            {/* --- RENDER OAUTH2 TAB PANEL --- */}
+            {activeTab === 'oauth' && <OauthSettings />}
             {activeTab === 'smtp' && (
               <SmtpSettings
                 settings={settings}

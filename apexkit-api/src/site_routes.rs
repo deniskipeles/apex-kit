@@ -231,6 +231,7 @@ async fn deploy_metadata_item(db: &Arc<dyn Db>, label: &str, content: &[u8]) -> 
                     model: a.model,
                     system_prompt: a.system_prompt,
                     template: a.template,
+                    config: a.config,
                 })
                 .await
                 .map_err(|e| e.to_string())?;

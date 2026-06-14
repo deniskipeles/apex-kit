@@ -5,10 +5,10 @@ import {
   CardHeader,
   CardTitle,
   CardContent,
-  Input,
   Label,
   Switch,
   Button,
+  Select,
 } from '../../../components/ui/Elements';
 import { AppSettings } from '../../../types';
 import { PasswordInput } from '../../../components/form/PasswordInput';
@@ -54,31 +54,59 @@ export const AiSettings = ({ settings, onChange, onSave }: AiSettingsProps) => {
         >
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label>Provider</Label>
-              <Input value="Google Gemini" disabled className="bg-secondary/20" />
+              <Label>Default Inference Provider</Label>
+              <Select
+                value={settings.ai?.provider || 'gemini'}
+                onChange={(e: any) => updateAi('provider', e.target.value)}
+              >
+                <option value="gemini">Google Gemini</option>
+                <option value="groq">Groq (OpenAI Compatible)</option>
+                <option value="openai">OpenAI API</option>
+              </Select>
             </div>
             <div className="space-y-2">
-              <Label>API Key</Label>
+              <Label>Master API Key</Label>
               <PasswordInput
                 value={settings.ai?.apiKey || ''}
                 onChange={(e: any) => updateAi('apiKey', e.target.value)}
-                placeholder="AIzaSy..."
+                placeholder="Enter API Key..."
               />
             </div>
           </div>
-          <div className="rounded-md bg-secondary/10 p-4 text-sm text-muted-foreground flex flex-col gap-2">
+
+          <div className="rounded-md bg-secondary/10 p-4 text-sm text-muted-foreground flex flex-col gap-3 border border-border border-dashed">
             <p>
-              ApexKit currently supports Google Gemini models. You need a valid API key to use AI
-              Actions.
+              ApexKit supports <strong>Google Gemini</strong>, <strong>Groq</strong>, and{' '}
+              <strong>OpenAI</strong> models. Enter your master API key above. Individual AI Actions
+              can override the provider, but they will share this global API Key (ensure the key
+              belongs to the provider you are using).
             </p>
-            <a
-              href="https://aistudio.google.com/app/apikey"
-              target="_blank"
-              rel="noreferrer"
-              className="text-primary hover:underline inline-flex items-center gap-1 w-fit"
-            >
-              Get API Key <ExternalLink className="h-3 w-3" />
-            </a>
+            <div className="flex flex-wrap gap-4 pt-2">
+              <a
+                href="https://aistudio.google.com/app/apikey"
+                target="_blank"
+                rel="noreferrer"
+                className="text-primary hover:underline inline-flex items-center gap-1 font-medium"
+              >
+                Get Gemini Key <ExternalLink className="h-3 w-3" />
+              </a>
+              <a
+                href="https://console.groq.com/keys"
+                target="_blank"
+                rel="noreferrer"
+                className="text-primary hover:underline inline-flex items-center gap-1 font-medium"
+              >
+                Get Groq Key <ExternalLink className="h-3 w-3" />
+              </a>
+              <a
+                href="https://platform.openai.com/api-keys"
+                target="_blank"
+                rel="noreferrer"
+                className="text-primary hover:underline inline-flex items-center gap-1 font-medium"
+              >
+                Get OpenAI Key <ExternalLink className="h-3 w-3" />
+              </a>
+            </div>
           </div>
         </CardContent>
       </Card>

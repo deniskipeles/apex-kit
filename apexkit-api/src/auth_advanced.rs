@@ -57,7 +57,7 @@ struct GoogleUser {
     picture: Option<String>,
 }
 
-// Helper to fetch and decrypt
+// Helper to fetch, dynamically inspect, and decrypt database secrets safely
 async fn get_secret(db: Arc<dyn Db>, vault: Arc<Vault>, key: &str) -> Result<String, AppError> {
     let json_opt = db
         .get_config(key)
@@ -67,12 +67,17 @@ async fn get_secret(db: Arc<dyn Db>, vault: Arc<Vault>, key: &str) -> Result<Str
     let json_val = json_opt
         .ok_or_else(|| AppError::UnknownError(format!("Configuration '{}' missing", key)))?;
 
-    let enc: EncryptedValue = serde_json::from_value(json_val)
-        .map_err(|_| AppError::UnknownError("Invalid secret format".into()))?;
-
-    vault
-        .decrypt(&enc)
-        .map_err(|_| AppError::UnknownError("Decryption failed".into()))
+    // 1. Try to parse as EncryptedValue. If successful, decrypt it.
+    if let Ok(enc) = serde_json::from_value::<EncryptedValue>(json_val.clone()) {
+        vault
+            .decrypt(&enc)
+            .map_err(|_| AppError::UnknownError("Decryption failed. Verify master key.".into()))
+    } else if let Some(raw_str) = json_val.as_str() {
+        // 2. Fallback: If not encrypted, return the raw string directly
+        Ok(raw_str.to_string())
+    } else {
+        Err(AppError::UnknownError("Invalid secret format".into()))
+    }
 }
 
 // --- GitHub Handlers ---
@@ -138,11 +143,41 @@ pub async fn github_callback(
         .await
         .map_err(|_| AppError::UnknownError("Failed to parse user".into()))?;
 
+    // --- NEW: Explicitly fetch private emails from GitHub ---
+    let mut actual_email = gh_user.email.clone();
+
+    if actual_email.is_none() || actual_email.as_ref().unwrap().is_empty() {
+        #[derive(Deserialize)]
+        struct GithubEmail {
+            email: String,
+            primary: bool,
+            verified: bool,
+        }
+
+        if let Ok(emails_res) = client
+            .get("https://api.github.com/user/emails")
+            .header("User-Agent", "ApexKit")
+            .header(
+                "Authorization",
+                format!("Bearer {}", token_res.access_token),
+            )
+            .send()
+            .await
+        {
+            if let Ok(emails) = emails_res.json::<Vec<GithubEmail>>().await {
+                // Prefer primary and verified email
+                if let Some(primary) = emails.iter().find(|e| e.primary && e.verified) {
+                    actual_email = Some(primary.email.clone());
+                } else if let Some(first) = emails.first() {
+                    actual_email = Some(first.email.clone());
+                }
+            }
+        }
+    }
+
     // NORMALIZATION
     let provider_id = gh_user.id.to_string();
-    let email = gh_user
-        .email
-        .unwrap_or_else(|| format!("{}@github.oauth", gh_user.login));
+    let email = actual_email.unwrap_or_else(|| format!("{}@github.oauth", gh_user.login));
     let name = gh_user.name.unwrap_or(gh_user.login);
     let avatar = gh_user.avatar_url;
 
@@ -197,7 +232,7 @@ pub async fn google_callback(
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,
     scope: Option<Extension<EventScope>>,
-    uri: axum::http::Uri, // [FIX]: Use Uri extractor instead of Request
+    uri: axum::http::Uri,
     Query(params): Query<OauthCallback>,
 ) -> Result<Response, AppError> {
     let client_id = get_secret(db.clone(), state.vault.clone(), "google_client_id").await?;
@@ -246,15 +281,20 @@ pub async fn google_callback(
 
     // 3. Find or Create User
     let provider_id = g_user.id.clone();
-    let email = g_user
-        .email
-        .clone()
-        .unwrap_or_else(|| format!("{}@google.oauth", g_user.id));
+
+    // [FIXED] Reject login if Google does not return an email, rather than making one up.
+    let email = g_user.email.clone().ok_or_else(|| {
+        AppError::UnknownError(
+            "Google account has no associated email address. Required for login.".into(),
+        )
+    })?;
+
     let name = g_user
         .name
         .unwrap_or_else(|| email.split('@').next().unwrap_or("User").to_string());
     let avatar = g_user.picture;
 
+    // This will now seamlessly link to an existing account if the email matches
     process_oauth_user(
         db,
         provider_id,
@@ -279,38 +319,49 @@ async fn process_oauth_user(
     scope_str: String,
     redirect_target: Option<String>,
 ) -> Result<Response, AppError> {
-    let existing = db
+    // 1. Check if this specific OAuth identity (e.g. GitHub ID 12345) already exists
+    let existing_identity = db
         .get_user_by_oauth(&provider_name, &provider_id)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    let user = match existing {
-        Some(u) => u,
+    let user = match existing_identity {
+        Some(u) => u, // User has logged in with this provider before
         None => {
-            // Unified Metadata Object
-            let metadata = serde_json::json!({
-                "avatar": avatar,
-                "name": name,
-                "provider": provider_name
-            });
+            // 2. Check if a user with this email already exists from a different provider or email/password
+            if let Ok(Some(existing_user)) = db.get_user_by_email(&email).await {
+                // Email exists! Securely link this new OAuth method to the existing account
+                db.link_oauth(existing_user.id, &provider_name, &provider_id)
+                    .await
+                    .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-            let pwd = uuid::Uuid::new_v4().to_string();
-            let hash = auth::hash_password(&pwd).unwrap();
+                existing_user
+            } else {
+                // 3. Completely new user. Create account and link identity.
+                let metadata = serde_json::json!({
+                    "avatar": avatar,
+                    "name": name,
+                    "provider": provider_name
+                });
 
-            let u = db
-                .create_user(&email, &hash, "user", Some(metadata))
-                .await
-                .map_err(|_| {
-                    AppError::UnknownError("Email already taken by another account".into())
-                })?;
+                let pwd = uuid::Uuid::new_v4().to_string();
+                let hash = auth::hash_password(&pwd).unwrap();
 
-            db.link_oauth(u.id, &provider_name, &provider_id)
-                .await
-                .map_err(|e| AppError::UnknownError(e.to_string()))?;
-            u
+                let u = db
+                    .create_user(&email, &hash, "user", Some(metadata))
+                    .await
+                    .map_err(|_| AppError::UnknownError("Failed to create new user".into()))?;
+
+                db.link_oauth(u.id, &provider_name, &provider_id)
+                    .await
+                    .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+                u
+            }
         }
     };
 
+    // Generate JWT for the resolved user
     let token = auth::create_jwt(user.id, &user.email, &user.role, &scope_str)
         .map_err(|_| AppError::UnknownError("Token failed".into()))?;
 

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Save, Sparkles, Info } from 'lucide-react';
-import { Button, Input, Label, Select } from '../../../components/ui/Elements';
+import { Save, Sparkles, Info, BrainCircuit, Globe, RefreshCw, Layers } from 'lucide-react';
+import { Button, Input, Label, Select, Switch } from '../../../components/ui/Elements';
 import { Dialog } from '../../../components/ui/Dialog';
 import { AiAction } from '../../../types';
 
@@ -11,102 +11,98 @@ interface AiActionEditorProps {
   initialData?: AiAction;
 }
 
-// Updated Model List based on your supported models
-const MODEL_GROUPS = [
-  {
-    label: 'Gemini Flash (Fast & Efficient)',
-    models: [
-      { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
-      { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite' },
-      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash' },
-      { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite' },
-    ],
-  },
-  {
-    label: 'Image Generation & Editing',
-    models: [
-      {
-        id: 'gemini-3-pro-image-preview',
-        name: 'Gemini 3 Pro Image Preview',
-      },
-      {
-        id: 'gemini-2.5-flash-image',
-        name: 'Gemini 2.5 Flash Image',
-      },
-      {
-        id: 'imagen-4.0-generate-001',
-        name: 'Imagen 4',
-      },
-      {
-        id: 'imagen-4.0-ultra-generate-001',
-        name: 'Imagen 4 Ultra',
-      },
-      {
-        id: 'imagen-4.0-fast-generate-001',
-        name: 'Imagen 4 Fast',
-      },
-    ],
-  },
-  {
-    label: 'Gemini Pro (High Intelligence)',
-    models: [
-      { id: 'gemini-3-pro', name: 'Gemini 3 Pro' },
-      { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
-    ],
-  },
-  {
-    label: 'Gemma 3 (Open Models)',
-    models: [
-      { id: 'gemma-3-27b', name: 'Gemma 3 (27B)' },
-      { id: 'gemma-3-12b', name: 'Gemma 3 (12B)' },
-      { id: 'gemma-3-4b', name: 'Gemma 3 (4B)' },
-      { id: 'gemma-3-2b', name: 'Gemma 3 (2B)' },
-      { id: 'gemma-3-1b', name: 'Gemma 3 (1B)' },
-    ],
-  },
-  {
-    label: 'Specialized & Experimental',
-    models: [
-      { id: 'gemini-2.5-flash-tts', name: 'Gemini 2.5 Flash TTS (Multimodal)' },
-      { id: 'learnlm-2.0-flash-experimental', name: 'LearnLM 2.0 Flash (Experimental)' },
-      { id: 'gemini-robotics-er-1.5-preview', name: 'Gemini Robotics 1.5 (Preview)' },
-      { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash (Experimental)' },
-    ],
-  },
-  {
-    label: 'Live API (Real-time)',
-    models: [
-      { id: 'gemini-2.5-flash-live', name: 'Gemini 2.5 Flash Live' },
-      { id: 'gemini-2.0-flash-live', name: 'Gemini 2.0 Flash Live' },
-      { id: 'gemini-2.5-flash-native-audio-dialog', name: 'Gemini 2.5 Native Audio' },
-    ],
-  },
+const PROVIDER_GROUPS = [
+  { value: 'gemini', label: 'Google Gemini' },
+  { value: 'groq', label: 'Groq (OpenAI Compatible)' },
+  { value: 'openai', label: 'OpenAI API' },
 ];
+
+const MODEL_GROUPS = {
+  gemini: [
+    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+    { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite' },
+    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash' },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+  ],
+  groq: [
+    { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 (70B)' },
+    { id: 'llama3-8b-8192', name: 'Llama 3 (8B)' },
+    { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7b' },
+  ],
+  openai: [
+    { id: 'gpt-4o', name: 'GPT-4o' },
+    { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
+    { id: 'o1-mini', name: 'o1 Mini' },
+  ],
+};
 
 export const AiActionEditor = ({ isOpen, onClose, onSave, initialData }: AiActionEditorProps) => {
   const [formData, setFormData] = useState<Partial<AiAction>>({
     name: '',
     slug: '',
-    model: 'gemini-2.5-flash', // Default to latest stable flash
+    model: 'gemini-2.5-flash',
     system_prompt: '',
-    template: 'User Request: {{input}}\n\nContext: ...',
+    template: 'User Request: {{input}}',
+    config: {
+      provider: 'gemini',
+      grounding: false,
+      streaming: false,
+      url_context: false,
+    },
   });
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
     if (initialData) {
-      setFormData(initialData);
+      setFormData({
+        ...initialData,
+        config: {
+          provider: 'gemini',
+          grounding: false,
+          streaming: false,
+          url_context: false,
+          ...(initialData.config || {}),
+        },
+      });
     } else {
-      // Reset defaults on new open
       setFormData({
         name: '',
         slug: '',
         model: 'gemini-2.5-flash',
         system_prompt: '',
         template: 'User Request: {{input}}',
+        config: {
+          provider: 'gemini',
+          grounding: false,
+          streaming: false,
+          url_context: false,
+        },
       });
     }
   }, [initialData, isOpen]);
+
+  const updateConfig = (key: string, value: any) => {
+    setFormData((prev) => ({
+      ...prev,
+      config: {
+        ...(prev.config || {}),
+        [key]: value,
+      },
+    }));
+  };
+
+  const handleProviderChange = (prov: string) => {
+    const defaultModel = MODEL_GROUPS[prov as keyof typeof MODEL_GROUPS]?.[0]?.id || '';
+    setFormData((prev) => ({
+      ...prev,
+      model: defaultModel,
+      config: {
+        ...(prev.config || {}),
+        provider: prov,
+        grounding: prov === 'gemini' ? prev.config?.grounding || false : false, // Grounding is exclusive to Gemini
+      },
+    }));
+  };
 
   const handleSave = async () => {
     setIsSaving(true);
@@ -118,7 +114,6 @@ export const AiActionEditor = ({ isOpen, onClose, onSave, initialData }: AiActio
     }
   };
 
-  // Auto-slug generator
   const handleNameChange = (val: string) => {
     if (!initialData) {
       const slug = val
@@ -133,6 +128,9 @@ export const AiActionEditor = ({ isOpen, onClose, onSave, initialData }: AiActio
 
   if (!isOpen) return null;
 
+  const currentProvider = formData.config?.provider || 'gemini';
+  const availableModels = MODEL_GROUPS[currentProvider as keyof typeof MODEL_GROUPS] || [];
+
   return (
     <Dialog
       isOpen={isOpen}
@@ -140,78 +138,105 @@ export const AiActionEditor = ({ isOpen, onClose, onSave, initialData }: AiActio
       title={initialData ? 'Edit AI Action' : 'New AI Action'}
       size="lg"
     >
-      <div className="flex flex-col h-[75vh] gap-6">
-        {/* Identity Section */}
+      <div className="flex flex-col h-[75vh] gap-5">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="space-y-2">
             <Label required>Action Name</Label>
             <Input
               value={formData.name}
               onChange={(e: any) => handleNameChange(e.target.value)}
-              placeholder="e.g. Summarize Text"
+              placeholder="e.g. Code Reviewer"
               autoFocus
             />
           </div>
           <div className="space-y-2">
             <Label required>Slug (API Endpoint)</Label>
-            <div className="flex items-center">
-              <span className="text-xs text-muted-foreground mr-1 bg-secondary/50 px-2 py-1.5 rounded-l border border-r-0 border-input">
-                /ai/run/
-              </span>
-              <Input
-                value={formData.slug}
-                onChange={(e: any) => setFormData({ ...formData, slug: e.target.value })}
-                className="font-mono rounded-l-none"
-                disabled={!!initialData}
-              />
-            </div>
+            <Input
+              value={formData.slug}
+              onChange={(e: any) => setFormData({ ...formData, slug: e.target.value })}
+              className="font-mono"
+              disabled={!!initialData}
+            />
           </div>
         </div>
 
-        {/* Model Configuration */}
-        <div className="space-y-2">
-          <Label required>AI Model</Label>
-          <Select
-            value={formData.model}
-            onChange={(e: any) => setFormData({ ...formData, model: e.target.value })}
-          >
-            {MODEL_GROUPS.map((group) => (
-              <optgroup key={group.label} label={group.label}>
-                {group.models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </Select>
-          <p className="text-[10px] text-muted-foreground">
-            Select the model best suited for speed, reasoning, or specialized tasks.
-          </p>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label required>Inference Provider</Label>
+            <Select
+              value={currentProvider}
+              onChange={(e: any) => handleProviderChange(e.target.value)}
+            >
+              {PROVIDER_GROUPS.map((p) => (
+                <option key={p.value} value={p.value}>
+                  {p.label}
+                </option>
+              ))}
+            </Select>
+          </div>
+
+          <div className="space-y-2">
+            <Label required>AI Model</Label>
+            <Select
+              value={formData.model}
+              onChange={(e: any) => setFormData({ ...formData, model: e.target.value })}
+            >
+              {availableModels.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name}
+                </option>
+              ))}
+            </Select>
+          </div>
         </div>
 
-        {/* System Instruction */}
+        {/* Dynamic Config Controls */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 p-3.5 bg-secondary/15 rounded-lg border border-border border-dashed">
+          {currentProvider === 'gemini' && (
+            <div className="flex items-center justify-between p-2 bg-background rounded border border-border/50">
+              <span className="text-xs font-semibold flex items-center gap-1.5">
+                <Globe className="h-4.5 w-4.5 text-blue-400" /> Google Search
+              </span>
+              <Switch
+                checked={formData.config?.grounding || false}
+                onCheckedChange={(c) => updateConfig('grounding', c)}
+              />
+            </div>
+          )}
+          <div className="flex items-center justify-between p-2 bg-background rounded border border-border/50">
+            <span className="text-xs font-semibold flex items-center gap-1.5">
+              <RefreshCw className="h-4.5 w-4.5 text-purple-400 animate-spin-slow" /> SSE Streaming
+            </span>
+            <Switch
+              checked={formData.config?.streaming || false}
+              onCheckedChange={(c) => updateConfig('streaming', c)}
+            />
+          </div>
+          <div className="flex items-center justify-between p-2 bg-background rounded border border-border/50">
+            <span className="text-xs font-semibold flex items-center gap-1.5">
+              <BrainCircuit className="h-4.5 w-4.5 text-emerald-400" /> URL Scraper
+            </span>
+            <Switch
+              checked={formData.config?.url_context || false}
+              onCheckedChange={(c) => updateConfig('url_context', c)}
+            />
+          </div>
+        </div>
+
         <div className="space-y-2">
-          <Label>System Persona / Instructions</Label>
+          <Label>System Instructions (Behavior Persona)</Label>
           <Input
             value={formData.system_prompt || ''}
             onChange={(e: any) => setFormData({ ...formData, system_prompt: e.target.value })}
-            placeholder="You are a helpful assistant. You always respond in JSON..."
+            placeholder="You are an expert compiler engineer..."
           />
-          <p className="text-[10px] text-muted-foreground">
-            Defines the AI's behavior and constraints globally.
-          </p>
         </div>
 
-        {/* Template Editor */}
-        <div className="flex-1 flex flex-col space-y-2 min-h-[200px]">
+        <div className="flex-1 flex flex-col space-y-2 min-h-[150px]">
           <div className="flex justify-between items-center">
             <Label className="flex items-center gap-2">
               <Sparkles className="h-3.5 w-3.5 text-primary" /> User Prompt Template
             </Label>
-            <span className="text-[10px] bg-primary/10 text-primary px-2 py-0.5 rounded">
-              Supports Handlebars: {'{{variable}}'}
-            </span>
           </div>
           <div className="flex-1 relative rounded-md border border-input overflow-hidden">
             <textarea
@@ -224,11 +249,10 @@ export const AiActionEditor = ({ isOpen, onClose, onSave, initialData }: AiActio
           </div>
         </div>
 
-        {/* Footer */}
         <div className="flex items-center justify-between pt-4 border-t border-border mt-auto shrink-0">
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <Info className="h-4 w-4" />
-            <span>Variables in template automatically become API inputs.</span>
+            <span>Parameters in template become SDK payload keys.</span>
           </div>
           <div className="flex gap-3">
             <Button variant="ghost" onClick={onClose}>

@@ -9,6 +9,8 @@ pub struct DashboardStats {
     pub db_size_mb: f64,
     pub collections_count: i64,
     pub total_records: i64,
+    pub total_vectors: i64,
+    pub indexes_size_mb: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]

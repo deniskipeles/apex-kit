@@ -15,8 +15,10 @@ use common::{admin_token, setup_test_context_with_forwarder, test_request};
 #[tokio::test]
 async fn test_full_replication_loop() {
     // 1. Set environment variables to force HTTP fallback (simulates HF Spaces)
-    std::env::set_var("APEXKIT_MASTER_KEY", "TEST_MASTER_KEY_12345");
-    std::env::set_var("APEX_FORCE_HTTP_REPLICATION", "true");
+    unsafe {
+        std::env::set_var("APEXKIT_MASTER_KEY", "TEST_MASTER_KEY_12345");
+        std::env::set_var("APEX_FORCE_HTTP_REPLICATION", "true");
+    }
 
     // 2. Setup MASTER
     let (sqlite_event_tx, mut _sqlite_event_rx) = tokio::sync::broadcast::channel(100);

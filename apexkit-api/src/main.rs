@@ -161,6 +161,11 @@ async fn main() {
         println!("");
         println!(" 3. TO BE USED ON SERVER RESTART.");
         println!("=======================================================\n");
+
+        // Wrap in unsafe block to satisfy the Rust 1.81+ compiler
+        unsafe {
+            env::set_var("APEXKIT_MASTER_KEY", &new_key);
+        }
         new_key
     });
 
@@ -623,6 +628,7 @@ async fn seed_ai_actions(
             model: "gemini-2.5-flash-image".to_string(),
             system_prompt: Some("You are a creative image generation assistant.".to_string()),
             template: "{{prompt}}".to_string(),
+            config: None
         },
         CreateActionReq {
             name: "Content Editor".to_string(),
@@ -630,6 +636,7 @@ async fn seed_ai_actions(
             model: "gemini-2.5-flash-lite".to_string(),
             system_prompt: Some("You are an expert content editor. Use Google Search to ensure information is accurate. Respond in Markdown.".to_string()),
             template: "User Request: {{prompt}}\n\nOriginal Text:\n{{originalText}}".to_string(),
+            config: None
         },
         CreateActionReq {
             name: "Edit Image".to_string(),
@@ -637,6 +644,7 @@ async fn seed_ai_actions(
             model: "gemini-2.5-flash-image".to_string(),
             system_prompt: Some("You are an expert image editor.".to_string()),
             template: "Edit the attached image based on this instruction: {{prompt}}".to_string(),
+            config: None
         }
     ];
 

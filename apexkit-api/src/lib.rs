@@ -1315,6 +1315,9 @@ async fn sandbox_lifecycle_middleware(
         .ok_or(StatusCode::NOT_FOUND)?
         .clone();
 
+    let method = req.method().to_string();
+    let path_req = req.uri().path().to_string();
+
     // 1. Capture Ingress
     let ingress = req
         .headers()
@@ -1326,8 +1329,8 @@ async fn sandbox_lifecycle_middleware(
     // Before Request Hook
     let hook_payload = serde_json::json!({
         "sandbox_id": session_id,
-        "path": req.uri().path(),
-        "method": req.method().to_string(),
+        "path": path_req,
+        "method": method,
         "ip": req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("unknown"),
         "ingress": ingress,
         "egress": 0
@@ -1349,7 +1352,7 @@ async fn sandbox_lifecycle_middleware(
 
     match state.sandbox_manager.get_sandbox(&session_id).await {
         Ok(sandbox_db) => {
-            req.extensions_mut().insert(sandbox_db);
+            req.extensions_mut().insert(sandbox_db.clone());
 
             // [FIX] Use ScopedDynamicStorage to support S3 Reselling
             let scope = EventScope::Sandbox(session_id.clone());
@@ -1360,7 +1363,6 @@ async fn sandbox_lifecycle_middleware(
             req.extensions_mut().insert(storage);
             req.extensions_mut().insert(scope);
 
-            // Capture path before consuming req
             let path_clone = req.uri().path().to_string();
 
             let mut response = next.run(req).await;
@@ -1378,13 +1380,28 @@ async fn sandbox_lifecycle_middleware(
                 .or_else(|| response.body().size_hint().exact())
                 .unwrap_or(0);
 
-            // After Request Hook (Async)
+            // After Request Hook & Logging
             let status = response.status().as_u16();
             let state_clone = state.clone();
             let base_url_clone = base_url.clone();
             let sid_clone = session_id.to_string();
+            let sandbox_db_clone = sandbox_db.clone();
 
             tokio::spawn(async move {
+                // LOG API REQUEST
+                if !path_clone.starts_with("/_dashboard/assets")
+                    && !path_clone.starts_with("/styles.css")
+                {
+                    let level = if status >= 400 { "error" } else { "info" };
+                    let _ = sandbox_db_clone
+                        .log_system_event(
+                            level,
+                            "API",
+                            &format!("{} {} - {}", method, path_clone, status),
+                        )
+                        .await;
+                }
+
                 let payload = serde_json::json!({
                     "sandbox_id": sid_clone,
                     "path": path_clone,
@@ -1416,6 +1433,9 @@ async fn tenant_resolver_middleware(
     mut req: Request,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
+    let method = req.method().to_string();
+    let path_req = req.uri().path().to_string();
+
     let mut key_scope_override: Option<String> = None;
 
     // [FIXED] Use fast fail key parser for Smart Key Overrides
@@ -1501,8 +1521,8 @@ async fn tenant_resolver_middleware(
     if !tenant_id.is_empty() {
         let hook_payload = serde_json::json!({
             "tenant_id": tenant_id,
-            "path": req.uri().path(),
-            "method": req.method().to_string(),
+            "path": path_req,
+            "method": method,
             "ip": req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("unknown"),
             "ingress": ingress,
             "egress": 0
@@ -1531,6 +1551,24 @@ async fn tenant_resolver_middleware(
         response
             .headers_mut()
             .insert("X-Apex-Scope", HeaderValue::from_static("root"));
+
+        let status = response.status().as_u16();
+        let db_clone = state.db.clone();
+
+        tokio::spawn(async move {
+            // LOG ROOT API REQUEST
+            if !path_req.starts_with("/_dashboard/assets") && !path_req.starts_with("/styles.css") {
+                let level = if status >= 400 { "error" } else { "info" };
+                let _ = db_clone
+                    .log_system_event(
+                        level,
+                        "API",
+                        &format!("{} {} - {}", method, path_req, status),
+                    )
+                    .await;
+            }
+        });
+
         return Ok(response);
     }
 
@@ -1566,8 +1604,23 @@ async fn tenant_resolver_middleware(
             let state_clone = state.clone();
             let base_url_clone = base_url.clone();
             let tid_clone = tenant_id.clone();
+            let tenant_db_clone = tenant_db.clone();
 
             tokio::spawn(async move {
+                // LOG TENANT API REQUEST
+                if !path_clone.starts_with("/_dashboard/assets")
+                    && !path_clone.starts_with("/styles.css")
+                {
+                    let level = if status >= 400 { "error" } else { "info" };
+                    let _ = tenant_db_clone
+                        .log_system_event(
+                            level,
+                            "API",
+                            &format!("{} {} - {}", method, path_clone, status),
+                        )
+                        .await;
+                }
+
                 let payload = serde_json::json!({
                     "tenant_id": tid_clone,
                     "path": path_clone,

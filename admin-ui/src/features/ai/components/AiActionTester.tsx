@@ -33,12 +33,23 @@ export const AiActionTester = ({ action, isOpen, onClose }: AiActionTesterProps)
 
   const handleRun = async () => {
     setIsLoading(true);
-    setResult(null);
+    setResult(''); // Clear previous results for clean stream entry
+
+    const isStreaming = action.config?.streaming === true;
+
     try {
-      const res = await aiService.run(action.slug, variables);
-      setResult(res.result || JSON.stringify(res, null, 2));
+      if (isStreaming) {
+        // Stream the response tokens directly into the output state
+        await aiService.run(action.slug, variables, (chunk) => {
+          setResult((prev) => (prev || '') + chunk);
+        });
+      } else {
+        // Fallback to standard atomic block fetch
+        const res = await aiService.run(action.slug, variables);
+        setResult(res.result || JSON.stringify(res, null, 2));
+      }
     } catch (e: any) {
-      setResult(`Error: ${e.message || 'Unknown error'}`);
+      setResult(`Error: ${e.message || 'Unknown error during execution'}`);
     } finally {
       setIsLoading(false);
     }
@@ -66,6 +77,7 @@ export const AiActionTester = ({ action, isOpen, onClose }: AiActionTesterProps)
                   value={variables[field] || ''}
                   onChange={(e) => setVariables({ ...variables, [field]: e.target.value })}
                   placeholder={`Value for ${field}...`}
+                  disabled={isLoading}
                 />
               </div>
             ))
@@ -83,7 +95,7 @@ export const AiActionTester = ({ action, isOpen, onClose }: AiActionTesterProps)
             Output
           </div>
           <div className="flex-1 bg-[#1e1e1e] rounded-lg border border-border p-4 font-mono text-sm text-[#d4d4d4] overflow-auto shadow-inner min-h-[300px]">
-            {isLoading ? (
+            {isLoading && !result ? (
               <div className="flex items-center justify-center h-full text-primary gap-2">
                 <Loader2 className="animate-spin h-5 w-5" /> Generating...
               </div>

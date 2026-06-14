@@ -14,8 +14,12 @@ export const aiService = {
     return await apiClient.ai.deleteAction(id);
   },
 
-  run: async (slug: string, variables: Record<string, string>) => {
-    return await apiClient.ai.run(slug, variables);
+  run: async (
+    slug: string,
+    variables: Record<string, string>,
+    onChunk?: (text: string) => void
+  ) => {
+    return await apiClient.ai.run(slug, variables, onChunk);
   },
 
   exportActions: async () => {

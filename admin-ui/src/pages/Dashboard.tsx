@@ -10,6 +10,8 @@ import {
   TrendingUp,
   AlertCircle,
   Terminal,
+  BrainCircuit,
+  Search
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Button, Badge } from '../components/ui/Elements';
 import { LineChart } from '../components/charts/LineChart';
@@ -89,13 +91,13 @@ export const Dashboard = () => {
       </div>
 
       {/* Top Metric Cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
         {[
           {
             label: 'Total Requests',
             val: stats.total_requests?.toLocaleString() || '0',
             icon: Activity,
-            trend: 'Overall System Traffic',
+            trend: 'Overall API Traffic',
             color: 'text-blue-500',
             bg: 'bg-blue-500/10',
           },
@@ -103,13 +105,13 @@ export const Dashboard = () => {
             label: 'Database Size',
             val: `${stats.db_size_mb?.toFixed(2) || 0} MB`,
             icon: HardDrive,
-            trend: 'Physical Disk Usage',
+            trend: 'Physical DB Usage',
             color: 'text-purple-500',
             bg: 'bg-purple-500/10',
           },
           {
             label: 'Collections',
-            val: stats.collections_count || 0,
+            val: stats.collections_count?.toLocaleString() || '0',
             icon: Database,
             trend: 'Active Schema Tables',
             color: 'text-emerald-500',
@@ -123,6 +125,22 @@ export const Dashboard = () => {
             color: 'text-amber-500',
             bg: 'bg-amber-500/10',
           },
+          {
+            label: 'Total Vectors',
+            val: stats.total_vectors?.toLocaleString() || '0',
+            icon: BrainCircuit,
+            trend: 'AI Embeddings',
+            color: 'text-indigo-500',
+            bg: 'bg-indigo-500/10',
+          },
+          {
+            label: 'Indexes Size',
+            val: `${stats.indexes_size_mb?.toFixed(2) || 0} MB`,
+            icon: Search,
+            trend: 'Tantivy Search Size',
+            color: 'text-pink-500',
+            bg: 'bg-pink-500/10',
+          },
         ].map((stat, i) => (
           <Card
             key={i}
@@ -134,17 +152,17 @@ export const Dashboard = () => {
               <stat.icon className={`h-5 w-5 ${stat.color}`} />
             </div>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-bold text-muted-foreground uppercase tracking-wider">
+              <CardTitle className="text-sm font-bold text-muted-foreground uppercase tracking-wider truncate pr-6">
                 {stat.label}
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-extrabold text-foreground tracking-tight">
+              <div className="text-2xl font-extrabold text-foreground tracking-tight truncate">
                 {stat.val}
               </div>
               <div className="flex items-center gap-1.5 mt-2">
-                <TrendingUp className="h-3 w-3 text-muted-foreground" />
-                <p className="text-[10px] text-muted-foreground uppercase font-semibold">
+                <TrendingUp className="h-3 w-3 text-muted-foreground shrink-0" />
+                <p className="text-[10px] text-muted-foreground uppercase font-semibold truncate">
                   {stat.trend}
                 </p>
               </div>

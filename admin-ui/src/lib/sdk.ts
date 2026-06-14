@@ -663,11 +663,80 @@ export class ApexKit {
         this._request('/admin/ai/actions', { method: 'POST', body: data }),
       deleteAction: (id: string | number) =>
         this._request(`/admin/ai/actions/${id}`, { method: 'DELETE' }),
-      run: (slug: string, variables: Record<string, any>) =>
-        this._request<{ result: string; metadata: any }>(`/ai/run/${slug}`, {
+      run: async (
+        slug: string,
+        variables: Record<string, any>,
+        onChunk?: (text: string) => void
+      ): Promise<{ result: string; metadata: any }> => {
+        let path = `/ai/run/${slug}`;
+        if (!path.startsWith('/api/v1')) {
+          path = `/api/v1${path}`;
+        }
+        const url = new URL(`${this.baseUrl}${path}`);
+
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (this.token) {
+          headers['Authorization'] = `Bearer ${this.token}`;
+        }
+
+        const response = await fetch(url.toString(), {
           method: 'POST',
-          body: { variables },
-        }),
+          headers,
+          body: JSON.stringify({ variables }),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(errText || `API Error: ${response.statusText}`);
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+
+        // Handle SSE Stream
+        if (contentType.includes('text/event-stream')) {
+          const reader = response.body?.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let fullText = '';
+
+          if (reader) {
+            let buffer = '';
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || ''; // Keep the last incomplete line in the buffer
+
+              for (const line of lines) {
+                if (line.startsWith('data:')) {
+                  const dataVal = line.substring(5).trim();
+                  if (dataVal && dataVal !== '[DONE]') {
+                    let cleanChunk = dataVal;
+                    // Safely unwrap strings if the backend serialized them as JSON
+                    try {
+                      const parsed = JSON.parse(dataVal);
+                      if (typeof parsed === 'string') cleanChunk = parsed;
+                    } catch (e) {}
+
+                    // Replace escaped literal newlines
+                    cleanChunk = cleanChunk.replace(/\\n/g, '\n');
+
+                    if (onChunk) onChunk(cleanChunk);
+                    fullText += cleanChunk;
+                  }
+                }
+              }
+            }
+          }
+          return { result: fullText, metadata: null };
+        }
+
+        // Standard JSON response fallback
+        return await response.json();
+      },
 
       // Architect (Child Context - Executed inside Sandbox scope)
       getSession: () => this._request<AiSession>('/admin/ai/session', { method: 'GET' }),

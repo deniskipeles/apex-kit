@@ -1,5 +1,5 @@
 use crate::BaseUrl;
-use crate::{AppError, AppState, DatabaseConnection, settings::AiConfigDto}; // Added DatabaseConnection
+use crate::{AppError, AppState, DatabaseConnection, settings::AiConfigDto};
 use crate::{extract_log_meta, trigger_void_hook};
 use apexkit_core::realtime::EventScope;
 use apexkit_core::{
@@ -8,15 +8,18 @@ use apexkit_core::{
     security::EncryptedValue,
 };
 use axum::extract::ConnectInfo;
+use axum::response::IntoResponse;
+use axum::response::sse::{Event, Sse};
 use axum::{
     Extension,
     extract::{Json, Path, State},
     http::StatusCode,
 };
-use regex::Regex;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
+use tokio::io::AsyncBufReadExt;
 use utoipa::{IntoParams, ToSchema};
 
 #[derive(Deserialize, ToSchema)]
@@ -61,7 +64,7 @@ fn parse_data_uri(uri: &str) -> Option<(String, String)> {
 )]
 pub async fn list_actions(
     Extension(claims): Extension<Claims>,
-    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
+    DatabaseConnection(db): DatabaseConnection,
     State(_state): State<AppState>,
 ) -> Result<Json<Vec<AiAction>>, AppError> {
     if claims.role != "admin" {
@@ -82,7 +85,7 @@ pub async fn list_actions(
 )]
 pub async fn create_action(
     Extension(claims): Extension<Claims>,
-    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
+    DatabaseConnection(db): DatabaseConnection,
     State(_state): State<AppState>,
     Json(payload): Json<CreateActionReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -104,7 +107,7 @@ pub async fn create_action(
 )]
 pub async fn delete_action(
     Extension(claims): Extension<Claims>,
-    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
+    DatabaseConnection(db): DatabaseConnection,
     State(_state): State<AppState>,
     Path(path): Path<DelActionPath>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -131,27 +134,16 @@ pub async fn run_action(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>, // [NEW]
-    headers: axum::http::HeaderMap,             // [NEW]
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     BaseUrl(base_url): BaseUrl,
     scope: Option<Extension<EventScope>>,
     Path(path): Path<RunActionPath>,
     Json(payload): Json<ExecutePromptReq>,
-) -> Result<Json<Value>, AppError> {
-    // Extract slug manually
+) -> Result<axum::response::Response, AppError> {
     let slug = path.slug;
     let claims = auth.map(|Extension(c)| c);
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
-    // [TRIGGER] Before AI Run
-    trigger_void_hook(
-        &state,
-        "before_ai_run",
-        json!({ "slug": slug, "vars": payload.variables }),
-        claims.as_ref(),
-        Some(&event_scope.clone()),
-        Some(base_url.clone()),
-    )
-    .await?;
 
     // 1. Get Action Config (From Tenant/Sandbox DB)
     let action = db
@@ -189,137 +181,291 @@ pub async fn run_action(
         .decrypt(&encrypted_val)
         .map_err(|_| AppError::UnknownError("Failed to decrypt API Key".into()))?;
 
-    // 3. Construct Request Parts (Multimodal Support)
-    let mut content_parts = Vec::new();
+    // 3. Resolve Config Variables safely from Option<serde_json::Value>
+    let config = action.config.as_ref();
+    let provider = config
+        .and_then(|c| c.get("provider"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("gemini");
+    let grounding = config
+        .and_then(|c| c.get("grounding"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let url_context = config
+        .and_then(|c| c.get("url_context"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let streaming = config
+        .and_then(|c| c.get("streaming"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    // A. Handle Text Template
+    // 4. Construct Final Templated Prompt
     let mut final_prompt = action.template.clone();
-    let re = Regex::new(r"\{\{(\w+)\}\}").unwrap();
+    let re_vars = regex::Regex::new(r"\{\{(\w+)\}\}").unwrap();
 
-    final_prompt = re
+    final_prompt = re_vars
         .replace_all(&final_prompt, |caps: &regex::Captures| {
             let key = &caps[1];
-            // Only replace text variables here
             payload
                 .variables
                 .get(key)
                 .and_then(|v| v.as_str())
-                // Ignore data URIs in text replacement to avoid massive logs/errors
-                .filter(|s| !s.starts_with("data:"))
+                .filter(|s| !s.starts_with("data:")) // Ignore binary/image base64 strings in templates
                 .unwrap_or("")
                 .to_string()
         })
         .to_string();
 
-    if !final_prompt.trim().is_empty() {
-        content_parts.push(json!({ "text": final_prompt }));
-    }
-
-    // B. Handle Image Inputs (e.g. for Editing or Vision)
-    // Look for variables that contain Data URIs (base64 images)
-    if let Some(obj) = payload.variables.as_object() {
-        for (_key, value) in obj {
-            if let Some(str_val) = value.as_str()
-                && let Some((mime, data)) = parse_data_uri(str_val)
-            {
-                content_parts.push(json!({
-                    "inline_data": {
-                        "mime_type": mime,
-                        "data": data
-                    }
-                }));
-            }
-        }
-    }
-
-    // 4. Construct Gemini API Request Body
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        action.model, api_key
-    );
-
-    let mut request_body = json!({
-        "contents": [{
-            "parts": content_parts
-        }],
-        // You MUST include this to get groundingMetadata back
-        "tools": [
-            { "google_search": {} }
-        ]
-    });
-
-    // Add System Instructions if present
-    if let Some(sys_prompt) = action.system_prompt
-        && !sys_prompt.trim().is_empty()
-    {
-        request_body["system_instruction"] = json!({
-            "parts": [{ "text": sys_prompt }]
-        });
-    }
-
-    // 5. Execute Request
-    let res = client
-        .post(url)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| AppError::UnknownError(format!("Gemini Req Failed: {}", e)))?;
-
-    if !res.status().is_success() {
-        let err_text = res.text().await.unwrap_or_default();
-        return Err(AppError::UnknownError(format!(
-            "Gemini API Error: {}",
-            err_text
-        )));
-    }
-
-    let response_json: Value = res
-        .json()
-        .await
-        .map_err(|_| AppError::JsonError("Invalid response".into()))?;
-
-    // 6. Parse Response (Handle Text OR Image Output)
-    let candidate = &response_json["candidates"][0]["content"]["parts"][0];
-
-    let result = if let Some(text) = candidate["text"].as_str() {
-        // Text response
-        text.to_string()
-    } else if let Some(inline_data) = candidate["inline_data"].as_object() {
-        // Image response (Base64)
-        let mime = inline_data["mime_type"].as_str().unwrap_or("image/png");
-        let data = inline_data["data"].as_str().unwrap_or("");
-        format!("data:{};base64,{}", mime, data)
-    } else {
-        return Err(AppError::UnknownError(
-            "Unsupported Gemini response format".into(),
-        ));
-    };
-
-    // Extract Metadata (Grounding/Search results)
-    let metadata = response_json["candidates"][0]["groundingMetadata"].clone();
-
-    // [LOG]
-    let meta = extract_log_meta(&headers, Some(addr), json!({ "slug": slug }));
-    let _ = db
-        .log_audit_event("info", "AI Action Run", "ai", Some(meta))
-        .await;
-
-    // [TRIGGER] After AI Run
-    let _ = trigger_void_hook(
+    // [TRIGGER] Before AI Run
+    trigger_void_hook(
         &state,
-        "after_ai_run",
-        json!({ "slug": slug, "result": result, "metadata": metadata }),
+        "before_ai_run",
+        json!({ "slug": slug, "vars": payload.variables }),
         claims.as_ref(),
         Some(&event_scope.clone()),
         Some(base_url.clone()),
     )
-    .await;
+    .await?;
 
-    Ok(Json(json!({
-        "result": result,
-        "metadata": metadata
-    })))
+    let client = reqwest::Client::new();
+
+    // 5. CALL AI PROVIDER LAYER
+    if provider == "gemini" {
+        // --- GOOGLE GEMINI EXECUTION INGRESS ---
+        let mut content_parts = vec![json!({ "text": final_prompt })];
+
+        // Capture base64 inline images if present
+        if let Some(obj) = payload.variables.as_object() {
+            for (_key, value) in obj {
+                if let Some(str_val) = value.as_str()
+                    && let Some((mime, data)) = parse_data_uri(str_val)
+                {
+                    content_parts.push(json!({
+                        "inline_data": {
+                            "mime_type": mime,
+                            "data": data
+                        }
+                    }));
+                }
+            }
+        }
+
+        let mut request_body = json!({
+            "contents": [{ "parts": content_parts }]
+        });
+
+        // Setup tools array
+        let mut tools = vec![];
+        if grounding {
+            tools.push(json!({"google_search": {}}));
+        }
+        if url_context {
+            tools.push(json!({"urlContext": {}}));
+        }
+        if !tools.is_empty() {
+            request_body["tools"] = json!(tools);
+        }
+
+        // Add System Instructions if present
+        if let Some(sys_prompt) = &action.system_prompt {
+            if !sys_prompt.trim().is_empty() {
+                request_body["system_instruction"] = json!({
+                    "parts": [{ "text": sys_prompt }]
+                });
+            }
+        }
+
+        if streaming {
+            // --- STREAMING PIPELINE (SSE via unified lines reader) ---
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
+                action.model, api_key
+            );
+
+            let res = client
+                .post(url)
+                .json(&request_body)
+                .send()
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+            let stream = res.bytes_stream();
+            let stream_reader = tokio_util::io::StreamReader::new(
+                stream
+                    .map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+            );
+            let mut buf_reader = tokio::io::BufReader::new(stream_reader);
+
+            let response_stream = async_stream::stream! {
+                let mut line = String::new();
+                while let Ok(n) = buf_reader.read_line(&mut line).await {
+                    if n == 0 { break; }
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("data:") {
+                        let data_val = trimmed.strip_prefix("data:").unwrap().trim();
+                        if data_val == "[DONE]" { break; }
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data_val) {
+                            if let Some(chunk) = parsed["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                                // Explicitly typed as Result<Event, std::io::Error>
+                                yield Ok::<Event, std::io::Error>(Event::default().data(chunk));
+                            }
+                        }
+                    }
+                    line.clear();
+                }
+            };
+
+            let sse =
+                Sse::new(response_stream).keep_alive(axum::response::sse::KeepAlive::default());
+            Ok(sse.into_response())
+        } else {
+            // --- STANDARD SINGLE RESPONSE ---
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                action.model, api_key
+            );
+
+            let res = client
+                .post(url)
+                .json(&request_body)
+                .send()
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+            let response_json: serde_json::Value = res
+                .json()
+                .await
+                .map_err(|_| AppError::JsonError("Invalid response".into()))?;
+
+            let candidate = &response_json["candidates"][0]["content"]["parts"][0];
+            let result = candidate["text"].as_str().unwrap_or("").to_string();
+            let metadata = response_json["candidates"][0]["groundingMetadata"].clone();
+
+            // [LOG]
+            let meta = extract_log_meta(&headers, Some(addr), json!({ "slug": slug }));
+            let _ = db
+                .log_audit_event("info", "AI Action Run", "ai", Some(meta))
+                .await;
+
+            // [TRIGGER] After AI Run
+            let _ = trigger_void_hook(
+                &state,
+                "after_ai_run",
+                json!({ "slug": slug, "result": result, "metadata": metadata }),
+                claims.as_ref(),
+                Some(&event_scope.clone()),
+                Some(base_url.clone()),
+            )
+            .await;
+
+            Ok(axum::Json(json!({
+                "result": result,
+                "metadata": metadata
+            }))
+            .into_response())
+        }
+    } else {
+        // --- OPENAI-COMPATIBLE (GROQ / OPENAI) EXECUTION INGRESS ---
+        let endpoint = if provider == "groq" {
+            "https://api.groq.com/openai/v1/chat/completions"
+        } else {
+            "https://api.openai.com/v1/chat/completions"
+        };
+
+        let mut messages = vec![];
+        if let Some(sys) = &action.system_prompt {
+            if !sys.trim().is_empty() {
+                messages.push(json!({ "role": "system", "content": sys }));
+            }
+        }
+        messages.push(json!({ "role": "user", "content": final_prompt }));
+
+        let request_body = json!({
+            "model": action.model,
+            "messages": messages,
+            "stream": streaming
+        });
+
+        if streaming {
+            // --- OPENAI SSE COMPATIBLE STREAM PARSING ---
+            let res = client
+                .post(endpoint)
+                .bearer_auth(&api_key)
+                .json(&request_body)
+                .send()
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+            let stream = res.bytes_stream();
+            let stream_reader = tokio_util::io::StreamReader::new(
+                stream
+                    .map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+            );
+            let mut buf_reader = tokio::io::BufReader::new(stream_reader);
+
+            let response_stream = async_stream::stream! {
+                let mut line = String::new();
+                while let Ok(n) = buf_reader.read_line(&mut line).await {
+                    if n == 0 { break; }
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("data:") {
+                        let data_val = trimmed.strip_prefix("data:").unwrap().trim();
+                        if data_val == "[DONE]" { break; }
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data_val) {
+                            if let Some(delta) = parsed["choices"][0]["delta"]["content"].as_str() {
+                                // Explicitly typed as Result<Event, std::io::Error>
+                                yield Ok::<Event, std::io::Error>(Event::default().data(delta));
+                            }
+                        }
+                    }
+                    line.clear();
+                }
+            };
+
+            let sse =
+                Sse::new(response_stream).keep_alive(axum::response::sse::KeepAlive::default());
+            Ok(sse.into_response())
+        } else {
+            // --- STANDARD SINGLE RESPONSE ---
+            let res = client
+                .post(endpoint)
+                .bearer_auth(&api_key)
+                .json(&request_body)
+                .send()
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+            let response_json: serde_json::Value = res
+                .json()
+                .await
+                .map_err(|_| AppError::JsonError("Invalid response".into()))?;
+
+            let result = response_json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            // [LOG]
+            let meta = extract_log_meta(&headers, Some(addr), json!({ "slug": slug }));
+            let _ = db
+                .log_audit_event("info", "AI Action Run", "ai", Some(meta))
+                .await;
+
+            // [TRIGGER] After AI Run
+            let _ = trigger_void_hook(
+                &state,
+                "after_ai_run",
+                json!({ "slug": slug, "result": result, "metadata": null }),
+                claims.as_ref(),
+                Some(&event_scope.clone()),
+                Some(base_url.clone()),
+            )
+            .await;
+
+            Ok(axum::Json(json!({ "result": result, "metadata": null })).into_response())
+        }
+    }
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -338,7 +484,7 @@ pub struct CodeEditReq {
 )]
 pub async fn edit_code(
     Extension(claims): Extension<Claims>,
-    DatabaseConnection(db): DatabaseConnection, // <--- FIXED: Use Injected DB
+    DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     Json(req): Json<CodeEditReq>,
 ) -> Result<Json<Value>, AppError> {
@@ -384,8 +530,7 @@ pub async fn edit_code(
         system_context, req.current_code, req.prompt
     );
 
-    // 3. Call LLM (Standard Text generation, not JSON mode)
-    // Call LLM using req.model
+    // 3. Call LLM
     let client = reqwest::Client::new();
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
@@ -412,7 +557,6 @@ pub async fn edit_code(
         .unwrap_or("")
         .to_string();
 
-    // Cleanup markdown if AI ignores instructions
     code = code
         .trim()
         .trim_start_matches("```javascript")
@@ -441,15 +585,12 @@ pub async fn delete_session(
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // 1. Delete Metadata Record
     state
         .db
         .delete_ai_session(&id)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // 2. Delete Physical Sandbox Files & Cache
-    // Note: Also need to delete from _sandboxes metadata table in Root DB
     state
         .db
         .delete_sandbox_metadata(&id)

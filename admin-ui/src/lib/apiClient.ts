@@ -907,8 +907,12 @@ export const apiClient = {
     deleteAction: async (id: string) => {
       await pb.ai.deleteAction(id);
     },
-    run: async (slug: string, variables: Record<string, string>) => {
-      return await pb.ai.run(slug, variables);
+    run: async (
+      slug: string,
+      variables: Record<string, string>,
+      onChunk?: (text: string) => void
+    ) => {
+      return await pb.ai.run(slug, variables, onChunk);
     },
 
     // [NEW] Scoped AI Architect Session Calls (Child Context - routed automatically to the Sandbox)
