@@ -1,0 +1,124 @@
+[package]
+name = "apexkit-api"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+# Web Framework (Axum 0.8)
+axum = { version = "=0.8.7", features = ["macros", "ws", "multipart"] }
+tokio = { version = "1.37.0", features = ["full"] }
+futures = "0.3" 
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace", "fs", "compression-gzip", "compression-br"] }
+async-stream = "0.3"
+
+# Data & Database
+serde = { version = "1.0.200", features = ["derive"] }
+serde_json = "1.0.117"
+apexkit-core = { path = "../apexkit-core" }
+apexkit-vector = { path = "../apexkit-vector" }
+
+# Data Import
+csv = "1.3"
+
+# GraphQL
+async-graphql = { version = "7.0", features = ["dynamic-schema", "dataloader"] }
+async-graphql-axum = "7.0"
+
+# OpenAPI Docs
+utoipa = { version = "5.4.0", features = ["axum_extras"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+# Dynamic gRPC and Protobufs
+prost-reflect = { version = "0.14", features = ["serde"] }
+protox = "0.7"
+bytes = "1.5"
+
+# Utilities
+validator = { version = "0.18.1", features = ["derive"] }
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
+dotenvy = "0.15"
+async-trait = "0.1"
+regex = "1.10" # For AI Prompt Templates
+
+# Headers & Extraction
+axum-extra = { version = "0.10", features = ["typed-header"] }
+headers = "0.4"
+
+# Logging & Monitoring
+tracing = "0.1"
+# Note: "json" feature added for file logging support
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+time = { version = "0.3", features = ["formatting"] }
+metrics = "0.21"
+metrics-exporter-prometheus = "0.12"
+
+# Rate Limiting (Updated for Axum 0.8)
+tower_governor = "0.8.0"
+governor = "0.6"
+
+# Static Assets
+rust-embed = "8.0"
+mime_guess = "2.0"
+
+# HTTP Client (Fix for Cloud Build Environment)
+# Using native-tls-vendored to avoid 'aws-lc-sys' compilation bugs on some Linux distros
+reqwest = { version = "0.12.4", default-features = false, features = ["json", "multipart", "native-tls-vendored"] }
+
+# Keep forcing ring for direct use
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+
+# Scheduler
+tokio-cron-scheduler = "0.9"
+cron = "0.12"
+
+# Templates
+tera = "1.19" 
+serde_qs = "0.13" # To parse query strings/form data for scripts
+
+chrono = { version = "0.4", features = ["serde"] }
+# Image processing and Caching
+image = { version = "0.24", features = ["avif-encoder", "webp-encoder", "jpeg", "png", "gif"] }
+moka = { version = "0.12", features = ["future"] } # High performance cache
+md5 = "0.7"
+base64 = "0.21"
+
+# --- CLI ENGINE ---
+clap = { version = "4.5", features = ["derive"] }
+
+# Compression/Archive (Optimized for size)
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+# Filesystem Traversal
+walkdir = "2.4"
+
+# Replication
+tonic = { version = "0.14.5", features = ["transport", "tls-ring", "tls-native-roots"] }
+prost = "0.14.3"
+tonic-prost = "0.14.5"
+tokio-stream = "0.1"
+rusqlite = { version = "0.39.0", features = ["bundled", "hooks", "serde_json", "blob"] }
+tokio-tungstenite = { version = "0.21.0", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+tokio-util = { version = "0.7.10", features = ["io"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14.5"
+protobuf-src = "2.1.1"
+
+[dev-dependencies]
+assert-json-diff = "2.0.2"
+hyper = "1.8.1"
+
+[features]
+default = []
+cuda = ["apexkit-vector/cuda"]
+metal = ["apexkit-vector/metal"]
+
+# Profile optimizations for release
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+

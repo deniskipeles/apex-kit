@@ -85,14 +85,14 @@ jobs:
 
       - name: Build (${{ matrix.target }})
         run: |
-          cargo zigbuild --target ${{ matrix.target }} --release -p apexkit-api
+          cargo zigbuild --target ${{ matrix.target }} --release -p apexkit-cli
 
       - name: Prepare Artifacts
         shell: bash
         run: |
           mkdir -p dist
           # The binary Cargo outputs
-          SRC_BIN="target/${{ matrix.target }}/release/apexkit-api${{ matrix.extension }}"
+          SRC_BIN="target/${{ matrix.target }}/release/apexkit-cli${{ matrix.extension }}"
           # The clean name we want inside the archive
           BIN_NAME="apexkit${{ matrix.extension }}"
           
