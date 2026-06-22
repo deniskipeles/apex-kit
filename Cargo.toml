@@ -1,8 +1,9 @@
 [workspace]
 members = [
-    "apexkit-api", 
-    "apexkit-core",
-    "apex-vector",
+    "crates/apexkit-cli",
+    "crates/apexkit-api", 
+    "crates/apexkit-core",
+    "crates/apexkit-vector"
 ]
 resolver = "2"
 
