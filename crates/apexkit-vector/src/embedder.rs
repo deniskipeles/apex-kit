@@ -4,35 +4,49 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use html2text::from_read;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tokenizers::{PaddingParams, Tokenizer};
 
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 
 use crate::models::gemma_embed::{GemmaEmbedConfig, GemmaEmbedModel, dump_tensor_names, masked_mean_pool};
+use crate::models::onnx_vision::{OnnxVisionConfig, OnnxVisionEmbedder};
+use crate::models::qwen_embed::{QwenEmbedConfig, QwenEmbedModel, last_token_pool};
 use crate::models::siglip2::{Siglip2VisionModel, SiglipVisionConfig};
 
-/// EmbeddingGemma uses task-specific prompt prefixes rather than a bare string.
-/// Document/passage embeddings (what you store and search against) use one prefix;
-/// search queries use another. Picking the wrong one measurably hurts retrieval quality,
-/// so this is exposed as an explicit choice rather than baked into `embed()` silently.
-#[derive(Clone, Copy, Debug)]
-pub enum GemmaTaskPrefix {
-    /// For text you are indexing / storing as a retrievable document.
-    Document,
-    /// For the incoming search query at retrieval time.
-    Query,
-    /// No prefix - use only if you know your checkpoint wasn't tuned with prefixes.
-    None,
+/// Which text-backbone family is currently loaded. Each family has its own pooling
+/// strategy and prompt-prefix convention, so call sites branch on this rather than a
+/// scattered pile of `is_gemma` / `is_qwen` booleans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendKind {
+    Bert,
+    Gemma,
+    Qwen,
 }
 
-impl GemmaTaskPrefix {
-    fn apply(&self, text: &str) -> String {
-        match self {
-            GemmaTaskPrefix::Document => format!("title: none | text: {text}"),
-            GemmaTaskPrefix::Query => format!("task: search result | query: {text}"),
-            GemmaTaskPrefix::None => text.to_string(),
-        }
+/// Which side of a retrieval pair this text is - affects prompt prefixing differently
+/// per backbone (see `apply_prefix` below).
+#[derive(Clone, Copy, Debug)]
+enum TaskKind {
+    Document,
+    Query,
+}
+
+/// EmbeddingGemma uses a prefix on BOTH sides (document and query), just different ones.
+/// Qwen3-Embedding only prefixes the QUERY side; documents are embedded raw. BERT-family
+/// models (MiniLM, BGE, GTE) get no prefix at all. Getting any of this backwards hurts
+/// retrieval quality without ever throwing an error, so it's centralized here instead of
+/// left for call sites to remember.
+fn apply_prefix(kind: BackendKind, task: TaskKind, text: &str) -> String {
+    match (kind, task) {
+        (BackendKind::Gemma, TaskKind::Document) => format!("title: none | text: {text}"),
+        (BackendKind::Gemma, TaskKind::Query) => format!("task: search result | query: {text}"),
+        (BackendKind::Qwen, TaskKind::Document) => text.to_string(),
+        (BackendKind::Qwen, TaskKind::Query) => format!(
+            "Instruct: Given a query, retrieve relevant documents.\nQuery: {text}"
+        ),
+        (BackendKind::Bert, _) => text.to_string(),
     }
 }
 
@@ -90,9 +104,19 @@ impl EmbeddingModelConfig {
     pub fn gemma_300m() -> Self {
         Self {
             repo_id: "google/embeddinggemma-300m".to_string(),
-            // EmbeddingGemma's real context window; lower this if you hit memory limits.
             window_size: 2048,
             overlap: 256,
+            ..Default::default()
+        }
+    }
+
+    /// Qwen3-Embedding-0.6B - causal decoder backbone with last-token pooling. See
+    /// `models/qwen_embed.rs` for the full forward-pass implementation and pooling notes.
+    pub fn qwen3_embedding_0_6b() -> Self {
+        Self {
+            repo_id: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+            window_size: 8192,
+            overlap: 512,
             ..Default::default()
         }
     }
@@ -121,15 +145,86 @@ impl EmbeddingModelConfig {
 enum ModelBackend {
     Bert(Box<BertModel>),
     Gemma(Box<GemmaEmbedModel>),
+    Qwen(Box<QwenEmbedModel>),
+}
+
+// ---------------------------------------------------------------------------
+// Vision backend selection
+// ---------------------------------------------------------------------------
+//
+// Controlled by the APEXKIT_VISION_MODEL env var, read once at first use (the vision
+// model is lazy-loaded on the first `embed_image` call, same as before):
+//
+//   unset / "siglip2-onnx"   -> DEFAULT. onnx-community/siglip2-base-patch16-384-ONNX,
+//                               run through ONNX Runtime. Quantized weights, low RAM.
+//   "tinyclip-onnx"          -> TinyCLIP-ViT-4M via ONNX Runtime. Needs
+//                               APEXKIT_VISION_MODEL_REPO / APEXKIT_VISION_MODEL_FILE set
+//                               to wherever you've hosted a verified ONNX export - see the
+//                               caveat in models/onnx_vision.rs.
+//   "mobileclip-onnx"        -> MobileCLIP-S0 via ONNX Runtime. Same caveat as above.
+//   "candle-siglip2"         -> LEGACY. The original hand-rolled candle SigLIP2 path from
+//                               before this change. Heavier (full F32 weights, custom
+//                               transformer), kept only for environments that can't use
+//                               ONNX Runtime for some reason.
+//
+// Additional overrides:
+//   APEXKIT_VISION_MODEL_REPO  - override the HF repo id for the selected preset
+//   APEXKIT_VISION_MODEL_FILE  - override the .onnx filename within that repo
+//   APEXKIT_VISION_INPUT_NAME  - override the ONNX input tensor name (default "pixel_values")
+enum VisionBackend {
+    Onnx(OnnxVisionEmbedder),
+    CandleSiglip2(Siglip2VisionModel),
+}
+
+struct VisionPreset {
+    repo_id: String,
+    file_name: String,
+    onnx_cfg: OnnxVisionConfig,
+}
+
+fn resolve_vision_preset() -> VisionPreset {
+    let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2-onnx".to_string());
+    let repo_override = std::env::var("APEXKIT_VISION_MODEL_REPO").ok();
+    let file_override = std::env::var("APEXKIT_VISION_MODEL_FILE").ok();
+    let input_name_override = std::env::var("APEXKIT_VISION_INPUT_NAME").ok();
+
+    let (default_repo, default_file, mut onnx_cfg) = match selection.as_str() {
+        "tinyclip-onnx" => (
+            "wkcn/TinyCLIP-ViT-4M-Text-3M".to_string(),
+            "onnx/model.onnx".to_string(),
+            OnnxVisionConfig::tinyclip_vit_4m(),
+        ),
+        "mobileclip-onnx" => (
+            "apple/MobileCLIP".to_string(),
+            "onnx/model.onnx".to_string(),
+            OnnxVisionConfig::mobileclip_s0(),
+        ),
+        // "siglip2-onnx" and anything unrecognized fall back to the default preset.
+        _ => (
+            "onnx-community/siglip2-base-patch16-384-ONNX".to_string(),
+            "onnx/model_quantized.onnx".to_string(),
+            OnnxVisionConfig::siglip2_base_patch16_384_onnx(),
+        ),
+    };
+
+    if let Some(name) = input_name_override {
+        onnx_cfg.input_name = name;
+    }
+
+    VisionPreset {
+        repo_id: repo_override.unwrap_or(default_repo),
+        file_name: file_override.unwrap_or(default_file),
+        onnx_cfg,
+    }
 }
 
 pub struct CandleEmbedder {
     backend: Mutex<ModelBackend>,
-    vision_backend: Mutex<Option<Siglip2VisionModel>>,
+    backend_kind: BackendKind,
+    vision_backend: Mutex<Option<VisionBackend>>,
     tokenizer: Tokenizer,
     device: Device,
     config: EmbeddingModelConfig,
-    is_gemma: bool,
 }
 
 fn get_best_device() -> Result<Device> {
@@ -149,13 +244,8 @@ impl CandleEmbedder {
     pub fn new(config: EmbeddingModelConfig) -> Result<Self> {
         let device = get_best_device().unwrap_or(Device::Cpu);
 
-        let mut actual_config = config.clone();
+        let actual_config = config.clone();
         let lower_repo = actual_config.repo_id.to_lowercase();
-
-        if lower_repo.contains("qwen") {
-            tracing::warn!("Qwen models are not implemented yet! Defaulting to all-MiniLM-L6-v2.");
-            actual_config = EmbeddingModelConfig::default();
-        }
 
         let api_builder = ApiBuilder::new();
         let api = if let Ok(token) = std::env::var("HF_TOKEN") {
@@ -173,8 +263,9 @@ impl CandleEmbedder {
         let raw_config: serde_json::Value = serde_json::from_str(&config_str)?;
 
         let is_gemma = lower_repo.contains("gemma");
+        let is_qwen = lower_repo.contains("qwen");
 
-        let backend = if is_gemma {
+        let (backend, backend_kind) = if is_gemma {
             tracing::info!("Apex Vector: Loading EmbeddingGemma transformer (full forward pass).");
             let cfg: GemmaEmbedConfig = serde_json::from_value(raw_config).with_context(|| {
                 "failed to parse Gemma config.json - check field names against GemmaEmbedConfig"
@@ -198,7 +289,32 @@ impl CandleEmbedder {
                     return Err(e);
                 }
             };
-            ModelBackend::Gemma(Box::new(model))
+            (ModelBackend::Gemma(Box::new(model)), BackendKind::Gemma)
+        } else if is_qwen {
+            tracing::info!("Apex Vector: Loading Qwen embedding transformer (causal, last-token pooling).");
+            let cfg: QwenEmbedConfig = serde_json::from_value(raw_config).with_context(|| {
+                "failed to parse Qwen config.json - check field names against QwenEmbedConfig"
+            })?;
+
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(
+                    std::slice::from_ref(&weights_filename),
+                    DType::F32,
+                    &device,
+                )?
+            };
+
+            let model = match QwenEmbedModel::load(vb, cfg, &device) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("Qwen load failed ({e}). Dumping tensor names from safetensors for debugging:");
+                    if let Ok(raw_tensors) = candle_core::safetensors::load(&weights_filename, &device) {
+                        dump_tensor_names(&raw_tensors);
+                    }
+                    return Err(e);
+                }
+            };
+            (ModelBackend::Qwen(Box::new(model)), BackendKind::Qwen)
         } else {
             tracing::info!("Apex Vector: Loading BERT-style text model");
             let vb = unsafe {
@@ -210,7 +326,7 @@ impl CandleEmbedder {
             };
             let cfg: BertConfig = serde_json::from_value(raw_config)?;
             let model = BertModel::load(vb, &cfg)?;
-            ModelBackend::Bert(Box::new(model))
+            (ModelBackend::Bert(Box::new(model)), BackendKind::Bert)
         };
 
         let tokenizer_bytes = std::fs::read(&tokenizer_filename)?;
@@ -225,35 +341,30 @@ impl CandleEmbedder {
 
         Ok(Self {
             backend: Mutex::new(backend),
+            backend_kind,
             vision_backend: Mutex::new(None),
             tokenizer,
             device,
             config: actual_config,
-            is_gemma,
         })
     }
 
-    /// Embed a document/passage for storage and search. Equivalent to the old `embed()`
-    /// signature but now routes through correct masked pooling and (for Gemma) the
-    /// document task-prefix automatically.
+    /// Embed a document/passage for storage and search.
     pub fn embed(&self, html_content: &str) -> Result<Vec<f32>> {
-        self.embed_with_task(html_content, GemmaTaskPrefix::Document)
+        self.embed_with_task(html_content, TaskKind::Document)
     }
 
-    /// Embed a search query. Use this at query time, not at indexing time - EmbeddingGemma
-    /// was trained with different prefixes for queries vs documents and mixing them up
-    /// will quietly hurt ranking quality even though nothing errors.
+    /// Embed a search query. Use this at query time, not at indexing time - both
+    /// EmbeddingGemma and Qwen3-Embedding were trained with different text on the query
+    /// side vs the document side, and mixing them up will quietly hurt ranking quality
+    /// even though nothing errors.
     pub fn embed_query(&self, query_text: &str) -> Result<Vec<f32>> {
-        self.embed_with_task(query_text, GemmaTaskPrefix::Query)
+        self.embed_with_task(query_text, TaskKind::Query)
     }
 
-    fn embed_with_task(&self, html_content: &str, task: GemmaTaskPrefix) -> Result<Vec<f32>> {
+    fn embed_with_task(&self, html_content: &str, task: TaskKind) -> Result<Vec<f32>> {
         let clean_text = from_read(html_content.as_bytes(), usize::MAX);
-        let clean_text = if self.is_gemma {
-            task.apply(&clean_text)
-        } else {
-            clean_text
-        };
+        let clean_text = apply_prefix(self.backend_kind, task, &clean_text);
 
         let encoding = self.tokenizer.encode(clean_text, true).map_err(E::msg)?;
         let token_ids = encoding.get_ids();
@@ -304,20 +415,15 @@ impl CandleEmbedder {
         Ok(final_vector)
     }
 
-    /// Runs a single forward pass for a window of token ids that's already <= window_size.
-    /// NOTE: this path builds its own attention mask of all-1s because a single window
-    /// (pre-batching) has no padding. The real padding fix lives in
-    /// `run_model_pass_with_mask`, used when you batch multiple texts together - see below.
+    /// Single window, no padding (attention mask is all-1s).
     fn run_model_pass(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
         let attention_mask: Vec<u32> = vec![1; token_ids.len()];
         self.run_model_pass_with_mask(token_ids, &attention_mask)
     }
 
-    /// Attention-mask-aware forward pass. This is the fix for the original bug: padding
-    /// tokens are excluded from both the model's attention computation (for BERT, via the
-    /// mask passed into `forward`) and from the pooling average (for both backends, via
-    /// `masked_mean_pool` / manual masked sum-then-divide). Previously padding tokens were
-    /// silently included in both, diluting every embedding produced from a padded batch.
+    /// Attention-mask-aware forward pass, branching on backend-specific pooling:
+    ///   - BERT / Gemma: bidirectional, masked MEAN pooling over real tokens.
+    ///   - Qwen: causal, LAST-real-token pooling (see models/qwen_embed.rs for why).
     fn run_model_pass_with_mask(&self, token_ids: &[u32], attention_mask: &[u32]) -> Result<Vec<f32>> {
         let mut backend_lock = self.backend.lock().unwrap();
 
@@ -329,12 +435,7 @@ impl CandleEmbedder {
                     .unsqueeze(0)?
                     .to_dtype(DType::F32)?;
 
-                // THE FIX: pass the real attention mask instead of None, so padding tokens
-                // don't get attended to.
                 let hidden = m.forward(&token_tensor, &type_tensor, Some(&mask_tensor))?;
-
-                // THE FIX: masked mean pool - divide by the count of REAL tokens, not the
-                // padded sequence length.
                 let pooled = masked_mean_pool(&hidden, &mask_tensor)?;
                 let normalized = normalize_l2(&pooled)?;
                 let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
@@ -344,8 +445,6 @@ impl CandleEmbedder {
                 let token_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
                 let mask_tensor = Tensor::new(attention_mask, &self.device)?.unsqueeze(0)?;
 
-                // Real Gemma transformer forward pass (full attention + MLP stack),
-                // not a raw embedding-table lookup.
                 let hidden = m.forward(&token_tensor, &mask_tensor)?;
                 let mask_f32 = mask_tensor.to_dtype(DType::F32)?;
                 let pooled = masked_mean_pool(&hidden, &mask_f32)?;
@@ -353,19 +452,26 @@ impl CandleEmbedder {
                 let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
                 Ok(vec)
             }
+            ModelBackend::Qwen(m) => {
+                let token_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
+                let mask_tensor = Tensor::new(attention_mask, &self.device)?.unsqueeze(0)?;
+
+                let hidden = m.forward(&token_tensor, &mask_tensor)?;
+                // Last-token pooling needs the mask as owned Vec<Vec<u32>> (batch of one).
+                let pooled = last_token_pool(&hidden, &[attention_mask.to_vec()])?;
+                let normalized = normalize_l2(&pooled)?;
+                let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
+                Ok(vec)
+            }
         }
     }
 
-    /// Batch-embed multiple documents in one padded batch. This is where the old attention
-    /// mask bug would have silently corrupted results the most, since `BatchLongest`
-    /// padding means shorter texts in the batch get diluted by pad tokens unless the mask
-    /// is correctly threaded through both attention and pooling.
+    /// Batch-embed multiple documents in one padded batch.
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let prefixed: Vec<String> = if self.is_gemma {
-            texts.iter().map(|t| GemmaTaskPrefix::Document.apply(t)).collect()
-        } else {
-            texts.to_vec()
-        };
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|t| apply_prefix(self.backend_kind, TaskKind::Document, t))
+            .collect();
 
         let encodings = self
             .tokenizer
@@ -385,78 +491,122 @@ impl CandleEmbedder {
         let mut vision_lock = self.vision_backend.lock().unwrap();
 
         if vision_lock.is_none() {
-            tracing::info!("Apex Vector: Lazy-loading SigLIP2 vision model for image vectorization...");
-            let api = ApiBuilder::new().build()?;
-            let repo = api.repo(Repo::new(
-                "google/siglip2-base-patch16-224".to_string(),
-                RepoType::Model,
-            ));
+            let preset = resolve_vision_preset();
+            let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2-onnx".to_string());
 
-            let weights = repo.get("model.safetensors")?;
-            let vision_config = SiglipVisionConfig::siglip2_base_patch16_224();
+            if selection == "candle-siglip2" {
+                tracing::info!("Apex Vector: Loading LEGACY candle SigLIP2 vision model (APEXKIT_VISION_MODEL=candle-siglip2).");
+                let api = ApiBuilder::new().build()?;
+                let repo = api.repo(Repo::new(
+                    "google/siglip2-base-patch16-224".to_string(),
+                    RepoType::Model,
+                ));
+                let weights = repo.get("model.safetensors")?;
+                let vision_config = SiglipVisionConfig::siglip2_base_patch16_224();
 
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    std::slice::from_ref(&weights),
-                    DType::F32,
-                    &self.device,
-                )?
-            };
+                let vb = unsafe {
+                    VarBuilder::from_mmaped_safetensors(
+                        std::slice::from_ref(&weights),
+                        DType::F32,
+                        &self.device,
+                    )?
+                };
 
-            let model = match Siglip2VisionModel::load(vb, vision_config) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::error!("SigLIP2 load failed ({e}). Dumping tensor names for debugging:");
-                    if let Ok(raw_tensors) = candle_core::safetensors::load(&weights, &self.device) {
-                        dump_tensor_names(&raw_tensors);
+                let model = match Siglip2VisionModel::load(vb, vision_config) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Candle SigLIP2 load failed ({e}). Dumping tensor names for debugging:");
+                        if let Ok(raw_tensors) = candle_core::safetensors::load(&weights, &self.device) {
+                            dump_tensor_names(&raw_tensors);
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-            };
-            *vision_lock = Some(model);
+                };
+                *vision_lock = Some(VisionBackend::CandleSiglip2(model));
+            } else {
+                tracing::info!(
+                    "Apex Vector: Loading ONNX vision model '{}' from repo '{}' file '{}' (APEXKIT_VISION_MODEL={})",
+                    selection, preset.repo_id, preset.file_name, selection
+                );
+                let api = ApiBuilder::new().build()?;
+                let repo = api.repo(Repo::new(preset.repo_id.clone(), RepoType::Model));
+                let model_path: PathBuf = repo.get(&preset.file_name).with_context(|| {
+                    format!(
+                        "failed to fetch '{}' from repo '{}' - if this preset's default \
+                         filename doesn't exist in that repo, set APEXKIT_VISION_MODEL_FILE \
+                         to the correct path (check the repo's file listing on HF)",
+                        preset.file_name, preset.repo_id
+                    )
+                })?;
+
+                let embedder = OnnxVisionEmbedder::load(&model_path, preset.onnx_cfg)?;
+                *vision_lock = Some(VisionBackend::Onnx(embedder));
+            }
         }
 
-        let model = vision_lock.as_ref().unwrap();
-        let cfg = model.config();
-        let image_size = cfg.image_size;
+        let backend = vision_lock.as_mut().unwrap();
 
         let b64 = if let Some(idx) = base64_image.find(',') {
             &base64_image[idx + 1..]
         } else {
             base64_image
         };
-
         let image_bytes = STANDARD.decode(b64).map_err(E::msg)?;
         let img = image::load_from_memory(&image_bytes).map_err(E::msg)?;
 
-        let resized = img.resize_exact(
-            image_size as u32,
-            image_size as u32,
-            image::imageops::FilterType::Triangle,
-        );
-        let rgb = resized.to_rgb8();
+        match backend {
+            VisionBackend::Onnx(embedder) => {
+                let cfg = embedder.config();
+                let size = cfg.image_size;
+                let resized = img.resize_exact(size as u32, size as u32, image::imageops::FilterType::Triangle);
+                let rgb = resized.to_rgb8();
 
-        // SigLIP preprocessing: scale to [-1, 1] (mean=0.5, std=0.5 per channel), not the
-        // ImageNet/CLIP mean-std normalization used previously.
-        let mut data = Vec::with_capacity(3 * image_size * image_size);
-        for c in 0..3 {
-            for y in 0..image_size as u32 {
-                for x in 0..image_size as u32 {
-                    let pixel = rgb.get_pixel(x, y);
-                    let val = pixel[c] as f32 / 255.0;
-                    let norm_val = (val - 0.5) / 0.5;
-                    data.push(norm_val);
+                let mut data = Vec::with_capacity(3 * size * size);
+                for c in 0..3 {
+                    for y in 0..size as u32 {
+                        for x in 0..size as u32 {
+                            let pixel = rgb.get_pixel(x, y);
+                            let val = pixel[c] as f32 / 255.0;
+                            let norm_val = (val - cfg.mean[c]) / cfg.std[c];
+                            data.push(norm_val);
+                        }
+                    }
                 }
+
+                let pooled = embedder.embed(data)?;
+                let mut vec = pooled;
+                l2_normalize_in_place(&mut vec);
+                Ok(vec)
+            }
+            VisionBackend::CandleSiglip2(model) => {
+                let cfg = model.config();
+                let image_size = cfg.image_size;
+                let resized = img.resize_exact(
+                    image_size as u32,
+                    image_size as u32,
+                    image::imageops::FilterType::Triangle,
+                );
+                let rgb = resized.to_rgb8();
+
+                let mut data = Vec::with_capacity(3 * image_size * image_size);
+                for c in 0..3 {
+                    for y in 0..image_size as u32 {
+                        for x in 0..image_size as u32 {
+                            let pixel = rgb.get_pixel(x, y);
+                            let val = pixel[c] as f32 / 255.0;
+                            let norm_val = (val - 0.5) / 0.5;
+                            data.push(norm_val);
+                        }
+                    }
+                }
+
+                let tensor = Tensor::from_vec(data, (3, image_size, image_size), &self.device)?.unsqueeze(0)?;
+                let pooled = model.forward(&tensor)?;
+                let normalized = normalize_l2(&pooled)?;
+                let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
+                Ok(vec)
             }
         }
-
-        let tensor = Tensor::from_vec(data, (3, image_size, image_size), &self.device)?.unsqueeze(0)?;
-        let pooled = model.forward(&tensor)?;
-
-        let normalized = normalize_l2(&pooled)?;
-        let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
-
-        Ok(vec)
     }
 }
 

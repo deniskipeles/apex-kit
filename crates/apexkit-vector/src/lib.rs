@@ -7,9 +7,8 @@ pub mod embedder;
 pub mod index;
 pub mod models;
 
-
 // Re-export common types
-pub use embedder::{CandleEmbedder, EmbeddingModelConfig, GemmaTaskPrefix};
+pub use embedder::{CandleEmbedder, EmbeddingModelConfig};
 pub use index::VectorIndex;
 
 #[derive(Clone)]

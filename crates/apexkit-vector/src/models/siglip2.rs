@@ -82,8 +82,12 @@ impl VisAttention {
         let h = cfg.hidden_size;
         let head_dim = h / cfg.num_attention_heads;
         let lin = |name: &str| -> Result<Linear> {
-            let w = vb.get((h, h), &format!("{prefix}.{name}.weight")).context(format!("missing {prefix}.{name}.weight"))?;
-            let b = vb.get(h, &format!("{prefix}.{name}.bias")).context(format!("missing {prefix}.{name}.bias"))?;
+            let w = vb
+                .get((h, h), &format!("{prefix}.{name}.weight"))
+                .context(format!("missing {prefix}.{name}.weight"))?;
+            let b = vb
+                .get(h, &format!("{prefix}.{name}.bias"))
+                .context(format!("missing {prefix}.{name}.bias"))?;
             Ok(Linear::new(w, Some(b)))
         };
         Ok(Self {
@@ -98,15 +102,32 @@ impl VisAttention {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
-        let q = self.q_proj.forward(x)?.reshape((b, seq, self.n_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
-        let k = self.k_proj.forward(x)?.reshape((b, seq, self.n_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
-        let v = self.v_proj.forward(x)?.reshape((b, seq, self.n_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, seq, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, seq, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b, seq, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
 
         let scale = 1f64 / (self.head_dim as f64).sqrt();
         let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = probs.matmul(&v)?;
-        let out = out.transpose(1, 2)?.reshape((b, seq, self.n_heads * self.head_dim))?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, seq, self.n_heads * self.head_dim))?;
         Ok(self.out_proj.forward(&out)?)
     }
 }
@@ -120,10 +141,18 @@ impl VisMlp {
     fn load(vb: &VarBuilder, prefix: &str, cfg: &SiglipVisionConfig) -> Result<Self> {
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
-        let fc1_w = vb.get((i, h), &format!("{prefix}.fc1.weight")).context("missing mlp.fc1.weight")?;
-        let fc1_b = vb.get(i, &format!("{prefix}.fc1.bias")).context("missing mlp.fc1.bias")?;
-        let fc2_w = vb.get((h, i), &format!("{prefix}.fc2.weight")).context("missing mlp.fc2.weight")?;
-        let fc2_b = vb.get(h, &format!("{prefix}.fc2.bias")).context("missing mlp.fc2.bias")?;
+        let fc1_w = vb
+            .get((i, h), &format!("{prefix}.fc1.weight"))
+            .context("missing mlp.fc1.weight")?;
+        let fc1_b = vb
+            .get(i, &format!("{prefix}.fc1.bias"))
+            .context("missing mlp.fc1.bias")?;
+        let fc2_w = vb
+            .get((h, i), &format!("{prefix}.fc2.weight"))
+            .context("missing mlp.fc2.weight")?;
+        let fc2_b = vb
+            .get(h, &format!("{prefix}.fc2.bias"))
+            .context("missing mlp.fc2.bias")?;
         Ok(Self {
             fc1: Linear::new(fc1_w, Some(fc1_b)),
             fc2: Linear::new(fc2_w, Some(fc2_b)),
@@ -137,8 +166,12 @@ impl VisMlp {
 }
 
 fn load_layer_norm(vb: &VarBuilder, prefix: &str, size: usize, eps: f64) -> Result<LayerNorm> {
-    let w = vb.get(size, &format!("{prefix}.weight")).context(format!("missing {prefix}.weight"))?;
-    let b = vb.get(size, &format!("{prefix}.bias")).context(format!("missing {prefix}.bias"))?;
+    let w = vb
+        .get(size, &format!("{prefix}.weight"))
+        .context(format!("missing {prefix}.weight"))?;
+    let b = vb
+        .get(size, &format!("{prefix}.bias"))
+        .context(format!("missing {prefix}.bias"))?;
     Ok(LayerNorm::new(w, b, eps))
 }
 
@@ -152,9 +185,19 @@ struct VisLayer {
 impl VisLayer {
     fn load(vb: &VarBuilder, prefix: &str, cfg: &SiglipVisionConfig) -> Result<Self> {
         Ok(Self {
-            ln1: load_layer_norm(vb, &format!("{prefix}.layer_norm1"), cfg.hidden_size, cfg.layer_norm_eps)?,
+            ln1: load_layer_norm(
+                vb,
+                &format!("{prefix}.layer_norm1"),
+                cfg.hidden_size,
+                cfg.layer_norm_eps,
+            )?,
             attn: VisAttention::load(vb, &format!("{prefix}.self_attn"), cfg)?,
-            ln2: load_layer_norm(vb, &format!("{prefix}.layer_norm2"), cfg.hidden_size, cfg.layer_norm_eps)?,
+            ln2: load_layer_norm(
+                vb,
+                &format!("{prefix}.layer_norm2"),
+                cfg.hidden_size,
+                cfg.layer_norm_eps,
+            )?,
             mlp: VisMlp::load(vb, &format!("{prefix}.mlp"), cfg)?,
         })
     }
@@ -189,18 +232,31 @@ impl Siglip2VisionModel {
             groups: 1,
             cudnn_fwd_algo: None,
         };
-        let patch_w = vb.get(
-            (cfg.hidden_size, cfg.num_channels, cfg.patch_size, cfg.patch_size),
-            "vision_model.embeddings.patch_embedding.weight",
-        ).context("missing patch_embedding.weight")?;
-        let patch_b = vb.get(cfg.hidden_size, "vision_model.embeddings.patch_embedding.bias")
+        let patch_w = vb
+            .get(
+                (
+                    cfg.hidden_size,
+                    cfg.num_channels,
+                    cfg.patch_size,
+                    cfg.patch_size,
+                ),
+                "vision_model.embeddings.patch_embedding.weight",
+            )
+            .context("missing patch_embedding.weight")?;
+        let patch_b = vb
+            .get(
+                cfg.hidden_size,
+                "vision_model.embeddings.patch_embedding.bias",
+            )
             .context("missing patch_embedding.bias")?;
         let patch_embed = Conv2d::new(patch_w, Some(patch_b), conv_cfg);
 
-        let position_embedding = vb.get(
-            (cfg.num_patches(), cfg.hidden_size),
-            "vision_model.embeddings.position_embedding.weight",
-        ).context("missing position_embedding.weight")?;
+        let position_embedding = vb
+            .get(
+                (cfg.num_patches(), cfg.hidden_size),
+                "vision_model.embeddings.position_embedding.weight",
+            )
+            .context("missing position_embedding.weight")?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
@@ -208,9 +264,20 @@ impl Siglip2VisionModel {
             layers.push(VisLayer::load(&vb, &prefix, &cfg)?);
         }
 
-        let post_layernorm = load_layer_norm(&vb, "vision_model.post_layernorm", cfg.hidden_size, cfg.layer_norm_eps)?;
+        let post_layernorm = load_layer_norm(
+            &vb,
+            "vision_model.post_layernorm",
+            cfg.hidden_size,
+            cfg.layer_norm_eps,
+        )?;
 
-        Ok(Self { patch_embed, position_embedding, layers, post_layernorm, cfg })
+        Ok(Self {
+            patch_embed,
+            position_embedding,
+            layers,
+            post_layernorm,
+            cfg,
+        })
     }
 
     /// pixel_values: [batch, channels, image_size, image_size], already normalized.

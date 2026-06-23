@@ -111,7 +111,9 @@ struct RmsNorm {
 
 impl RmsNorm {
     fn load(vb: &VarBuilder, name: &str, size: usize, eps: f64) -> Result<Self> {
-        let weight = vb.get(size, name).context(format!("missing tensor {name}"))?;
+        let weight = vb
+            .get(size, name)
+            .context(format!("missing tensor {name}"))?;
         Ok(Self { weight, eps })
     }
 
@@ -149,14 +151,23 @@ impl RotaryEmbedding {
         let freqs = positions
             .reshape((max_pos, 1))?
             .broadcast_mul(&inv_freq.reshape((1, half))?)?;
-        Ok(Self { cos: freqs.cos()?, sin: freqs.sin()? })
+        Ok(Self {
+            cos: freqs.cos()?,
+            sin: freqs.sin()?,
+        })
     }
 
     fn apply(&self, x: &Tensor, seq_len: usize) -> Result<Tensor> {
         let head_dim = x.dim(D::Minus1)?;
         let half = head_dim / 2;
-        let cos = self.cos.i((..seq_len, ..))?.reshape((1, 1, seq_len, half))?;
-        let sin = self.sin.i((..seq_len, ..))?.reshape((1, 1, seq_len, half))?;
+        let cos = self
+            .cos
+            .i((..seq_len, ..))?
+            .reshape((1, 1, seq_len, half))?;
+        let sin = self
+            .sin
+            .i((..seq_len, ..))?
+            .reshape((1, 1, seq_len, half))?;
 
         let x1 = x.narrow(D::Minus1, 0, half)?;
         let x2 = x.narrow(D::Minus1, half, half)?;
@@ -167,8 +178,16 @@ impl RotaryEmbedding {
     }
 }
 
-fn linear(vb: &VarBuilder, prefix: &str, in_dim: usize, out_dim: usize, with_bias: bool) -> Result<Linear> {
-    let w = vb.get((out_dim, in_dim), &format!("{prefix}.weight")).context(format!("missing {prefix}.weight"))?;
+fn linear(
+    vb: &VarBuilder,
+    prefix: &str,
+    in_dim: usize,
+    out_dim: usize,
+    with_bias: bool,
+) -> Result<Linear> {
+    let w = vb
+        .get((out_dim, in_dim), &format!("{prefix}.weight"))
+        .context(format!("missing {prefix}.weight"))?;
     let b = if with_bias {
         vb.get(out_dim, &format!("{prefix}.bias")).ok()
     } else {
@@ -201,23 +220,63 @@ impl Attention {
         let bias = cfg.attention_bias;
 
         let q_proj = linear(vb, &format!("{prefix}.q_proj"), h, n_heads * head_dim, bias)?;
-        let k_proj = linear(vb, &format!("{prefix}.k_proj"), h, n_kv_heads * head_dim, bias)?;
-        let v_proj = linear(vb, &format!("{prefix}.v_proj"), h, n_kv_heads * head_dim, bias)?;
+        let k_proj = linear(
+            vb,
+            &format!("{prefix}.k_proj"),
+            h,
+            n_kv_heads * head_dim,
+            bias,
+        )?;
+        let v_proj = linear(
+            vb,
+            &format!("{prefix}.v_proj"),
+            h,
+            n_kv_heads * head_dim,
+            bias,
+        )?;
         let o_proj = linear(vb, &format!("{prefix}.o_proj"), n_heads * head_dim, h, bias)?;
 
         // Qwen3 QK-norm tensors are per-head-dim sized, not per-hidden-size.
-        let q_norm = RmsNorm::try_load_optional(vb, &format!("{prefix}.q_norm.weight"), head_dim, cfg.rms_norm_eps);
-        let k_norm = RmsNorm::try_load_optional(vb, &format!("{prefix}.k_norm.weight"), head_dim, cfg.rms_norm_eps);
+        let q_norm = RmsNorm::try_load_optional(
+            vb,
+            &format!("{prefix}.q_norm.weight"),
+            head_dim,
+            cfg.rms_norm_eps,
+        );
+        let k_norm = RmsNorm::try_load_optional(
+            vb,
+            &format!("{prefix}.k_norm.weight"),
+            head_dim,
+            cfg.rms_norm_eps,
+        );
 
-        Ok(Self { q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, n_heads, n_kv_heads, head_dim })
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        })
     }
 
     fn forward(&self, x: &Tensor, rope: &RotaryEmbedding, attn_bias: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
 
-        let mut q = self.q_proj.forward(x)?.reshape((b, seq, self.n_heads, self.head_dim))?;
-        let mut k = self.k_proj.forward(x)?.reshape((b, seq, self.n_kv_heads, self.head_dim))?;
-        let v = self.v_proj.forward(x)?
+        let mut q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, seq, self.n_heads, self.head_dim))?;
+        let mut k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, seq, self.n_kv_heads, self.head_dim))?;
+        let v = self
+            .v_proj
+            .forward(x)?
             .reshape((b, seq, self.n_kv_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -237,7 +296,11 @@ impl Attention {
         let k = rope.apply(&k, seq)?;
 
         let rep = self.n_heads / self.n_kv_heads;
-        let (k, v) = if rep > 1 { (repeat_kv(&k, rep)?, repeat_kv(&v, rep)?) } else { (k, v) };
+        let (k, v) = if rep > 1 {
+            (repeat_kv(&k, rep)?, repeat_kv(&v, rep)?)
+        } else {
+            (k, v)
+        };
 
         let scale = 1f64 / (self.head_dim as f64).sqrt();
         let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
@@ -245,14 +308,18 @@ impl Attention {
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
 
         let out = probs.matmul(&v)?;
-        let out = out.transpose(1, 2)?.reshape((b, seq, self.n_heads * self.head_dim))?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, seq, self.n_heads * self.head_dim))?;
         Ok(self.o_proj.forward(&out)?)
     }
 }
 
 fn repeat_kv(x: &Tensor, rep: usize) -> Result<Tensor> {
     let (b, n_kv, seq, d) = x.dims4()?;
-    Ok(x.unsqueeze(2)?.expand((b, n_kv, rep, seq, d))?.reshape((b, n_kv * rep, seq, d))?)
+    Ok(x.unsqueeze(2)?
+        .expand((b, n_kv, rep, seq, d))?
+        .reshape((b, n_kv * rep, seq, d))?)
 }
 
 struct Mlp {
@@ -289,9 +356,19 @@ struct Layer {
 impl Layer {
     fn load(vb: &VarBuilder, prefix: &str, cfg: &QwenEmbedConfig) -> Result<Self> {
         Ok(Self {
-            input_norm: RmsNorm::load(vb, &format!("{prefix}.input_layernorm.weight"), cfg.hidden_size, cfg.rms_norm_eps)?,
+            input_norm: RmsNorm::load(
+                vb,
+                &format!("{prefix}.input_layernorm.weight"),
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+            )?,
             attn: Attention::load(vb, &format!("{prefix}.self_attn"), cfg)?,
-            post_attn_norm: RmsNorm::load(vb, &format!("{prefix}.post_attention_layernorm.weight"), cfg.hidden_size, cfg.rms_norm_eps)?,
+            post_attn_norm: RmsNorm::load(
+                vb,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+            )?,
             mlp: Mlp::load(vb, &format!("{prefix}.mlp"), cfg)?,
         })
     }
@@ -321,14 +398,24 @@ pub struct QwenEmbedModel {
 impl QwenEmbedModel {
     pub fn load(vb: VarBuilder, mut cfg: QwenEmbedConfig, device: &Device) -> Result<Self> {
         let embed_tokens = vb
-            .get((cfg.vocab_size, cfg.hidden_size), "model.embed_tokens.weight")
+            .get(
+                (cfg.vocab_size, cfg.hidden_size),
+                "model.embed_tokens.weight",
+            )
             .context("missing model.embed_tokens.weight")?;
 
         // Auto-detect QK-norm / attention-bias presence from layer 0 rather than trusting
         // config.json, since some Qwen config exports omit these fields entirely.
         let head_dim = cfg.head_dim();
-        cfg.use_qk_norm = vb.get(head_dim, "model.layers.0.self_attn.q_norm.weight").is_ok();
-        cfg.attention_bias = vb.get(cfg.num_attention_heads * head_dim, "model.layers.0.self_attn.q_proj.bias").is_ok();
+        cfg.use_qk_norm = vb
+            .get(head_dim, "model.layers.0.self_attn.q_norm.weight")
+            .is_ok();
+        cfg.attention_bias = vb
+            .get(
+                cfg.num_attention_heads * head_dim,
+                "model.layers.0.self_attn.q_proj.bias",
+            )
+            .is_ok();
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
@@ -336,10 +423,23 @@ impl QwenEmbedModel {
             layers.push(Layer::load(&vb, &prefix, &cfg)?);
         }
 
-        let final_norm = RmsNorm::load(&vb, "model.norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
-        let rope = RotaryEmbedding::new(head_dim, cfg.max_position_embeddings, cfg.rope_theta, device)?;
+        let final_norm =
+            RmsNorm::load(&vb, "model.norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
+        let rope = RotaryEmbedding::new(
+            head_dim,
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            device,
+        )?;
 
-        Ok(Self { embed_tokens, layers, final_norm, rope, cfg, device: device.clone() })
+        Ok(Self {
+            embed_tokens,
+            layers,
+            final_norm,
+            rope,
+            cfg,
+            device: device.clone(),
+        })
     }
 
     /// Returns last-hidden-state: [batch, seq, hidden].
@@ -348,7 +448,10 @@ impl QwenEmbedModel {
     pub fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let (b, seq) = input_ids.dims2()?;
         if seq > self.cfg.max_position_embeddings {
-            bail!("sequence length {seq} exceeds max_position_embeddings {}", self.cfg.max_position_embeddings);
+            bail!(
+                "sequence length {seq} exceeds max_position_embeddings {}",
+                self.cfg.max_position_embeddings
+            );
         }
 
         let flat_ids = input_ids.flatten_all()?;
@@ -377,7 +480,7 @@ impl QwenEmbedModel {
         for layer in &self.layers {
             x = layer.forward(&x, &self.rope, &attn_bias)?;
         }
-        Ok(self.final_norm.forward(&x)?)
+        self.final_norm.forward(&x)
     }
 
     pub fn device(&self) -> &Device {
@@ -392,10 +495,7 @@ pub fn last_token_pool(hidden: &Tensor, attention_mask: &[Vec<u32>]) -> Result<T
     let (b, _seq, h) = hidden.dims3()?;
     let mut rows = Vec::with_capacity(b);
     for (batch_idx, mask_row) in attention_mask.iter().enumerate().take(b) {
-        let last_real_idx = mask_row
-            .iter()
-            .rposition(|&m| m == 1)
-            .unwrap_or(0);
+        let last_real_idx = mask_row.iter().rposition(|&m| m == 1).unwrap_or(0);
         let row = hidden.i((batch_idx, last_real_idx, ..))?.reshape((1, h))?;
         rows.push(row);
     }

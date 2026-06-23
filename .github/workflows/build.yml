@@ -49,7 +49,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 musl-tools nasm perl cmake
+          sudo apt-get install -y mingw-w64 musl-tools nasm perl cmake pkg-config libssl-dev
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

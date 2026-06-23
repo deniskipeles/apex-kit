@@ -586,10 +586,10 @@ export class ApexKit {
           method: 'POST',
           body: {},
         }),
-      revectorizeCollection: (collectionId: string | number) =>
+      revectorizeCollection: (collectionId: string | number, force = false) =>
         this._request(`/admin/collections/${collectionId}/revectorize`, {
           method: 'POST',
-          body: { force: false },
+          body: { force },
         }),
 
       // Import/Export

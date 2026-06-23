@@ -11,7 +11,7 @@ import {
   AlertCircle,
   Terminal,
   BrainCircuit,
-  Search
+  Search,
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Button, Badge } from '../components/ui/Elements';
 import { LineChart } from '../components/charts/LineChart';

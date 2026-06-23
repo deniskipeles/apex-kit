@@ -93,7 +93,7 @@ export const VectorSearchPanel = () => {
     if (!selectedColId) return;
     setIsReindexing(true);
     try {
-      const res = await apiClient.collections.revectorize(selectedColId);
+      const res = await apiClient.collections.revectorize(selectedColId, true);
       if (res.ok || res.success) {
         toast(res.message || 'Background jobs started', 'success');
       } else {

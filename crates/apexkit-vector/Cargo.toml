@@ -27,6 +27,22 @@ html2text = "0.6"
 image = "0.24"
 base64 = "0.21"
 
+# ONNX Runtime backend for small/quantized vision models (default vision path - see
+# models/onnx_vision.rs). The legacy hand-rolled candle SigLIP2 path in models/siglip2.rs
+# is kept and selectable via APEXKIT_VISION_MODEL=candle-siglip2, but ort + a quantized
+# .onnx file is the lower-RAM default now.
+# IMPORTANT: ort does NOT re-export ndarray (there's no `ort::ndarray` module - that was
+# wrong). ort 2.0.0-rc.12 depends on ndarray 0.17 internally as its own dependency. Since
+# ndarray is pre-1.0 (semver treats every minor bump as breaking), our own `ndarray`
+# dependency MUST resolve to the same 0.17.x line or Cargo will keep two separate copies
+# in the dependency graph, and `Array4` from our copy won't satisfy the
+# `OwnedTensorArrayData` trait that ort's `Value::from_array` expects from ITS copy - this
+# is exactly the "multiple different versions of crate `ndarray`" error. If you ever bump
+# the `ort` version, check its Cargo.toml for whatever ndarray version it pins and match it
+# here too.
+ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
+ndarray = { version = "0.17", default-features = false }
+
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]

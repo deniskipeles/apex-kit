@@ -89,7 +89,9 @@ struct GemmaRmsNorm {
 
 impl GemmaRmsNorm {
     fn load(vb: &VarBuilder, name: &str, size: usize, eps: f64) -> Result<Self> {
-        let weight = vb.get(size, name).context(format!("missing tensor {name}"))?;
+        let weight = vb
+            .get(size, name)
+            .context(format!("missing tensor {name}"))?;
         Ok(Self { weight, eps })
     }
 
@@ -170,24 +172,58 @@ impl Attention {
         let n_heads = cfg.num_attention_heads;
         let n_kv_heads = cfg.n_kv_heads();
 
-        let q_proj = linear_no_bias(vb, &format!("{prefix}.q_proj.weight"), h, n_heads * head_dim)?;
-        let k_proj = linear_no_bias(vb, &format!("{prefix}.k_proj.weight"), h, n_kv_heads * head_dim)?;
-        let v_proj = linear_no_bias(vb, &format!("{prefix}.v_proj.weight"), h, n_kv_heads * head_dim)?;
-        let o_proj = linear_no_bias(vb, &format!("{prefix}.o_proj.weight"), n_heads * head_dim, h)?;
+        let q_proj = linear_no_bias(
+            vb,
+            &format!("{prefix}.q_proj.weight"),
+            h,
+            n_heads * head_dim,
+        )?;
+        let k_proj = linear_no_bias(
+            vb,
+            &format!("{prefix}.k_proj.weight"),
+            h,
+            n_kv_heads * head_dim,
+        )?;
+        let v_proj = linear_no_bias(
+            vb,
+            &format!("{prefix}.v_proj.weight"),
+            h,
+            n_kv_heads * head_dim,
+        )?;
+        let o_proj = linear_no_bias(
+            vb,
+            &format!("{prefix}.o_proj.weight"),
+            n_heads * head_dim,
+            h,
+        )?;
 
-        Ok(Self { q_proj, k_proj, v_proj, o_proj, n_heads, n_kv_heads, head_dim })
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        })
     }
 
     fn forward(&self, x: &Tensor, rope: &RotaryEmbedding, attn_bias: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
 
-        let q = self.q_proj.forward(x)?
+        let q = self
+            .q_proj
+            .forward(x)?
             .reshape((b, seq, self.n_heads, self.head_dim))?
             .transpose(1, 2)?; // [b, h, seq, d]
-        let k = self.k_proj.forward(x)?
+        let k = self
+            .k_proj
+            .forward(x)?
             .reshape((b, seq, self.n_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let v = self.v_proj.forward(x)?
+        let v = self
+            .v_proj
+            .forward(x)?
             .reshape((b, seq, self.n_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
@@ -209,7 +245,9 @@ impl Attention {
         let attn_probs = candle_nn::ops::softmax_last_dim(&attn_scores)?;
 
         let out = attn_probs.matmul(&v.contiguous()?)?; // [b, h, seq, d]
-        let out = out.transpose(1, 2)?.reshape((b, seq, self.n_heads * self.head_dim))?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, seq, self.n_heads * self.head_dim))?;
         Ok(self.o_proj.forward(&out)?)
     }
 }
@@ -224,7 +262,9 @@ fn repeat_kv(x: &Tensor, rep: usize) -> Result<Tensor> {
 }
 
 fn linear_no_bias(vb: &VarBuilder, name: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
-    let w = vb.get((out_dim, in_dim), name).context(format!("missing tensor {name}"))?;
+    let w = vb
+        .get((out_dim, in_dim), name)
+        .context(format!("missing tensor {name}"))?;
     Ok(Linear::new(w, None))
 }
 
@@ -268,9 +308,19 @@ struct Layer {
 impl Layer {
     fn load(vb: &VarBuilder, prefix: &str, cfg: &GemmaEmbedConfig) -> Result<Self> {
         Ok(Self {
-            input_norm: GemmaRmsNorm::load(vb, &format!("{prefix}.input_layernorm.weight"), cfg.hidden_size, cfg.rms_norm_eps)?,
+            input_norm: GemmaRmsNorm::load(
+                vb,
+                &format!("{prefix}.input_layernorm.weight"),
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+            )?,
             attn: Attention::load(vb, &format!("{prefix}.self_attn"), cfg)?,
-            post_attn_norm: GemmaRmsNorm::load(vb, &format!("{prefix}.post_attention_layernorm.weight"), cfg.hidden_size, cfg.rms_norm_eps)?,
+            post_attn_norm: GemmaRmsNorm::load(
+                vb,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+            )?,
             mlp: Mlp::load(vb, &format!("{prefix}.mlp"), cfg)?,
         })
     }
@@ -303,7 +353,10 @@ pub struct GemmaEmbedModel {
 impl GemmaEmbedModel {
     pub fn load(vb: VarBuilder, cfg: GemmaEmbedConfig, device: &Device) -> Result<Self> {
         let embed_tokens = vb
-            .get((cfg.vocab_size, cfg.hidden_size), "model.embed_tokens.weight")
+            .get(
+                (cfg.vocab_size, cfg.hidden_size),
+                "model.embed_tokens.weight",
+            )
             .context("missing model.embed_tokens.weight")?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -312,10 +365,23 @@ impl GemmaEmbedModel {
             layers.push(Layer::load(&vb, &prefix, &cfg)?);
         }
 
-        let final_norm = GemmaRmsNorm::load(&vb, "model.norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
-        let rope = RotaryEmbedding::new(cfg.head_dim(), cfg.max_position_embeddings, cfg.rope_theta, device)?;
+        let final_norm =
+            GemmaRmsNorm::load(&vb, "model.norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
+        let rope = RotaryEmbedding::new(
+            cfg.head_dim(),
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            device,
+        )?;
 
-        Ok(Self { embed_tokens, layers, final_norm, rope, cfg, device: device.clone() })
+        Ok(Self {
+            embed_tokens,
+            layers,
+            final_norm,
+            rope,
+            cfg,
+            device: device.clone(),
+        })
     }
 
     /// Returns last-hidden-state: [batch, seq, hidden]. Caller does pooling.
@@ -323,7 +389,10 @@ impl GemmaEmbedModel {
     pub fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let (b, seq) = input_ids.dims2()?;
         if seq > self.cfg.max_position_embeddings {
-            bail!("sequence length {seq} exceeds max_position_embeddings {}", self.cfg.max_position_embeddings);
+            bail!(
+                "sequence length {seq} exceeds max_position_embeddings {}",
+                self.cfg.max_position_embeddings
+            );
         }
 
         // Embedding lookup via index_select, then Gemma's sqrt(hidden_size) scaling.
@@ -342,7 +411,7 @@ impl GemmaEmbedModel {
         for layer in &self.layers {
             x = layer.forward(&x, &self.rope, &attn_bias)?;
         }
-        Ok(self.final_norm.forward(&x)?)
+        self.final_norm.forward(&x)
     }
 
     pub fn device(&self) -> &Device {

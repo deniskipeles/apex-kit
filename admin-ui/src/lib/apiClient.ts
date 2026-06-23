@@ -263,8 +263,8 @@ export const apiClient = {
     const res = await pb.admins.reIndex(collectionId);
     return res;
   },
-  revectorizeCollection: async (collectionId?: string) => {
-    const res = await pb.admins.revectorizeCollection(collectionId as any);
+  revectorizeCollection: async (collectionId: string | number, force?: boolean) => {
+    const res = await pb.admins.revectorizeCollection(collectionId, force);
     return res;
   },
 
@@ -570,7 +570,8 @@ export const apiClient = {
       return transformCollection(res);
     },
     delete: async (id: string): Promise<void> => pb.admins.deleteCollection(id),
-    revectorize: (id: string) => pb.admins.revectorizeCollection(id),
+    revectorize: (id: string | number, force?: boolean) =>
+      pb.admins.revectorizeCollection(id, force),
     reIndex: (id: string) => pb.admins.reIndex(id),
 
     exportSchema: async () => {

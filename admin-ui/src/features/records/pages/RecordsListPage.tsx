@@ -359,7 +359,7 @@ export const RecordsListPage = () => {
   const handleReVectorize = async () => {
     if (!collection) return;
     try {
-      const res = await apiClient.revectorizeCollection(collection.id);
+      const res = await apiClient.revectorizeCollection(collection.id, true);
       if (res.success) toast('AI Vectorization started', 'success');
       else toast('Failed to start vectorization', 'error');
     } catch (e) {
