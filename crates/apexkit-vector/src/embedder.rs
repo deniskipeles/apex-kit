@@ -1,4 +1,4 @@
-use anyhow::{Context, Error as E, Result};
+use anyhow::{Context, Error as E, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -10,14 +10,18 @@ use tokenizers::{PaddingParams, Tokenizer};
 
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 
-use crate::models::gemma_embed::{GemmaEmbedConfig, GemmaEmbedModel, dump_tensor_names, masked_mean_pool};
-use crate::models::onnx_vision::{OnnxVisionConfig, OnnxVisionEmbedder};
+use crate::models::gemma_embed::{
+    GemmaEmbedConfig, GemmaEmbedModel, dump_tensor_names, masked_mean_pool,
+};
+use crate::models::onnx_text::{OnnxTextConfig, OnnxTextEmbedder};
+use crate::models::onnx_vision::{OnnxVisionConfig, OnnxVisionEmbedder, VisionFamily};
 use crate::models::qwen_embed::{QwenEmbedConfig, QwenEmbedModel, last_token_pool};
 use crate::models::siglip2::{Siglip2VisionModel, SiglipVisionConfig};
 
-/// Which text-backbone family is currently loaded. Each family has its own pooling
-/// strategy and prompt-prefix convention, so call sites branch on this rather than a
-/// scattered pile of `is_gemma` / `is_qwen` booleans.
+// =====================================================================================
+// TEXT BACKBONE SELECTION (BERT / Gemma / Qwen) - unchanged from prior revisions
+// =====================================================================================
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BackendKind {
     Bert,
@@ -25,27 +29,20 @@ enum BackendKind {
     Qwen,
 }
 
-/// Which side of a retrieval pair this text is - affects prompt prefixing differently
-/// per backbone (see `apply_prefix` below).
 #[derive(Clone, Copy, Debug)]
 enum TaskKind {
     Document,
     Query,
 }
 
-/// EmbeddingGemma uses a prefix on BOTH sides (document and query), just different ones.
-/// Qwen3-Embedding only prefixes the QUERY side; documents are embedded raw. BERT-family
-/// models (MiniLM, BGE, GTE) get no prefix at all. Getting any of this backwards hurts
-/// retrieval quality without ever throwing an error, so it's centralized here instead of
-/// left for call sites to remember.
 fn apply_prefix(kind: BackendKind, task: TaskKind, text: &str) -> String {
     match (kind, task) {
         (BackendKind::Gemma, TaskKind::Document) => format!("title: none | text: {text}"),
         (BackendKind::Gemma, TaskKind::Query) => format!("task: search result | query: {text}"),
         (BackendKind::Qwen, TaskKind::Document) => text.to_string(),
-        (BackendKind::Qwen, TaskKind::Query) => format!(
-            "Instruct: Given a query, retrieve relevant documents.\nQuery: {text}"
-        ),
+        (BackendKind::Qwen, TaskKind::Query) => {
+            format!("Instruct: Given a query, retrieve relevant documents.\nQuery: {text}")
+        }
         (BackendKind::Bert, _) => text.to_string(),
     }
 }
@@ -100,7 +97,6 @@ impl EmbeddingModelConfig {
             ..Default::default()
         }
     }
-
     pub fn gemma_300m() -> Self {
         Self {
             repo_id: "google/embeddinggemma-300m".to_string(),
@@ -109,9 +105,6 @@ impl EmbeddingModelConfig {
             ..Default::default()
         }
     }
-
-    /// Qwen3-Embedding-0.6B - causal decoder backbone with last-token pooling. See
-    /// `models/qwen_embed.rs` for the full forward-pass implementation and pooling notes.
     pub fn qwen3_embedding_0_6b() -> Self {
         Self {
             repo_id: "Qwen/Qwen3-Embedding-0.6B".to_string(),
@@ -120,7 +113,6 @@ impl EmbeddingModelConfig {
             ..Default::default()
         }
     }
-
     pub fn custom(
         repo_id: String,
         revision: String,
@@ -148,83 +140,206 @@ enum ModelBackend {
     Qwen(Box<QwenEmbedModel>),
 }
 
-// ---------------------------------------------------------------------------
-// Vision backend selection
-// ---------------------------------------------------------------------------
+// =====================================================================================
+// VISION BACKEND SELECTION - siglip / siglip2 / clip / openclip / dinov2 / custom
+// =====================================================================================
 //
-// Controlled by the APEXKIT_VISION_MODEL env var, read once at first use (the vision
-// model is lazy-loaded on the first `embed_image` call, same as before):
+// Controlled by:
+//   APEXKIT_VISION_MODEL = siglip | siglip2 (default) | clip | openclip | dinov2 | custom
+//                          | candle-siglip2 (legacy hand-rolled candle path, vision-only)
 //
-//   unset / "siglip2-onnx"   -> DEFAULT. onnx-community/siglip2-base-patch16-384-ONNX,
-//                               run through ONNX Runtime. Quantized weights, low RAM.
-//   "tinyclip-onnx"          -> TinyCLIP-ViT-4M via ONNX Runtime. Needs
-//                               APEXKIT_VISION_MODEL_REPO / APEXKIT_VISION_MODEL_FILE set
-//                               to wherever you've hosted a verified ONNX export - see the
-//                               caveat in models/onnx_vision.rs.
-//   "mobileclip-onnx"        -> MobileCLIP-S0 via ONNX Runtime. Same caveat as above.
-//   "candle-siglip2"         -> LEGACY. The original hand-rolled candle SigLIP2 path from
-//                               before this change. Heavier (full F32 weights, custom
-//                               transformer), kept only for environments that can't use
-//                               ONNX Runtime for some reason.
+//   APEXKIT_VISION_MODEL_REPO        - override the HF repo id for the selected preset's
+//                                       IMAGE tower (defaults to a known-good repo per family)
+//   APEXKIT_VISION_MODEL_FILE        - override the image tower .onnx filename
+//   APEXKIT_VISION_INPUT_NAME        - override the image tower's ONNX input tensor name
 //
-// Additional overrides:
-//   APEXKIT_VISION_MODEL_REPO  - override the HF repo id for the selected preset
-//   APEXKIT_VISION_MODEL_FILE  - override the .onnx filename within that repo
-//   APEXKIT_VISION_INPUT_NAME  - override the ONNX input tensor name (default "pixel_values")
+//   APEXKIT_VISION_TEXT_REPO         - HF repo id for the paired TEXT tower (cross-modal
+//                                       text-image search). Defaults to APEXKIT_VISION_MODEL_REPO
+//                                       if unset, since most CLIP-family ONNX exports ship
+//                                       both towers in the same repo.
+//   APEXKIT_VISION_TEXT_FILE         - text tower .onnx filename (default: "onnx/textual.onnx";
+//                                       override per repo layout)
+//   APEXKIT_VISION_TEXT_TOKENIZER    - tokenizer.json filename for the text tower
+//                                       (default: "tokenizer.json")
+//   APEXKIT_VISION_TEXT_DISABLE      - set to "1"/"true" to force-disable the text tower
+//                                       even for a family that supports it (e.g. if your
+//                                       repo only ships the vision half)
+//
+// Custom (APEXKIT_VISION_MODEL=custom) ALSO requires:
+//   APEXKIT_VISION_CUSTOM_IMAGE_SIZE - integer, e.g. "224"
+//   APEXKIT_VISION_CUSTOM_MEAN       - comma-separated 3 floats, e.g. "0.5,0.5,0.5"
+//   APEXKIT_VISION_CUSTOM_STD        - comma-separated 3 floats, e.g. "0.5,0.5,0.5"
+//   (APEXKIT_VISION_MODEL_REPO/_FILE are required too, same as any other preset)
+//
+// DINOv2 has no text tower by design (see VisionFamily::supports_text_image_in_principle)
+// - APEXKIT_VISION_TEXT_* env vars are ignored when APEXKIT_VISION_MODEL=dinov2.
+
 enum VisionBackend {
-    Onnx(OnnxVisionEmbedder),
-    CandleSiglip2(Siglip2VisionModel),
+    Onnx {
+        family: VisionFamily,
+        vision: OnnxVisionEmbedder,
+        text: Option<OnnxTextEmbedder>,
+        vision_repo: String,
+        vision_file: String,
+    },
+    /// Legacy hand-rolled candle SigLIP2 path from before the ONNX migration. Vision-only
+    /// (no text tower) - kept only for environments that can't use ONNX Runtime.
+    CandleSiglip2 {
+        model: Siglip2VisionModel,
+        repo: String,
+    },
 }
 
-struct VisionPreset {
-    repo_id: String,
-    file_name: String,
+struct ResolvedVisionConfig {
+    family: VisionFamily,
+    vision_repo: String,
+    vision_file: String,
     onnx_cfg: OnnxVisionConfig,
+    text_repo: Option<String>,
+    text_file: Option<String>,
+    text_tokenizer_file: Option<String>,
+    text_cfg: OnnxTextConfig,
 }
 
-fn resolve_vision_preset() -> VisionPreset {
-    let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2-onnx".to_string());
+fn env_bool(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn parse_csv_f32_3(s: &str) -> Result<[f32; 3]> {
+    let parts: Vec<f32> = s
+        .split(',')
+        .map(|p| p.trim().parse::<f32>())
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("failed to parse '{s}' as 3 comma-separated floats: {e}"))?;
+    if parts.len() != 3 {
+        bail!(
+            "expected exactly 3 comma-separated floats, got {} in '{}'",
+            parts.len(),
+            s
+        );
+    }
+    Ok([parts[0], parts[1], parts[2]])
+}
+
+fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
+    let selection_str =
+        std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2".to_string());
+    let family = VisionFamily::from_env_str(&selection_str);
+
     let repo_override = std::env::var("APEXKIT_VISION_MODEL_REPO").ok();
     let file_override = std::env::var("APEXKIT_VISION_MODEL_FILE").ok();
     let input_name_override = std::env::var("APEXKIT_VISION_INPUT_NAME").ok();
 
-    let (default_repo, default_file, mut onnx_cfg) = match selection.as_str() {
-        "tinyclip-onnx" => (
-            "wkcn/TinyCLIP-ViT-4M-Text-3M".to_string(),
+    let (default_repo, default_file, mut onnx_cfg, default_text_cfg) = match family {
+        VisionFamily::Siglip => (
+            "google/siglip-base-patch16-224".to_string(),
             "onnx/model.onnx".to_string(),
-            OnnxVisionConfig::tinyclip_vit_4m(),
+            OnnxVisionConfig::siglip_base_patch16_224(),
+            OnnxTextConfig::siglip_style(),
         ),
-        "mobileclip-onnx" => (
-            "apple/MobileCLIP".to_string(),
-            "onnx/model.onnx".to_string(),
-            OnnxVisionConfig::mobileclip_s0(),
-        ),
-        // "siglip2-onnx" and anything unrecognized fall back to the default preset.
-        _ => (
+        VisionFamily::Siglip2 => (
             "onnx-community/siglip2-base-patch16-384-ONNX".to_string(),
             "onnx/model_quantized.onnx".to_string(),
-            OnnxVisionConfig::siglip2_base_patch16_384_onnx(),
+            OnnxVisionConfig::siglip2_base_patch16_384(),
+            OnnxTextConfig::siglip_style(),
         ),
+        VisionFamily::Clip => (
+            "openai/clip-vit-base-patch32".to_string(),
+            "onnx/visual.onnx".to_string(),
+            OnnxVisionConfig::clip_vit_base_patch32(),
+            OnnxTextConfig::clip_style(),
+        ),
+        VisionFamily::OpenClip => (
+            "laion/CLIP-ViT-B-32-laion2B-s34B-b79K".to_string(),
+            "onnx/visual.onnx".to_string(),
+            OnnxVisionConfig::openclip_vit_b_32(),
+            OnnxTextConfig::clip_style(),
+        ),
+        VisionFamily::Dinov2 => (
+            "facebook/dinov2-base".to_string(),
+            "onnx/model.onnx".to_string(),
+            OnnxVisionConfig::dinov2_base(),
+            OnnxTextConfig::default(), // unused - DINOv2 has no text tower
+        ),
+        VisionFamily::Custom => {
+            let image_size: usize = std::env::var("APEXKIT_VISION_CUSTOM_IMAGE_SIZE")
+                .context("APEXKIT_VISION_MODEL=custom requires APEXKIT_VISION_CUSTOM_IMAGE_SIZE")?
+                .parse()
+                .context("APEXKIT_VISION_CUSTOM_IMAGE_SIZE must be a positive integer")?;
+            let mean = parse_csv_f32_3(
+                &std::env::var("APEXKIT_VISION_CUSTOM_MEAN")
+                    .context("APEXKIT_VISION_MODEL=custom requires APEXKIT_VISION_CUSTOM_MEAN")?,
+            )?;
+            let std_dev = parse_csv_f32_3(
+                &std::env::var("APEXKIT_VISION_CUSTOM_STD")
+                    .context("APEXKIT_VISION_MODEL=custom requires APEXKIT_VISION_CUSTOM_STD")?,
+            )?;
+            let repo = repo_override
+                .clone()
+                .context("APEXKIT_VISION_MODEL=custom requires APEXKIT_VISION_MODEL_REPO")?;
+            let file = file_override
+                .clone()
+                .context("APEXKIT_VISION_MODEL=custom requires APEXKIT_VISION_MODEL_FILE")?;
+            (
+                repo,
+                file,
+                OnnxVisionConfig {
+                    image_size,
+                    mean,
+                    std: std_dev,
+                    input_name: "pixel_values".to_string(),
+                },
+                OnnxTextConfig::default(),
+            )
+        }
     };
 
     if let Some(name) = input_name_override {
         onnx_cfg.input_name = name;
     }
 
-    VisionPreset {
-        repo_id: repo_override.unwrap_or(default_repo),
-        file_name: file_override.unwrap_or(default_file),
+    let vision_repo = repo_override.unwrap_or(default_repo);
+    let vision_file = file_override.unwrap_or(default_file);
+
+    let text_disabled = env_bool("APEXKIT_VISION_TEXT_DISABLE");
+    let (text_repo, text_file, text_tokenizer_file) =
+        if family.supports_text_image_in_principle() && !text_disabled {
+            let text_repo =
+                std::env::var("APEXKIT_VISION_TEXT_REPO").unwrap_or_else(|_| vision_repo.clone());
+            let text_file = std::env::var("APEXKIT_VISION_TEXT_FILE")
+                .unwrap_or_else(|_| "onnx/textual.onnx".to_string());
+            let text_tokenizer_file = std::env::var("APEXKIT_VISION_TEXT_TOKENIZER")
+                .unwrap_or_else(|_| "tokenizer.json".to_string());
+            (Some(text_repo), Some(text_file), Some(text_tokenizer_file))
+        } else {
+            (None, None, None)
+        };
+
+    Ok(ResolvedVisionConfig {
+        family,
+        vision_repo,
+        vision_file,
         onnx_cfg,
-    }
+        text_repo,
+        text_file,
+        text_tokenizer_file,
+        text_cfg: default_text_cfg,
+    })
 }
+
+// =====================================================================================
+// CandleEmbedder
+// =====================================================================================
 
 pub struct CandleEmbedder {
     backend: Mutex<ModelBackend>,
     backend_kind: BackendKind,
+    text_config: EmbeddingModelConfig,
     vision_backend: Mutex<Option<VisionBackend>>,
     tokenizer: Tokenizer,
     device: Device,
-    config: EmbeddingModelConfig,
 }
 
 fn get_best_device() -> Result<Device> {
@@ -267,10 +382,9 @@ impl CandleEmbedder {
 
         let (backend, backend_kind) = if is_gemma {
             tracing::info!("Apex Vector: Loading EmbeddingGemma transformer (full forward pass).");
-            let cfg: GemmaEmbedConfig = serde_json::from_value(raw_config).with_context(|| {
-                "failed to parse Gemma config.json - check field names against GemmaEmbedConfig"
-            })?;
-
+            let cfg: GemmaEmbedConfig = serde_json::from_value(raw_config).context(
+                "failed to parse Gemma config.json - check field names against GemmaEmbedConfig",
+            )?;
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
                     std::slice::from_ref(&weights_filename),
@@ -278,12 +392,13 @@ impl CandleEmbedder {
                     &device,
                 )?
             };
-
             let model = match GemmaEmbedModel::load(vb, cfg, &device) {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::error!("Gemma load failed ({e}). Dumping tensor names from safetensors for debugging:");
-                    if let Ok(raw_tensors) = candle_core::safetensors::load(&weights_filename, &device) {
+                    tracing::error!("Gemma load failed ({e}). Dumping tensor names for debugging:");
+                    if let Ok(raw_tensors) =
+                        candle_core::safetensors::load(&weights_filename, &device)
+                    {
                         dump_tensor_names(&raw_tensors);
                     }
                     return Err(e);
@@ -291,11 +406,12 @@ impl CandleEmbedder {
             };
             (ModelBackend::Gemma(Box::new(model)), BackendKind::Gemma)
         } else if is_qwen {
-            tracing::info!("Apex Vector: Loading Qwen embedding transformer (causal, last-token pooling).");
-            let cfg: QwenEmbedConfig = serde_json::from_value(raw_config).with_context(|| {
-                "failed to parse Qwen config.json - check field names against QwenEmbedConfig"
-            })?;
-
+            tracing::info!(
+                "Apex Vector: Loading Qwen embedding transformer (causal, last-token pooling)."
+            );
+            let cfg: QwenEmbedConfig = serde_json::from_value(raw_config).context(
+                "failed to parse Qwen config.json - check field names against QwenEmbedConfig",
+            )?;
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
                     std::slice::from_ref(&weights_filename),
@@ -303,12 +419,13 @@ impl CandleEmbedder {
                     &device,
                 )?
             };
-
             let model = match QwenEmbedModel::load(vb, cfg, &device) {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::error!("Qwen load failed ({e}). Dumping tensor names from safetensors for debugging:");
-                    if let Ok(raw_tensors) = candle_core::safetensors::load(&weights_filename, &device) {
+                    tracing::error!("Qwen load failed ({e}). Dumping tensor names for debugging:");
+                    if let Ok(raw_tensors) =
+                        candle_core::safetensors::load(&weights_filename, &device)
+                    {
                         dump_tensor_names(&raw_tensors);
                     }
                     return Err(e);
@@ -332,7 +449,6 @@ impl CandleEmbedder {
         let tokenizer_bytes = std::fs::read(&tokenizer_filename)?;
         let mut tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
             .map_err(|e| anyhow::anyhow!("Tokenizer Parse Error: {}", e))?;
-
         let pp = PaddingParams {
             strategy: tokenizers::PaddingStrategy::BatchLongest,
             ..Default::default()
@@ -342,22 +458,21 @@ impl CandleEmbedder {
         Ok(Self {
             backend: Mutex::new(backend),
             backend_kind,
+            text_config: actual_config,
             vision_backend: Mutex::new(None),
             tokenizer,
             device,
-            config: actual_config,
         })
     }
 
-    /// Embed a document/passage for storage and search.
+    // ------------------------------------------------------------------
+    // Text embedding (document/query, text-to-text search)
+    // ------------------------------------------------------------------
+
     pub fn embed(&self, html_content: &str) -> Result<Vec<f32>> {
         self.embed_with_task(html_content, TaskKind::Document)
     }
 
-    /// Embed a search query. Use this at query time, not at indexing time - both
-    /// EmbeddingGemma and Qwen3-Embedding were trained with different text on the query
-    /// side vs the document side, and mixing them up will quietly hurt ranking quality
-    /// even though nothing errors.
     pub fn embed_query(&self, query_text: &str) -> Result<Vec<f32>> {
         self.embed_with_task(query_text, TaskKind::Query)
     }
@@ -369,8 +484,8 @@ impl CandleEmbedder {
         let encoding = self.tokenizer.encode(clean_text, true).map_err(E::msg)?;
         let token_ids = encoding.get_ids();
 
-        let window_size = self.config.window_size;
-        let overlap = self.config.overlap;
+        let window_size = self.text_config.window_size;
+        let overlap = self.text_config.overlap;
         let stride = if window_size > overlap {
             window_size - overlap
         } else {
@@ -410,21 +525,20 @@ impl CandleEmbedder {
         for val in &mut final_vector {
             *val /= count_f32;
         }
-
         l2_normalize_in_place(&mut final_vector);
         Ok(final_vector)
     }
 
-    /// Single window, no padding (attention mask is all-1s).
     fn run_model_pass(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
         let attention_mask: Vec<u32> = vec![1; token_ids.len()];
         self.run_model_pass_with_mask(token_ids, &attention_mask)
     }
 
-    /// Attention-mask-aware forward pass, branching on backend-specific pooling:
-    ///   - BERT / Gemma: bidirectional, masked MEAN pooling over real tokens.
-    ///   - Qwen: causal, LAST-real-token pooling (see models/qwen_embed.rs for why).
-    fn run_model_pass_with_mask(&self, token_ids: &[u32], attention_mask: &[u32]) -> Result<Vec<f32>> {
+    fn run_model_pass_with_mask(
+        &self,
+        token_ids: &[u32],
+        attention_mask: &[u32],
+    ) -> Result<Vec<f32>> {
         let mut backend_lock = self.backend.lock().unwrap();
 
         match &mut *backend_lock {
@@ -434,45 +548,36 @@ impl CandleEmbedder {
                 let mask_tensor = Tensor::new(attention_mask, &self.device)?
                     .unsqueeze(0)?
                     .to_dtype(DType::F32)?;
-
                 let hidden = m.forward(&token_tensor, &type_tensor, Some(&mask_tensor))?;
                 let pooled = masked_mean_pool(&hidden, &mask_tensor)?;
                 let normalized = normalize_l2(&pooled)?;
-                let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
-                Ok(vec)
+                Ok(normalized.squeeze(0)?.to_vec1::<f32>()?)
             }
             ModelBackend::Gemma(m) => {
                 let token_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
                 let mask_tensor = Tensor::new(attention_mask, &self.device)?.unsqueeze(0)?;
-
                 let hidden = m.forward(&token_tensor, &mask_tensor)?;
                 let mask_f32 = mask_tensor.to_dtype(DType::F32)?;
                 let pooled = masked_mean_pool(&hidden, &mask_f32)?;
                 let normalized = normalize_l2(&pooled)?;
-                let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
-                Ok(vec)
+                Ok(normalized.squeeze(0)?.to_vec1::<f32>()?)
             }
             ModelBackend::Qwen(m) => {
                 let token_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
                 let mask_tensor = Tensor::new(attention_mask, &self.device)?.unsqueeze(0)?;
-
                 let hidden = m.forward(&token_tensor, &mask_tensor)?;
-                // Last-token pooling needs the mask as owned Vec<Vec<u32>> (batch of one).
                 let pooled = last_token_pool(&hidden, &[attention_mask.to_vec()])?;
                 let normalized = normalize_l2(&pooled)?;
-                let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
-                Ok(vec)
+                Ok(normalized.squeeze(0)?.to_vec1::<f32>()?)
             }
         }
     }
 
-    /// Batch-embed multiple documents in one padded batch.
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let prefixed: Vec<String> = texts
             .iter()
             .map(|t| apply_prefix(self.backend_kind, TaskKind::Document, t))
             .collect();
-
         let encodings = self
             .tokenizer
             .encode_batch(prefixed, true)
@@ -487,64 +592,135 @@ impl CandleEmbedder {
         Ok(out)
     }
 
-    pub fn embed_image(&self, base64_image: &str) -> Result<Vec<f32>> {
+    // ------------------------------------------------------------------
+    // Vision backend loading (lazy, shared by image-image and text-image paths)
+    // ------------------------------------------------------------------
+
+    fn ensure_vision_loaded(&self) -> Result<()> {
         let mut vision_lock = self.vision_backend.lock().unwrap();
-
-        if vision_lock.is_none() {
-            let preset = resolve_vision_preset();
-            let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2-onnx".to_string());
-
-            if selection == "candle-siglip2" {
-                tracing::info!("Apex Vector: Loading LEGACY candle SigLIP2 vision model (APEXKIT_VISION_MODEL=candle-siglip2).");
-                let api = ApiBuilder::new().build()?;
-                let repo = api.repo(Repo::new(
-                    "google/siglip2-base-patch16-224".to_string(),
-                    RepoType::Model,
-                ));
-                let weights = repo.get("model.safetensors")?;
-                let vision_config = SiglipVisionConfig::siglip2_base_patch16_224();
-
-                let vb = unsafe {
-                    VarBuilder::from_mmaped_safetensors(
-                        std::slice::from_ref(&weights),
-                        DType::F32,
-                        &self.device,
-                    )?
-                };
-
-                let model = match Siglip2VisionModel::load(vb, vision_config) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!("Candle SigLIP2 load failed ({e}). Dumping tensor names for debugging:");
-                        if let Ok(raw_tensors) = candle_core::safetensors::load(&weights, &self.device) {
-                            dump_tensor_names(&raw_tensors);
-                        }
-                        return Err(e);
-                    }
-                };
-                *vision_lock = Some(VisionBackend::CandleSiglip2(model));
-            } else {
-                tracing::info!(
-                    "Apex Vector: Loading ONNX vision model '{}' from repo '{}' file '{}' (APEXKIT_VISION_MODEL={})",
-                    selection, preset.repo_id, preset.file_name, selection
-                );
-                let api = ApiBuilder::new().build()?;
-                let repo = api.repo(Repo::new(preset.repo_id.clone(), RepoType::Model));
-                let model_path: PathBuf = repo.get(&preset.file_name).with_context(|| {
-                    format!(
-                        "failed to fetch '{}' from repo '{}' - if this preset's default \
-                         filename doesn't exist in that repo, set APEXKIT_VISION_MODEL_FILE \
-                         to the correct path (check the repo's file listing on HF)",
-                        preset.file_name, preset.repo_id
-                    )
-                })?;
-
-                let embedder = OnnxVisionEmbedder::load(&model_path, preset.onnx_cfg)?;
-                *vision_lock = Some(VisionBackend::Onnx(embedder));
-            }
+        if vision_lock.is_some() {
+            return Ok(());
         }
 
-        let backend = vision_lock.as_mut().unwrap();
+        let selection =
+            std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2".to_string());
+
+        if selection == "candle-siglip2" {
+            tracing::info!(
+                "Apex Vector: Loading LEGACY candle SigLIP2 vision model (APEXKIT_VISION_MODEL=candle-siglip2)."
+            );
+            let api = ApiBuilder::new().build()?;
+            let repo_id = "google/siglip2-base-patch16-224".to_string();
+            let repo = api.repo(Repo::new(repo_id.clone(), RepoType::Model));
+            let weights = repo.get("model.safetensors")?;
+            let vision_config = SiglipVisionConfig::siglip2_base_patch16_224();
+
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(
+                    std::slice::from_ref(&weights),
+                    DType::F32,
+                    &self.device,
+                )?
+            };
+            let model = match Siglip2VisionModel::load(vb, vision_config) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(
+                        "Candle SigLIP2 load failed ({e}). Dumping tensor names for debugging:"
+                    );
+                    if let Ok(raw_tensors) = candle_core::safetensors::load(&weights, &self.device)
+                    {
+                        dump_tensor_names(&raw_tensors);
+                    }
+                    return Err(e);
+                }
+            };
+            *vision_lock = Some(VisionBackend::CandleSiglip2 {
+                model,
+                repo: repo_id,
+            });
+            return Ok(());
+        }
+
+        let resolved = resolve_vision_config()?;
+        tracing::info!(
+            "Apex Vector: Loading ONNX vision family '{}' - vision repo='{}' file='{}', text repo={:?} file={:?}",
+            resolved.family.as_str(),
+            resolved.vision_repo,
+            resolved.vision_file,
+            resolved.text_repo,
+            resolved.text_file
+        );
+
+        let api = ApiBuilder::new().build()?;
+        let vision_repo = api.repo(Repo::new(resolved.vision_repo.clone(), RepoType::Model));
+        let vision_model_path: PathBuf =
+            vision_repo.get(&resolved.vision_file).with_context(|| {
+                format!(
+                    "failed to fetch vision tower '{}' from repo '{}' - if this preset's default \
+                 filename doesn't exist in that repo, set APEXKIT_VISION_MODEL_FILE to the \
+                 correct path (check the repo's file listing on HF)",
+                    resolved.vision_file, resolved.vision_repo
+                )
+            })?;
+        let vision_embedder = OnnxVisionEmbedder::load(&vision_model_path, resolved.onnx_cfg)?;
+
+        let text_embedder = match (
+            &resolved.text_repo,
+            &resolved.text_file,
+            &resolved.text_tokenizer_file,
+        ) {
+            (Some(text_repo_id), Some(text_file), Some(text_tok_file)) => {
+                let text_repo = api.repo(Repo::new(text_repo_id.clone(), RepoType::Model));
+                match (text_repo.get(text_file), text_repo.get(text_tok_file)) {
+                    (Ok(text_model_path), Ok(text_tok_path)) => {
+                        match OnnxTextEmbedder::load(
+                            &text_model_path,
+                            &text_tok_path,
+                            resolved.text_cfg.clone(),
+                        ) {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Apex Vector: text tower failed to load ({e}) - text-image search will be \
+                                     unavailable for this session. Image-image search is unaffected."
+                                );
+                                None
+                            }
+                        }
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        tracing::warn!(
+                            "Apex Vector: text tower files not found in repo '{}' ({e}) - text-image search \
+                             will be unavailable. Set APEXKIT_VISION_TEXT_REPO/_FILE/_TOKENIZER if the text \
+                             tower lives elsewhere, or APEXKIT_VISION_TEXT_DISABLE=1 to silence this warning.",
+                            text_repo_id
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        *vision_lock = Some(VisionBackend::Onnx {
+            family: resolved.family,
+            vision: vision_embedder,
+            text: text_embedder,
+            vision_repo: resolved.vision_repo,
+            vision_file: resolved.vision_file,
+        });
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Image-image search: embed any image for comparison against other images.
+    // ------------------------------------------------------------------
+
+    pub fn embed_image(&self, base64_image: &str) -> Result<Vec<f32>> {
+        self.ensure_vision_loaded()?;
+        let vision_lock = self.vision_backend.lock().unwrap();
+        let backend = vision_lock.as_ref().unwrap();
 
         let b64 = if let Some(idx) = base64_image.find(',') {
             &base64_image[idx + 1..]
@@ -555,10 +731,14 @@ impl CandleEmbedder {
         let img = image::load_from_memory(&image_bytes).map_err(E::msg)?;
 
         match backend {
-            VisionBackend::Onnx(embedder) => {
-                let cfg = embedder.config();
+            VisionBackend::Onnx { vision, .. } => {
+                let cfg = vision.config();
                 let size = cfg.image_size;
-                let resized = img.resize_exact(size as u32, size as u32, image::imageops::FilterType::Triangle);
+                let resized = img.resize_exact(
+                    size as u32,
+                    size as u32,
+                    image::imageops::FilterType::Triangle,
+                );
                 let rgb = resized.to_rgb8();
 
                 let mut data = Vec::with_capacity(3 * size * size);
@@ -567,18 +747,16 @@ impl CandleEmbedder {
                         for x in 0..size as u32 {
                             let pixel = rgb.get_pixel(x, y);
                             let val = pixel[c] as f32 / 255.0;
-                            let norm_val = (val - cfg.mean[c]) / cfg.std[c];
-                            data.push(norm_val);
+                            data.push((val - cfg.mean[c]) / cfg.std[c]);
                         }
                     }
                 }
 
-                let pooled = embedder.embed(data)?;
-                let mut vec = pooled;
-                l2_normalize_in_place(&mut vec);
-                Ok(vec)
+                let mut pooled = vision.embed(data)?;
+                l2_normalize_in_place(&mut pooled);
+                Ok(pooled)
             }
-            VisionBackend::CandleSiglip2(model) => {
+            VisionBackend::CandleSiglip2 { model, .. } => {
                 let cfg = model.config();
                 let image_size = cfg.image_size;
                 let resized = img.resize_exact(
@@ -594,19 +772,163 @@ impl CandleEmbedder {
                         for x in 0..image_size as u32 {
                             let pixel = rgb.get_pixel(x, y);
                             let val = pixel[c] as f32 / 255.0;
-                            let norm_val = (val - 0.5) / 0.5;
-                            data.push(norm_val);
+                            data.push((val - 0.5) / 0.5);
                         }
                     }
                 }
 
-                let tensor = Tensor::from_vec(data, (3, image_size, image_size), &self.device)?.unsqueeze(0)?;
+                let tensor = Tensor::from_vec(data, (3, image_size, image_size), &self.device)?
+                    .unsqueeze(0)?;
                 let pooled = model.forward(&tensor)?;
                 let normalized = normalize_l2(&pooled)?;
-                let vec = normalized.squeeze(0)?.to_vec1::<f32>()?;
-                Ok(vec)
+                Ok(normalized.squeeze(0)?.to_vec1::<f32>()?)
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Text-image search: embed query text into the SAME joint space as embed_image's
+    // output, using the active vision model's paired text tower. Returns an error for
+    // model families/configs with no text tower (DINOv2 always; others if the text
+    // tower wasn't found/configured) instead of silently returning a meaningless vector.
+    // ------------------------------------------------------------------
+
+    pub fn embed_text_for_image_search(&self, text: &str) -> Result<Vec<f32>> {
+        self.ensure_vision_loaded()?;
+        let vision_lock = self.vision_backend.lock().unwrap();
+        let backend = vision_lock.as_ref().unwrap();
+
+        match backend {
+            VisionBackend::Onnx {
+                family: _,
+                text: Some(text_embedder),
+                ..
+            } => {
+                let mut pooled = text_embedder.embed(text)?;
+                l2_normalize_in_place(&mut pooled);
+                Ok(pooled)
+            }
+            VisionBackend::Onnx {
+                family, text: None, ..
+            } => {
+                if family.supports_text_image_in_principle() {
+                    bail!(
+                        "text-image search is unsupported right now: the '{}' family supports it in \
+                         principle, but no text tower was loaded for the current configuration. Set \
+                         APEXKIT_VISION_TEXT_REPO/_FILE/_TOKENIZER to point at one.",
+                        family.as_str()
+                    )
+                } else {
+                    bail!(
+                        "text-image search is unsupported: '{}' is a vision-only model with no paired \
+                         text tower - this is a model limitation, not a missing feature.",
+                        family.as_str()
+                    )
+                }
+            }
+            VisionBackend::CandleSiglip2 { .. } => {
+                bail!(
+                    "text-image search is unsupported: the legacy candle-siglip2 path is vision-only. \
+                     Switch APEXKIT_VISION_MODEL to siglip2 (the ONNX default) to get a paired text tower."
+                )
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Stable model identity, for tagging stored vectors with which model produced them.
+    // ------------------------------------------------------------------
+
+    pub fn current_text_model_id(&self) -> String {
+        format!("{}@{}", self.text_config.repo_id, self.text_config.revision)
+    }
+
+    pub fn current_vision_model_id(&self) -> Result<String> {
+        self.ensure_vision_loaded()?;
+        let vision_lock = self.vision_backend.lock().unwrap();
+        let backend = vision_lock.as_ref().unwrap();
+        Ok(match backend {
+            VisionBackend::Onnx {
+                family,
+                vision_repo,
+                vision_file,
+                ..
+            } => {
+                format!("{}:{}:{}", family.as_str(), vision_repo, vision_file)
+            }
+            VisionBackend::CandleSiglip2 { repo, .. } => {
+                format!("candle-siglip2:{}:model.safetensors", repo)
+            }
+        })
+    }
+}
+
+// =====================================================================================
+// Free-function identity helpers, exposed via lib.rs - read directly from env so callers
+// can compute an identity string WITHOUT needing a loaded CandleEmbedder instance handy
+// (e.g. at startup, before deciding whether to re-index due to a model change).
+// =====================================================================================
+
+/// Mirrors the active_model_name -> EmbeddingModelConfig mapping applications typically
+/// build around this crate (bge-small / bge-base / gte-small / gemma-300m / qwen3-embedding
+/// / custom), driven by APEX_VECTOR_TEXT_MODEL + the APEX_VECTOR_CUSTOM_* env vars, so the
+/// identity string can be computed independently of whatever model instance is currently
+/// loaded in memory.
+pub fn get_current_text_model() -> String {
+    let active_model_name =
+        std::env::var("APEX_VECTOR_TEXT_MODEL").unwrap_or_else(|_| "default".to_string());
+
+    let cfg = match active_model_name.as_str() {
+        "bge-small" => EmbeddingModelConfig::bge_small_en_v1_5(),
+        "bge-base" => EmbeddingModelConfig::bge_base_en_v1_5(),
+        "gte-small" => EmbeddingModelConfig::gte_small(),
+        "gemma-300m" => EmbeddingModelConfig::gemma_300m(),
+        "qwen3-embedding" => EmbeddingModelConfig::qwen3_embedding_0_6b(),
+        "custom" => EmbeddingModelConfig::custom(
+            std::env::var("APEX_VECTOR_CUSTOM_REPO")
+                .unwrap_or_else(|_| "sentence-transformers/all-MiniLM-L6-v2".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_REV").unwrap_or_else(|_| "main".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_CONFIG")
+                .unwrap_or_else(|_| "config.json".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_TOKENIZER")
+                .unwrap_or_else(|_| "tokenizer.json".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_WEIGHTS")
+                .unwrap_or_else(|_| "model.safetensors".to_string()),
+            std::env::var("APEX_VECTOR_CUSTOM_WINDOW")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512),
+            std::env::var("APEX_VECTOR_CUSTOM_OVERLAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(128),
+        ),
+        _ => EmbeddingModelConfig::default(),
+    };
+
+    format!("{}@{}", cfg.repo_id, cfg.revision)
+}
+
+/// Same idea as `get_current_text_model`, but for the vision side. Reads
+/// APEXKIT_VISION_MODEL plus its repo/file overrides directly, without requiring a loaded
+/// vision backend - this is deliberately a pure env read, not a method on CandleEmbedder,
+/// so callers can compute it cheaply (e.g. to decide whether stored vectors need
+/// re-embedding) without paying the cost of actually loading the ONNX session.
+pub fn get_current_vision_model() -> String {
+    let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2".to_string());
+
+    if selection == "candle-siglip2" {
+        return "candle-siglip2:google/siglip2-base-patch16-224:model.safetensors".to_string();
+    }
+
+    match resolve_vision_config() {
+        Ok(resolved) => format!(
+            "{}:{}:{}",
+            resolved.family.as_str(),
+            resolved.vision_repo,
+            resolved.vision_file
+        ),
+        Err(e) => format!("unresolved:{selection}:error={e}"),
     }
 }
 

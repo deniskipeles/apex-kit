@@ -1,34 +1,89 @@
-// Generic ONNX Runtime vision embedder, intended for small/quantized vision-language
-// models (SigLIP2-ONNX, TinyCLIP, MobileCLIP) that need to run comfortably under ~512MB
-// RAM - the candle SigLIP2 path in `siglip2.rs` loads full F32 weights and a full
-// hand-rolled transformer, which is fine on a server but heavy for constrained
-// environments. This module instead defers the whole forward pass to `ort`
-// (ONNX Runtime's Rust bindings), which can load int8/int4-quantized `.onnx` files and
-// run them with a much smaller memory footprint than an F32 candle model.
+// Generic ONNX Runtime vision embedder, scoped to five supported families:
+// SigLIP, SigLIP2, CLIP, OpenCLIP, DINOv2 - plus a "Custom" escape hatch for any ONNX
+// vision model that fits the same input/output contract (NCHW float input, pooled or
+// per-patch hidden state output). Each family gets its own preprocessing config (image
+// size, channel mean/std) because they were trained with different normalization
+// conventions; using the wrong one won't error, it'll just quietly produce worse
+// embeddings (same failure mode as everything else pooling/preprocessing related in this
+// crate - nothing crashes, the numbers are just wrong).
 //
-// IMPORTANT CAVEATS (read before trusting this in production):
-//   1. `ort`'s API has changed across major versions (1.x vs 2.x have different builder
-//      and tensor-extraction signatures). This is written against the 2.x API shape as I
-//      understand it, but I have no compiler in this environment to verify it - check
-//      against whatever `ort` version actually resolves in your Cargo.lock and adjust the
-//      `Session::builder()` / `try_extract_raw_tensor` calls if they don't match.
-//   2. Output handling is intentionally defensive (see `embed`) because different ONNX
-//      exports name/shape their pooled output differently: some give you a ready-made
-//      [1, hidden] pooled embedding, others give [1, seq, hidden] last-hidden-state and
-//      expect you to pool yourself. We handle both, mean-pooling the 3D case, but we
-//      can't know which one your specific export uses until you run it once and check
-//      `dims` via the `tracing::info!` log this prints on first run.
-//   3. Input tensor name is configurable (`input_name`, default "pixel_values") because
-//      exports disagree about this too - if `session.run` errors with an "unknown input"
-//      style message, inspect the model's actual input name (e.g. with Netron or
-//      `python -c "import onnx; print(onnx.load(path).graph.input)"`) and set it via
-//      `OnnxVisionConfig.input_name` / the `APEXKIT_VISION_INPUT_NAME` env var.
+// CROSS-MODAL CAPABILITY: SigLIP, SigLIP2, CLIP, and OpenCLIP are trained with a paired
+// text tower in the same embedding space, so text-image search is meaningful for them.
+// DINOv2 is a vision-only self-supervised model with no text tower at all - there is no
+// such thing as "DINOv2 text embedding," so text-image search for DINOv2 is not a missing
+// feature to implement later, it's a model limitation. `VisionFamily::supports_text_image`
+// reflects this, and `CandleEmbedder::embed_text_for_image_search` uses it to fail loudly
+// (`bail!`) instead of silently returning a meaningless vector.
+//
+// IMPORTANT ORT/NDARRAY VERSION NOTE: ort does not re-export ndarray. Whatever `ndarray`
+// version this crate declares in Cargo.toml MUST match the version ort's own Cargo.toml
+// pins internally (currently 0.17 for ort 2.0.0-rc.12), or you get the
+// "OwnedTensorArrayData is not satisfied... multiple different versions of crate
+// `ndarray`" error - two structurally-identical-looking types that the compiler treats as
+// unrelated because they come from different crate-version instantiations.
 
 use anyhow::{Context, Result, bail};
 use ndarray::Array4;
 use ort::session::Session;
 use ort::value::Value;
 use std::path::Path;
+use std::sync::Mutex;
+
+/// The five vision-model families this crate knows how to preprocess and run, plus a
+/// `Custom` escape hatch for anything else with a compatible ONNX input/output contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisionFamily {
+    Siglip,
+    Siglip2,
+    Clip,
+    OpenClip,
+    Dinov2,
+    Custom,
+}
+
+impl VisionFamily {
+    /// Parses the APEXKIT_VISION_MODEL env value. Unrecognized strings fall back to
+    /// `Siglip2` (the default) rather than erroring, on the theory that a typo'd env var
+    /// shouldn't take down the whole service - but it does log a warning, so the mistake
+    /// is visible rather than silently "working" with the wrong model.
+    pub fn from_env_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "siglip" => VisionFamily::Siglip,
+            "siglip2" => VisionFamily::Siglip2,
+            "clip" => VisionFamily::Clip,
+            "openclip" => VisionFamily::OpenClip,
+            "dinov2" => VisionFamily::Dinov2,
+            "custom" => VisionFamily::Custom,
+            other => {
+                tracing::warn!(
+                    "Apex Vector: unrecognized APEXKIT_VISION_MODEL='{other}', falling back to siglip2. \
+                     Valid values: siglip, siglip2, clip, openclip, dinov2, custom."
+                );
+                VisionFamily::Siglip2
+            }
+        }
+    }
+
+    /// DINOv2 is vision-only (no paired text tower exists for it, by design). The other
+    /// four families are trained with a joint text/image embedding space and support
+    /// text-image search - PROVIDED a text-tower ONNX file is actually configured; this
+    /// flag says the model family is capable in principle, not that the current
+    /// configuration definitely has a text tower loaded (custom configs may omit one).
+    pub fn supports_text_image_in_principle(&self) -> bool {
+        !matches!(self, VisionFamily::Dinov2)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VisionFamily::Siglip => "siglip",
+            VisionFamily::Siglip2 => "siglip2",
+            VisionFamily::Clip => "clip",
+            VisionFamily::OpenClip => "openclip",
+            VisionFamily::Dinov2 => "dinov2",
+            VisionFamily::Custom => "custom",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct OnnxVisionConfig {
@@ -38,23 +93,20 @@ pub struct OnnxVisionConfig {
     pub input_name: String,
 }
 
-impl Default for OnnxVisionConfig {
-    fn default() -> Self {
-        Self {
-            image_size: 384,
-            mean: [0.5, 0.5, 0.5],
-            std: [0.5, 0.5, 0.5],
-            input_name: "pixel_values".to_string(),
-        }
-    }
-}
-
 impl OnnxVisionConfig {
-    /// onnx-community/siglip2-base-patch16-384-ONNX - SigLIP2 base, 384px, exported to ONNX
-    /// with quantized variants available. This is the new default vision model: small
-    /// enough (quantized weights run well under 512MB RAM) without writing a custom
-    /// transformer forward pass by hand, since ONNX Runtime does that for us.
-    pub fn siglip2_base_patch16_384_onnx() -> Self {
+    /// google/siglip-base-patch16-224 - original SigLIP, sigmoid-loss CLIP variant.
+    pub fn siglip_base_patch16_224() -> Self {
+        Self {
+            image_size: 224,
+            mean: [0.5, 0.5, 0.5],
+            std: [0.5, 0.5, 0.5],
+            input_name: "pixel_values".to_string(),
+        }
+    }
+
+    /// onnx-community/siglip2-base-patch16-384-ONNX - SigLIP2, default vision model.
+    /// Confirmed public quantized ONNX export, fits comfortably under 512MB RAM.
+    pub fn siglip2_base_patch16_384() -> Self {
         Self {
             image_size: 384,
             mean: [0.5, 0.5, 0.5],
@@ -63,12 +115,8 @@ impl OnnxVisionConfig {
         }
     }
 
-    /// TinyCLIP-ViT-4M-Text-3M - much smaller ViT (~4M vision params), good fit for very
-    /// constrained RAM. CAVEAT: I don't have a confirmed public ONNX export path for this
-    /// checkpoint at the time of writing - you'll likely need to export it yourself
-    /// (optimum-cli export onnx) or point APEXKIT_VISION_MODEL_REPO / _FILE at wherever
-    /// you've hosted the .onnx file. Image size matches OpenCLIP's standard 224px.
-    pub fn tinyclip_vit_4m() -> Self {
+    /// openai/clip-vit-base-patch32 - original OpenAI CLIP, ImageNet-style normalization.
+    pub fn clip_vit_base_patch32() -> Self {
         Self {
             image_size: 224,
             mean: [0.48145466, 0.4578275, 0.40821073],
@@ -77,34 +125,48 @@ impl OnnxVisionConfig {
         }
     }
 
-    /// Apple MobileCLIP (e.g. MobileCLIP-S0). CAVEAT: same as TinyCLIP above - Apple's
-    /// official release is CoreML/PyTorch; a quantized ONNX export is not something I can
-    /// confirm is publicly hosted right now. Treat the repo/file as something you supply
-    /// via env vars after exporting/quantizing it yourself, or after finding a community
-    /// ONNX mirror you've verified.
-    pub fn mobileclip_s0() -> Self {
+    /// laion/CLIP-ViT-B-32-laion2B-s34B-b79K - OpenCLIP, same preprocessing convention as
+    /// OpenAI CLIP (ImageNet mean/std), different training data/weights.
+    pub fn openclip_vit_b_32() -> Self {
         Self {
-            image_size: 256,
-            mean: [0.0, 0.0, 0.0],
-            std: [1.0, 1.0, 1.0],
+            image_size: 224,
+            mean: [0.48145466, 0.4578275, 0.40821073],
+            std: [0.26862954, 0.26130258, 0.27577711],
+            input_name: "pixel_values".to_string(),
+        }
+    }
+
+    /// facebook/dinov2-base - vision-only self-supervised model, ImageNet normalization,
+    /// no text tower (see `VisionFamily::supports_text_image_in_principle`).
+    pub fn dinov2_base() -> Self {
+        Self {
+            image_size: 224,
+            mean: [0.485, 0.456, 0.406],
+            std: [0.229, 0.224, 0.225],
             input_name: "pixel_values".to_string(),
         }
     }
 }
 
 pub struct OnnxVisionEmbedder {
-    session: Session,
+    session: Mutex<Session>,
     cfg: OnnxVisionConfig,
 }
 
 impl OnnxVisionEmbedder {
     pub fn load(model_path: &Path, cfg: OnnxVisionConfig) -> Result<Self> {
-        tracing::info!("Apex Vector: Loading ONNX vision model from {:?}", model_path);
+        tracing::info!(
+            "Apex Vector: Loading ONNX vision model from {:?}",
+            model_path
+        );
         let session = Session::builder()
             .context("failed to create ONNX Runtime session builder")?
             .commit_from_file(model_path)
             .with_context(|| format!("failed to load ONNX model at {:?}", model_path))?;
-        Ok(Self { session, cfg })
+        Ok(Self {
+            session: Mutex::new(session),
+            cfg,
+        })
     }
 
     pub fn config(&self) -> &OnnxVisionConfig {
@@ -113,7 +175,7 @@ impl OnnxVisionEmbedder {
 
     /// `pixel_data` must already be a flat CHW f32 buffer (channels, height, width),
     /// normalized per `self.cfg.mean` / `self.cfg.std`, length == 3 * image_size * image_size.
-    pub fn embed(&mut self, pixel_data: Vec<f32>) -> Result<Vec<f32>> {
+    pub fn embed(&self, pixel_data: Vec<f32>) -> Result<Vec<f32>> {
         let size = self.cfg.image_size;
         let expected_len = 3 * size * size;
         if pixel_data.len() != expected_len {
@@ -128,16 +190,15 @@ impl OnnxVisionEmbedder {
 
         let array = Array4::from_shape_vec((1, 3, size, size), pixel_data)
             .context("failed to reshape pixel buffer into NCHW tensor")?;
-        // `Value::from_array` returns `Value<TensorValueType<f32>>`, not the `Value`
-        // alias (`Value<DynValueTypeMarker>`) - annotating the binding as `Value` forces
-        // an implicit coercion that doesn't exist, hence the E0308. `.into_dyn()` does
-        // the conversion explicitly instead.
+        // Don't annotate this as `Value` (= Value<DynValueTypeMarker>) - from_array
+        // returns the concretely-typed Value<TensorValueType<f32>>; convert explicitly
+        // with .into_dyn() since that's what ort::inputs! expects.
         let input_value = Value::from_array(array)
             .context("failed to wrap pixel tensor as an ORT Value")?
             .into_dyn();
 
-        let outputs = self
-            .session
+        let mut session_guard = self.session.lock().unwrap();
+        let outputs = session_guard
             .run(ort::inputs![self.cfg.input_name.as_str() => input_value])
             .context(
                 "ONNX Runtime inference failed - check that input_name matches the model's \
@@ -156,10 +217,8 @@ impl OnnxVisionEmbedder {
         tracing::info!("Apex Vector: ONNX vision output dims = {:?}", dims);
 
         let pooled: Vec<f32> = match dims.len() {
-            // Already pooled: [1, hidden] or just [hidden]
             1 => data.to_vec(),
             2 => data.to_vec(),
-            // Last-hidden-state: [1, seq, hidden] - mean-pool over the sequence/patch dim.
             3 => {
                 let seq = dims[1];
                 let hidden = dims[2];
@@ -174,7 +233,10 @@ impl OnnxVisionEmbedder {
                 }
                 acc
             }
-            other => bail!("unexpected ONNX output rank {other} (dims={:?}) - inspect the model's actual output shape and adjust embed()", dims),
+            other => bail!(
+                "unexpected ONNX output rank {other} (dims={:?}) - inspect the model's actual output shape and adjust embed()",
+                dims
+            ),
         };
 
         Ok(pooled)

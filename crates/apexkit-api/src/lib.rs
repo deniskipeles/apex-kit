@@ -27,10 +27,11 @@ pub use utils::{BaseUrl, DatabaseConnection, StorageConnection};
 use apexkit_core::{
     Db, VectorProvider,
     cache::CachedDb,
-    database::sqlite::connection::a_new_database_connection,
-    models::ChangesetEvent,
-    models::ai::CreateActionReq,
-    models::script::CreateScriptReq,
+    database::{
+        sqlite::connections::a_new_database_connection,
+        traits::{CollectionStore, SearchStore, VectorStore},
+    },
+    models::{ChangesetEvent, ai::CreateActionReq, script::CreateScriptReq},
     realtime,
     security::vault::{MasterKey, Vault},
     storage::StorageBackend,

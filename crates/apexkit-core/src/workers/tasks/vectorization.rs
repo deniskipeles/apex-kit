@@ -12,9 +12,11 @@ pub async fn handle_generate_embedding(
     field_name: String,
     content: String,
     content_type: String,
-    model: String,
+    model: Option<String>,
 ) -> Result<(), String> {
     if let Some((db, vector_provider)) = resolver.resolve(tenant_id.as_deref()).await {
+        let mut is_image_embedding = false;
+
         let vec_res = if content_type == "file" {
             let fs_root = match tenant_id.as_deref() {
                 Some(id) if id.starts_with("session_") => {
@@ -34,6 +36,7 @@ pub async fn handle_generate_embedding(
                 if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
                     use base64::{Engine as _, engine::general_purpose::STANDARD};
                     let b64 = STANDARD.encode(&bytes);
+                    is_image_embedding = true;
                     vector_provider.embed_image(&b64).await
                 } else {
                     Err("Only image files are currently supported for vectorization.".into())
@@ -45,10 +48,25 @@ pub async fn handle_generate_embedding(
                 ))
             }
         } else if content.starts_with("data:image/") {
+            is_image_embedding = true;
             vector_provider.embed_image(&content).await
         } else {
             vector_provider.embed(&content).await
         };
+
+        // [FIX]: `model` is now optional. If the caller didn't pin a specific model
+        // identity, ask apexkit_vector what's actually active right now - using the
+        // VISION identity when we just embedded an image, and the TEXT identity
+        // otherwise. This keeps stored `model` tags accurate even when the active model
+        // changes via env vars (APEXKIT_VISION_MODEL / APEX_VECTOR_TEXT_MODEL) without
+        // every call site needing to know or pass that down explicitly.
+        let resolved_model = model.unwrap_or_else(|| {
+            if is_image_embedding {
+                apexkit_vector::get_current_vision_model()
+            } else {
+                apexkit_vector::get_current_text_model()
+            }
+        });
 
         match vec_res {
             Ok(vec) => {
@@ -58,7 +76,7 @@ pub async fn handle_generate_embedding(
                 {
                     eprintln!("[Job] Failed to index vector: {}", e);
                 }
-                db.save_vector(collection_id, record_id, &field_name, vec, &model)
+                db.save_vector(collection_id, record_id, &field_name, vec, &resolved_model)
                     .await
                     .map_err(|e| e.to_string())?;
                 println!(

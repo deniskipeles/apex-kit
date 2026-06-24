@@ -8,7 +8,9 @@ pub mod index;
 pub mod models;
 
 // Re-export common types
-pub use embedder::{CandleEmbedder, EmbeddingModelConfig};
+pub use embedder::{
+    CandleEmbedder, EmbeddingModelConfig, get_current_text_model, get_current_vision_model,
+};
 pub use index::VectorIndex;
 
 #[derive(Clone)]

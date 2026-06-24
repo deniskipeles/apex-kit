@@ -8,7 +8,7 @@ pub async fn a_new_database_connection(
     vector_provider: Arc<dyn VectorProvider>,
     forwarder: Option<Arc<dyn crate::batching::WriteForwarder>>,
     event_tx: Option<tokio::sync::broadcast::Sender<ChangesetEvent>>,
-) -> std::result::Result<super::connection::ApexKit, Box<dyn std::error::Error + Send + Sync>> {
+) -> std::result::Result<super::connections::ApexKit, Box<dyn std::error::Error + Send + Sync>> {
     let base_path = "storage/system";
     let base_dirs = vec![
         base_path,
@@ -42,7 +42,7 @@ pub async fn a_new_database_connection(
     setup_sys(&sys)?;
     setup_vectors(&vec)?;
 
-    let mut instance = super::connection::ApexKit::new(
+    let mut instance = super::connections::ApexKit::new(
         base_path,
         core,
         data,

@@ -5,7 +5,7 @@ pub mod user;
 use clap::Subcommand;
 use std::sync::Arc;
 
-use apexkit_core::database::sqlite::connection::a_new_database_connection;
+use apexkit_core::database::sqlite::connections::a_new_database_connection;
 use apexkit_core::database::traits::{Db, VectorProvider};
 use async_trait::async_trait; // <--- ADD THIS IMPORT
 

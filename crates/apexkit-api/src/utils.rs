@@ -108,13 +108,21 @@ pub async fn resolve_db_from_scope(
 
 // Helpers for helpers
 pub fn get_current_model() -> String {
-    let model = std::env::var("APEX_VECTOR_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
-    if model == "custom" {
-        std::env::var("APEX_VECTOR_CUSTOM_REPO").unwrap_or("custom".to_string())
+    let content_type = "";
+    if content_type == "file" {
+        apexkit_vector::get_current_vision_model()
     } else {
-        model
+        apexkit_vector::get_current_text_model()
     }
 }
+// pub fn get_current_model(content_type: Option<&str>) -> String {
+//     if content_type == Some("file") {
+//         apexkit_vector::get_current_vision_model()
+//     }else{
+//         apexkit_vector::get_current_text_model()
+//     }
+// }
+
 pub fn get_tenant_id_from_scope(scope: Option<&EventScope>) -> Option<String> {
     match scope {
         Some(EventScope::Tenant(id)) => Some(id.clone()),

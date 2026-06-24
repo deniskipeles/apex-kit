@@ -158,7 +158,7 @@ pub fn start_background_worker(
                             field_name,
                             content,
                             content_type,
-                            model,
+                            Some(model),
                         )
                         .await
                         {

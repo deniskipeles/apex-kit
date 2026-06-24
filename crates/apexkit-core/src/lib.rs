@@ -18,7 +18,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use config::COMPOSITE_SEPARATOR;
 pub use database::{
     batching, cache, models,
-    sqlite::connection::ApexKit,
+    sqlite::connections::ApexKit,
     traits::{Db, VectorProvider},
 };
 pub use scripting::ScriptContext;
