@@ -107,21 +107,13 @@ pub async fn resolve_db_from_scope(
 }
 
 // Helpers for helpers
-pub fn get_current_model() -> String {
-    let content_type = "";
-    if content_type == "file" {
+pub fn get_current_model(content_type: &str) -> String {
+    if content_type == "file" || content_type == "image" {
         apexkit_vector::get_current_vision_model()
     } else {
         apexkit_vector::get_current_text_model()
     }
 }
-// pub fn get_current_model(content_type: Option<&str>) -> String {
-//     if content_type == Some("file") {
-//         apexkit_vector::get_current_vision_model()
-//     }else{
-//         apexkit_vector::get_current_text_model()
-//     }
-// }
 
 pub fn get_tenant_id_from_scope(scope: Option<&EventScope>) -> Option<String> {
     match scope {

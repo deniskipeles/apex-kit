@@ -576,26 +576,31 @@ impl SandboxManager {
         // E. Hydrate Vector Index from Disk
         let db_clone = db_arc.clone();
         let vec_prov_clone = vec_provider.clone();
-        let active_model = crate::utils::get_current_model();
+
+        // Fetch both models so we load text AND image vectors into the index
+        let active_text_model = apexkit_vector::get_current_text_model();
+        let active_vision_model = apexkit_vector::get_current_vision_model();
 
         let session_id_str = session_id.to_string();
 
         tokio::spawn(async move {
             if let Ok(cols) = db_clone.list_collections().await {
                 for col in cols {
-                    if let Ok(vecs) = db_clone
-                        .get_vectors_for_collection(col.id, &active_model)
-                        .await
-                    {
-                        let count = vecs.len();
-                        for (rid, field, v) in vecs {
-                            let _ = vec_prov_clone.index(col.id, rid, &field, &v).await;
-                        }
-                        if count > 0 {
-                            info!(
-                                "Sandbox {}: Hydrated {} vectors for col {}",
-                                session_id_str, count, col.id
-                            );
+                    for active_model in [&active_text_model, &active_vision_model] {
+                        if let Ok(vecs) = db_clone
+                            .get_vectors_for_collection(col.id, active_model)
+                            .await
+                        {
+                            let count = vecs.len();
+                            for (rid, field, v) in vecs {
+                                let _ = vec_prov_clone.index(col.id, rid, &field, &v).await;
+                            }
+                            if count > 0 {
+                                info!(
+                                    "Sandbox {}: Hydrated {} vectors for col {} (Model: {})",
+                                    session_id_str, count, col.id, active_model
+                                );
+                            }
                         }
                     }
                 }

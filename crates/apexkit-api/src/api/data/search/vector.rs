@@ -402,7 +402,6 @@ pub async fn revectorize_collection_handler(
     .await?;
 
     let current_tenant = crate::utils::get_tenant_id_from_scope(scope.as_ref().map(|e| &e.0));
-    let current_model = crate::utils::get_current_model();
 
     let schema = collection.schema.clone().unwrap_or_default();
 
@@ -439,14 +438,28 @@ pub async fn revectorize_collection_handler(
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .items;
 
-    let mut jobs_queued = 0;
-    let mut skipped = 0;
+    let mut total_queued = 0;
+    let mut total_skipped = 0;
+
+    // Maps to track counts per model
+    let mut model_queued_counts: HashMap<String, usize> = HashMap::new();
+    let mut model_skipped_counts: HashMap<String, usize> = HashMap::new();
 
     for record in all_records {
         let record_id: i64 = record.id;
 
         for field_name in &vectorizable_fields {
             if let Some(text_content) = record.data.get(field_name).and_then(|v| v.as_str()) {
+                // Add field detection logic
+                let def = schema.fields.get(field_name).unwrap();
+                let c_type = if def.r#type == apexkit_core::models::schema::FieldType::File {
+                    "file"
+                } else {
+                    "text"
+                };
+
+                let current_model = crate::utils::get_current_model(c_type);
+
                 if !options.force {
                     let exists = db
                         .has_vector(collection.id, record_id, field_name, &current_model)
@@ -454,7 +467,10 @@ pub async fn revectorize_collection_handler(
                         .unwrap_or(false);
 
                     if exists {
-                        skipped += 1;
+                        total_skipped += 1;
+                        *model_skipped_counts
+                            .entry(current_model.clone())
+                            .or_insert(0) += 1;
                         continue;
                     }
                 }
@@ -465,19 +481,41 @@ pub async fn revectorize_collection_handler(
                     record_id,
                     field_name: field_name.clone(),
                     content: text_content.to_string(),
-                    content_type: "text".to_string(),
-                    model: current_model.clone(),
+                    content_type: c_type.to_string(),
+                    model: current_model.clone(), // Pass field-specific model
                 };
+
                 state.queue.enqueue(job).await;
-                jobs_queued += 1;
+
+                total_queued += 1;
+                *model_queued_counts.entry(current_model).or_insert(0) += 1;
             }
         }
     }
+
+    // Construct a detailed human-readable message
+    let mut queued_details = Vec::new();
+    for (model, count) in &model_queued_counts {
+        queued_details.push(format!("{}: {}", model, count));
+    }
+    let queued_breakdown = if queued_details.is_empty() {
+        "".to_string()
+    } else {
+        format!(" ({})", queued_details.join(", "))
+    };
+
+    let message = format!(
+        "Queued {} jobs{}. Skipped {} existing.",
+        total_queued, queued_breakdown, total_skipped
+    );
+
     Ok(Json(serde_json::json!({
         "success": true,
-        "message": format!("Queued {} jobs for model '{}'. Skipped {} existing.",jobs_queued,current_model,skipped),
-        "jobs_queued": jobs_queued,
-        "skipped": skipped,
+        "message": message,
+        "jobs_queued": total_queued,
+        "skipped": total_skipped,
+        "models_queued": model_queued_counts,    // Added explicit breakdown to JSON payload
+        "models_skipped": model_skipped_counts,  // Added explicit breakdown to JSON payload
         "mode": if options.force { "hard (overwrite)" } else { "soft (skip existing)" }
     })))
 }

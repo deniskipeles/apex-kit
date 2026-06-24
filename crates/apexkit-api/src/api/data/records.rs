@@ -1,7 +1,5 @@
 use crate::hooks::{trigger_hooks, trigger_void_hook};
-use crate::utils::{
-    extract_log_meta, get_current_model, get_tenant_id_from_scope, resolve_collection_by_id_or_name,
-};
+use crate::utils::{extract_log_meta, get_tenant_id_from_scope, resolve_collection_by_id_or_name};
 use crate::{
     AppError, AppState, BaseUrl, DatabaseConnection, IdPath, RecordListResponse, RecordPath,
     RecordResponse, RelationRequest,
@@ -442,11 +440,11 @@ pub async fn create_record(
     // Jobs (Vector/Index)
     if let Some(schema) = col.schema {
         let current_tenant = get_tenant_id_from_scope(Some(&event_scope));
-        let model_name = get_current_model();
 
         for (field_name, def) in &schema.fields {
             if def.vectorize
                 && let Some(content_val) = data_to_save.get(field_name).and_then(|v| v.as_str())
+            // NOTE: use `data_updates` instead of `data_to_save` in update_record
             {
                 // Determine if this field is a File reference or raw Text
                 let c_type = if def.r#type == FieldType::File {
@@ -455,14 +453,17 @@ pub async fn create_record(
                     "text"
                 };
 
+                // Pass the content type!
+                let model_name = crate::utils::get_current_model(c_type);
+
                 let job = Job::GenerateEmbedding {
                     tenant_id: current_tenant.clone(),
                     collection_id: col.id,
-                    record_id: rid,
+                    record_id: rid, // NOTE: path.record_id in update_record
                     field_name: field_name.clone(),
                     content: content_val.to_string(),
                     content_type: c_type.to_string(),
-                    model: model_name.clone(),
+                    model: model_name,
                 };
                 state.queue.enqueue(job).await;
             }
@@ -580,17 +581,20 @@ pub async fn update_record(
 
     if let Some(schema) = col.schema {
         let current_tenant = get_tenant_id_from_scope(Some(&event_scope));
-        let model_name = get_current_model();
 
         for (field_name, def) in &schema.fields {
             if def.vectorize {
                 // Use data_updates which is the final payload being sent to DB
                 if let Some(content_val) = data_updates.get(field_name).and_then(|v| v.as_str()) {
+                    // Determine if this field is a File reference or raw Text
                     let c_type = if def.r#type == FieldType::File {
                         "file"
                     } else {
                         "text"
                     };
+
+                    // Pass the content type!
+                    let model_name = crate::utils::get_current_model(c_type);
 
                     let job = Job::GenerateEmbedding {
                         tenant_id: current_tenant.clone(),

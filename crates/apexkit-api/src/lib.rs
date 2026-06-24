@@ -258,22 +258,32 @@ pub async fn start(port: u16) {
 
     // --- 5. HNSW Index Hydration ---
     let mut total_vectors_loaded = 0;
+
+    // Fetch both model signatures
+    let active_text_model = apexkit_vector::get_current_text_model();
+    let active_vision_model = apexkit_vector::get_current_vision_model();
+
     tracing::info!(
-        "Reloading HNSW index from vectors database for model '{}'...",
-        active_model_name
+        "Reloading HNSW index from vectors database for models '{}' and '{}'...",
+        active_text_model,
+        active_vision_model
     );
+
     if let Ok(all_collections) = cached_db.list_collections().await {
         for col in &all_collections {
-            if let Ok(vectors_to_load) = cached_db
-                .get_vectors_for_collection(col.id, &active_model_name)
-                .await
-            {
-                for (rec_id, field_name, vector) in vectors_to_load {
-                    vector_provider
-                        .index(col.id, rec_id, &field_name, &vector)
-                        .await
-                        .ok();
-                    total_vectors_loaded += 1;
+            // Check for BOTH text and image vectors
+            for active_model in [&active_text_model, &active_vision_model] {
+                if let Ok(vectors_to_load) = cached_db
+                    .get_vectors_for_collection(col.id, active_model)
+                    .await
+                {
+                    for (rec_id, field_name, vector) in vectors_to_load {
+                        vector_provider
+                            .index(col.id, rec_id, &field_name, &vector)
+                            .await
+                            .ok();
+                        total_vectors_loaded += 1;
+                    }
                 }
             }
         }
