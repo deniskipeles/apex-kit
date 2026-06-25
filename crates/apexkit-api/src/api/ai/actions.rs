@@ -1,6 +1,9 @@
 use crate::BaseUrl;
 use crate::{AppError, AppState, DatabaseConnection, system::dto::AiConfigDto};
-use crate::{hooks::trigger_void_hook, utils::extract_log_meta};
+use crate::{
+    hooks::{trigger_filter_hook, trigger_void_hook},
+    utils::extract_log_meta,
+};
 use apexkit_core::realtime::EventScope;
 use apexkit_core::{
     auth::Claims,
@@ -200,6 +203,22 @@ pub async fn run_action(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // --- [NEW]: DATA INJECTION HOOK ---
+    // Trigger Filter Hook to allow scripts to inject context (e.g., Vector Search results)
+    let hook_payload = json!({ "slug": slug, "vars": payload.variables });
+    let modified_payload = trigger_filter_hook(
+        &state,
+        "before_ai_run",
+        hook_payload,
+        claims.as_ref(),
+        Some(&event_scope.clone()),
+        Some(base_url.clone()),
+    )
+    .await?;
+
+    // Extract the potentially modified variables
+    let final_vars = modified_payload.get("vars").unwrap_or(&payload.variables);
+
     // 4. Construct Final Templated Prompt
     let mut final_prompt = action.template.clone();
     let re_vars = regex::Regex::new(r"\{\{(\w+)\}\}").unwrap();
@@ -207,13 +226,20 @@ pub async fn run_action(
     final_prompt = re_vars
         .replace_all(&final_prompt, |caps: &regex::Captures| {
             let key = &caps[1];
-            payload
-                .variables
+            final_vars
                 .get(key)
-                .and_then(|v| v.as_str())
+                .map(|v| {
+                    // Automatically stringify objects/arrays so RAG context maps cleanly
+                    if v.is_object() || v.is_array() {
+                        serde_json::to_string(v).unwrap_or_default()
+                    } else if let Some(s) = v.as_str() {
+                        s.to_string()
+                    } else {
+                        v.to_string() // Handles numbers/booleans natively
+                    }
+                })
                 .filter(|s| !s.starts_with("data:")) // Ignore binary/image base64 strings in templates
-                .unwrap_or("")
-                .to_string()
+                .unwrap_or_default()
         })
         .to_string();
 
@@ -379,11 +405,45 @@ pub async fn run_action(
         }
         messages.push(json!({ "role": "user", "content": final_prompt }));
 
-        let request_body = json!({
+        let mut request_body = json!({
             "model": action.model,
             "messages": messages,
             "stream": streaming
         });
+
+        // Resolve advanced parameters (Action config overrides Global AI config)
+        let temp = config
+            .and_then(|c| c.get("temperature").and_then(|v| v.as_f64()))
+            .map(|v| v as f32)
+            .or(ai_config.temperature);
+        let max_tok = config
+            .and_then(|c| c.get("max_tokens").and_then(|v| v.as_u64()))
+            .map(|v| v as u32)
+            .or(ai_config.max_tokens);
+        let top_p_val = config
+            .and_then(|c| c.get("top_p").and_then(|v| v.as_f64()))
+            .map(|v| v as f32)
+            .or(ai_config.top_p);
+
+        if let Some(obj) = request_body.as_object_mut() {
+            if let Some(t) = temp {
+                obj.insert("temperature".to_string(), json!(t));
+            }
+            if let Some(m) = max_tok {
+                if provider == "groq" {
+                    // Groq specifically expects `max_completion_tokens` for newer models
+                    obj.insert("max_completion_tokens".to_string(), json!(m));
+                } else {
+                    obj.insert("max_tokens".to_string(), json!(m));
+                }
+            }
+            if let Some(tp) = top_p_val {
+                obj.insert("top_p".to_string(), json!(tp));
+            }
+
+            // Explicitly set stop to null as required by some strict API validations
+            obj.insert("stop".to_string(), Value::Null);
+        }
 
         if streaming {
             // --- OPENAI SSE COMPATIBLE STREAM PARSING ---
@@ -432,10 +492,18 @@ pub async fn run_action(
                 .await
                 .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
+            if !res.status().is_success() {
+                let err_text = res.text().await.unwrap_or_default();
+                return Err(AppError::UnknownError(format!(
+                    "AI Provider Error: {}",
+                    err_text
+                )));
+            }
+
             let response_json: serde_json::Value = res
                 .json()
                 .await
-                .map_err(|_| AppError::JsonError("Invalid response".into()))?;
+                .map_err(|_| AppError::JsonError("Invalid response from AI provider".into()))?;
 
             let result = response_json["choices"][0]["message"]["content"]
                 .as_str()

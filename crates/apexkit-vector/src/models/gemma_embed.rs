@@ -355,18 +355,18 @@ impl GemmaEmbedModel {
         let embed_tokens = vb
             .get(
                 (cfg.vocab_size, cfg.hidden_size),
-                "model.embed_tokens.weight",
+                "embed_tokens.weight",
             )
-            .context("missing model.embed_tokens.weight")?;
+            .context("missing embed_tokens.weight")?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            let prefix = format!("model.layers.{i}");
+            let prefix = format!("layers.{i}");
             layers.push(Layer::load(&vb, &prefix, &cfg)?);
         }
 
         let final_norm =
-            GemmaRmsNorm::load(&vb, "model.norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
+            GemmaRmsNorm::load(&vb, "norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
         let rope = RotaryEmbedding::new(
             cfg.head_dim(),
             cfg.max_position_embeddings,

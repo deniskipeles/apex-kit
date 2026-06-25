@@ -400,31 +400,31 @@ impl QwenEmbedModel {
         let embed_tokens = vb
             .get(
                 (cfg.vocab_size, cfg.hidden_size),
-                "model.embed_tokens.weight",
+                "embed_tokens.weight",
             )
-            .context("missing model.embed_tokens.weight")?;
+            .context("missing embed_tokens.weight")?;
 
         // Auto-detect QK-norm / attention-bias presence from layer 0 rather than trusting
         // config.json, since some Qwen config exports omit these fields entirely.
         let head_dim = cfg.head_dim();
         cfg.use_qk_norm = vb
-            .get(head_dim, "model.layers.0.self_attn.q_norm.weight")
+            .get(head_dim, "layers.0.self_attn.q_norm.weight")
             .is_ok();
         cfg.attention_bias = vb
             .get(
                 cfg.num_attention_heads * head_dim,
-                "model.layers.0.self_attn.q_proj.bias",
+                "layers.0.self_attn.q_proj.bias",
             )
             .is_ok();
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            let prefix = format!("model.layers.{i}");
+            let prefix = format!("layers.{i}");
             layers.push(Layer::load(&vb, &prefix, &cfg)?);
         }
 
         let final_norm =
-            RmsNorm::load(&vb, "model.norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
+            RmsNorm::load(&vb, "norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
         let rope = RotaryEmbedding::new(
             head_dim,
             cfg.max_position_embeddings,
