@@ -81,7 +81,20 @@ impl VectorProvider for ApexBridge {
             engine
                 .embedder
                 .embed_image(&image)
-                .map_err(|e| e.to_string())
+                .map_err(|e| format!("{:?}", e)) // was: e.to_string()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn embed_text_for_image_search(&self, text: &str) -> Result<Vec<f32>, String> {
+        let engine = self.engine.clone();
+        let text = text.to_string();
+        tokio::task::spawn_blocking(move || {
+            engine
+                .embedder
+                .embed_text_for_image_search(&text)
+                .map_err(|e| format!("{:?}", e))
         })
         .await
         .map_err(|e| e.to_string())?
@@ -117,6 +130,9 @@ impl VectorProvider for FallbackVectorProvider {
         Err("Vector Engine failed to initialize. Check server logs.".to_string())
     }
     async fn embed_image(&self, _image: &str) -> Result<Vec<f32>, String> {
+        Err("Vector Engine failed to initialize. Check server logs.".to_string())
+    }
+    async fn embed_text_for_image_search(&self, _text: &str) -> Result<Vec<f32>, String> {
         Err("Vector Engine failed to initialize. Check server logs.".to_string())
     }
     async fn search(

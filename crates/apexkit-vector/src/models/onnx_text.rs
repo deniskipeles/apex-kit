@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
-use ort::session::Session;
+use ort::session::{OutputSelector, RunOptions, Session};
 use ort::value::Value;
 use std::path::Path;
 use std::sync::Mutex;
@@ -38,6 +38,13 @@ pub struct OnnxTextConfig {
     /// SigLIP/OpenCLIP ONNX exports vary - set this to `None` to use the tokenizer's
     /// natural output length with no fixed truncation/padding.
     pub fixed_seq_len: Option<usize>,
+    /// Name of the graph output to request. For a fused vision+text checkpoint (the
+    /// default SigLIP2-ONNX export ships both towers in one file), an unfiltered
+    /// `session.run()` would also try to compute the vision branch's output and fail
+    /// because we never supply `pixel_values` here. Naming the text-side output (commonly
+    /// "text_embeds") via `OutputSelector` keeps ORT from touching the vision branch at
+    /// all. Confirm the real name with `onnx.load(...).graph.output` for your checkpoint.
+    pub output_name: String,
 }
 
 impl Default for OnnxTextConfig {
@@ -46,6 +53,7 @@ impl Default for OnnxTextConfig {
             input_ids_name: "input_ids".to_string(),
             attention_mask_name: Some("attention_mask".to_string()),
             fixed_seq_len: None,
+            output_name: "text_embeds".to_string(),
         }
     }
 }
@@ -56,14 +64,16 @@ impl OnnxTextConfig {
             input_ids_name: "input_ids".to_string(),
             attention_mask_name: Some("attention_mask".to_string()),
             fixed_seq_len: Some(77),
+            output_name: "text_embeds".to_string(),
         }
     }
 
     pub fn siglip_style() -> Self {
         Self {
             input_ids_name: "input_ids".to_string(),
-            attention_mask_name: Some("attention_mask".to_string()),
+            attention_mask_name: None, // SigLIP's text tower doesn't take one
             fixed_seq_len: Some(64),
+            output_name: "pooler_output".to_string(),
         }
     }
 }
@@ -126,6 +136,13 @@ impl OnnxTextEmbedder {
             .context("failed to wrap input_ids as an ORT Value")?
             .into_dyn();
 
+        // Request ONLY the text-side output. An unfiltered run() would also try to
+        // compute the vision branch's output on a fused checkpoint and fail because we
+        // never supply pixel_values here.
+        let run_options = RunOptions::new()
+            .context("failed to create ORT RunOptions")?
+            .with_outputs(OutputSelector::no_default().with(self.cfg.output_name.as_str()));
+
         let mut session_guard = self.session.lock().unwrap();
         let outputs = if let Some(mask_name) = &self.cfg.attention_mask_name {
             let mask_array = Array2::from_shape_vec((1, seq_len), mask)
@@ -133,12 +150,18 @@ impl OnnxTextEmbedder {
             let mask_value = Value::from_array(mask_array)
                 .context("failed to wrap attention_mask as an ORT Value")?
                 .into_dyn();
-            session_guard.run(ort::inputs![
-                self.cfg.input_ids_name.as_str() => ids_value,
-                mask_name.as_str() => mask_value,
-            ])
+            session_guard.run_with_options(
+                ort::inputs![
+                    self.cfg.input_ids_name.as_str() => ids_value,
+                    mask_name.as_str() => mask_value,
+                ],
+                &run_options,
+            )
         } else {
-            session_guard.run(ort::inputs![self.cfg.input_ids_name.as_str() => ids_value])
+            session_guard.run_with_options(
+                ort::inputs![self.cfg.input_ids_name.as_str() => ids_value],
+                &run_options,
+            )
         }
         .context(
             "ONNX text-tower inference failed - check input_ids_name/attention_mask_name \

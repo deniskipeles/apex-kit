@@ -132,6 +132,10 @@ fn make_api_router() -> Router<AppState> {
             post(vector_routes::query_image_vector_search),
         )
         .route(
+            "/collections/{id}/search-image-vector-with-text",
+            post(vector_routes::query_text_image_vector_search),
+        )
+        .route(
             "/collections/{id}/get-vector/{record_id}",
             get(vector_routes::get_record_vector),
         )
@@ -477,6 +481,8 @@ pub fn app_router(state: AppState) -> Router {
         vector_routes::search_vector,
         vector_routes::query_vector_search,
         vector_routes::get_record_vector,
+        vector_routes::query_image_vector_search,
+        vector_routes::query_text_image_vector_search,
         serve_css::serve_styles,
         tenant_routes::create_tenant_handler,
         sse::sse_handler,
@@ -525,6 +531,8 @@ pub fn app_router(state: AppState) -> Router {
         crate::api::migration::export::ExportQuery,
         crate::api::auth::verification::RequestPasswordResetReq,crate::api::auth::verification::ConfirmPasswordResetReq,
         vector_routes::VectorSearchReq,
+        vector_routes::ImageVectorSearchReq,
+        vector_routes::TextImageVectorSearchReq,
         vector_routes::RecordVectorPath,
         vector_routes::TextVectorSearchReq,
         tenant_routes::TenantResponse,tenant_routes::CreateTenantReq,

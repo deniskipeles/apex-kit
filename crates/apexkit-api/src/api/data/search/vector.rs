@@ -48,6 +48,12 @@ pub struct ImageVectorSearchReq {
     pub limit: Option<usize>,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct TextImageVectorSearchReq {
+    pub query_text: String,
+    pub limit: Option<usize>,
+}
+
 //  Handler: Get Vector
 #[utoipa::path(
     get,
@@ -290,6 +296,110 @@ pub async fn query_image_vector_search(
         .embed_image(&payload.image_data)
         .await
         .map_err(|e| AppError::UnknownError(format!("Image Embedding failed: {}", e)))?;
+
+    let limit = payload.limit.unwrap_or(10).min(100);
+
+    let vectorizable_fields: Vec<String> = collection
+        .schema
+        .as_ref()
+        .unwrap_or(&Default::default())
+        .fields
+        .iter()
+        .filter(|(_, def)| {
+            def.vectorize && def.r#type == apexkit_core::models::schema::FieldType::File
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if vectorizable_fields.is_empty() {
+        return Err(AppError::NotFound(
+            "No vectorizable File fields found for this collection.".into(),
+        ));
+    }
+
+    // [FIX]: same min-distance tracking as the text-search handler above.
+    let mut best_scores: HashMap<i64, f32> = HashMap::new();
+    let mut id_to_record: HashMap<i64, apexkit_core::models::Record> = HashMap::new();
+
+    for field_name in vectorizable_fields {
+        let records_with_scores = db
+            .search_vector(collection.id, &field_name, query_vector.clone(), limit)
+            .await
+            .map_err(|e| {
+                AppError::UnknownError(format!("Vector search failed for {}: {}", field_name, e))
+            })?;
+
+        for (rec, distance) in records_with_scores {
+            id_to_record.insert(rec.id, rec.clone());
+
+            // [FIX]: Track the LOWEST distance (= most similar) per record.
+            let entry = best_scores.entry(rec.id).or_insert(f32::MAX);
+            if distance < *entry {
+                *entry = distance;
+            }
+        }
+    }
+
+    let mut sorted_ids: Vec<(i64, f32)> = best_scores.into_iter().collect();
+    // [FIX]: Sort ASCENDING - lowest distance (best match) first.
+    sorted_ids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let final_records: Vec<RecordResponse> = sorted_ids
+        .into_iter()
+        .take(limit)
+        .filter_map(|(id, score)| {
+            if let Some(mut r) = id_to_record.remove(&id) {
+                // Inject the score so it's visible in the API/UI
+                if let Some(obj) = r.data.as_object_mut() {
+                    obj.insert("_score".to_string(), serde_json::json!(score));
+                }
+                Some(RecordResponse {
+                    id: r.id,
+                    data: r.data,
+                    expand: r.expand,
+                    created: r.created,
+                    updated: r.updated,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(Json(final_records))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/collections/{id}/search-image-vector-with-text",
+    request_body = TextImageVectorSearchReq,
+    params(IdPath),
+    responses((status = 200,body = Vec<RecordResponse>))
+)]
+pub async fn query_text_image_vector_search(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    Path(path): Path<IdPath>,
+    Json(payload): Json<TextImageVectorSearchReq>,
+) -> Result<Json<Vec<RecordResponse>>, AppError> {
+    let claims = auth.map(|Extension(c)| c);
+    let collection = resolve_collection_by_id_or_name(&db, &path.id).await?;
+
+    let policy = collection
+        .schema
+        .as_ref()
+        .map(|s| s.policies.read.as_str())
+        .unwrap_or("public");
+    if !apexkit_core::auth::policies::check_access(policy, claims.as_ref(), None) {
+        return Err(AppError::Forbidden("Search denied".into()));
+    }
+
+    let query_vector = state
+        .vector_provider
+        .embed_text_for_image_search(&payload.query_text)
+        .await
+        .map_err(|e| AppError::UnknownError(format!("Text-image embedding failed: {}", e)))?;
 
     let limit = payload.limit.unwrap_or(10).min(100);
 

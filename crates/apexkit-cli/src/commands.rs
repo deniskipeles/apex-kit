@@ -57,6 +57,12 @@ pub async fn get_cli_db() -> Result<Arc<dyn Db>, String> {
         async fn embed_image(&self, _i: &str) -> std::result::Result<Vec<f32>, String> {
             Ok(vec![])
         }
+        async fn embed_text_for_image_search(
+            &self,
+            _t: &str,
+        ) -> std::result::Result<Vec<f32>, String> {
+            Ok(vec![])
+        }
         async fn search(
             &self,
             _c: i64,

@@ -44,6 +44,22 @@ impl VectorProvider for TenantVectorProvider {
         }
     }
 
+    async fn embed_text_for_image_search(&self, text: &str) -> Result<Vec<f32>, String> {
+        if let Some(embedder) = &self.embedder {
+            let embedder = embedder.clone();
+            let txt = text.to_string();
+            tokio::task::spawn_blocking(move || {
+                embedder
+                    .embed_text_for_image_search(&txt)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            Err("Vector AI is disabled (Embedder not initialized)".to_string())
+        }
+    }
+
     async fn search(
         &self,
         col: i64,

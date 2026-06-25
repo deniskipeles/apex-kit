@@ -76,6 +76,11 @@ pub trait VectorProvider: Send + Sync {
     /// Generates vector embeddings for a given base64 encoded image resource.
     async fn embed_image(&self, base64_image: &str) -> std::result::Result<Vec<f32>, String>;
 
+    async fn embed_text_for_image_search(
+        &self,
+        text: &str,
+    ) -> std::result::Result<Vec<f32>, String>;
+
     /// Searches for closest vectors using approximate or exact nearest neighbor matches.
     async fn search(
         &self,

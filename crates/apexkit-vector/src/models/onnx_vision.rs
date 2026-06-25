@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result, bail};
 use ndarray::Array4;
-use ort::session::Session;
+use ort::session::{OutputSelector, RunOptions, Session};
 use ort::value::Value;
 use std::path::Path;
 use std::sync::Mutex;
@@ -91,6 +91,15 @@ pub struct OnnxVisionConfig {
     pub mean: [f32; 3],
     pub std: [f32; 3],
     pub input_name: String,
+    /// Name of the graph output to actually request. THIS MATTERS for fused
+    /// vision+text checkpoints (like the default SigLIP2-ONNX export, which ships
+    /// vision and text towers in one model_quantized.onnx): requesting an unfiltered
+    /// `session.run()` pulls in every declared output, including the text branch, which
+    /// then fails because we never supplied `input_ids`. Naming the specific output we
+    /// want (commonly "image_embeds") via `OutputSelector` makes ORT only execute the
+    /// vision branch. Confirm the real name with `onnx.load(...).graph.output` - don't
+    /// trust this default blindly, it's the onnx-community convention, not a guarantee.
+    pub output_name: String,
 }
 
 impl OnnxVisionConfig {
@@ -101,17 +110,22 @@ impl OnnxVisionConfig {
             mean: [0.5, 0.5, 0.5],
             std: [0.5, 0.5, 0.5],
             input_name: "pixel_values".to_string(),
+            output_name: "image_embeds".to_string(),
         }
     }
 
     /// onnx-community/siglip2-base-patch16-384-ONNX - SigLIP2, default vision model.
-    /// Confirmed public quantized ONNX export, fits comfortably under 512MB RAM.
+    /// Confirmed public quantized ONNX export, fits comfortably under 512MB RAM. This is
+    /// a FUSED vision+text graph (one model_quantized.onnx with both towers) - requesting
+    /// only the "image_embeds" output via OutputSelector keeps ORT from also trying to
+    /// execute the text branch (which would otherwise demand `input_ids` we don't have).
     pub fn siglip2_base_patch16_384() -> Self {
         Self {
             image_size: 384,
             mean: [0.5, 0.5, 0.5],
             std: [0.5, 0.5, 0.5],
             input_name: "pixel_values".to_string(),
+            output_name: "image_embeds".to_string(),
         }
     }
 
@@ -122,6 +136,7 @@ impl OnnxVisionConfig {
             mean: [0.48145466, 0.4578275, 0.40821073],
             std: [0.26862954, 0.26130258, 0.27577711],
             input_name: "pixel_values".to_string(),
+            output_name: "image_embeds".to_string(),
         }
     }
 
@@ -133,17 +148,21 @@ impl OnnxVisionConfig {
             mean: [0.48145466, 0.4578275, 0.40821073],
             std: [0.26862954, 0.26130258, 0.27577711],
             input_name: "pixel_values".to_string(),
+            output_name: "image_embeds".to_string(),
         }
     }
 
     /// facebook/dinov2-base - vision-only self-supervised model, ImageNet normalization,
-    /// no text tower (see `VisionFamily::supports_text_image_in_principle`).
+    /// no text tower (see `VisionFamily::supports_text_image_in_principle`). Vision-only
+    /// exports typically only declare one real output (no fused text branch to avoid), so
+    /// "last_hidden_state" is the common default - confirm against your actual export.
     pub fn dinov2_base() -> Self {
         Self {
             image_size: 224,
             mean: [0.485, 0.456, 0.406],
             std: [0.229, 0.224, 0.225],
             input_name: "pixel_values".to_string(),
+            output_name: "last_hidden_state".to_string(),
         }
     }
 }
@@ -197,12 +216,24 @@ impl OnnxVisionEmbedder {
             .context("failed to wrap pixel tensor as an ORT Value")?
             .into_dyn();
 
+        // Request ONLY the output we need. With no selector, session.run() computes
+        // every declared graph output - for a fused vision+text checkpoint (the default
+        // SigLIP2-ONNX export), that drags in the text branch and fails because we never
+        // supplied input_ids. Naming the specific output here makes ORT's executor skip
+        // any node not needed to produce it - including the entire text tower.
+        let run_options = RunOptions::new()
+            .context("failed to create ORT RunOptions")?
+            .with_outputs(OutputSelector::no_default().with(self.cfg.output_name.as_str()));
+
         let mut session_guard = self.session.lock().unwrap();
         let outputs = session_guard
-            .run(ort::inputs![self.cfg.input_name.as_str() => input_value])
+            .run_with_options(
+                ort::inputs![self.cfg.input_name.as_str() => input_value],
+                &run_options,
+            )
             .context(
-                "ONNX Runtime inference failed - check that input_name matches the model's \
-                 actual input tensor name (inspect with Netron if unsure)",
+                "ONNX Runtime inference failed - check that input_name/output_name match the \
+                 model's actual graph (inspect with Netron or `onnx.load(...).graph` if unsure)",
             )?;
 
         let first_output = outputs

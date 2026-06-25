@@ -231,6 +231,8 @@ fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
     let repo_override = std::env::var("APEXKIT_VISION_MODEL_REPO").ok();
     let file_override = std::env::var("APEXKIT_VISION_MODEL_FILE").ok();
     let input_name_override = std::env::var("APEXKIT_VISION_INPUT_NAME").ok();
+    let output_name_override = std::env::var("APEXKIT_VISION_OUTPUT_NAME").ok();
+    let text_output_name_override = std::env::var("APEXKIT_VISION_TEXT_OUTPUT_NAME").ok();
 
     let (default_repo, default_file, mut onnx_cfg, default_text_cfg) = match family {
         VisionFamily::Siglip => (
@@ -241,9 +243,17 @@ fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
         ),
         VisionFamily::Siglip2 => (
             "onnx-community/siglip2-base-patch16-384-ONNX".to_string(),
-            "onnx/model_quantized.onnx".to_string(),
-            OnnxVisionConfig::siglip2_base_patch16_384(),
-            OnnxTextConfig::siglip_style(),
+            "onnx/vision_model_quantized.onnx".to_string(),
+            {
+                let mut cfg = OnnxVisionConfig::siglip2_base_patch16_384();
+                cfg.output_name = "pooler_output".to_string();
+                cfg
+            },
+            {
+                let mut cfg = OnnxTextConfig::siglip_style();
+                cfg.output_name = "pooler_output".to_string();
+                cfg
+            },
         ),
         VisionFamily::Clip => (
             "openai/clip-vit-base-patch32".to_string(),
@@ -290,6 +300,7 @@ fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
                     mean,
                     std: std_dev,
                     input_name: "pixel_values".to_string(),
+                    output_name: "image_embeds".to_string(), // overridden below via APEXKIT_VISION_OUTPUT_NAME if set
                 },
                 OnnxTextConfig::default(),
             )
@@ -298,6 +309,14 @@ fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
 
     if let Some(name) = input_name_override {
         onnx_cfg.input_name = name;
+    }
+    if let Some(name) = output_name_override {
+        onnx_cfg.output_name = name;
+    }
+
+    let mut default_text_cfg = default_text_cfg;
+    if let Some(name) = text_output_name_override {
+        default_text_cfg.output_name = name;
     }
 
     let vision_repo = repo_override.unwrap_or(default_repo);
@@ -309,7 +328,7 @@ fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
             let text_repo =
                 std::env::var("APEXKIT_VISION_TEXT_REPO").unwrap_or_else(|_| vision_repo.clone());
             let text_file = std::env::var("APEXKIT_VISION_TEXT_FILE")
-                .unwrap_or_else(|_| "onnx/textual.onnx".to_string());
+                .unwrap_or_else(|_| "onnx/text_model_quantized.onnx".to_string());
             let text_tokenizer_file = std::env::var("APEXKIT_VISION_TEXT_TOKENIZER")
                 .unwrap_or_else(|_| "tokenizer.json".to_string());
             (Some(text_repo), Some(text_file), Some(text_tokenizer_file))
@@ -800,7 +819,6 @@ impl CandleEmbedder {
 
         match backend {
             VisionBackend::Onnx {
-                family: _,
                 text: Some(text_embedder),
                 ..
             } => {
