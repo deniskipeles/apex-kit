@@ -202,7 +202,8 @@ pub async fn start(port: u16) {
 
     // --- 3. Vector Engine Initialization ---
     tracing::info!("Initializing Apex Vector Engine...");
-    let active_model_name = env::var("APEX_VECTOR_TEXT_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+    let active_model_name =
+        env::var("APEX_VECTOR_TEXT_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
 
     let model_config = match active_model_name.as_str() {
         "bge-small" => EmbeddingModelConfig::bge_small_en_v1_5(),
@@ -210,6 +211,8 @@ pub async fn start(port: u16) {
         "gte-small" => EmbeddingModelConfig::gte_small(),
         "gemma-300m" => EmbeddingModelConfig::gemma_300m(),
         "qwen3-embedding" => EmbeddingModelConfig::qwen3_embedding_0_6b(),
+        "gemma-300m-onnx" => EmbeddingModelConfig::gemma_300m_onnx(),
+        "qwen3-embedding-onnx" => EmbeddingModelConfig::qwen3_embedding_0_6b_onnx(),
         "custom" => EmbeddingModelConfig::custom(
             env::var("APEX_VECTOR_CUSTOM_REPO")
                 .unwrap_or("sentence-transformers/all-MiniLM-L6-v2".to_string()),

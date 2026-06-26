@@ -13,8 +13,11 @@ use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use crate::models::gemma_embed::{
     GemmaEmbedConfig, GemmaEmbedModel, dump_tensor_names, masked_mean_pool,
 };
+// imports: swap onnx_text -> onnx_vision_text for the cross-modal tower,
+// add new onnx_text for the stand-alone text-embed models
 use crate::models::onnx_text::{OnnxTextConfig, OnnxTextEmbedder};
 use crate::models::onnx_vision::{OnnxVisionConfig, OnnxVisionEmbedder, VisionFamily};
+use crate::models::onnx_vision_text::{OnnxVisionTextConfig, OnnxVisionTextEmbedder};
 use crate::models::qwen_embed::{QwenEmbedConfig, QwenEmbedModel, last_token_pool};
 use crate::models::siglip2::{Siglip2VisionModel, SiglipVisionConfig};
 
@@ -134,10 +137,30 @@ impl EmbeddingModelConfig {
     }
 }
 
+impl EmbeddingModelConfig {
+    pub fn gemma_300m_onnx() -> Self {
+        Self {
+            repo_id: "onnx-community/embeddinggemma-300m-ONNX".to_string(),
+            window_size: 2048,
+            overlap: 256,
+            ..Default::default()
+        }
+    }
+    pub fn qwen3_embedding_0_6b_onnx() -> Self {
+        Self {
+            repo_id: "onnx-community/Qwen3-Embedding-0.6B-ONNX".to_string(),
+            window_size: 8192,
+            overlap: 512,
+            ..Default::default()
+        }
+    }
+}
+
 enum ModelBackend {
     Bert(Box<BertModel>),
     Gemma(Box<GemmaEmbedModel>),
     Qwen(Box<QwenEmbedModel>),
+    OnnxText(Box<OnnxTextEmbedder>),
 }
 
 // =====================================================================================
@@ -178,7 +201,7 @@ enum VisionBackend {
     Onnx {
         family: VisionFamily,
         vision: OnnxVisionEmbedder,
-        text: Option<OnnxTextEmbedder>,
+        text: Option<OnnxVisionTextEmbedder>,
         vision_repo: String,
         vision_file: String,
     },
@@ -198,7 +221,7 @@ struct ResolvedVisionConfig {
     text_repo: Option<String>,
     text_file: Option<String>,
     text_tokenizer_file: Option<String>,
-    text_cfg: OnnxTextConfig,
+    text_cfg: OnnxVisionTextConfig,
 }
 
 fn env_bool(name: &str) -> bool {
@@ -239,7 +262,7 @@ fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
             "google/siglip-base-patch16-224".to_string(),
             "onnx/model.onnx".to_string(),
             OnnxVisionConfig::siglip_base_patch16_224(),
-            OnnxTextConfig::siglip_style(),
+            OnnxVisionTextConfig::siglip_style(),
         ),
         VisionFamily::Siglip2 => (
             "onnx-community/siglip2-base-patch16-384-ONNX".to_string(),
@@ -250,7 +273,7 @@ fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
                 cfg
             },
             {
-                let mut cfg = OnnxTextConfig::siglip_style();
+                let mut cfg = OnnxVisionTextConfig::siglip_style();
                 cfg.output_name = "pooler_output".to_string();
                 cfg
             },
@@ -259,19 +282,19 @@ fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
             "openai/clip-vit-base-patch32".to_string(),
             "onnx/visual.onnx".to_string(),
             OnnxVisionConfig::clip_vit_base_patch32(),
-            OnnxTextConfig::clip_style(),
+            OnnxVisionTextConfig::clip_style(),
         ),
         VisionFamily::OpenClip => (
             "laion/CLIP-ViT-B-32-laion2B-s34B-b79K".to_string(),
             "onnx/visual.onnx".to_string(),
             OnnxVisionConfig::openclip_vit_b_32(),
-            OnnxTextConfig::clip_style(),
+            OnnxVisionTextConfig::clip_style(),
         ),
         VisionFamily::Dinov2 => (
             "facebook/dinov2-base".to_string(),
             "onnx/model.onnx".to_string(),
             OnnxVisionConfig::dinov2_base(),
-            OnnxTextConfig::default(), // unused - DINOv2 has no text tower
+            OnnxVisionTextConfig::default(), // unused - DINOv2 has no text tower
         ),
         VisionFamily::Custom => {
             let image_size: usize = std::env::var("APEXKIT_VISION_CUSTOM_IMAGE_SIZE")
@@ -302,7 +325,7 @@ fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
                     input_name: "pixel_values".to_string(),
                     output_name: "image_embeds".to_string(), // overridden below via APEXKIT_VISION_OUTPUT_NAME if set
                 },
-                OnnxTextConfig::default(),
+                OnnxVisionTextConfig::default(),
             )
         }
     };
@@ -391,78 +414,133 @@ impl CandleEmbedder {
         let repo = api.repo(Repo::new(actual_config.repo_id.clone(), RepoType::Model));
 
         let tokenizer_filename = repo.get(&actual_config.tokenizer_file)?;
-        let weights_filename = repo.get(&actual_config.weights_file)?;
-        let config_filename = repo.get(&actual_config.config_file)?;
-        let config_str = std::fs::read_to_string(config_filename)?;
-        let raw_config: serde_json::Value = serde_json::from_str(&config_str)?;
 
         let is_gemma = lower_repo.contains("gemma");
         let is_qwen = lower_repo.contains("qwen");
+        let is_onnx_text = lower_repo.contains("-onnx") || lower_repo.contains("_onnx");
 
-        let (backend, backend_kind) = if is_gemma {
-            tracing::info!("Apex Vector: Loading EmbeddingGemma transformer (full forward pass).");
-            let cfg: GemmaEmbedConfig = serde_json::from_value(raw_config).context(
-                "failed to parse Gemma config.json - check field names against GemmaEmbedConfig",
-            )?;
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    std::slice::from_ref(&weights_filename),
-                    DType::F32,
-                    &device,
-                )?
-            };
-            let model = match GemmaEmbedModel::load(vb, cfg, &device) {
-                Ok(m) => m,
+        let (backend, backend_kind) = if is_onnx_text && (is_gemma || is_qwen) {
+            tracing::info!("Apex Vector: Loading ONNX text-embedding model (ort backend).");
+            let onnx_file = std::env::var("APEXKIT_TEXT_MODEL_FILE")
+                .unwrap_or_else(|_| "onnx/model.onnx".to_string());
+            let onnx_path = repo.get(&onnx_file).with_context(|| {
+        format!(
+            "failed to fetch text-embed onnx file '{onnx_file}' - if the default path doesn't \
+             exist in this repo, set APEXKIT_TEXT_MODEL_FILE (e.g. onnx/model_quantized.onnx)"
+        )
+    })?;
+
+            let onnx_data_file = format!("{onnx_file}_data");
+            match repo.get(&onnx_data_file) {
+                Ok(_) => {}
                 Err(e) => {
-                    tracing::error!("Gemma load failed ({e}). Dumping tensor names for debugging:");
-                    if let Ok(raw_tensors) =
-                        candle_core::safetensors::load(&weights_filename, &device)
-                    {
-                        dump_tensor_names(&raw_tensors);
-                    }
-                    return Err(e);
+                    tracing::debug!(
+                        "Apex Vector: no external-data sidecar '{onnx_data_file}' found ({e}) - \
+                 assuming this export is self-contained (small enough to not need one)."
+                    );
                 }
+            }
+
+            // Qwen3's exported graph is decoder-with-cache (built for generation), so it
+            // unconditionally expects past_key_values.{i}.key/.value inputs even on a single
+            // forward pass. Need num_hidden_layers/num_key_value_heads/head_dim for that, so
+            // fetch config.json here too (skip model.safetensors only).
+            let config_filename = repo.get(&actual_config.config_file)?;
+            let config_str = std::fs::read_to_string(&config_filename)?;
+            let raw_config: serde_json::Value = serde_json::from_str(&config_str)?;
+
+            let cfg = if is_gemma {
+                OnnxTextConfig::gemma_embed_onnx()
+            } else {
+                OnnxTextConfig::qwen3_embed_onnx_with_kv_shape(&raw_config)?
             };
-            (ModelBackend::Gemma(Box::new(model)), BackendKind::Gemma)
-        } else if is_qwen {
-            tracing::info!(
-                "Apex Vector: Loading Qwen embedding transformer (causal, last-token pooling)."
-            );
-            let cfg: QwenEmbedConfig = serde_json::from_value(raw_config).context(
-                "failed to parse Qwen config.json - check field names against QwenEmbedConfig",
-            )?;
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    std::slice::from_ref(&weights_filename),
-                    DType::F32,
-                    &device,
-                )?
+            let embedder = OnnxTextEmbedder::load(&onnx_path, &tokenizer_filename, cfg)?;
+            let kind = if is_gemma {
+                BackendKind::Gemma
+            } else {
+                BackendKind::Qwen
             };
-            let model = match QwenEmbedModel::load(vb, cfg, &device) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::error!("Qwen load failed ({e}). Dumping tensor names for debugging:");
-                    if let Ok(raw_tensors) =
-                        candle_core::safetensors::load(&weights_filename, &device)
-                    {
-                        dump_tensor_names(&raw_tensors);
-                    }
-                    return Err(e);
-                }
-            };
-            (ModelBackend::Qwen(Box::new(model)), BackendKind::Qwen)
+            (ModelBackend::OnnxText(Box::new(embedder)), kind)
         } else {
-            tracing::info!("Apex Vector: Loading BERT-style text model");
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    std::slice::from_ref(&weights_filename),
-                    DType::F32,
-                    &device,
-                )?
-            };
-            let cfg: BertConfig = serde_json::from_value(raw_config)?;
-            let model = BertModel::load(vb, &cfg)?;
-            (ModelBackend::Bert(Box::new(model)), BackendKind::Bert)
+            // Only candle (safetensors) backends need weights_file/config_file - fetch
+            // them here, not unconditionally up top, since ONNX repos don't ship a
+            // model.safetensors and would 404 before ever reaching this branch.
+            let weights_filename = repo.get(&actual_config.weights_file)?;
+            let config_filename = repo.get(&actual_config.config_file)?;
+            let config_str = std::fs::read_to_string(config_filename)?;
+            let raw_config: serde_json::Value = serde_json::from_str(&config_str)?;
+
+            if is_gemma {
+                tracing::info!(
+                    "Apex Vector: Loading EmbeddingGemma transformer (full forward pass)."
+                );
+                let cfg: GemmaEmbedConfig = serde_json::from_value(raw_config).context(
+                    "failed to parse Gemma config.json - check field names against GemmaEmbedConfig",
+                )?;
+                let vb = unsafe {
+                    VarBuilder::from_mmaped_safetensors(
+                        std::slice::from_ref(&weights_filename),
+                        DType::F32,
+                        &device,
+                    )?
+                };
+                let model = match GemmaEmbedModel::load(vb, cfg, &device) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!(
+                            "Gemma load failed ({e}). Dumping tensor names for debugging:"
+                        );
+                        if let Ok(raw_tensors) =
+                            candle_core::safetensors::load(&weights_filename, &device)
+                        {
+                            dump_tensor_names(&raw_tensors);
+                        }
+                        return Err(e);
+                    }
+                };
+                (ModelBackend::Gemma(Box::new(model)), BackendKind::Gemma)
+            } else if is_qwen {
+                tracing::info!(
+                    "Apex Vector: Loading Qwen embedding transformer (causal, last-token pooling)."
+                );
+                let cfg: QwenEmbedConfig = serde_json::from_value(raw_config).context(
+                    "failed to parse Qwen config.json - check field names against QwenEmbedConfig",
+                )?;
+                let vb = unsafe {
+                    VarBuilder::from_mmaped_safetensors(
+                        std::slice::from_ref(&weights_filename),
+                        DType::F32,
+                        &device,
+                    )?
+                };
+                let model = match QwenEmbedModel::load(vb, cfg, &device) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!(
+                            "Qwen load failed ({e}). Dumping tensor names for debugging:"
+                        );
+                        if let Ok(raw_tensors) =
+                            candle_core::safetensors::load(&weights_filename, &device)
+                        {
+                            dump_tensor_names(&raw_tensors);
+                        }
+                        return Err(e);
+                    }
+                };
+                (ModelBackend::Qwen(Box::new(model)), BackendKind::Qwen)
+            } else {
+                tracing::info!("Apex Vector: Loading BERT-style text model");
+                let vb = unsafe {
+                    VarBuilder::from_mmaped_safetensors(
+                        std::slice::from_ref(&weights_filename),
+                        DType::F32,
+                        &device,
+                    )?
+                };
+                let cfg: BertConfig = serde_json::from_value(raw_config)?;
+                let model = BertModel::load(vb, &cfg)?;
+                (ModelBackend::Bert(Box::new(model)), BackendKind::Bert)
+            }
         };
 
         let tokenizer_bytes = std::fs::read(&tokenizer_filename)?;
@@ -499,6 +577,15 @@ impl CandleEmbedder {
     fn embed_with_task(&self, html_content: &str, task: TaskKind) -> Result<Vec<f32>> {
         let clean_text = from_read(html_content.as_bytes(), usize::MAX);
         let clean_text = apply_prefix(self.backend_kind, task, &clean_text);
+
+        {
+            let backend_lock = self.backend.lock().unwrap();
+            if let ModelBackend::OnnxText(onnx) = &*backend_lock {
+                let mut v = onnx.embed(&clean_text)?;
+                l2_normalize_in_place(&mut v);
+                return Ok(v);
+            }
+        }
 
         let encoding = self.tokenizer.encode(clean_text, true).map_err(E::msg)?;
         let token_ids = encoding.get_ids();
@@ -589,6 +676,11 @@ impl CandleEmbedder {
                 let normalized = normalize_l2(&pooled)?;
                 Ok(normalized.squeeze(0)?.to_vec1::<f32>()?)
             }
+            ModelBackend::OnnxText(_) => {
+                bail!(
+                    "internal error: OnnxText backend should never reach run_model_pass_with_mask"
+                )
+            }
         }
     }
 
@@ -597,6 +689,13 @@ impl CandleEmbedder {
             .iter()
             .map(|t| apply_prefix(self.backend_kind, TaskKind::Document, t))
             .collect();
+
+        {
+            let backend_lock = self.backend.lock().unwrap();
+            if let ModelBackend::OnnxText(onnx) = &*backend_lock {
+                return onnx.embed_batch(&prefixed);
+            }
+        }
         let encodings = self
             .tokenizer
             .encode_batch(prefixed, true)
@@ -693,7 +792,7 @@ impl CandleEmbedder {
                 let text_repo = api.repo(Repo::new(text_repo_id.clone(), RepoType::Model));
                 match (text_repo.get(text_file), text_repo.get(text_tok_file)) {
                     (Ok(text_model_path), Ok(text_tok_path)) => {
-                        match OnnxTextEmbedder::load(
+                        match OnnxVisionTextEmbedder::load(
                             &text_model_path,
                             &text_tok_path,
                             resolved.text_cfg.clone(),
@@ -902,6 +1001,8 @@ pub fn get_current_text_model() -> String {
         "gte-small" => EmbeddingModelConfig::gte_small(),
         "gemma-300m" => EmbeddingModelConfig::gemma_300m(),
         "qwen3-embedding" => EmbeddingModelConfig::qwen3_embedding_0_6b(),
+        "gemma-300m-onnx" => EmbeddingModelConfig::gemma_300m_onnx(),
+        "qwen3-embedding-onnx" => EmbeddingModelConfig::qwen3_embedding_0_6b_onnx(),
         "custom" => EmbeddingModelConfig::custom(
             std::env::var("APEX_VECTOR_CUSTOM_REPO")
                 .unwrap_or_else(|_| "sentence-transformers/all-MiniLM-L6-v2".to_string()),

@@ -353,10 +353,7 @@ pub struct GemmaEmbedModel {
 impl GemmaEmbedModel {
     pub fn load(vb: VarBuilder, cfg: GemmaEmbedConfig, device: &Device) -> Result<Self> {
         let embed_tokens = vb
-            .get(
-                (cfg.vocab_size, cfg.hidden_size),
-                "embed_tokens.weight",
-            )
+            .get((cfg.vocab_size, cfg.hidden_size), "embed_tokens.weight")
             .context("missing embed_tokens.weight")?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -365,8 +362,7 @@ impl GemmaEmbedModel {
             layers.push(Layer::load(&vb, &prefix, &cfg)?);
         }
 
-        let final_norm =
-            GemmaRmsNorm::load(&vb, "norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
+        let final_norm = GemmaRmsNorm::load(&vb, "norm.weight", cfg.hidden_size, cfg.rms_norm_eps)?;
         let rope = RotaryEmbedding::new(
             cfg.head_dim(),
             cfg.max_position_embeddings,

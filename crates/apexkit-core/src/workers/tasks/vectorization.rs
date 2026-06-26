@@ -74,6 +74,7 @@ pub async fn handle_generate_embedding(
                     .index(collection_id, record_id, &field_name, &vec)
                     .await
                 {
+                    eprintln!("embed() failed, full chain: {:#}", e);
                     eprintln!("[Job] Failed to index vector: {}", e);
                 }
                 db.save_vector(collection_id, record_id, &field_name, vec, &resolved_model)

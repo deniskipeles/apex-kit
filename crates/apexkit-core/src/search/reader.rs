@@ -1,11 +1,11 @@
-use super::engine::{FUZZY_DISTANCE, FUZZY_MIN_LEN, SearchManager};
+use super::engine::SearchManager;
 use crate::models::InstantResult;
 use serde_json::{Map, Value as JsonValue};
 use tantivy::TantivyDocument;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
-    Field, FieldType as TantivyFieldType, IndexRecordOption, Schema, Term, Value as TantivyValue,
+    Field, FieldType as TantivyFieldType, IndexRecordOption, Schema, Term, Value,
 };
 
 impl SearchManager {
@@ -56,41 +56,56 @@ impl SearchManager {
             return Ok(vec![]);
         }
 
-        let parser = QueryParser::for_index(&ci.index, text_fields.clone());
+        // We require EVERY word the user types to match *something* (Must)
         let mut top_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
         for token in trimmed.split_whitespace() {
             let token_lower = token.to_lowercase();
-            let mut per_token: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            // But within that word, it can match ANY field, as Exact, Prefix, or Fuzzy (Should)
+            let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
             for field in &text_fields {
-                let field_name = schema.get_field_name(*field);
+                let term = Term::from_field_text(*field, &token_lower);
 
-                let distance = if token_lower.len() > FUZZY_MIN_LEN {
-                    FUZZY_DISTANCE
-                } else {
-                    0
-                };
-                let term_val = Term::from_field_text(*field, &token_lower);
-                let fuzzy_q = FuzzyTermQuery::new(term_val, distance, true);
-                per_token.push((Occur::Should, Box::new(fuzzy_q)));
+                // 1. EXACT MATCH (Massive Boost: x10.0)
+                // Ensures that if they type "app", the word "app" wins against "apple" or "ape"
+                let exact_q =
+                    TermQuery::new(term.clone(), IndexRecordOption::WithFreqsAndPositions);
+                let boosted_exact = BoostQuery::new(Box::new(exact_q), 10.0);
+                field_clauses.push((Occur::Should, Box::new(boosted_exact)));
 
-                let prefix_str = format!("{}:{}*", field_name, token_lower);
-                if let Ok(prefix_q) = parser.parse_query(&prefix_str) {
-                    per_token.push((Occur::Should, prefix_q));
+                // 2. PREFIX MATCH (Moderate Boost: x2.0)
+                // Using Regex for prefix since it's highly optimized in Tantivy for typeahead
+                let prefix_pattern = format!("{}.*", regex::escape(&token_lower));
+                if let Ok(prefix_q) =
+                    tantivy::query::RegexQuery::from_pattern(&prefix_pattern, *field)
+                {
+                    let boosted_prefix = BoostQuery::new(Box::new(prefix_q), 2.0);
+                    field_clauses.push((Occur::Should, Box::new(boosted_prefix)));
+                }
+
+                // 3. FUZZY TYPO MATCH (Standard score: x1.0, only if word is long enough)
+                // Prevents "in" from matching "it", "is", "if", which ruins results.
+                if token_lower.len() >= 4 {
+                    let fuzzy_q = FuzzyTermQuery::new(term.clone(), 1, true);
+                    field_clauses.push((Occur::Should, Box::new(fuzzy_q)));
                 }
             }
 
+            // Numeric matching (Exact only)
             if let Ok(num_val) = token.parse::<f64>() {
                 for field in &number_fields {
                     let term_val = Term::from_field_f64(*field, num_val);
                     let exact_q = TermQuery::new(term_val, IndexRecordOption::Basic);
-                    per_token.push((Occur::Should, Box::new(exact_q)));
+                    field_clauses.push((Occur::Should, Box::new(exact_q)));
                 }
             }
 
-            if !per_token.is_empty() {
-                top_clauses.push((Occur::Must, Box::new(BooleanQuery::new(per_token))));
+            // [THE FIX IS HERE]:
+            // Change Occur::Must to Occur::Should so it doesn't require EVERY word to match.
+            // Tantivy will sum the scores, so matching more words still ranks higher!
+            if !field_clauses.is_empty() {
+                top_clauses.push((Occur::Should, Box::new(BooleanQuery::new(field_clauses))));
             }
         }
 
@@ -98,6 +113,8 @@ impl SearchManager {
             return Ok(vec![]);
         }
 
+        // Because we changed the inner items to Should, this BooleanQuery now acts as a massive OR statement,
+        // prioritizing documents that trigger the most Should clauses.
         let query = BooleanQuery::new(top_clauses);
         let top_docs = searcher
             .search(&query, &TopDocs::with_limit(limit))

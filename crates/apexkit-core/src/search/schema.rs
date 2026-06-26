@@ -31,8 +31,9 @@ pub fn build_tantivy_schema(collection_schema: &CollectionSchema) -> TantivySche
                 builder.add_f64_field(&format!("{}_lng", name), STORED | INDEXED | FAST);
             }
             _ => {
+                // [FIX] Changed tokenizer from "default" to "en_stem" for Meilisearch-like stemming
                 let text_indexing = TextFieldIndexing::default()
-                    .set_tokenizer("default")
+                    .set_tokenizer("en_stem")
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions);
                 let options = TextOptions::default()
                     .set_indexing_options(text_indexing)
