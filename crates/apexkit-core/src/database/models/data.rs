@@ -10,6 +10,7 @@ pub struct DashboardStats {
     pub collections_count: i64,
     pub total_records: i64,
     pub total_vectors: i64,
+    pub total_files: i64,
     pub indexes_size_mb: f64,
 }
 
@@ -25,6 +26,11 @@ pub struct DashboardData {
     pub stats: DashboardStats,
     pub chart: Vec<ChartPoint>,
     pub recent_logs: Vec<serde_json::Value>,
+    // --- Detailed Breakdowns ---
+    pub db_sizes: Vec<DbSizeDetail>,
+    pub vector_models: Vec<VectorModelDetail>,
+    pub index_sizes: Vec<IndexSizeDetail>,
+    pub top_collections: Vec<CollectionRecordDetail>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
@@ -198,3 +204,28 @@ pub struct SandboxMetadata {
     pub current_storage_mb: f64,
     pub max_storage_mb: i64,
 }
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DbSizeDetail {
+    pub name: String,
+    pub size_mb: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct VectorModelDetail {
+    pub model: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct IndexSizeDetail {
+    pub collection_name: String,
+    pub size_mb: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CollectionRecordDetail {
+    pub name: String,
+    pub count: i64,
+}
+

@@ -12,8 +12,10 @@ import {
   Terminal,
   BrainCircuit,
   Search,
+  Folder,
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Button, Badge } from '../components/ui/Elements';
+import { Dialog } from '../components/ui/Dialog';
 import { LineChart } from '../components/charts/LineChart';
 import { apiClient } from '../lib/apiClient';
 import { useToast } from '../components/feedback/Toast';
@@ -21,6 +23,9 @@ import { useToast } from '../components/feedback/Toast';
 export const Dashboard = () => {
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [detailModal, setDetailModal] = useState<
+    'db' | 'vectors' | 'indexes' | 'collections' | null
+  >(null);
   const { toast } = useToast();
 
   const fetchData = async () => {
@@ -55,7 +60,16 @@ export const Dashboard = () => {
     { dataKey: 'errors', color: 'hsl(var(--destructive))' },
   ];
 
-  const { stats, chart, recent_logs } = data || { stats: {}, chart: [], recent_logs: [] };
+  const { stats, chart, recent_logs, db_sizes, vector_models, index_sizes, top_collections } =
+    data || {
+      stats: {},
+      chart: [],
+      recent_logs: [],
+      db_sizes: [],
+      vector_models: [],
+      index_sizes: [],
+      top_collections: [],
+    };
 
   const getBadgeVariant = (level: string) => {
     const lvl = level.toLowerCase();
@@ -91,7 +105,7 @@ export const Dashboard = () => {
       </div>
 
       {/* Top Metric Cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
         {[
           {
             label: 'Total Requests',
@@ -102,12 +116,39 @@ export const Dashboard = () => {
             bg: 'bg-blue-500/10',
           },
           {
+            label: 'Total Files',
+            val: stats.total_files?.toLocaleString() || '0',
+            icon: Folder,
+            trend: 'Uploaded Assets',
+            color: 'text-orange-500',
+            bg: 'bg-orange-500/10',
+          },
+          {
             label: 'Database Size',
             val: `${stats.db_size_mb?.toFixed(2) || 0} MB`,
             icon: HardDrive,
-            trend: 'Physical DB Usage',
+            trend: 'Click for breakdown',
             color: 'text-purple-500',
             bg: 'bg-purple-500/10',
+            modalKey: 'db',
+          },
+          {
+            label: 'Indexes Size',
+            val: `${stats.indexes_size_mb?.toFixed(2) || 0} MB`,
+            icon: Search,
+            trend: 'Click for breakdown',
+            color: 'text-pink-500',
+            bg: 'bg-pink-500/10',
+            modalKey: 'indexes',
+          },
+          {
+            label: 'Total Records',
+            val: stats.total_records?.toLocaleString() || '0',
+            icon: FileText,
+            trend: 'Click to view top tables',
+            color: 'text-amber-500',
+            bg: 'bg-amber-500/10',
+            modalKey: 'collections',
           },
           {
             label: 'Collections',
@@ -118,33 +159,19 @@ export const Dashboard = () => {
             bg: 'bg-emerald-500/10',
           },
           {
-            label: 'Total Records',
-            val: stats.total_records?.toLocaleString() || '0',
-            icon: FileText,
-            trend: 'Combined Row Count',
-            color: 'text-amber-500',
-            bg: 'bg-amber-500/10',
-          },
-          {
             label: 'Total Vectors',
             val: stats.total_vectors?.toLocaleString() || '0',
             icon: BrainCircuit,
-            trend: 'AI Embeddings',
+            trend: 'Click for models usage',
             color: 'text-indigo-500',
             bg: 'bg-indigo-500/10',
-          },
-          {
-            label: 'Indexes Size',
-            val: `${stats.indexes_size_mb?.toFixed(2) || 0} MB`,
-            icon: Search,
-            trend: 'Tantivy Search Size',
-            color: 'text-pink-500',
-            bg: 'bg-pink-500/10',
+            modalKey: 'vectors',
           },
         ].map((stat, i) => (
           <Card
             key={i}
-            className="hover:border-primary/40 transition-colors group overflow-hidden relative"
+            onClick={() => stat.modalKey && setDetailModal(stat.modalKey as any)}
+            className={`transition-all duration-200 group overflow-hidden relative ${stat.modalKey ? 'cursor-pointer hover:border-primary/50 hover:shadow-md hover:-translate-y-0.5' : 'hover:border-border'}`}
           >
             <div
               className={`absolute top-0 right-0 p-4 ${stat.bg} rounded-bl-3xl opacity-50 group-hover:opacity-100 transition-opacity`}
@@ -162,7 +189,7 @@ export const Dashboard = () => {
               </div>
               <div className="flex items-center gap-1.5 mt-2">
                 <TrendingUp className="h-3 w-3 text-muted-foreground shrink-0" />
-                <p className="text-[10px] text-muted-foreground uppercase font-semibold truncate">
+                <p className="text-[10px] text-muted-foreground uppercase font-semibold truncate group-hover:text-primary transition-colors">
                   {stat.trend}
                 </p>
               </div>
@@ -190,10 +217,10 @@ export const Dashboard = () => {
           <CardHeader className="border-b border-border/50 pb-4 bg-secondary/5">
             <CardTitle className="flex items-center justify-between text-base">
               <span className="flex items-center gap-2">
-                <AlertCircle className="h-4 w-4 text-primary" /> Live Log Feed
+                <AlertCircle className="h-4 w-4 text-primary" /> Live System Logs
               </span>
               <Badge variant="outline" className="text-[10px] font-mono">
-                Last 10 Events
+                Last 100
               </Badge>
             </CardTitle>
           </CardHeader>
@@ -247,6 +274,119 @@ export const Dashboard = () => {
           </CardContent>
         </Card>
       </div>
+
+      {/* --- Detailed Breakdown Modals --- */}
+      <Dialog
+        isOpen={detailModal === 'db'}
+        onClose={() => setDetailModal(null)}
+        title="Database Sizes"
+        size="sm"
+      >
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground mb-4">
+            Physical file sizes of the active SQLite databases in this environment.
+          </p>
+          <div className="border border-border rounded-lg overflow-hidden bg-card divide-y divide-border">
+            {db_sizes.map((db: any, i: number) => (
+              <div key={i} className="flex justify-between items-center p-3 text-sm">
+                <span className="font-mono text-primary font-medium">{db.name}</span>
+                <span className="font-mono text-muted-foreground">{db.size_mb.toFixed(2)} MB</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Dialog>
+
+      <Dialog
+        isOpen={detailModal === 'vectors'}
+        onClose={() => setDetailModal(null)}
+        title="Vector Embeddings by Model"
+        size="sm"
+      >
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground mb-4">
+            Total embeddings generated and indexed, grouped by the AI Model that produced them.
+          </p>
+          {vector_models.length === 0 ? (
+            <div className="p-4 text-center text-sm text-muted-foreground italic border rounded-lg bg-secondary/10">
+              No vectors generated yet.
+            </div>
+          ) : (
+            <div className="border border-border rounded-lg overflow-hidden bg-card divide-y divide-border">
+              {vector_models.map((vm: any, i: number) => (
+                <div key={i} className="flex justify-between items-center p-3 text-sm">
+                  <span className="font-mono text-foreground font-medium truncate pr-4">
+                    {vm.model}
+                  </span>
+                  <Badge variant="secondary" className="font-mono">
+                    {vm.count.toLocaleString()}
+                  </Badge>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Dialog>
+
+      <Dialog
+        isOpen={detailModal === 'indexes'}
+        onClose={() => setDetailModal(null)}
+        title="Search Indexes (Tantivy)"
+        size="sm"
+      >
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground mb-4">
+            Disk space used by full-text and semantic search indexes per collection.
+          </p>
+          {index_sizes.length === 0 ? (
+            <div className="p-4 text-center text-sm text-muted-foreground italic border rounded-lg bg-secondary/10">
+              No search indexes built.
+            </div>
+          ) : (
+            <div className="border border-border rounded-lg overflow-hidden bg-card divide-y divide-border max-h-[60vh] overflow-y-auto">
+              {index_sizes.map((idx: any, i: number) => (
+                <div
+                  key={i}
+                  className="flex justify-between items-center p-3 text-sm hover:bg-secondary/10 transition-colors"
+                >
+                  <span className="font-semibold text-foreground truncate pr-4 capitalize">
+                    {idx.collection_name}
+                  </span>
+                  <span className="font-mono text-muted-foreground">
+                    {idx.size_mb.toFixed(2)} MB
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Dialog>
+
+      <Dialog
+        isOpen={detailModal === 'collections'}
+        onClose={() => setDetailModal(null)}
+        title="Top Collections by Record Count"
+        size="sm"
+      >
+        <div className="space-y-3">
+          <div className="border border-border rounded-lg overflow-hidden bg-card divide-y divide-border max-h-[60vh] overflow-y-auto">
+            {top_collections.map((tc: any, i: number) => (
+              <div
+                key={i}
+                className="flex justify-between items-center p-3 text-sm hover:bg-secondary/10 transition-colors"
+              >
+                <div className="flex items-center gap-3">
+                  <span className="text-muted-foreground font-mono w-4">{i + 1}.</span>
+                  <span className="font-semibold text-primary capitalize">{tc.name}</span>
+                </div>
+                <Badge variant="outline" className="font-mono bg-background">
+                  {tc.count.toLocaleString()}
+                </Badge>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Dialog>
     </div>
   );
 };

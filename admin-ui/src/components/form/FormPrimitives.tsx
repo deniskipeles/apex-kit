@@ -135,21 +135,28 @@ export const Label = ({ className, children, required, ...props }: any) => (
   </label>
 );
 
-export const Card = ({ className, children }: any) => (
+export const Card = ({ className, children, ...props }: any) => (
   <div
     className={`rounded-xl border border-border bg-card text-card-foreground shadow ${className}`}
+    {...props}
   >
     {children}
   </div>
 );
-export const CardHeader = ({ className, children }: any) => (
-  <div className={`flex flex-col space-y-1.5 p-6 ${className}`}>{children}</div>
+export const CardHeader = ({ className, children, ...props }: any) => (
+  <div className={`flex flex-col space-y-1.5 p-6 ${className}`} {...props}>
+    {children}
+  </div>
 );
-export const CardTitle = ({ className, children }: any) => (
-  <h3 className={`font-semibold leading-none tracking-tight ${className}`}>{children}</h3>
+export const CardTitle = ({ className, children, ...props }: any) => (
+  <h3 className={`font-semibold leading-none tracking-tight ${className}`} {...props}>
+    {children}
+  </h3>
 );
-export const CardContent = ({ className, children }: any) => (
-  <div className={`p-6 pt-0 ${className}`}>{children}</div>
+export const CardContent = ({ className, children, ...props }: any) => (
+  <div className={`p-6 pt-0 ${className}`} {...props}>
+    {children}
+  </div>
 );
 
 export const Badge = ({ variant = 'default', className, children }: any) => {
