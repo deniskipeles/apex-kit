@@ -103,12 +103,9 @@ pub async fn sandbox_lifecycle_middleware(
                     && !path_clone.starts_with("/styles.css")
                 {
                     let level = if status >= 400 { "error" } else { "info" };
+                    let meta = serde_json::json!({ "method": method, "path": path_clone, "status": status, "sandbox_id": sid_clone });
                     let _ = sandbox_db_clone
-                        .log_system_event(
-                            level,
-                            "API",
-                            &format!("{} {} - {}", method, path_clone, status),
-                        )
+                        .log_audit_event(level, "API Request", "API-NON-CRUD-OPS", Some(meta))
                         .await;
                 }
 

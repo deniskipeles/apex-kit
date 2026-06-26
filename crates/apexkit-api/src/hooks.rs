@@ -16,8 +16,12 @@ pub async fn trigger_void_hook(
     scope: Option<&EventScope>,
     base_url: Option<String>,
 ) -> Result<(), AppError> {
-    let scripts = state
-        .db
+    let actual_scope = scope.cloned().unwrap_or(EventScope::Root);
+
+    // [FIX]: Resolve the specific DB for the sandbox/tenant to find local scripts
+    let db = resolve_db_from_scope(state, &actual_scope).await?;
+
+    let scripts = db
         .get_scripts_by_trigger(trigger)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
@@ -35,7 +39,7 @@ pub async fn trigger_void_hook(
 
     let context = Arc::new(crate::ScopedScriptContext {
         state: state.clone(),
-        scope: scope.cloned().unwrap_or(EventScope::Root),
+        scope: actual_scope.clone(),
     });
 
     for script in scripts {
@@ -46,7 +50,7 @@ pub async fn trigger_void_hook(
                 ctx.clone(),
                 context.clone(),
                 base_url.clone(),
-                scope.cloned(),
+                Some(actual_scope.clone()),
             )
             .await
             .map_err(|e| {
@@ -68,8 +72,12 @@ pub async fn trigger_filter_hook(
     scope: Option<&EventScope>,
     base_url: Option<String>,
 ) -> Result<Value, AppError> {
-    let scripts = state
-        .db
+    let actual_scope = scope.cloned().unwrap_or(EventScope::Root);
+
+    // [FIX]: Resolve the specific DB for the sandbox/tenant to find local scripts
+    let db = resolve_db_from_scope(state, &actual_scope).await?;
+
+    let scripts = db
         .get_scripts_by_trigger(trigger)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
@@ -82,7 +90,7 @@ pub async fn trigger_filter_hook(
 
     let context = Arc::new(crate::ScopedScriptContext {
         state: state.clone(),
-        scope: scope.cloned().unwrap_or(EventScope::Root),
+        scope: actual_scope.clone(),
     });
 
     for script in scripts {
@@ -99,7 +107,7 @@ pub async fn trigger_filter_hook(
                 ctx,
                 context.clone(),
                 base_url.clone(),
-                scope.cloned(),
+                Some(actual_scope.clone()),
             )
             .await
             .map_err(|e| {

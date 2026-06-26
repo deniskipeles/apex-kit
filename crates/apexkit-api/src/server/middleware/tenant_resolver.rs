@@ -145,12 +145,10 @@ pub async fn tenant_resolver_middleware(
             // LOG ROOT API REQUEST
             if !path_req.starts_with("/_dashboard/assets") && !path_req.starts_with("/styles.css") {
                 let level = if status >= 400 { "error" } else { "info" };
+                let meta =
+                    serde_json::json!({ "method": method, "path": path_req, "status": status });
                 let _ = db_clone
-                    .log_system_event(
-                        level,
-                        "API",
-                        &format!("{} {} - {}", method, path_req, status),
-                    )
+                    .log_audit_event(level, "API Request", "API-NON-CRUD-OPS", Some(meta))
                     .await;
             }
         });
@@ -198,12 +196,9 @@ pub async fn tenant_resolver_middleware(
                     && !path_clone.starts_with("/styles.css")
                 {
                     let level = if status >= 400 { "error" } else { "info" };
+                    let meta = serde_json::json!({ "method": method, "path": path_clone, "status": status, "tenant_id": tid_clone });
                     let _ = tenant_db_clone
-                        .log_system_event(
-                            level,
-                            "API",
-                            &format!("{} {} - {}", method, path_clone, status),
-                        )
+                        .log_audit_event(level, "API Request", "API-NON-CRUD-OPS", Some(meta))
                         .await;
                 }
 

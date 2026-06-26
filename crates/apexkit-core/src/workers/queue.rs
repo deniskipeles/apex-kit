@@ -162,7 +162,6 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            eprintln!("embed() failed, full chain: {:#}", e);
                             eprintln!("[Job] Embedding generation failed: {}", e);
                         }
                     }
