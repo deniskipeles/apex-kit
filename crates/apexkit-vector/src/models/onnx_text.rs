@@ -53,6 +53,8 @@ pub struct OnnxTextConfig {
     /// export). None for graphs with no KV-cache inputs (e.g. EmbeddingGemma, if its
     /// export is a plain encoder graph).
     pub kv_cache: Option<KvCacheShape>,
+    /// [NEW] Whether the ONNX graph expects an explicit `position_ids` input tensor
+    pub requires_position_ids: bool, 
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +72,7 @@ impl OnnxTextConfig {
             output_name: "sentence_embedding".to_string(), // confirmed real graph output - already pooled
             pooling: Pooling::MaskedMean, // unused for 2D output, harmless to leave
             kv_cache: None,
+            requires_position_ids: false, // [NEW] Gemma ONNX graph does not take position_ids
         }
     }
 
@@ -105,6 +108,7 @@ impl OnnxTextConfig {
                 num_kv_heads,
                 head_dim,
             }),
+            requires_position_ids: true, // [NEW] Qwen3 decoder graph requires position_ids
         })
     }
 }
@@ -197,13 +201,16 @@ impl OnnxTextEmbedder {
         // Decoder-with-cache exports also want explicit position_ids: [batch, seq_len],
         // values 0..seq_len-1 per row. Simple absolute positions are correct here since
         // there's no actual cached prefix on this call (past_key_values are empty).
-        let position_ids: Vec<i64> = (0..max_len as i64).cycle().take(batch * max_len).collect();
-        let position_ids_array = Array2::from_shape_vec((batch, max_len), position_ids)
-            .context("failed to reshape position_ids into [batch, max_len]")?;
-        let position_ids_value = Value::from_array(position_ids_array)
-            .context("failed to wrap position_ids as an ORT Value")?
-            .into_dyn();
-        inputs.push(("position_ids".into(), position_ids_value));
+        // [FIXED] Only inject position_ids if the specific ONNX graph requires it
+        if self.cfg.requires_position_ids {
+            let position_ids: Vec<i64> = (0..max_len as i64).cycle().take(batch * max_len).collect();
+            let position_ids_array = Array2::from_shape_vec((batch, max_len), position_ids)
+                .context("failed to reshape position_ids into [batch, max_len]")?;
+            let position_ids_value = Value::from_array(position_ids_array)
+                .context("failed to wrap position_ids as an ORT Value")?
+                .into_dyn();
+            inputs.push(("position_ids".into(), position_ids_value));
+        }
 
         if let Some(kv) = &self.cfg.kv_cache {
             for layer in 0..kv.num_layers {

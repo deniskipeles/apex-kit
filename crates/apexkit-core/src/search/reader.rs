@@ -9,6 +9,9 @@ use tantivy::schema::{
 };
 
 impl SearchManager {
+    /// Convenience wrapper around `instant_search` that returns just the
+    /// matching record IDs (discarding scores/snippets). Useful for callers
+    /// that only need the ID list (e.g. to fetch full records from the DB).
     pub fn search(
         &self,
         collection_id: i64,
@@ -22,6 +25,11 @@ impl SearchManager {
             .collect())
     }
 
+    /// Core search implementation. Builds a multi-field, multi-strategy
+    /// boolean query per whitespace-separated token in `query_str`, runs it
+    /// against the collection's index, and returns scored results with
+    /// inline field snippets (so callers don't necessarily need a DB
+    /// round-trip just to render result previews).
     pub fn instant_search(
         &self,
         collection_id: i64,
@@ -34,12 +42,17 @@ impl SearchManager {
         let searcher = ci.reader.searcher();
         let schema = ci.index.schema();
 
+        // Collect all text fields up front — every token will be matched
+        // against each of these.
         let text_fields: Vec<Field> = schema
             .fields()
             .filter(|(_, e)| matches!(e.field_type(), TantivyFieldType::Str(_)))
             .map(|(f, _)| f)
             .collect();
 
+        // Collect numeric (F64) fields too, but explicitly exclude the
+        // synthetic "_lat"/"_lng" sub-fields generated for GeoPoint types —
+        // those aren't meaningful targets for plain numeric term matching.
         let number_fields: Vec<Field> = schema
             .fields()
             .filter(|(_, e)| {
@@ -56,12 +69,17 @@ impl SearchManager {
             return Ok(vec![]);
         }
 
-        // We require EVERY word the user types to match *something* (Must)
+        // top_clauses holds one sub-query per input token. Each sub-query
+        // itself is an OR (Should) across all the ways that token could
+        // match across all fields (see below).
         let mut top_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
         for token in trimmed.split_whitespace() {
             let token_lower = token.to_lowercase();
-            // But within that word, it can match ANY field, as Exact, Prefix, or Fuzzy (Should)
+
+            // field_clauses: for THIS token, all the (field, strategy)
+            // combinations that could match it. These are combined with
+            // Occur::Should, i.e. "match any of these, score additively".
             let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
             for field in &text_fields {
@@ -75,7 +93,9 @@ impl SearchManager {
                 field_clauses.push((Occur::Should, Box::new(boosted_exact)));
 
                 // 2. PREFIX MATCH (Moderate Boost: x2.0)
-                // Using Regex for prefix since it's highly optimized in Tantivy for typeahead
+                // Using Regex for prefix since it's highly optimized in Tantivy for typeahead.
+                // regex::escape ensures any regex metacharacters in the user's
+                // input are treated literally rather than as regex syntax.
                 let prefix_pattern = format!("{}.*", regex::escape(&token_lower));
                 if let Ok(prefix_q) =
                     tantivy::query::RegexQuery::from_pattern(&prefix_pattern, *field)
@@ -86,13 +106,16 @@ impl SearchManager {
 
                 // 3. FUZZY TYPO MATCH (Standard score: x1.0, only if word is long enough)
                 // Prevents "in" from matching "it", "is", "if", which ruins results.
+                // Edit distance of 1, with `true` enabling "transposition" cost
+                // handling (so e.g. swapped adjacent letters count as distance 1).
                 if token_lower.len() >= 4 {
                     let fuzzy_q = FuzzyTermQuery::new(term.clone(), 1, true);
                     field_clauses.push((Occur::Should, Box::new(fuzzy_q)));
                 }
             }
 
-            // Numeric matching (Exact only)
+            // Numeric matching (Exact only) — if the token parses as a float,
+            // also try matching it exactly against every numeric field.
             if let Ok(num_val) = token.parse::<f64>() {
                 for field in &number_fields {
                     let term_val = Term::from_field_f64(*field, num_val);
@@ -104,6 +127,11 @@ impl SearchManager {
             // [THE FIX IS HERE]:
             // Change Occur::Must to Occur::Should so it doesn't require EVERY word to match.
             // Tantivy will sum the scores, so matching more words still ranks higher!
+            //
+            // i.e. this token's combined OR-query becomes one Should clause
+            // in the outer query, rather than a Must — so documents matching
+            // only some of the query's words can still appear (ranked lower)
+            // instead of being excluded entirely.
             if !field_clauses.is_empty() {
                 top_clauses.push((Occur::Should, Box::new(BooleanQuery::new(field_clauses))));
             }
@@ -125,6 +153,9 @@ impl SearchManager {
             .map_err(|_| "record_id missing")?;
         let mut results = Vec::with_capacity(top_docs.len());
 
+        // For each scored hit, fetch the full stored document, pull out the
+        // record_id, and build a JSON "snippet" of all other stored fields
+        // (so the caller gets a preview without needing a separate DB fetch).
         for (score, doc_addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_addr).map_err(|e| e.to_string())?;
 
@@ -145,11 +176,16 @@ impl SearchManager {
         Ok(results)
     }
 
+    /// Build a JSON object of all stored fields on `doc` (excluding
+    /// `record_id`, which is surfaced separately as `InstantResult.id`).
+    /// Used to give search callers a lightweight preview of matched records
+    /// without a round-trip to the primary datastore.
     pub(crate) fn build_snippet(schema: &Schema, doc: &TantivyDocument) -> Map<String, JsonValue> {
         let mut map = Map::new();
 
         for (field, entry) in schema.fields() {
             let name = entry.name();
+            // record_id is reported separately on InstantResult, so skip it here.
             if name == "record_id" {
                 continue;
             }
@@ -157,9 +193,14 @@ impl SearchManager {
                 continue;
             };
 
+            // Convert whatever Tantivy value type this field holds into the
+            // corresponding serde_json::Value variant. Order matters here:
+            // as_str/as_f64/as_u64/as_i64 are tried in sequence until one matches.
             let json_val = if let Some(s) = val.as_str() {
                 JsonValue::String(s.to_string())
             } else if let Some(f) = val.as_f64() {
+                // NaN/infinite floats have no valid JSON Number representation,
+                // so fall back to Null rather than panicking.
                 serde_json::Number::from_f64(f)
                     .map(JsonValue::Number)
                     .unwrap_or(JsonValue::Null)
@@ -168,6 +209,8 @@ impl SearchManager {
             } else if let Some(i) = val.as_i64() {
                 JsonValue::Number(serde_json::Number::from(i))
             } else {
+                // Unsupported/unknown stored value type — skip it rather
+                // than guessing.
                 continue;
             };
 
