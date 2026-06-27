@@ -33,7 +33,7 @@ import { InstantSearchInput } from '../../../components/search/InstantSearchInpu
 import { apiClient } from '@/src/lib/apiClient';
 import { useToast } from '@/src/components/feedback/Toast';
 import { Dialog } from '../../../components/ui/Dialog';
-import { Input, Label } from '../../../components/form/FormPrimitives';
+import { Input, Label, Switch } from '../../../components/form/FormPrimitives';
 import { APEX_NUMBER_OF_RECORD_FIELDS, APEX_TRUNCATION_SIZE } from '@/src/constants';
 import { VersionsModal } from '@/src/components/feedback/VersionsModal';
 import { FileThumbnail } from '../../../components/media/FileThumbnail'; // [NEW] Import
@@ -277,7 +277,7 @@ export const RecordsListPage = () => {
       else {
         // Note: This hits the DB search logic (e.g. SQL LIKE or Vector if implemented in backend)
         const res = await recordsService.searchRecords(targetCol.id, searchText);
-        setRecords(res);
+        setRecords(res as any);
         setTotalItems(res.length); // Assuming flat list return for search
       }
     } catch (e) {
@@ -356,10 +356,13 @@ export const RecordsListPage = () => {
     }
   };
 
-  const handleReVectorize = async () => {
+  const [isRevectorizeModalOpen, setIsRevectorizeModalOpen] = useState(false);
+  const [forceRevectorize, setForceRevectorize] = useState(false);
+
+  const handleRevectorize = async () => {
     if (!collection) return;
     try {
-      const res = await apiClient.revectorizeCollection(collection.id, true);
+      const res = await apiClient.revectorizeCollection(collection.id, forceRevectorize);
       if (res.success) toast('AI Vectorization started', 'success');
       else toast('Failed to start vectorization', 'error');
     } catch (e) {
@@ -724,7 +727,7 @@ export const RecordsListPage = () => {
 
             <ActionMenu
               onReindex={handleReIndex}
-              onRevectorize={handleReVectorize}
+              onRevectorize={() => setIsRevectorizeModalOpen(true)}
               onImport={() => setIsImportOpen(true)}
               onExport={handleExport}
             />
@@ -887,6 +890,47 @@ export const RecordsListPage = () => {
             </Button>
           </div>
         </form>
+      </Dialog>
+
+      <Dialog
+        isOpen={isRevectorizeModalOpen}
+        onClose={() => setIsRevectorizeModalOpen(false)}
+        title="Re-Vectorize Collections"
+        size="sm"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Queue background jobs to generate AI embeddings for all vector fields across your
+            collections.
+          </p>
+          <div className="flex items-center justify-between p-3 rounded-md bg-secondary/10 border border-border">
+            <div className="space-y-0.5">
+              <Label
+                className="text-sm cursor-pointer"
+                onClick={() => setForceRevectorize(!forceRevectorize)}
+              >
+                Force Overwrite
+              </Label>
+              <p className="text-[10px] text-muted-foreground">
+                Overwrite existing vectors. If off, skips records that already have them.
+              </p>
+            </div>
+            <Switch checked={forceRevectorize} onCheckedChange={setForceRevectorize} />
+          </div>
+          <div className="flex justify-end gap-2 pt-2 border-t border-border mt-4">
+            <Button variant="ghost" onClick={() => setIsRevectorizeModalOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                setIsRevectorizeModalOpen(false);
+                handleRevectorize();
+              }}
+            >
+              <Zap className="mr-2 h-4 w-4" /> Start Jobs
+            </Button>
+          </div>
+        </div>
       </Dialog>
     </div>
   );

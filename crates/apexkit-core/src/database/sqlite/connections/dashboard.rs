@@ -17,10 +17,18 @@ impl DashboardStore for ApexKit {
         let sys_conn = self.get_sys_read().await;
         let vec_conn = self.get_vector_read().await;
 
-        let collections_count: i64 = data_conn.query_row("SELECT COUNT(*) FROM collections", [], |r| r.get(0)).unwrap_or(0);
-        let total_records: i64 = data_conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0)).unwrap_or(0);
-        let total_vectors: i64 = vec_conn.query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0)).unwrap_or(0);
-        let total_files: i64 = data_conn.query_row("SELECT COUNT(*) FROM _storage_files", [], |r| r.get(0)).unwrap_or(0);
+        let collections_count: i64 = data_conn
+            .query_row("SELECT COUNT(*) FROM collections", [], |r| r.get(0))
+            .unwrap_or(0);
+        let total_records: i64 = data_conn
+            .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+            .unwrap_or(0);
+        let total_vectors: i64 = vec_conn
+            .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
+            .unwrap_or(0);
+        let total_files: i64 = data_conn
+            .query_row("SELECT COUNT(*) FROM _storage_files", [], |r| r.get(0))
+            .unwrap_or(0);
 
         // --- Calculate DB Sizes ---
         let mut db_sizes = Vec::new();
@@ -35,8 +43,12 @@ impl DashboardStore for ApexKit {
         ];
 
         for (name, conn) in conns {
-            let p_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(0);
-            let p_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(0);
+            let p_count: i64 = conn
+                .query_row("PRAGMA page_count", [], |r| r.get(0))
+                .unwrap_or(0);
+            let p_size: i64 = conn
+                .query_row("PRAGMA page_size", [], |r| r.get(0))
+                .unwrap_or(0);
             let bytes = p_count * p_size;
             total_db_bytes += bytes;
             db_sizes.push(crate::models::DbSizeDetail {
@@ -68,7 +80,10 @@ impl DashboardStore for ApexKit {
                     let size_bytes = calculate_dir_size(&entry.path()).unwrap_or(0);
                     if size_bytes > 0 {
                         total_index_bytes += size_bytes;
-                        let col_name = col_map.get(&id_str).cloned().unwrap_or_else(|| format!("Unknown ({})", id_str));
+                        let col_name = col_map
+                            .get(&id_str)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Unknown ({})", id_str));
                         index_sizes.push(crate::models::IndexSizeDetail {
                             collection_name: col_name,
                             size_mb: (size_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0,
@@ -78,12 +93,18 @@ impl DashboardStore for ApexKit {
             }
         }
         // Sort index sizes descending
-        index_sizes.sort_by(|a, b| b.size_mb.partial_cmp(&a.size_mb).unwrap_or(std::cmp::Ordering::Equal));
+        index_sizes.sort_by(|a, b| {
+            b.size_mb
+                .partial_cmp(&a.size_mb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let indexes_size_mb = (total_index_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
 
         // --- Vector Models Breakdown ---
         let mut vector_models = Vec::new();
-        if let Ok(mut stmt_vm) = vec_conn.prepare("SELECT model, COUNT(*) FROM vectors GROUP BY model ORDER BY COUNT(*) DESC") {
+        if let Ok(mut stmt_vm) = vec_conn
+            .prepare("SELECT model, COUNT(*) FROM vectors GROUP BY model ORDER BY COUNT(*) DESC")
+        {
             if let Ok(mut rows_vm) = stmt_vm.query([]) {
                 while let Some(row) = rows_vm.next().unwrap_or(None) {
                     if let (Ok(model), Ok(count)) = (row.get(0), row.get(1)) {
@@ -113,11 +134,13 @@ impl DashboardStore for ApexKit {
         ";
         let mut daily_stats: HashMap<String, (i64, i64)> = HashMap::new();
         let mut total_requests = 0;
-        
+
         if let Ok(mut stmt_chart) = log_conn.prepare(sql_chart) {
             if let Ok(mut rows) = stmt_chart.query([]) {
                 while let Some(row) = rows.next().unwrap_or(None) {
-                    if let (Ok(date_str), Ok(reqs), Ok(errs)) = (row.get::<_,String>(0), row.get(1), row.get(2)) {
+                    if let (Ok(date_str), Ok(reqs), Ok(errs)) =
+                        (row.get::<_, String>(0), row.get(1), row.get(2))
+                    {
                         total_requests += reqs;
                         daily_stats.insert(date_str, (reqs, errs));
                     }
@@ -132,7 +155,11 @@ impl DashboardStore for ApexKit {
             let date_key = date.format("%Y-%m-%d").to_string();
             let day_name = date.format("%a").to_string();
             let (reqs, errs) = daily_stats.get(&date_key).unwrap_or(&(0, 0));
-            chart_data.push(ChartPoint { name: day_name, requests: *reqs, errors: *errs });
+            chart_data.push(ChartPoint {
+                name: day_name,
+                requests: *reqs,
+                errors: *errs,
+            });
         }
 
         let mut recent_logs = Vec::new();

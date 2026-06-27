@@ -395,9 +395,14 @@ pub async fn query_text_image_vector_search(
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
+    let mut clean_query = payload.query_text.to_lowercase();
+    if !clean_query.ends_with('.') {
+        clean_query.push('.');
+    }
+
     let query_vector = state
         .vector_provider
-        .embed_text_for_image_search(&payload.query_text)
+        .embed_text_for_image_search(&clean_query)
         .await
         .map_err(|e| AppError::UnknownError(format!("Text-image embedding failed: {}", e)))?;
 

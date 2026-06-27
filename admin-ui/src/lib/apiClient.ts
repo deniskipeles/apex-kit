@@ -717,6 +717,13 @@ export const apiClient = {
     searchImageVector: async (collectionId: string | number, imageData: string, limit = 10) => {
       return await pb.collection(collectionId).searchImageVector(imageData, limit);
     },
+    searchImageVectorWithText: async (
+      collectionId: string | number,
+      queryText: string,
+      limit = 10
+    ) => {
+      return await pb.collection(collectionId).searchImageVectorWithText(queryText, limit);
+    },
     getVector: async (collectionId: string, recordId: number | string) => {
       return await pb.collection(collectionId).getVector(recordId);
     },

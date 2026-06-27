@@ -227,9 +227,17 @@ impl SearchStore for ApexKit {
         data: &Value,
         schema: &CollectionSchema,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
-        self.search
-            .index_record(collection_id, record_id, data, schema)
-            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn StdError + Send + Sync>)
+        let search = self.search.clone();
+        let data_clone = data.clone();
+        let schema_clone = schema.clone();
+
+        // Wrap the synchronous Tantivy write in spawn_blocking
+        tokio::task::spawn_blocking(move || {
+            search.index_record(collection_id, record_id, &data_clone, &schema_clone)
+        })
+        .await
+        .unwrap() // Unwrap the JoinError
+        .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn StdError + Send + Sync>)
     }
 
     async fn delete_record_search(
@@ -237,8 +245,12 @@ impl SearchStore for ApexKit {
         collection_id: i64,
         record_id: i64,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
-        self.search
-            .delete_record(collection_id, record_id)
+        let search = self.search.clone();
+
+        // Wrap the synchronous Tantivy delete in spawn_blocking
+        tokio::task::spawn_blocking(move || search.delete_record(collection_id, record_id))
+            .await
+            .unwrap() // Unwrap the JoinError
             .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn StdError + Send + Sync>)
     }
 }

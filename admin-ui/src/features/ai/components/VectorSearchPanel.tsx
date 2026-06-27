@@ -20,6 +20,7 @@ import {
   CardContent,
   Badge,
   Label,
+  Switch,
 } from '../../../components/ui/Elements';
 import { collectionsService } from '../../collections/services/collectionsService';
 import { Collection, AppRecord } from '../../../types';
@@ -40,6 +41,7 @@ export const VectorSearchPanel = () => {
   const [results, setResults] = useState<VectorSearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isReindexing, setIsReindexing] = useState(false);
+  const [forceRevectorize, setForceRevectorize] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
@@ -81,7 +83,7 @@ export const VectorSearchPanel = () => {
       } else {
         data = await apiClient.records.searchImageVector(selectedColId, imageBase64, 10);
       }
-      setResults(data);
+      setResults(data as any);
     } catch (err: any) {
       toast(err.message, 'error');
     } finally {
@@ -93,7 +95,7 @@ export const VectorSearchPanel = () => {
     if (!selectedColId) return;
     setIsReindexing(true);
     try {
-      const res = await apiClient.collections.revectorize(selectedColId, true);
+      const res = await apiClient.revectorizeCollection(selectedColId, forceRevectorize);
       if (res.ok || res.success) {
         toast(res.message || 'Background jobs started', 'success');
       } else {
@@ -237,7 +239,16 @@ export const VectorSearchPanel = () => {
                 </Button>
               </div>
 
-              <div className="pt-4 border-t border-border">
+              <div className="pt-4 border-t border-border space-y-3">
+                <div className="flex items-center justify-between p-2 rounded-md bg-secondary/5 border border-border/50">
+                  <Label
+                    className="text-xs cursor-pointer text-muted-foreground"
+                    onClick={() => setForceRevectorize(!forceRevectorize)}
+                  >
+                    Force Overwrite Existing
+                  </Label>
+                  <Switch checked={forceRevectorize} onCheckedChange={setForceRevectorize} />
+                </div>
                 <Button
                   variant="outline"
                   size="sm"

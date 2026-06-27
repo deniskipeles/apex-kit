@@ -454,6 +454,7 @@ impl CandleEmbedder {
             } else {
                 OnnxTextConfig::qwen3_embed_onnx_with_kv_shape(&raw_config)?
             };
+            // Pass tokenizer_filename to the load function
             let embedder = OnnxTextEmbedder::load(&onnx_path, &tokenizer_filename, cfg)?;
             let kind = if is_gemma {
                 BackendKind::Gemma
@@ -581,9 +582,12 @@ impl CandleEmbedder {
         {
             let backend_lock = self.backend.lock().unwrap();
             if let ModelBackend::OnnxText(onnx) = &*backend_lock {
-                let mut v = onnx.embed(&clean_text)?;
-                l2_normalize_in_place(&mut v);
-                return Ok(v);
+                // Route to the new chunk-aware ONNX method
+                return onnx.embed_windowed(
+                    &clean_text,
+                    self.text_config.window_size,
+                    self.text_config.overlap,
+                );
             }
         }
 
@@ -696,6 +700,7 @@ impl CandleEmbedder {
                 return onnx.embed_batch(&prefixed);
             }
         }
+
         let encodings = self
             .tokenizer
             .encode_batch(prefixed, true)

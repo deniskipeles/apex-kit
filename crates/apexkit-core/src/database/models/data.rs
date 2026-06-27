@@ -228,4 +228,3 @@ pub struct CollectionRecordDetail {
     pub name: String,
     pub count: i64,
 }
-

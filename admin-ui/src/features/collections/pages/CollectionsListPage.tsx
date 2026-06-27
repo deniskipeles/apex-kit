@@ -12,6 +12,7 @@ import {
   ArrowRight,
   Download,
   Upload,
+  Zap,
 } from 'lucide-react';
 import {
   Button,
@@ -24,6 +25,7 @@ import {
   Input,
   Select,
   Label,
+  Switch,
 } from '@/src/components/ui/Elements';
 import { Dialog } from '@/src/components/ui/Dialog';
 import { collectionsService } from '../services/collectionsService';
@@ -45,6 +47,8 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
   const [collectionToDelete, setCollectionToDelete] = useState<Collection | null>(null);
   const [isReindexing, setIsReindexing] = useState(false);
   const [isRevectorizing, setIsRevectorizing] = useState(false);
+  const [isRevectorizeModalOpen, setIsRevectorizeModalOpen] = useState(false);
+  const [forceRevectorize, setForceRevectorize] = useState(false);
 
   const [isExporting, setIsExporting] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
@@ -103,14 +107,14 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
     }
   };
 
-  const handleRevectorizeAll = async () => {
+  const handleRevectorizeAll = async (force: boolean) => {
     setIsRevectorizing(true);
     let count = 0;
     try {
       for (const col of collections) {
         // Only vectorizable collections
         if (col.schema.some((f) => f.vectorize)) {
-          await apiClient.revectorizeCollection(col.id);
+          await apiClient.revectorizeCollection(col.id, force);
           count++;
         }
       }
@@ -234,7 +238,7 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
         <Button
           variant="ghost"
           size="sm"
-          onClick={handleRevectorizeAll}
+          onClick={() => setIsRevectorizeModalOpen(true)}
           isLoading={isRevectorizing}
           className="text-xs text-muted-foreground hover:text-foreground hover:bg-purple-500/10 hover:text-purple-400"
         >
@@ -305,7 +309,7 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
                         variant="ghost"
                         size="icon"
                         className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                        onClick={(e) => {
+                        onClick={(e: any) => {
                           e.stopPropagation();
                           setCollectionToDelete(col);
                         }}
@@ -400,6 +404,48 @@ export const CollectionsListPage = ({ onCreate, onEdit }: CollectionsListPagePro
             </Button>
           </div>
         </form>
+      </Dialog>
+
+      {/* Re-Vectorization Modal */}
+      <Dialog
+        isOpen={isRevectorizeModalOpen}
+        onClose={() => setIsRevectorizeModalOpen(false)}
+        title="Re-Vectorize Collections"
+        size="sm"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Queue background jobs to generate AI embeddings for all vector fields across your
+            collections.
+          </p>
+          <div className="flex items-center justify-between p-3 rounded-md bg-secondary/10 border border-border">
+            <div className="space-y-0.5">
+              <Label
+                className="text-sm cursor-pointer"
+                onClick={() => setForceRevectorize(!forceRevectorize)}
+              >
+                Force Overwrite
+              </Label>
+              <p className="text-[10px] text-muted-foreground">
+                Overwrite existing vectors. If off, skips records that already have them.
+              </p>
+            </div>
+            <Switch checked={forceRevectorize} onCheckedChange={setForceRevectorize} />
+          </div>
+          <div className="flex justify-end gap-2 pt-2 border-t border-border mt-4">
+            <Button variant="ghost" onClick={() => setIsRevectorizeModalOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                setIsRevectorizeModalOpen(false);
+                handleRevectorizeAll(forceRevectorize);
+              }}
+            >
+              <Zap className="mr-2 h-4 w-4" /> Start Jobs
+            </Button>
+          </div>
+        </div>
       </Dialog>
 
       <ConfirmDialog

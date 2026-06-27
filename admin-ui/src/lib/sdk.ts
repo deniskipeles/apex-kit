@@ -914,6 +914,12 @@ export class ApexKit {
           body: { image_data: imageData, limit },
         }),
 
+      searchImageVectorWithText: (queryText: string, limit = 10) =>
+        this._request<BaseRecord[]>(`/collections/${collectionId}/search-image-vector-with-text`, {
+          method: 'POST',
+          body: { query_text: queryText, limit },
+        }),
+
       getVector: (recordId: string | number) =>
         this._request<Array<{ field_name: string; vector: number[]; model: string }>>(
           `/collections/${collectionId}/get-vector/${recordId}`,

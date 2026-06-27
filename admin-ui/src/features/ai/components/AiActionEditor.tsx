@@ -21,13 +21,20 @@ const MODEL_GROUPS = {
   gemini: [
     { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
     { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite' },
-    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash' },
     { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+    { id: 'gemini-3-flash-preview', name: 'Gemini 3.0 Flash Preview' },
+    { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview' },
   ],
   groq: [
     { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 (70B)' },
-    { id: 'llama3-8b-8192', name: 'Llama 3 (8B)' },
-    { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7b' },
+    { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 (8B)' },
+    { id: 'qwen/qwen3.6-27b', name: 'Qwen 3.6 (27B)' },
+    { id: 'qwen/qwen3-32b', name: 'Qwen 3 (32B)' },
+    { id: 'openai/gpt-oss-120b', name: 'GPT OSS (120B)' },
+    { id: 'openai/gpt-oss-20b', name: 'GPT OSS (20B)' },
+    { id: 'meta-llama/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout (17B)' },
+    { id: 'groq/compound', name: 'Groq Compound' },
+    { id: 'groq/compound-mini', name: 'Groq Compound Mini' },
   ],
   openai: [
     { id: 'gpt-4o', name: 'GPT-4o' },
@@ -199,7 +206,7 @@ export const AiActionEditor = ({ isOpen, onClose, onSave, initialData }: AiActio
               </span>
               <Switch
                 checked={formData.config?.grounding || false}
-                onCheckedChange={(c) => updateConfig('grounding', c)}
+                onCheckedChange={(c: any) => updateConfig('grounding', c)}
               />
             </div>
           )}
@@ -209,7 +216,7 @@ export const AiActionEditor = ({ isOpen, onClose, onSave, initialData }: AiActio
             </span>
             <Switch
               checked={formData.config?.streaming || false}
-              onCheckedChange={(c) => updateConfig('streaming', c)}
+              onCheckedChange={(c: any) => updateConfig('streaming', c)}
             />
           </div>
           <div className="flex items-center justify-between p-2 bg-background rounded border border-border/50">
@@ -218,7 +225,7 @@ export const AiActionEditor = ({ isOpen, onClose, onSave, initialData }: AiActio
             </span>
             <Switch
               checked={formData.config?.url_context || false}
-              onCheckedChange={(c) => updateConfig('url_context', c)}
+              onCheckedChange={(c: any) => updateConfig('url_context', c)}
             />
           </div>
         </div>

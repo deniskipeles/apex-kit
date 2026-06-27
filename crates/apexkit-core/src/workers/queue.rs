@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::database::traits::{Db, VectorProvider};
 use crate::models::schema::CollectionSchema;
@@ -84,11 +84,24 @@ pub fn start_background_worker(
     tokio::spawn(async move {
         println!("Background worker started...");
 
+        // Limit concurrent heavy CPU/ML tasks to prevent starving the Tokio blocking pool.
+        // 4 is a safe number for a standard server, keeping OS resources available.
+        let heavy_job_semaphore = Arc::new(Semaphore::new(4));
+
         while let Some(job) = rx.recv().await {
             let resolver = context_resolver.clone();
             let vault_clone = vault.clone();
+            let heavy_sem = heavy_job_semaphore.clone();
 
             tokio::spawn(async move {
+                // Acquire a permit ONLY if the job is resource-intensive
+                let _permit = match &job {
+                    Job::GenerateEmbedding { .. } | Job::IndexRecord { .. } => {
+                        Some(heavy_sem.acquire_owned().await.unwrap())
+                    }
+                    _ => None,
+                };
+
                 match job {
                     Job::SendWelcomeEmail {
                         tenant_id,
