@@ -196,14 +196,6 @@ impl RecordStore for CachedDb {
 
 #[async_trait]
 impl SearchStore for CachedDb {
-    async fn search_records(
-        &self,
-        collection_id: i64,
-        query: &str,
-    ) -> Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.search_records(collection_id, query).await
-    }
-
     async fn instant_search(
         &self,
         collection_id: i64,

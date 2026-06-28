@@ -95,6 +95,9 @@ pub struct RelationRequest {
 pub struct SearchQuery {
     pub q: String,
     pub limit: Option<usize>,
+    pub expand: Option<String>,
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
 }
 #[derive(Serialize, ToSchema, Deserialize)]
 pub struct RecordListResponse {

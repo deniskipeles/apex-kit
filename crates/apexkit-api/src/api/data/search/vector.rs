@@ -1,9 +1,10 @@
-use crate::BaseUrl;
 use crate::{AppError, AppState, DatabaseConnection, IdPath, RecordResponse};
+use crate::{BaseUrl, RecordListResponse};
 use crate::{
     hooks::trigger_void_hook,
     utils::{extract_log_meta, resolve_collection_by_id_or_name},
 };
+use apexkit_core::query::QueryOptions;
 use apexkit_core::realtime::EventScope;
 use apexkit_core::{auth::Claims, models::VectorRecord, workers::Job};
 use axum::extract::ConnectInfo;
@@ -21,12 +22,18 @@ pub struct VectorSearchReq {
     pub vector: Vec<f32>,
     pub limit: Option<usize>,
     pub field: String,
+    pub expand: Option<String>,
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema)]
 pub struct TextVectorSearchReq {
     pub query_text: String,
     pub limit: Option<usize>,
+    pub expand: Option<String>,
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -104,18 +111,18 @@ pub async fn get_record_vector(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/collections/{id}/search-vector",
+    path = "/api/v1/collections/{id}/search-vector-with-vector",
     request_body = VectorSearchReq,
     params(IdPath),
-    responses((status = 200,body = Vec<RecordResponse>))
+    responses((status = 200,body = RecordListResponse))
 )]
-pub async fn search_vector(
+pub async fn query_vector_with_vector(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(_state): State<AppState>,
     Path(path): Path<IdPath>,
     Json(payload): Json<VectorSearchReq>,
-) -> Result<Json<Vec<RecordResponse>>, AppError> {
+) -> Result<Json<RecordListResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
     let collection = resolve_collection_by_id_or_name(&db, &path.id).await?;
 
@@ -128,50 +135,97 @@ pub async fn search_vector(
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
-    let limit = payload.limit.unwrap_or(10).min(100);
+    // Fetch a larger candidate pool to support accurate pagination
+    let search_limit = payload.limit.unwrap_or(1000).min(1000);
     let mut records_with_scores = db
-        .search_vector(collection.id, &payload.field, payload.vector, limit)
+        .search_vector(collection.id, &payload.field, payload.vector, search_limit)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // [FIX]: `score` here is raw L2 distance from the HNSW index - LOWER means MORE similar
-    // (0.0 = identical). Sort ASCENDING so the closest match comes first.
+    // Sort ASCENDING by L2 distance score (0.0 is identical)
     records_with_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Map tuple (Record,f32) -> RecordResponse and inject _score
-    Ok(Json(
-        records_with_scores
+    let total = records_with_scores.len() as i64;
+    let page = payload.page.unwrap_or(1).max(1);
+    let per_page = payload.per_page.unwrap_or(20).clamp(1, 100);
+    let offset = (page - 1) * per_page;
+
+    // Apply pagination ranges
+    let paginated_results: Vec<(apexkit_core::models::Record, f32)> = records_with_scores
+        .into_iter()
+        .skip(offset as usize)
+        .take(per_page as usize)
+        .collect();
+
+    let mut final_records = Vec::new();
+    let ids: Vec<i64> = paginated_results.iter().map(|(r, _)| r.id).collect();
+    let mut scores_map: std::collections::HashMap<i64, f32> = paginated_results
+        .into_iter()
+        .map(|(r, score)| (r.id, score))
+        .collect();
+
+    // Query database once for paginated records + expand relations
+    if !ids.is_empty() {
+        let options = QueryOptions {
+            limit: Some(ids.len() as u64),
+            filter: Some(serde_json::json!({ "id": { "$in": ids } }).to_string()),
+            expand: payload.expand.clone(),
+            ..Default::default()
+        };
+        let list_res = db
+            .list_records(collection.id, options)
+            .await
+            .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+        let mut item_map: std::collections::HashMap<i64, apexkit_core::models::Record> =
+            list_res.items.into_iter().map(|r| (r.id, r)).collect();
+
+        // Restore distance scores & preserve relevance ranking
+        final_records = ids
             .into_iter()
-            .map(|(mut r, score)| {
-                if let Some(obj) = r.data.as_object_mut() {
-                    obj.insert("_score".to_string(), serde_json::json!(score));
-                }
-                RecordResponse {
-                    id: r.id,
-                    data: r.data,
-                    expand: r.expand,
-                    created: r.created,
-                    updated: r.updated,
+            .filter_map(|id| {
+                if let Some(mut r) = item_map.remove(&id) {
+                    let score = scores_map.remove(&id).unwrap_or(0.0);
+                    if let Some(obj) = r.data.as_object_mut() {
+                        obj.insert("_score".to_string(), serde_json::json!(score));
+                    }
+                    Some(r)
+                } else {
+                    None
                 }
             })
+            .collect();
+    }
+
+    Ok(Json(RecordListResponse {
+        items: final_records
+            .into_iter()
+            .map(|r| RecordResponse {
+                id: r.id,
+                data: r.data,
+                expand: r.expand,
+                created: r.created,
+                updated: r.updated,
+            })
             .collect(),
-    ))
+        total,
+    }))
 }
 
 #[utoipa::path(
     post,
-    path = "/api/v1/collections/{id}/search-text-vector",
+    path = "/api/v1/collections/{id}/search-vector-with-text",
     request_body = TextVectorSearchReq,
     params(IdPath),
-    responses((status = 200,body = Vec<RecordResponse>))
+    responses((status = 200,body = RecordListResponse))
 )]
-pub async fn query_vector_search(
+pub async fn query_vector_with_text(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     Path(path): Path<IdPath>,
     Json(payload): Json<TextVectorSearchReq>,
-) -> Result<Json<Vec<RecordResponse>>, AppError> {
+) -> Result<Json<RecordListResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
     let collection = resolve_collection_by_id_or_name(&db, &path.id).await?;
 
@@ -184,16 +238,13 @@ pub async fn query_vector_search(
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
-    // NOTE: use `embed_query` (the query-side prompt prefix), not `embed`, if your
-    // vector_provider distinguishes the two - mixing them up hurts ranking even though
-    // nothing here will error.
     let query_vector = state
         .vector_provider
         .embed(&payload.query_text)
         .await
         .map_err(|e| AppError::UnknownError(format!("Embedding generation failed: {}", e)))?;
 
-    let limit = payload.limit.unwrap_or(10).min(100);
+    let search_limit = payload.limit.unwrap_or(1000).min(1000);
 
     let vectorizable_fields: Vec<String> = collection
         .schema
@@ -211,24 +262,22 @@ pub async fn query_vector_search(
         ));
     }
 
-    // [FIX]: this map now tracks the BEST (lowest) distance seen for each record across
-    // all vectorizable fields, not the highest. Start from f32::MAX, not f32::MIN, since
-    // "no value yet" must lose to any real distance, never win against it.
     let mut best_scores: HashMap<i64, f32> = HashMap::new();
-    let mut id_to_record: HashMap<i64, apexkit_core::models::Record> = HashMap::new();
 
     for field_name in vectorizable_fields {
         let records_with_scores = db
-            .search_vector(collection.id, &field_name, query_vector.clone(), limit)
+            .search_vector(
+                collection.id,
+                &field_name,
+                query_vector.clone(),
+                search_limit,
+            )
             .await
             .map_err(|e| {
                 AppError::UnknownError(format!("Vector search failed for {}: {}", field_name, e))
             })?;
 
         for (rec, distance) in records_with_scores {
-            id_to_record.insert(rec.id, rec.clone());
-
-            // [FIX]: Track the LOWEST distance (= most similar) per record.
             let entry = best_scores.entry(rec.id).or_insert(f32::MAX);
             if distance < *entry {
                 *entry = distance;
@@ -237,37 +286,74 @@ pub async fn query_vector_search(
     }
 
     let mut sorted_ids: Vec<(i64, f32)> = best_scores.into_iter().collect();
-    // [FIX]: Sort ASCENDING - lowest distance (best match) first.
     sorted_ids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let final_records: Vec<RecordResponse> = sorted_ids
+    let total = sorted_ids.len() as i64;
+    let page = payload.page.unwrap_or(1).max(1);
+    let per_page = payload.per_page.unwrap_or(20).clamp(1, 100);
+    let offset = (page - 1) * per_page;
+
+    let paginated_ids: Vec<(i64, f32)> = sorted_ids
         .into_iter()
-        .take(limit)
-        .filter_map(|(id, score)| {
-            if let Some(mut r) = id_to_record.remove(&id) {
-                // Inject the score so it's visible in the API/UI
-                if let Some(obj) = r.data.as_object_mut() {
-                    obj.insert("_score".to_string(), serde_json::json!(score));
-                }
-                Some(RecordResponse {
-                    id: r.id,
-                    data: r.data,
-                    expand: r.expand,
-                    created: r.created,
-                    updated: r.updated,
-                })
-            } else {
-                None
-            }
-        })
+        .skip(offset as usize)
+        .take(per_page as usize)
         .collect();
 
-    Ok(Json(final_records))
+    let mut final_records = Vec::new();
+    let ids: Vec<i64> = paginated_ids.iter().map(|(id, _)| *id).collect();
+
+    if !ids.is_empty() {
+        let mut scores_map: std::collections::HashMap<i64, f32> =
+            paginated_ids.into_iter().collect();
+        let options = QueryOptions {
+            limit: Some(ids.len() as u64),
+            filter: Some(serde_json::json!({ "id": { "$in": ids } }).to_string()),
+            expand: payload.expand.clone(),
+            ..Default::default()
+        };
+        let list_res = db
+            .list_records(collection.id, options)
+            .await
+            .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+        let mut item_map: std::collections::HashMap<i64, apexkit_core::models::Record> =
+            list_res.items.into_iter().map(|r| (r.id, r)).collect();
+
+        // Restore scores & preserve relevance ranking
+        final_records = ids
+            .into_iter()
+            .filter_map(|id| {
+                if let Some(mut r) = item_map.remove(&id) {
+                    let score = scores_map.remove(&id).unwrap_or(0.0);
+                    if let Some(obj) = r.data.as_object_mut() {
+                        obj.insert("_score".to_string(), serde_json::json!(score));
+                    }
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
+
+    Ok(Json(RecordListResponse {
+        items: final_records
+            .into_iter()
+            .map(|r| RecordResponse {
+                id: r.id,
+                data: r.data,
+                expand: r.expand,
+                created: r.created,
+                updated: r.updated,
+            })
+            .collect(),
+        total,
+    }))
 }
 
 #[utoipa::path(
     post,
-    path = "/api/v1/collections/{id}/search-image-vector",
+    path = "/api/v1/collections/{id}/search-image-vector-with-image",
     request_body = ImageVectorSearchReq,
     params(IdPath),
     responses((status = 200,body = Vec<RecordResponse>))

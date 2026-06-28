@@ -120,15 +120,15 @@ fn make_api_router() -> Router<AppState> {
             get(ose::instant_search_handler),
         )
         .route(
-            "/collections/{id}/search-vector",
-            post(vector_routes::search_vector),
+            "/collections/{id}/search-vector-with-vector",
+            post(vector_routes::query_vector_with_vector),
         )
         .route(
-            "/collections/{id}/search-text-vector",
-            post(vector_routes::query_vector_search),
+            "/collections/{id}/search-vector-with-text",
+            post(vector_routes::query_vector_with_text),
         )
         .route(
-            "/collections/{id}/search-image-vector",
+            "/collections/{id}/search-image-vector-with-image",
             post(vector_routes::query_image_vector_search),
         )
         .route(
@@ -148,7 +148,7 @@ fn make_api_router() -> Router<AppState> {
         .route("/storage/files", get(storage::list_files))
         .route(
             "/storage/files/{id}",
-            axum::routing::delete(storage::delete_file),
+            get(storage::get_file).delete(storage::delete_file),
         )
         .route("/admin/storage/test", post(storage::test_s3_connection))
         .route("/admin/storage/migrate", post(storage::migrate_storage))
@@ -462,7 +462,7 @@ pub fn app_router(state: AppState) -> Router {
         records::list_records,records::create_record,records::get_record,records::update_record,records::delete_record,
         ose::search_records,ose::instant_search_handler,
         sql_query::query_records_handler,
-        storage::upload_file,storage::serve_file,storage::list_files,storage::delete_file,
+        storage::upload_file, storage::serve_file, storage::list_files, storage::get_file, storage::delete_file,
         records::create_relation,records::delete_relation,
         config_routes::set_config,
         settings::get_settings,settings::update_settings,
@@ -478,8 +478,8 @@ pub fn app_router(state: AppState) -> Router {
         crate::api::migration::export::schema::export_schema_handler,
         collections::reindex_collection_handler,
         vector_routes::revectorize_collection_handler,
-        vector_routes::search_vector,
-        vector_routes::query_vector_search,
+        vector_routes::query_vector_with_vector,
+        vector_routes::query_vector_with_text,
         vector_routes::get_record_vector,
         vector_routes::query_image_vector_search,
         vector_routes::query_text_image_vector_search,

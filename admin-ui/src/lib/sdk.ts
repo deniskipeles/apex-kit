@@ -832,10 +832,10 @@ export class ApexKit {
           method: 'POST',
           body: { query },
         }),
-      searchRecordsWithOSE: (query: string) =>
-        this._request<BaseRecord[]>(`/collections/${collectionId}/search`, {
+      searchRecordsWithOSE: (query: string, options: QueryOptions = {}) =>
+        this._request<ListResult<BaseRecord>>(`/collections/${collectionId}/search`, {
           method: 'GET',
-          params: { q: query },
+          params: { q: query, ...options },
         }),
       searchRecordsInstantlyWithOSE: (query: string) =>
         this._request<InstantResult[]>(`/collections/${collectionId}/instant-search`, {
@@ -896,20 +896,39 @@ export class ApexKit {
           },
         }),
 
-      searchVector: (field: string, vector: number[], limit = 10) =>
-        this._request<BaseRecord[]>(`/collections/${collectionId}/search-vector`, {
-          method: 'POST',
-          body: { field, vector, limit },
-        }),
+      searchVectorWithVector: (field: string, vector: number[], options: QueryOptions = {}) =>
+        this._request<ListResult<BaseRecord>>(
+          `/collections/${collectionId}/search-vector-with-vector`,
+          {
+            method: 'POST',
+            body: {
+              field,
+              vector,
+              limit: options.per_page || options.limit, // Maps to backend option limit
+              expand: options.expand,
+              page: options.page,
+              per_page: options.per_page,
+            },
+          }
+        ),
 
-      searchTextVector: (queryText: string, limit = 10) =>
-        this._request<BaseRecord[]>(`/collections/${collectionId}/search-text-vector`, {
-          method: 'POST',
-          body: { query_text: queryText, limit },
-        }),
+      searchVectorWithText: (queryText: string, options: QueryOptions = {}) =>
+        this._request<ListResult<BaseRecord>>(
+          `/collections/${collectionId}/search-vector-with-text`,
+          {
+            method: 'POST',
+            body: {
+              query_text: queryText,
+              limit: options.per_page || options.limit,
+              expand: options.expand,
+              page: options.page,
+              per_page: options.per_page,
+            },
+          }
+        ),
 
-      searchImageVector: (imageData: string, limit = 10) =>
-        this._request<BaseRecord[]>(`/collections/${collectionId}/search-image-vector`, {
+      searchImageVectorWithImage: (imageData: string, limit = 10) =>
+        this._request<BaseRecord[]>(`/collections/${collectionId}/search-image-vector-with-image`, {
           method: 'POST',
           body: { image_data: imageData, limit },
         }),
@@ -944,13 +963,64 @@ export class ApexKit {
 
       delete: (id: string | number) => this._request(`/storage/files/${id}`, { method: 'DELETE' }),
 
-      getFileUrl: (filename: string): string => {
+      getFileUrl: (
+        filename: string,
+        options?:
+          | string
+          | {
+              thumb?: string;
+              format?: string;
+              quality?: number;
+              signed?: boolean;
+              expiresIn?: number;
+            }
+      ): string | Promise<string> => {
         if (filename.startsWith('http://') || filename.startsWith('https://')) {
           return filename;
         }
+
+        // Asynchronous Signed Resolution
+        if (options && typeof options === 'object' && options.signed) {
+          const params: Record<string, any> = {};
+          if (options.expiresIn) {
+            params.expires_in = options.expiresIn;
+          }
+
+          return this._request<{ signed_url: string }>(
+            `/storage/files/${encodeURIComponent(filename)}`,
+            { method: 'GET', params }
+          ).then((res) => {
+            let url = res.signed_url;
+
+            // Append transformation parameters to the signed URL if provided
+            const extraParams = new URLSearchParams();
+            if (options.thumb) extraParams.append('thumb', options.thumb);
+            if (options.format) extraParams.append('format', options.format);
+            if (options.quality) extraParams.append('quality', String(options.quality));
+
+            const queryStr = extraParams.toString();
+            if (queryStr) {
+              url += (url.includes('?') ? '&' : '?') + queryStr;
+            }
+            return url;
+          });
+        }
+
+        // Synchronous Public URL Resolution (No Network Request)
         const base = this.baseUrl.replace(/\/$/, '');
         const name = filename.replace(/^\//, '');
-        return `${base}/api/v1/storage/file/${name}`;
+        const url = new URL(`${base}/api/v1/storage/file/${name}`);
+
+        if (options) {
+          if (typeof options === 'string') {
+            url.searchParams.append('thumb', options);
+          } else {
+            if (options.thumb) url.searchParams.append('thumb', options.thumb);
+            if (options.format) url.searchParams.append('format', options.format);
+            if (options.quality) url.searchParams.append('quality', String(options.quality));
+          }
+        }
+        return url.toString();
       },
     };
   }

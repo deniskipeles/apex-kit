@@ -189,13 +189,6 @@ pub trait RecordStore: Send + Sync {
 /// Store operations for full-text search indexing and synchronization.
 #[async_trait]
 pub trait SearchStore: Send + Sync {
-    /// Searches the full-text search index matching term query expressions.
-    async fn search_records(
-        &self,
-        collection_id: i64,
-        query: &str,
-    ) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>>;
-
     /// Purges and regenerates the entire search index for a specified target collection.
     async fn reindex_collection(
         &self,

@@ -256,9 +256,9 @@ export const apiClient = {
     field: string,
     vector: Array<number>,
     limit?: number
-  ) => pb.collection(collectionId).searchVector(field, vector, limit),
+  ) => pb.collection(collectionId).searchVectorWithVector(field, vector, { limit }),
   searchTextVector: (collectionId: string | number, queryText: string, limit?: number) =>
-    pb.collection(collectionId).searchTextVector(queryText, limit),
+    pb.collection(collectionId).searchVectorWithText(queryText, { limit }),
   reIndex: async (collectionId?: string) => {
     const res = await pb.admins.reIndex(collectionId);
     return res;
@@ -630,12 +630,13 @@ export const apiClient = {
     },
     recordsSearchOSE: async (
       collectionId: string | number,
-      query: string
+      query: string,
+      options?: Record<string, any>
     ): Promise<InstantResult[]> => {
       if (!query) return [];
       try {
-        const result = await pb.collection(collectionId).searchRecordsWithOSE(query);
-        return result.map((item: any) => ({
+        const result = await pb.collection(collectionId).searchRecordsWithOSE(query, options);
+        return result.items.map((item: any) => ({
           id: item.id.toString(),
           collectionId,
           collectionName: 'unknown',
@@ -709,13 +710,13 @@ export const apiClient = {
       return await pb.collection(collectionId).delete(recordId);
     },
     searchTextVector: async (collectionId: string | number, query: string, limit = 10) => {
-      return await pb.collection(collectionId).searchTextVector(query, limit);
+      return await pb.collection(collectionId).searchVectorWithText(query, { limit });
     },
     searchVector: async (collectionId: string, field: string, vector: number[], limit = 10) => {
-      return await pb.collection(collectionId).searchVector(field, vector, limit);
+      return await pb.collection(collectionId).searchVectorWithVector(field, vector, { limit });
     },
     searchImageVector: async (collectionId: string | number, imageData: string, limit = 10) => {
-      return await pb.collection(collectionId).searchImageVector(imageData, limit);
+      return await pb.collection(collectionId).searchImageVectorWithImage(imageData, limit);
     },
     searchImageVectorWithText: async (
       collectionId: string | number,

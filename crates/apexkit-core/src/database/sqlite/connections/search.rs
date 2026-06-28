@@ -1,60 +1,17 @@
 use super::ApexKit;
 use crate::database::sqlite::utils::row_to_record;
 use crate::database::traits::SearchStore;
+use crate::models::InstantResult;
 use crate::models::schema::CollectionSchema;
-use crate::models::{InstantResult, Record};
 use async_trait::async_trait;
 use rusqlite::params;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[async_trait]
 impl SearchStore for ApexKit {
-    async fn search_records(
-        &self,
-        collection_id: i64,
-        query: &str,
-    ) -> std::result::Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
-        self.ensure_search_index(collection_id).await?;
-
-        let ids = self.search.search(collection_id, query, 50)?;
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let id_list = ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT id,json(data),NULL,created,updated FROM records WHERE id IN ({})",
-            id_list
-        );
-        let conn = self.get_data_read().await;
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-
-        let mut records = Vec::new();
-        while let Some(row) = rows.next()? {
-            records.push(row_to_record(row)?);
-        }
-
-        let id_pos: HashMap<i64, usize> =
-            ids.iter().enumerate().map(|(pos, id)| (*id, pos)).collect();
-
-        records.sort_by(|a, b| {
-            let pos_a = id_pos.get(&a.id).unwrap_or(&usize::MAX);
-            let pos_b = id_pos.get(&b.id).unwrap_or(&usize::MAX);
-            pos_a.cmp(pos_b)
-        });
-
-        Ok(records)
-    }
-
     async fn reindex_collection(
         &self,
         id: i64,

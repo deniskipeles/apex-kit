@@ -5,7 +5,7 @@ use axum::{
     Extension, Json,
     body::Body,
     extract::{Multipart, Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
 };
 use image::ImageEncoder;
@@ -932,6 +932,7 @@ pub async fn upload_file(
 pub async fn serve_file(
     StorageConnection(storage): StorageConnection,
     State(state): State<AppState>,
+    headers: HeaderMap, // <--- Added
     Path(path): Path<FilenamePath>,
     Query(params): Query<FileParams>,
 ) -> Result<Response, AppError> {
@@ -972,6 +973,7 @@ pub async fn serve_file(
 
     process_image(
         &state,
+        &headers, // <--- Passed
         data,
         &mime_type,
         clean_filename.to_string(),
@@ -1002,6 +1004,66 @@ pub async fn list_files(
     Ok(Json(FileListResponse {
         items: files,
         total,
+    }))
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct GetFileQuery {
+    pub expires_in: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct StoredFileWithSignedUrl {
+    pub id: i64,
+    pub filename: String,
+    pub original_name: String,
+    pub mime_type: String,
+    pub size: i64,
+    pub created_at: String,
+    pub signed_url: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/storage/files/{id}",
+    params(
+        ("id" = String, Path, description = "File ID or Filename"),
+        GetFileQuery
+    ),
+    responses((status = 200, body = StoredFileWithSignedUrl))
+)]
+pub async fn get_file(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    StorageConnection(storage): StorageConnection,
+    Path(id_or_name): Path<String>,
+    Query(q): Query<GetFileQuery>,
+) -> Result<Json<StoredFileWithSignedUrl>, AppError> {
+    let _claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?;
+
+    // Resolves either an integer ID or a raw string filename
+    let file_meta = if let Ok(id) = id_or_name.parse::<i64>() {
+        db.get_file_metadata(id).await
+    } else {
+        db.get_file_by_filename(&id_or_name).await
+    }
+    .map_err(|e| AppError::UnknownError(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("File not found".into()))?;
+
+    let expires = q.expires_in.unwrap_or(3600); // Defaults to 1 hour
+    let signed_url = storage
+        .get_signed_url(&file_meta.filename, expires)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(Json(StoredFileWithSignedUrl {
+        id: file_meta.id,
+        filename: file_meta.filename,
+        original_name: file_meta.original_name,
+        mime_type: file_meta.mime_type,
+        size: file_meta.size,
+        created_at: file_meta.created_at,
+        signed_url,
     }))
 }
 
@@ -1072,9 +1134,9 @@ pub async fn delete_file(
 }
 
 // --- HELPER: Centralized Image Processing ---
-// --- HELPER: Centralized Image Processing ---
 async fn process_image(
     state: &AppState,
+    headers: &HeaderMap, // <--- Added
     original_bytes: Vec<u8>,
     original_mime: &str,
     cache_key: String,
@@ -1084,6 +1146,19 @@ async fn process_image(
 ) -> Result<Response, AppError> {
     let cache_header_val = "public, max-age=31536000, immutable";
     let etag = format!("\"{:x}\"", md5::compute(&original_bytes));
+
+    // 1. Serve 304 Not Modified if ETag matches for unmodified content
+    if let Some(if_none_match) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if if_none_match == etag {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .body(Body::empty())
+                .unwrap());
+        }
+    }
 
     if (dim_str.is_none() && req_format.is_none() && req_quality.is_none())
         || original_mime.contains("svg")
@@ -1120,6 +1195,20 @@ async fn process_image(
 
     if let Some(cached_bytes) = state.thumb_cache.get(&full_cache_key).await {
         let thumb_etag = format!("\"{:x}\"", md5::compute(cached_bytes.as_ref()));
+
+        // 2. Serve 304 Not Modified if ETag matches for cached/transformed thumbnails
+        if let Some(if_none_match) = headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+        {
+            if if_none_match == thumb_etag {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .body(Body::empty())
+                    .unwrap());
+            }
+        }
+
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, target_mime)
@@ -1146,7 +1235,6 @@ async fn process_image(
             let processed_img = if w > 0 || h > 0 {
                 let target_w = if w == 0 { u32::MAX } else { w };
                 let target_h = if h == 0 { u32::MAX } else { h };
-                // Triangle filter is much faster than Lanczos3 and perfectly fine for downscaling on the web
                 img.resize(target_w, target_h, FilterType::Triangle)
             } else {
                 img
@@ -1221,6 +1309,7 @@ pub async fn serve_app_logo(
     DatabaseConnection(db): DatabaseConnection,
     StorageConnection(storage): StorageConnection,
     State(state): State<AppState>,
+    headers: HeaderMap, // <--- Added
     Query(params): Query<FileParams>,
 ) -> Result<Response, AppError> {
     let settings = db
@@ -1258,6 +1347,7 @@ pub async fn serve_app_logo(
 
     process_image(
         &state,
+        &headers, // <--- Passed
         bytes,
         &mime,
         format!("logo_{}", cache_key_base),
