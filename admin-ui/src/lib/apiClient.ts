@@ -709,13 +709,26 @@ export const apiClient = {
     delete: async (collectionId: string, recordId: string): Promise<void> => {
       return await pb.collection(collectionId).delete(recordId);
     },
-    searchTextVector: async (collectionId: string | number, query: string, limit = 10) => {
-      return await pb.collection(collectionId).searchVectorWithText(query, { limit });
+    searchVectorWithText: async (
+      collectionId: string | number,
+      query: string,
+      options: Record<string, any> = { limit: 10 }
+    ) => {
+      return await pb.collection(collectionId).searchVectorWithText(query, options);
     },
-    searchVector: async (collectionId: string, field: string, vector: number[], limit = 10) => {
-      return await pb.collection(collectionId).searchVectorWithVector(field, vector, { limit });
+    searchVectorWithVector: async (
+      collectionId: string,
+      field: string,
+      vector: number[],
+      options: Record<string, any> = { limit: 10 }
+    ) => {
+      return await pb.collection(collectionId).searchVectorWithVector(field, vector, options);
     },
-    searchImageVector: async (collectionId: string | number, imageData: string, limit = 10) => {
+    searchImageVectorWithImage: async (
+      collectionId: string | number,
+      imageData: string,
+      limit = 10
+    ) => {
       return await pb.collection(collectionId).searchImageVectorWithImage(imageData, limit);
     },
     searchImageVectorWithText: async (

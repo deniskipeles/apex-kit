@@ -155,7 +155,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                         let limit = req.limit.unwrap_or(10).min(50);
 
                                         let mut resolved_search_id = None;
+                                        let mut current_db = state.db.clone(); // Fallback to Root
+                                        
                                         if let Ok(db) = resolve_db_from_scope(&state, &client_scope).await {
+                                            current_db = db.clone();
                                             let identifier = match &req.collection_id {
                                                 serde_json::Value::String(s) => s.clone(),
                                                 serde_json::Value::Number(n) => n.to_string(),
@@ -169,7 +172,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
 
                                         let mut allowed = false;
                                         if let Some(col_id) = resolved_search_id
-                                            && let Ok(Some(col)) = state.db.get_collection(col_id).await {
+                                            && let Ok(Some(col)) = current_db.get_collection(col_id).await {
                                                 let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
                                                 allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref(), None);
                                             }
@@ -181,7 +184,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                         }
 
                                         let col_id = resolved_search_id.unwrap();
-                                        match state.db.instant_search(col_id, &req.query, limit).await {
+                                        match current_db.instant_search(col_id, &req.query, limit).await {
                                             Ok(results) => {
                                                 let response = serde_json::json!({
                                                     "type": "SearchResult",
