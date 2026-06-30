@@ -46,11 +46,17 @@ pub async fn build_schema(
         .map(|c| (c.id.to_string(), c.name.clone()))
         .collect();
 
-    // 0. FETCH USER POLICIES
+    // 0. FETCH USER POLICIES (With Robust Double-Serialization Parsing)
     let policy_users_json = state.db.get_config("policy_users").await.unwrap_or(None);
     let user_read_policy = if let Some(val) = policy_users_json {
+        let parsed_val = match val {
+            serde_json::Value::String(s) => {
+                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+            }
+            other => other,
+        };
         if let Ok(p) =
-            serde_json::from_value::<apexkit_core::models::schema::CollectionPolicies>(val)
+            serde_json::from_value::<apexkit_core::models::schema::CollectionPolicies>(parsed_val)
         {
             p.read
         } else {
@@ -62,6 +68,7 @@ pub async fn build_schema(
 
     // --- 1. PRE-CALCULATE REVERSE RELATIONS & TARGET POLICIES ---
 
+    // A. User Reverse Owner Relations: (col_id, col_name, owner_field_name, target_policy)
     let mut user_reverse_fields = Vec::new();
     let mut user_field_names_count: HashMap<String, usize> = HashMap::new();
 
@@ -82,6 +89,7 @@ pub async fn build_schema(
         }
     }
 
+    // B. Collection Reverse Relations: Target Col ID -> Vec<(Origin Col ID, Origin Col Name, Rel Field Name, Origin Policy)>
     let mut reverse_relations_map: HashMap<i64, Vec<(i64, String, String, String)>> =
         HashMap::new();
     for other_col in &collections {
@@ -114,6 +122,7 @@ pub async fn build_schema(
     let mut user_object = Object::new("_AuthUser");
     let mut collection_objects: HashMap<String, Object> = HashMap::new();
 
+    // Standard System Fields (Prefix with _)
     query_root = query_root.field(Field::new(
         "_status",
         TypeRef::named(TypeRef::STRING),
@@ -160,6 +169,7 @@ pub async fn build_schema(
         let t_policy = target_policy.clone();
         let list_type = format!("{}List", capitalize(col_name));
 
+        // disambiguate if multiple owner fields are registered on the same collection
         let is_duplicate = *user_field_names_count.get(col_name).unwrap_or(&0) > 1;
         let field_key = if is_duplicate {
             format!("{}_via_{}", col_name, owner_field)
@@ -309,6 +319,7 @@ pub async fn build_schema(
     for col in &collections {
         let type_name = capitalize(&col.name);
         let col_id = col.id;
+        let _col_name = col.name.clone();
 
         let mut object = Object::new(&type_name);
 
@@ -371,7 +382,7 @@ pub async fn build_schema(
                         FieldFuture::new(async move {
                             let record = ctx.parent_value.try_downcast_ref::<Record>()?;
 
-                            // [FIXED] Robust ID Extractor
+                            // [FIXED] Robust ID Extractor (Supports Int, Float and String representations from DB)
                             let user_id = record
                                 .data
                                 .get(&name)
