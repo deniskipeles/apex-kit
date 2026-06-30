@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::{AppError, AppState, DatabaseConnection};
 use apexkit_core::{
     auth::Claims,
@@ -79,7 +81,7 @@ pub async fn create_template(
     // Clear global CSS cache (this is fine to be global as styles might be shared or recompiled)
     {
         let mut cache = state.css_cache.write().await;
-        *cache = String::new();
+        *cache = HashMap::new();
     }
 
     Ok(Json(json!({ "id": id })))
@@ -109,7 +111,7 @@ pub async fn update_template(
 
     {
         let mut cache = state.css_cache.write().await;
-        *cache = String::new();
+        *cache = HashMap::new();
     }
 
     Ok(Json(json!({ "success": true })))
@@ -136,7 +138,7 @@ pub async fn delete_template(
 
     {
         let mut cache = state.css_cache.write().await;
-        *cache = String::new();
+        *cache = HashMap::new();
     }
 
     Ok(Json(json!({ "success": true })))

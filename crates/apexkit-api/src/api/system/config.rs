@@ -1,5 +1,5 @@
-use crate::{AppError, AppState, DatabaseConnection};
-use apexkit_core::{auth::Claims, models::ConfigItem};
+use crate::{AppError, AppState, DatabaseConnection, utils::trigger_scope_reload};
+use apexkit_core::{auth::Claims, models::ConfigItem, realtime::EventScope};
 use axum::{
     Extension,
     extract::{Json, Path, State},
@@ -13,7 +13,7 @@ pub struct SetConfigRequest {
     pub key: String,
     pub value: String,
     #[serde(default)]
-    pub encrypt: bool, // [NEW] Allow client to request encryption
+    pub encrypt: bool,
 }
 
 #[utoipa::path(
@@ -46,6 +46,7 @@ pub async fn set_config(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>,
     Json(payload): Json<SetConfigRequest>,
 ) -> Result<StatusCode, AppError> {
     if claims.role != "admin" {
@@ -62,13 +63,22 @@ pub async fn set_config(
         json_val =
             serde_json::to_value(&encrypted).map_err(|e| AppError::UnknownError(e.to_string()))?;
     } else {
-        // Store as raw JSON string or object? For generic config, string is safest.
         json_val = serde_json::Value::String(payload.value);
     }
 
     db.set_config(&payload.key, &json_val, payload.encrypt)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    // [CRITICAL CACHE FIX]
+    // If a policy or security setting changes, instantly rebuild the GraphQL Schema
+    if payload.key.starts_with("policy_") || payload.key == "security" {
+        let state_clone = state.clone();
+        let scope_clone = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+        tokio::spawn(async move {
+            trigger_scope_reload(state_clone, scope_clone).await;
+        });
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -81,6 +91,8 @@ pub async fn set_config(
 pub async fn delete_config(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>,
     Path(key): Path<String>,
 ) -> Result<StatusCode, AppError> {
     if claims.role != "admin" {
@@ -90,6 +102,14 @@ pub async fn delete_config(
     db.delete_config(&key)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    if key.starts_with("policy_") || key == "security" {
+        let state_clone = state.clone();
+        let scope_clone = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+        tokio::spawn(async move {
+            trigger_scope_reload(state_clone, scope_clone).await;
+        });
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

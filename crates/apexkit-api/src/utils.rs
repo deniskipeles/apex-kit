@@ -85,7 +85,7 @@ pub fn extract_log_meta(
     meta
 }
 
-// Helper function to resolve DB from scope (async)
+// Helper to resolve DB from scope (async)
 pub async fn resolve_db_from_scope(
     state: &AppState,
     scope: &EventScope,
@@ -175,6 +175,44 @@ pub async fn resolve_collection_by_id_or_name(
     cols.into_iter()
         .find(|c| c.name == identifier)
         .ok_or_else(|| AppError::NotFound(format!("Collection '{}' not found", identifier)))
+}
+
+// --- SYSTEM SCOPE RELOADER ---
+// Invalidate cache and regenerate GraphQL schemas globally across environments
+pub async fn trigger_scope_reload(state: AppState, scope: EventScope) {
+    match scope {
+        EventScope::Root => {
+            let relation_loader = async_graphql::dataloader::DataLoader::new(
+                crate::graphql::RelationLoader::new(state.db.clone()),
+                tokio::spawn,
+            );
+            if let Ok(new_schema) =
+                crate::graphql::build_schema(state.clone(), std::sync::Arc::new(relation_loader))
+                    .await
+            {
+                let mut lock = state.schema.write().await;
+                *lock = new_schema;
+                tracing::info!(
+                    "[System] Root GraphQL schema automatically reloaded due to schema/config change."
+                );
+            }
+        }
+        EventScope::Tenant(id) => {
+            state.tenant_manager.invalidate(&id).await;
+            tracing::info!(
+                "[System] Tenant '{}' cache invalidated due to schema/config change.",
+                id
+            );
+        }
+        EventScope::Sandbox(id) => {
+            state.sandbox_manager.invalidate(&id).await;
+            tracing::info!(
+                "[System] Sandbox '{}' cache invalidated due to schema/config change.",
+                id
+            );
+        }
+        _ => {}
+    }
 }
 
 // --- DYNAMIC DOCS HELPERS ---

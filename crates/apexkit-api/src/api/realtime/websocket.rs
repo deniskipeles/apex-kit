@@ -156,7 +156,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
 
                                         let mut resolved_search_id = None;
                                         let mut current_db = state.db.clone(); // Fallback to Root
-                                        
+
                                         if let Ok(db) = resolve_db_from_scope(&state, &client_scope).await {
                                             current_db = db.clone();
                                             let identifier = match &req.collection_id {

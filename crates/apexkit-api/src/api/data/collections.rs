@@ -1,10 +1,10 @@
 use crate::hooks::{trigger_filter_hook, trigger_void_hook};
-use crate::utils::{extract_log_meta, resolve_collection_by_id_or_name};
+use crate::utils::{extract_log_meta, resolve_collection_by_id_or_name, trigger_scope_reload};
 use crate::{
     AppError, AppState, BaseUrl, CollectionResponse, CreateCollectionReq, DatabaseConnection,
     IdPath, UpdateCollection,
 };
-use apexkit_core::{auth::Claims, realtime::EventScope};
+use apexkit_core::{auth::Claims, realtime::EventScope, workers::Job};
 use axum::extract::ConnectInfo;
 use axum::{
     Extension,
@@ -343,6 +343,8 @@ pub async fn delete_collection(
 #[utoipa::path(post, path = "/api/v1/admin/collections/{id}/reindex", params(IdPath), responses((status = 200, description = "Reindexing started")))]
 pub async fn reindex_collection_handler(
     auth: Option<Extension<Claims>>,
+    scope: Option<Extension<EventScope>>,
+    State(state): State<AppState>,
     DatabaseConnection(db): DatabaseConnection,
     Path(path): Path<IdPath>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -350,47 +352,18 @@ pub async fn reindex_collection_handler(
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // [FIX] Resolve ID
     let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
+    let current_tenant = crate::utils::get_tenant_id_from_scope(scope.as_ref().map(|e| &e.0));
 
-    db.reindex_collection(col.id)
-        .await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "success": true })))
-}
+    state
+        .queue
+        .enqueue(Job::ReindexCollection {
+            tenant_id: current_tenant,
+            collection_id: col.id,
+        })
+        .await;
 
-async fn trigger_scope_reload(state: AppState, scope: EventScope) {
-    match scope {
-        EventScope::Root => {
-            let relation_loader = async_graphql::dataloader::DataLoader::new(
-                crate::graphql::RelationLoader::new(state.db.clone()),
-                tokio::spawn,
-            );
-            if let Ok(new_schema) =
-                crate::graphql::build_schema(state.clone(), std::sync::Arc::new(relation_loader))
-                    .await
-            {
-                let mut lock = state.schema.write().await;
-                *lock = new_schema;
-                tracing::info!(
-                    "[System] Root GraphQL schema automatically reloaded due to schema change."
-                );
-            }
-        }
-        EventScope::Tenant(id) => {
-            state.tenant_manager.invalidate(&id).await;
-            tracing::info!(
-                "[System] Tenant '{}' cache invalidated due to schema change.",
-                id
-            );
-        }
-        EventScope::Sandbox(id) => {
-            state.sandbox_manager.invalidate(&id).await;
-            tracing::info!(
-                "[System] Sandbox '{}' cache invalidated due to schema change.",
-                id
-            );
-        }
-        _ => {}
-    }
+    Ok(Json(
+        serde_json::json!({ "success": true, "message": "Reindexing job queued in background" }),
+    ))
 }

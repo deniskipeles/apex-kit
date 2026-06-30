@@ -7,6 +7,7 @@ use crate::AppState;
 use apexkit_core::auth::Claims;
 use apexkit_core::auth::policies;
 use apexkit_core::models::{ListResult, Record};
+use apexkit_core::query::QueryOptions;
 use apexkit_core::realtime::EventScope;
 use apexkit_core::{
     auth::User,
@@ -18,6 +19,7 @@ use async_graphql::{Value as GqlValue, dynamic::*};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
+
 // --- SCHEMA BUILDER ---
 
 pub async fn build_schema(
@@ -38,26 +40,91 @@ pub async fn build_schema(
         .limit_complexity(2000)
         .extension(Analyzer);
 
-    // --- 1. PREPARE STANDARD OBJECTS ---
+    let collections = state.db.list_collections().await.unwrap_or_default();
+    let col_id_to_name: HashMap<String, String> = collections
+        .iter()
+        .map(|c| (c.id.to_string(), c.name.clone()))
+        .collect();
+
+    // 0. FETCH USER POLICIES
+    let policy_users_json = state.db.get_config("policy_users").await.unwrap_or(None);
+    let user_read_policy = if let Some(val) = policy_users_json {
+        if let Ok(p) =
+            serde_json::from_value::<apexkit_core::models::schema::CollectionPolicies>(val)
+        {
+            p.read
+        } else {
+            "admin || owner:id".to_string()
+        }
+    } else {
+        "admin || owner:id".to_string()
+    };
+
+    // --- 1. PRE-CALCULATE REVERSE RELATIONS & TARGET POLICIES ---
+
+    let mut user_reverse_fields = Vec::new();
+    let mut user_field_names_count: HashMap<String, usize> = HashMap::new();
+
+    for col in &collections {
+        if let Some(schema) = &col.schema {
+            let col_policy = schema.policies.read.clone();
+            for (field_name, def) in &schema.fields {
+                if def.r#type == FieldType::Owner {
+                    user_reverse_fields.push((
+                        col.id,
+                        col.name.clone(),
+                        field_name.clone(),
+                        col_policy.clone(),
+                    ));
+                    *user_field_names_count.entry(col.name.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    let mut reverse_relations_map: HashMap<i64, Vec<(i64, String, String, String)>> =
+        HashMap::new();
+    for other_col in &collections {
+        if let Some(schema) = &other_col.schema {
+            let origin_policy = schema.policies.read.clone();
+            for (rel_name, def) in &schema.relations {
+                let target_col_id_opt = collections
+                    .iter()
+                    .find(|c| {
+                        c.name == def.target_collection || c.id.to_string() == def.target_collection
+                    })
+                    .map(|c| c.id);
+
+                if let Some(target_id) = target_col_id_opt {
+                    reverse_relations_map.entry(target_id).or_default().push((
+                        other_col.id,
+                        other_col.name.clone(),
+                        rel_name.clone(),
+                        origin_policy.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // --- 2. PREPARE STANDARD OBJECTS ---
 
     let mut query_root = Object::new("Query");
     let mut mutation_root = Object::new("Mutation");
-    let mut user_object = Object::new("User");
+    let mut user_object = Object::new("_AuthUser");
     let mut collection_objects: HashMap<String, Object> = HashMap::new();
 
-    // Standard Fields
     query_root = query_root.field(Field::new(
-        "status",
+        "_status",
         TypeRef::named(TypeRef::STRING),
         |_| FieldFuture::new(async { Ok(Some(GqlValue::from("ApexKit is running"))) }),
     ));
 
     mutation_root =
-        mutation_root.field(Field::new("ping", TypeRef::named(TypeRef::STRING), |_| {
+        mutation_root.field(Field::new("_ping", TypeRef::named(TypeRef::STRING), |_| {
             FieldFuture::new(async { Ok(Some(GqlValue::from("pong"))) })
         }));
 
-    // [Keep Standard User & UserList definitions as is...]
     user_object = user_object
         .field(Field::new("id", TypeRef::named_nn(TypeRef::ID), |ctx| {
             FieldFuture::new(async move {
@@ -86,7 +153,85 @@ pub async fn build_schema(
             },
         ));
 
-    let mut user_list = Object::new("UserList");
+    // --- 3. HYDRATE USER REVERSE RELATIONS ---
+    for (col_id, col_name, owner_field, target_policy) in &user_reverse_fields {
+        let col_id = *col_id;
+        let owner_field_clone = owner_field.clone();
+        let t_policy = target_policy.clone();
+        let list_type = format!("{}List", capitalize(col_name));
+
+        let is_duplicate = *user_field_names_count.get(col_name).unwrap_or(&0) > 1;
+        let field_key = if is_duplicate {
+            format!("{}_via_{}", col_name, owner_field)
+        } else {
+            col_name.clone()
+        };
+
+        user_object = user_object.field(
+            Field::new(field_key, TypeRef::named(&list_type), move |ctx| {
+                let s_col_id = col_id;
+                let s_owner_field = owner_field_clone.clone();
+                let policy_rule = t_policy.clone();
+
+                FieldFuture::new(async move {
+                    let state = ctx.data::<AppState>().unwrap().clone();
+                    let parent_user = ctx.parent_value.try_downcast_ref::<User>()?;
+                    let claims = ctx.data::<Claims>().ok();
+
+                    let rls_sql =
+                        policies::compile_to_sql(&policy_rule, claims).unwrap_or("1=0".to_string());
+                    if rls_sql == "1=0" {
+                        return Ok(Some(FieldValue::owned_any(ListResult {
+                            items: vec![],
+                            total: 0,
+                        })));
+                    }
+
+                    let limit = ctx.args.get("limit").and_then(|v| v.u64().ok());
+                    let offset = ctx.args.get("offset").and_then(|v| v.u64().ok());
+
+                    let user_filter = serde_json::json!({ s_owner_field.clone(): parent_user.id });
+
+                    let filter_str = match ctx.args.get("where") {
+                        Some(accessor) => {
+                            let mut user_where = accessor
+                                .deserialize::<serde_json::Value>()
+                                .unwrap_or(serde_json::json!({}));
+                            if let Some(obj) = user_where.as_object_mut() {
+                                obj.insert(
+                                    s_owner_field.clone(),
+                                    serde_json::json!(parent_user.id),
+                                );
+                            } else {
+                                user_where = user_filter;
+                            }
+                            Some(user_where.to_string())
+                        }
+                        None => Some(user_filter.to_string()),
+                    };
+
+                    let mut options = QueryOptions::default();
+                    options.limit = limit.or(Some(100));
+                    options.offset = offset;
+                    options.filter = filter_str;
+                    options.rls_sql = Some(rls_sql);
+
+                    let result = state
+                        .db
+                        .list_records(s_col_id, options)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+                    Ok(Some(FieldValue::owned_any(result)))
+                })
+            })
+            .argument(InputValue::new("limit", TypeRef::named(TypeRef::INT)))
+            .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
+            .argument(InputValue::new("where", TypeRef::named("JSON"))),
+        );
+    }
+
+    let mut user_list = Object::new("_AuthUserList");
     user_list = user_list
         .field(Field::new(
             "total",
@@ -98,24 +243,35 @@ pub async fn build_schema(
                 })
             },
         ))
-        .field(Field::new("items", TypeRef::named_nn_list("User"), |ctx| {
-            FieldFuture::new(async move {
-                let items = &ctx.parent_value.try_downcast_ref::<(i64, Vec<User>)>()?.1;
-                Ok(Some(FieldValue::list(
-                    items.iter().map(|u| FieldValue::owned_any(u.clone())),
-                )))
-            })
-        }));
+        .field(Field::new(
+            "items",
+            TypeRef::named_nn_list("_AuthUser"),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let items = &ctx.parent_value.try_downcast_ref::<(i64, Vec<User>)>()?.1;
+                    Ok(Some(FieldValue::list(
+                        items.iter().map(|u| FieldValue::owned_any(u.clone())),
+                    )))
+                })
+            },
+        ));
     schema_builder = schema_builder.register(user_list);
 
+    let u_list_policy = user_read_policy.clone();
     query_root = query_root.field(
-        Field::new("users", TypeRef::named("UserList"), move |ctx| {
+        Field::new("_users", TypeRef::named("_AuthUserList"), move |ctx| {
             let state = ctx.data::<AppState>().unwrap().clone();
+            let policy = u_list_policy.clone();
+
             FieldFuture::new(async move {
                 let claims = ctx.data::<Claims>().ok();
-                if !matches!(claims, Some(c) if c.role == "admin") {
-                    return Err(async_graphql::Error::new("Forbidden: Admins only"));
+
+                if !policies::check_access(&policy, claims, None) {
+                    return Err(async_graphql::Error::new(
+                        "Forbidden: Access denied by policy",
+                    ));
                 }
+
                 let limit = ctx
                     .args
                     .get("limit")
@@ -149,19 +305,11 @@ pub async fn build_schema(
         .argument(InputValue::new("search", TypeRef::named(TypeRef::STRING))),
     );
 
-    // --- 2. BUILD COLLECTION OBJECTS (QUERIES & MUTATIONS) ---
-    let collections = state.db.list_collections().await.unwrap_or_default();
-    let col_id_to_name: HashMap<String, String> = collections
-        .iter()
-        .map(|c| (c.id.to_string(), c.name.clone()))
-        .collect();
-
+    // --- 4. BUILD COLLECTION OBJECTS (QUERIES & MUTATIONS) ---
     for col in &collections {
         let type_name = capitalize(&col.name);
         let col_id = col.id;
-        let _col_name = col.name.clone();
 
-        // --- 2A. QUERY TYPES ---
         let mut object = Object::new(&type_name);
 
         let read_policy = col
@@ -195,17 +343,17 @@ pub async fn build_schema(
             })
         }));
 
-        // Dynamically build Input Objects for Mutations
         let create_input_name = format!("Create{}Input", type_name);
         let update_input_name = format!("Update{}Input", type_name);
 
         let mut create_input = InputObject::new(&create_input_name);
         let mut update_input = InputObject::new(&update_input_name);
 
+        let mut create_fields_count = 0;
+        let mut update_fields_count = 0;
+
         if let Some(schema) = &col.schema {
             for (field_name, def) in &schema.fields {
-                // [CRITICAL FIX]: Prevent GraphQL Panic
-                // Skip 'id' since it is already natively registered above
                 if field_name == "id" {
                     continue;
                 }
@@ -213,27 +361,58 @@ pub async fn build_schema(
                 let name_clone = field_name.clone();
                 let is_owner = def.r#type == FieldType::Owner;
 
-                // --- Query Field ---
                 if is_owner {
-                    let field = Field::new(field_name, TypeRef::named("User"), move |ctx| {
+                    let u_read_policy = user_read_policy.clone();
+
+                    let field = Field::new(field_name, TypeRef::named("_AuthUser"), move |ctx| {
                         let name = name_clone.clone();
+                        let policy_rule = u_read_policy.clone();
+
                         FieldFuture::new(async move {
                             let record = ctx.parent_value.try_downcast_ref::<Record>()?;
-                            let user_id =
-                                record.data.get(&name).and_then(|v| v.as_i64()).or_else(|| {
+
+                            // [FIXED] Robust ID Extractor
+                            let user_id = record
+                                .data
+                                .get(&name)
+                                .and_then(|v| v.as_i64())
+                                .or_else(|| {
+                                    record
+                                        .data
+                                        .get(&name)
+                                        .and_then(|v| v.as_f64())
+                                        .map(|f| f as i64)
+                                })
+                                .or_else(|| {
                                     record
                                         .data
                                         .get(&name)
                                         .and_then(|v| v.as_str())
                                         .and_then(|s| s.parse::<i64>().ok())
                                 });
+
                             if let Some(uid) = user_id {
                                 let loader = ctx.data::<DataLoader<UserLoader>>().unwrap();
-                                let user = loader
+                                let claims = ctx.data::<Claims>().ok();
+
+                                let user_opt = loader
                                     .load_one(uid)
                                     .await
                                     .map_err(async_graphql::Error::new)?;
-                                Ok(user.map(FieldValue::owned_any))
+
+                                if let Some(u) = user_opt {
+                                    let u_val = serde_json::json!({
+                                        "id": u.id,
+                                        "email": u.email,
+                                        "role": u.role,
+                                        "metadata": u.metadata
+                                    });
+
+                                    if policies::check_access(&policy_rule, claims, Some(&u_val)) {
+                                        return Ok(Some(FieldValue::owned_any(u)));
+                                    }
+                                }
+                                Ok(None)
                             } else {
                                 Ok(None)
                             }
@@ -244,6 +423,7 @@ pub async fn build_schema(
                     let gql_type = match def.r#type {
                         FieldType::Number => TypeRef::FLOAT,
                         FieldType::Boolean => TypeRef::BOOLEAN,
+                        FieldType::Json => "JSON",
                         _ => TypeRef::STRING,
                     };
                     let field = Field::new(field_name, TypeRef::named(gql_type), move |ctx| {
@@ -256,31 +436,27 @@ pub async fn build_schema(
                     object = object.field(field);
                 }
 
-                // --- Input Fields ---
                 let input_type = match def.r#type {
                     FieldType::Number => TypeRef::FLOAT,
                     FieldType::Boolean => TypeRef::BOOLEAN,
                     _ => TypeRef::STRING,
                 };
 
-                // Create Input (Respect required, ignore owner if auto-set)
                 if !is_owner || !def.auto {
-                    // For Create: if required, mark NonNull
                     let create_type_ref = if def.required {
                         TypeRef::named_nn(input_type)
                     } else {
                         TypeRef::named(input_type)
                     };
                     create_input = create_input.field(InputValue::new(field_name, create_type_ref));
+                    create_fields_count += 1;
                 }
 
-                // Update Input (All optional)
-                // For Owner fields, we allow updating explicitly via ID string unless it's strictly auto
                 update_input =
                     update_input.field(InputValue::new(field_name, TypeRef::named(input_type)));
+                update_fields_count += 1;
             }
 
-            // Relations (Read-Only fields for now)
             for (rel_name, rel_def) in &schema.relations {
                 let raw_target = &rel_def.target_collection;
                 let resolved_target_name = col_id_to_name.get(raw_target).unwrap_or(raw_target);
@@ -289,6 +465,14 @@ pub async fn build_schema(
                 let origin_col_id = col.id;
                 let r_name = rel_name.clone();
                 let is_list = rel_def.relation_type == RelationType::Many;
+
+                let target_read_policy = collections
+                    .iter()
+                    .find(|c| &c.name == resolved_target_name)
+                    .and_then(|c| c.schema.as_ref())
+                    .map(|s| s.policies.read.clone())
+                    .unwrap_or("public".to_string());
+
                 let type_ref = if is_list {
                     TypeRef::List(Box::new(TypeRef::named(&target_type_name)))
                 } else {
@@ -298,8 +482,12 @@ pub async fn build_schema(
                 let field = Field::new(rel_name, type_ref, move |ctx| {
                     let r_name = r_name.clone();
                     let t_col_name = t_col_name.clone();
+                    let policy_rule = target_read_policy.clone();
+
                     FieldFuture::new(async move {
                         let record = ctx.parent_value.try_downcast_ref::<Record>()?.clone();
+                        let claims = ctx.data::<Claims>().ok();
+
                         let loader = ctx
                             .data::<Arc<DataLoader<RelationLoader>>>()
                             .unwrap()
@@ -316,20 +504,154 @@ pub async fn build_schema(
                             .map_err(async_graphql::Error::new)?
                             .unwrap_or_default();
 
+                        let filtered_records: Vec<_> = records
+                            .into_iter()
+                            .filter(|r| policies::check_access(&policy_rule, claims, Some(&r.data)))
+                            .collect();
+
                         if is_list {
                             Ok(Some(FieldValue::list(
-                                records.into_iter().map(FieldValue::owned_any),
+                                filtered_records.into_iter().map(FieldValue::owned_any),
                             )))
                         } else {
-                            Ok(records.into_iter().next().map(FieldValue::owned_any))
+                            Ok(filtered_records
+                                .into_iter()
+                                .next()
+                                .map(FieldValue::owned_any))
                         }
                     })
                 });
                 object = object.field(field);
+
+                let create_rel_type = if is_list {
+                    if rel_def.required {
+                        TypeRef::named_nn_list_nn(TypeRef::ID)
+                    } else {
+                        TypeRef::named_list(TypeRef::ID)
+                    }
+                } else {
+                    if rel_def.required {
+                        TypeRef::named_nn(TypeRef::ID)
+                    } else {
+                        TypeRef::named(TypeRef::ID)
+                    }
+                };
+
+                let update_rel_type = if is_list {
+                    TypeRef::named_list(TypeRef::ID)
+                } else {
+                    TypeRef::named(TypeRef::ID)
+                };
+
+                create_input = create_input.field(InputValue::new(rel_name, create_rel_type));
+                create_fields_count += 1;
+
+                update_input = update_input.field(InputValue::new(rel_name, update_rel_type));
+                update_fields_count += 1;
             }
         }
 
-        // Register the Objects
+        // --- 4A. HYDRATE COLLECTION REVERSE RELATIONS ---
+        if let Some(rev_rels) = reverse_relations_map.get(&col_id) {
+            let mut field_names_count: HashMap<String, usize> = HashMap::new();
+            for (_, origin_col_name, _, _) in rev_rels {
+                *field_names_count
+                    .entry(origin_col_name.clone())
+                    .or_insert(0) += 1;
+            }
+
+            for (origin_col_id, origin_col_name, rel_field, origin_policy) in rev_rels {
+                let origin_col_id = *origin_col_id;
+                let rel_field_clone = rel_field.clone();
+                let o_policy = origin_policy.clone();
+                let list_type = format!("{}List", capitalize(origin_col_name));
+
+                let is_duplicate = *field_names_count.get(origin_col_name).unwrap_or(&0) > 1;
+                let field_key = if is_duplicate {
+                    format!("{}_via_{}", origin_col_name, rel_field)
+                } else {
+                    origin_col_name.clone()
+                };
+
+                object = object.field(
+                    Field::new(field_key, TypeRef::named(&list_type), move |ctx| {
+                        let s_col_id = origin_col_id;
+                        let s_rel_field = rel_field_clone.clone();
+                        let policy_rule = o_policy.clone();
+
+                        FieldFuture::new(async move {
+                            let state = ctx.data::<AppState>().unwrap().clone();
+                            let parent_record = ctx.parent_value.try_downcast_ref::<Record>()?;
+                            let claims = ctx.data::<Claims>().ok();
+
+                            let rls_sql = policies::compile_to_sql(&policy_rule, claims)
+                                .unwrap_or("1=0".to_string());
+                            if rls_sql == "1=0" {
+                                return Ok(Some(FieldValue::owned_any(ListResult {
+                                    items: vec![],
+                                    total: 0,
+                                })));
+                            }
+
+                            let limit = ctx.args.get("limit").and_then(|v| v.u64().ok());
+                            let offset = ctx.args.get("offset").and_then(|v| v.u64().ok());
+
+                            let rel_filter =
+                                serde_json::json!({ s_rel_field.clone(): parent_record.id });
+
+                            let filter_str = match ctx.args.get("where") {
+                                Some(accessor) => {
+                                    let mut user_where = accessor
+                                        .deserialize::<serde_json::Value>()
+                                        .unwrap_or(serde_json::json!({}));
+                                    if let Some(obj) = user_where.as_object_mut() {
+                                        obj.insert(
+                                            s_rel_field.clone(),
+                                            serde_json::json!(parent_record.id),
+                                        );
+                                    } else {
+                                        user_where = rel_filter;
+                                    }
+                                    Some(user_where.to_string())
+                                }
+                                None => Some(rel_filter.to_string()),
+                            };
+
+                            let mut options = QueryOptions::default();
+                            options.limit = limit.or(Some(100));
+                            options.offset = offset;
+                            options.filter = filter_str;
+                            options.rls_sql = Some(rls_sql);
+
+                            let result = state
+                                .db
+                                .list_records(s_col_id, options)
+                                .await
+                                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+                            Ok(Some(FieldValue::owned_any(result)))
+                        })
+                    })
+                    .argument(InputValue::new("limit", TypeRef::named(TypeRef::INT)))
+                    .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
+                    .argument(InputValue::new("where", TypeRef::named("JSON"))),
+                );
+            }
+        }
+
+        if create_fields_count == 0 {
+            create_input = create_input.field(InputValue::new(
+                "clientMutationId",
+                TypeRef::named(TypeRef::STRING),
+            ));
+        }
+        if update_fields_count == 0 {
+            update_input = update_input.field(InputValue::new(
+                "clientMutationId",
+                TypeRef::named(TypeRef::STRING),
+            ));
+        }
+
         collection_objects.insert(type_name.clone(), object);
         schema_builder = schema_builder.register(create_input);
         schema_builder = schema_builder.register(update_input);
@@ -371,38 +693,43 @@ pub async fn build_schema(
         let list_field = Field::new(query_name, TypeRef::named(&list_type_name), move |ctx| {
             let state = ctx.data::<AppState>().unwrap().clone();
 
-            // Access Check
-            let claims = ctx.data::<Claims>().ok();
-            if !policies::check_access(&policy_clone, claims, None) {
-                return FieldFuture::new(async {
-                    Err::<Option<FieldValue>, _>(async_graphql::Error::new("Forbidden"))
-                });
-            }
+            FieldFuture::new({
+                let value = policy_clone.clone();
+                async move {
+                    let claims = ctx.data::<Claims>().ok();
 
-            FieldFuture::new(async move {
-                let limit = ctx.args.get("limit").and_then(|v| v.u64().ok());
-                let offset = ctx.args.get("offset").and_then(|v| v.u64().ok());
-                let filter_str = match ctx.args.get("where") {
-                    Some(accessor) => accessor
-                        .deserialize::<serde_json::Value>()
-                        .ok()
-                        .map(|j| j.to_string()),
-                    None => None,
-                };
-                let mut options = apexkit_core::query::QueryOptions::default();
-                if limit.is_some() || offset.is_some() {
-                    options.limit = limit;
-                    options.offset = offset;
-                } else {
-                    options.limit = Some(100);
+                    let rls_sql = policies::compile_to_sql(&value, claims)
+                        .map_err(|e| async_graphql::Error::new(e))?;
+                    if rls_sql == "1=0" {
+                        return Err(async_graphql::Error::new("Forbidden"));
+                    }
+
+                    let limit = ctx.args.get("limit").and_then(|v| v.u64().ok());
+                    let offset = ctx.args.get("offset").and_then(|v| v.u64().ok());
+                    let filter_str = match ctx.args.get("where") {
+                        Some(accessor) => accessor
+                            .deserialize::<serde_json::Value>()
+                            .ok()
+                            .map(|j| j.to_string()),
+                        None => None,
+                    };
+                    let mut options = apexkit_core::query::QueryOptions::default();
+                    if limit.is_some() || offset.is_some() {
+                        options.limit = limit;
+                        options.offset = offset;
+                    } else {
+                        options.limit = Some(100);
+                    }
+                    options.filter = filter_str;
+                    options.rls_sql = Some(rls_sql);
+
+                    let result = state
+                        .db
+                        .list_records(col_id, options)
+                        .await
+                        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                    Ok(Some(FieldValue::owned_any(result)))
                 }
-                options.filter = filter_str;
-                let result = state
-                    .db
-                    .list_records(col_id, options)
-                    .await
-                    .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-                Ok(Some(FieldValue::owned_any(result)))
             })
         })
         .argument(InputValue::new("limit", TypeRef::named(TypeRef::INT)))
@@ -426,30 +753,25 @@ pub async fn build_schema(
             let sch = c_schema.clone();
 
             FieldFuture::new(async move {
-                // 1. Check Policy
                 if !policies::check_access(&p, claims.as_ref(), None) {
                     return Err(async_graphql::Error::new("Forbidden: Create denied"));
                 }
 
-                // 2. Parse Input
                 let input_val = ctx
                     .args
                     .get("data")
                     .ok_or(async_graphql::Error::new("Missing data"))?;
                 let json_data = gql_input_to_json(input_val.as_value().clone());
 
-                // 3. Prepare & Inject Auto Fields
                 let uid = claims.as_ref().map(|c| c.uid);
                 let final_data = prepare_data_for_create(json_data, &sch, uid);
 
-                // 4. Create in DB
                 let id = state
                     .db
                     .create_record(c_col_id, &final_data)
                     .await
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-                // 5. Return Created Record
                 let rec = state
                     .db
                     .get_record(c_col_id, id, None)
@@ -477,7 +799,6 @@ pub async fn build_schema(
             let p = u_policy.clone();
 
             FieldFuture::new(async move {
-                // FIX: Use .ok() to convert Result -> Option inside and_then
                 let id_str: String = ctx
                     .args
                     .get("id")
@@ -494,7 +815,6 @@ pub async fn build_schema(
                     .ok_or(async_graphql::Error::new("Missing data"))?;
                 let json_data = gql_input_to_json(input_val.as_value().clone());
 
-                // 1. Fetch Existing (Needed for Policy Check)
                 let existing = state
                     .db
                     .get_record(u_col_id, id, None)
@@ -502,12 +822,10 @@ pub async fn build_schema(
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?
                     .ok_or(async_graphql::Error::new("Record not found"))?;
 
-                // 2. Check Policy against Existing Data
                 if !policies::check_access(&p, claims.as_ref(), Some(&existing.data)) {
                     return Err(async_graphql::Error::new("Forbidden: Update denied"));
                 }
 
-                // 3. Update in DB
                 let updated = state
                     .db
                     .update_record(u_col_id, id, &json_data)
@@ -536,7 +854,6 @@ pub async fn build_schema(
                 let p = d_policy.clone();
 
                 FieldFuture::new(async move {
-                    // FIX: Use .ok() to convert Result -> Option inside and_then
                     let id_str: String = ctx
                         .args
                         .get("id")
@@ -547,7 +864,6 @@ pub async fn build_schema(
                         .parse::<i64>()
                         .map_err(|_| async_graphql::Error::new("Invalid ID format"))?;
 
-                    // 1. Fetch Existing (Needed for Policy Check)
                     let existing = state
                         .db
                         .get_record(d_col_id, id, None)
@@ -555,12 +871,10 @@ pub async fn build_schema(
                         .map_err(|e| async_graphql::Error::new(e.to_string()))?
                         .ok_or(async_graphql::Error::new("Record not found"))?;
 
-                    // 2. Check Policy
                     if !policies::check_access(&p, claims.as_ref(), Some(&existing.data)) {
                         return Err(async_graphql::Error::new("Forbidden: Delete denied"));
                     }
 
-                    // 3. Delete
                     state
                         .db
                         .delete_record(d_col_id, id)
@@ -574,7 +888,7 @@ pub async fn build_schema(
         mutation_root = mutation_root.field(delete_mutation);
     }
 
-    // --- 3. FETCH & INJECT CUSTOM RESOLVERS FROM SCRIPTS ---
+    // --- 5. FETCH & INJECT CUSTOM RESOLVERS FROM SCRIPTS ---
     let scripts = state.db.list_scripts().await.unwrap_or_default();
 
     for script in scripts {
@@ -658,7 +972,7 @@ pub async fn build_schema(
             match config.parent.as_str() {
                 "Query" => query_root = query_root.field(field),
                 "Mutation" => mutation_root = mutation_root.field(field),
-                "User" => user_object = user_object.field(field),
+                "User" | "_AuthUser" => user_object = user_object.field(field),
                 other => {
                     if let Some(obj) = collection_objects.get_mut(other) {
                         let new_obj = std::mem::replace(obj, Object::new(other));

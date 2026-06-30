@@ -135,14 +135,12 @@ pub async fn query_vector_with_vector(
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
-    // Fetch a larger candidate pool to support accurate pagination
     let search_limit = payload.limit.unwrap_or(1000).min(1000);
     let mut records_with_scores = db
         .search_vector(collection.id, &payload.field, payload.vector, search_limit)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // Sort ASCENDING by L2 distance score (0.0 is identical)
     records_with_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let total = records_with_scores.len() as i64;
@@ -150,7 +148,6 @@ pub async fn query_vector_with_vector(
     let per_page = payload.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
-    // Apply pagination ranges
     let paginated_results: Vec<(apexkit_core::models::Record, f32)> = records_with_scores
         .into_iter()
         .skip(offset as usize)
@@ -164,7 +161,6 @@ pub async fn query_vector_with_vector(
         .map(|(r, score)| (r.id, score))
         .collect();
 
-    // Query database once for paginated records + expand relations
     if !ids.is_empty() {
         let options = QueryOptions {
             limit: Some(ids.len() as u64),
@@ -180,7 +176,6 @@ pub async fn query_vector_with_vector(
         let mut item_map: std::collections::HashMap<i64, apexkit_core::models::Record> =
             list_res.items.into_iter().map(|r| (r.id, r)).collect();
 
-        // Restore distance scores & preserve relevance ranking
         final_records = ids
             .into_iter()
             .filter_map(|id| {
@@ -319,7 +314,6 @@ pub async fn query_vector_with_text(
         let mut item_map: std::collections::HashMap<i64, apexkit_core::models::Record> =
             list_res.items.into_iter().map(|r| (r.id, r)).collect();
 
-        // Restore scores & preserve relevance ranking
         final_records = ids
             .into_iter()
             .filter_map(|id| {
@@ -403,7 +397,6 @@ pub async fn query_image_vector_search(
         ));
     }
 
-    // [FIX]: same min-distance tracking as the text-search handler above.
     let mut best_scores: HashMap<i64, f32> = HashMap::new();
     let mut id_to_record: HashMap<i64, apexkit_core::models::Record> = HashMap::new();
 
@@ -418,7 +411,6 @@ pub async fn query_image_vector_search(
         for (rec, distance) in records_with_scores {
             id_to_record.insert(rec.id, rec.clone());
 
-            // [FIX]: Track the LOWEST distance (= most similar) per record.
             let entry = best_scores.entry(rec.id).or_insert(f32::MAX);
             if distance < *entry {
                 *entry = distance;
@@ -427,7 +419,6 @@ pub async fn query_image_vector_search(
     }
 
     let mut sorted_ids: Vec<(i64, f32)> = best_scores.into_iter().collect();
-    // [FIX]: Sort ASCENDING - lowest distance (best match) first.
     sorted_ids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let final_records: Vec<RecordResponse> = sorted_ids
@@ -512,7 +503,6 @@ pub async fn query_text_image_vector_search(
         ));
     }
 
-    // [FIX]: same min-distance tracking as the text-search handler above.
     let mut best_scores: HashMap<i64, f32> = HashMap::new();
     let mut id_to_record: HashMap<i64, apexkit_core::models::Record> = HashMap::new();
 
@@ -527,7 +517,6 @@ pub async fn query_text_image_vector_search(
         for (rec, distance) in records_with_scores {
             id_to_record.insert(rec.id, rec.clone());
 
-            // [FIX]: Track the LOWEST distance (= most similar) per record.
             let entry = best_scores.entry(rec.id).or_insert(f32::MAX);
             if distance < *entry {
                 *entry = distance;
@@ -536,7 +525,6 @@ pub async fn query_text_image_vector_search(
     }
 
     let mut sorted_ids: Vec<(i64, f32)> = best_scores.into_iter().collect();
-    // [FIX]: Sort ASCENDING - lowest distance (best match) first.
     sorted_ids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let final_records: Vec<RecordResponse> = sorted_ids
@@ -564,12 +552,13 @@ pub async fn query_text_image_vector_search(
     Ok(Json(final_records))
 }
 
+// [FIX] Extracts bulk operation to worker queue
 #[utoipa::path(
     post,
     path = "/api/v1/admin/collections/{id}/revectorize",
     request_body = RevectorizeOptions,
     params(IdPath),
-    responses((status = 202,description = "Revectorization jobs queued"))
+    responses((status = 202,description = "Revectorization job queued"))
 )]
 pub async fn revectorize_collection_handler(
     auth: Option<Extension<Claims>>,
@@ -602,121 +591,29 @@ pub async fn revectorize_collection_handler(
     )
     .await?;
 
-    let current_tenant = crate::utils::get_tenant_id_from_scope(scope.as_ref().map(|e| &e.0));
-
-    let schema = collection.schema.clone().unwrap_or_default();
-
-    let vectorizable_fields: Vec<String> = schema
-        .fields
-        .iter()
-        .filter(|(_, def)| def.vectorize)
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    if vectorizable_fields.is_empty() {
-        return Ok(Json(serde_json::json!({
-            "success": true,
-            "message": "No vector fields found."
-        })));
-    }
-
     let meta = extract_log_meta(
         &headers,
         Some(addr),
         serde_json::json!({ "collection_id": collection.id,"force": options.force }),
     );
     let _ = db
-        .log_audit_event("info", "Revectorization Started", "ai", Some(meta))
+        .log_audit_event("info", "Revectorization Job Queued", "ai", Some(meta))
         .await;
 
-    let mut query_opts = apexkit_core::query::QueryOptions::default();
-    query_opts.limit = Some(100_000);
-    query_opts.per_page = None;
+    let current_tenant = crate::utils::get_tenant_id_from_scope(scope.as_ref().map(|e| &e.0));
 
-    let all_records = db
-        .list_records(collection.id, query_opts)
-        .await
-        .map_err(|e| AppError::UnknownError(e.to_string()))?
-        .items;
-
-    let mut total_queued = 0;
-    let mut total_skipped = 0;
-
-    // Maps to track counts per model
-    let mut model_queued_counts: HashMap<String, usize> = HashMap::new();
-    let mut model_skipped_counts: HashMap<String, usize> = HashMap::new();
-
-    for record in all_records {
-        let record_id: i64 = record.id;
-
-        for field_name in &vectorizable_fields {
-            if let Some(text_content) = record.data.get(field_name).and_then(|v| v.as_str()) {
-                // Add field detection logic
-                let def = schema.fields.get(field_name).unwrap();
-                let c_type = if def.r#type == apexkit_core::models::schema::FieldType::File {
-                    "file"
-                } else {
-                    "text"
-                };
-
-                let current_model = crate::utils::get_current_model(c_type);
-
-                if !options.force {
-                    let exists = db
-                        .has_vector(collection.id, record_id, field_name, &current_model)
-                        .await
-                        .unwrap_or(false);
-
-                    if exists {
-                        total_skipped += 1;
-                        *model_skipped_counts
-                            .entry(current_model.clone())
-                            .or_insert(0) += 1;
-                        continue;
-                    }
-                }
-
-                let job = Job::GenerateEmbedding {
-                    tenant_id: current_tenant.clone(),
-                    collection_id: collection.id,
-                    record_id,
-                    field_name: field_name.clone(),
-                    content: text_content.to_string(),
-                    content_type: c_type.to_string(),
-                    model: current_model.clone(), // Pass field-specific model
-                };
-
-                state.queue.enqueue(job).await;
-
-                total_queued += 1;
-                *model_queued_counts.entry(current_model).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Construct a detailed human-readable message
-    let mut queued_details = Vec::new();
-    for (model, count) in &model_queued_counts {
-        queued_details.push(format!("{}: {}", model, count));
-    }
-    let queued_breakdown = if queued_details.is_empty() {
-        "".to_string()
-    } else {
-        format!(" ({})", queued_details.join(", "))
-    };
-
-    let message = format!(
-        "Queued {} jobs{}. Skipped {} existing.",
-        total_queued, queued_breakdown, total_skipped
-    );
+    // Queue the bulk job. The worker will handle pagination and execution.
+    state
+        .queue
+        .enqueue(Job::RevectorizeCollection {
+            tenant_id: current_tenant,
+            collection_id: collection.id,
+            force: options.force,
+        })
+        .await;
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "message": message,
-        "jobs_queued": total_queued,
-        "skipped": total_skipped,
-        "models_queued": model_queued_counts,    // Added explicit breakdown to JSON payload
-        "models_skipped": model_skipped_counts,  // Added explicit breakdown to JSON payload
-        "mode": if options.force { "hard (overwrite)" } else { "soft (skip existing)" }
+        "message": "Revectorization job successfully queued in background.",
     })))
 }

@@ -54,12 +54,6 @@ pub async fn handle_generate_embedding(
             vector_provider.embed(&content).await
         };
 
-        // [FIX]: `model` is now optional. If the caller didn't pin a specific model
-        // identity, ask apexkit_vector what's actually active right now - using the
-        // VISION identity when we just embedded an image, and the TEXT identity
-        // otherwise. This keeps stored `model` tags accurate even when the active model
-        // changes via env vars (APEXKIT_VISION_MODEL / APEX_VECTOR_TEXT_MODEL) without
-        // every call site needing to know or pass that down explicitly.
         let resolved_model = model.unwrap_or_else(|| {
             if is_image_embedding {
                 apexkit_vector::get_current_vision_model()
@@ -120,6 +114,141 @@ pub async fn handle_delete_record(
         db.delete_record_search(collection_id, record_id)
             .await
             .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// [NEW] Handles Safe Sequential Bulk Vectorization with DB Pagination
+pub async fn handle_revectorize_collection(
+    resolver: Arc<dyn JobContext>,
+    tenant_id: Option<String>,
+    collection_id: i64,
+    force: bool,
+) -> Result<(), String> {
+    if let Some((db, _)) = resolver.resolve(tenant_id.as_deref()).await {
+        let collection = db
+            .get_collection(collection_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("Collection not found")?;
+
+        let schema = collection.schema.unwrap_or_default();
+        let vectorizable_fields: Vec<String> = schema
+            .fields
+            .iter()
+            .filter(|(_, def)| def.vectorize)
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        if vectorizable_fields.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "[Job] Starting bulk revectorization for collection {}",
+            collection_id
+        );
+
+        let mut offset = 0;
+        let limit = 1000;
+
+        loop {
+            let mut query_opts = crate::query::QueryOptions::default();
+            query_opts.limit = Some(limit);
+            query_opts.offset = Some(offset);
+
+            let records = db
+                .list_records(collection_id, query_opts)
+                .await
+                .map_err(|e| e.to_string())?
+                .items;
+            if records.is_empty() {
+                break; // Pagination complete
+            }
+
+            for record in records {
+                for field_name in &vectorizable_fields {
+                    if let Some(content) = record.data.get(field_name).and_then(|v| v.as_str()) {
+                        let def = schema.fields.get(field_name).unwrap();
+                        let c_type = if def.r#type == crate::models::schema::FieldType::File {
+                            "file"
+                        } else {
+                            "text"
+                        };
+
+                        // [RESOLVED MISMAPPED DEPENDENCY]
+                        // Resolve the model name directly via apexkit_vector to preserve crate boundaries.
+                        let current_model = if c_type == "file" {
+                            apexkit_vector::get_current_vision_model()
+                        } else {
+                            apexkit_vector::get_current_text_model()
+                        };
+
+                        if !force {
+                            if db
+                                .has_vector(collection_id, record.id, field_name, &current_model)
+                                .await
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                        }
+
+                        // Generate the embedding synchronously in this worker thread
+                        if let Err(e) = handle_generate_embedding(
+                            resolver.clone(),
+                            tenant_id.clone(),
+                            collection_id,
+                            record.id,
+                            field_name.clone(),
+                            content.to_string(),
+                            c_type.to_string(),
+                            Some(current_model),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                "[Job] Failed to vectorize record {}: {}",
+                                record.id,
+                                e
+                            );
+                        }
+
+                        // We strictly sleep for 50ms between generation loops.
+                        // This explicitly yields the Tokio task scheduler, giving live HTTP requests
+                        // doing Instant Searches a chance to grab the CandleEmbedder Mutex.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            offset += limit;
+        }
+        tracing::info!(
+            "[Job] Finished bulk revectorization for collection {}",
+            collection_id
+        );
+    }
+    Ok(())
+}
+
+// [NEW] Handle Tantivy OSE Indexing in Background
+pub async fn handle_reindex_collection(
+    resolver: Arc<dyn JobContext>,
+    tenant_id: Option<String>,
+    collection_id: i64,
+) -> Result<(), String> {
+    if let Some((db, _)) = resolver.resolve(tenant_id.as_deref()).await {
+        tracing::info!(
+            "[Job] Starting Tantivy index rebuild for collection {}",
+            collection_id
+        );
+        db.reindex_collection(collection_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        tracing::info!(
+            "[Job] Finished Tantivy index rebuild for collection {}",
+            collection_id
+        );
     }
     Ok(())
 }

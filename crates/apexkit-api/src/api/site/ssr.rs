@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tera::Tera;
-use tracing::{info, warn}; // [NEW] Import Claims
+use tracing::{info, warn};
 
 // --- HELPERS ---
 fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
@@ -39,16 +39,31 @@ fn merge_json(a: &mut Value, b: Value) {
 }
 
 fn extract_ssr_js(content: &str) -> (Option<String>, String) {
-    if let Ok(re) =
-        Regex::new(r"(?s)<script[^>]*>\s*//\s*---@@ssr\s*(.*?)\s*//\s*---@@ssr\s*</script>")
-        && let Some(caps) = re.captures(content)
-        && let Some(js_match) = caps.get(1)
-    {
-        let js_code = js_match.as_str().trim().to_string();
-        let html_content = re.replace(content, "").to_string();
-        return (Some(js_code), html_content);
+    // 1. NEW: Clean <script type="server/js"> syntax
+    if let Ok(re) = Regex::new(r#"(?is)<script[^>]*type=["']server/js["'][^>]*>(.*?)</script>"#) {
+        if let Some(caps) = re.captures(content) {
+            if let Some(js_match) = caps.get(1) {
+                let js_code = js_match.as_str().trim().to_string();
+                let html_content = re.replace(content, "").to_string();
+                return (Some(js_code), html_content);
+            }
+        }
     }
 
+    // 2. Legacy: // ---@@ssr
+    if let Ok(re) =
+        Regex::new(r"(?s)<script[^>]*>\s*//\s*---@@ssr\s*(.*?)\s*//\s*---@@ssr\s*</script>")
+    {
+        if let Some(caps) = re.captures(content) {
+            if let Some(js_match) = caps.get(1) {
+                let js_code = js_match.as_str().trim().to_string();
+                let html_content = re.replace(content, "").to_string();
+                return (Some(js_code), html_content);
+            }
+        }
+    }
+
+    // 3. Legacy: Frontmatter (---)
     let trimmed = content.trim_start();
     if trimmed.starts_with("---")
         && let Some(end_idx) = trimmed[3..].find("\n---")
@@ -93,11 +108,19 @@ async fn render_view_core(
 
     let is_htmx = headers.contains_key("HX-Request");
 
+    let auth_obj = auth.map(|c| json!({ "id": c.uid, "email": c.sub, "role": c.role }));
+
     let mut context_data = json!({
         "params": params,
         "headers": headers_to_map(&headers),
         "is_htmx": is_htmx,
-        "auth": auth.map(|c| json!({ "id": c.uid, "email": c.sub, "role": c.role })),
+        "auth": auth_obj.clone(),
+    });
+
+    // Auto-injected SSR state for the frontend global window variable
+    let mut ssr_state = json!({
+        "params": params,
+        "auth": auth_obj
     });
 
     let base_url = headers
@@ -148,7 +171,8 @@ async fn render_view_core(
                         .unwrap_or(StatusCode::BAD_REQUEST);
                 return Ok((status, Json(script_res)).into_response());
             }
-            merge_json(&mut context_data, script_res);
+            merge_json(&mut context_data, script_res.clone());
+            merge_json(&mut ssr_state, script_res);
         }
     }
 
@@ -176,7 +200,8 @@ async fn render_view_core(
                     .unwrap_or(StatusCode::BAD_REQUEST);
             return Ok((status, Json(script_res)).into_response());
         }
-        merge_json(&mut context_data, script_res);
+        merge_json(&mut context_data, script_res.clone());
+        merge_json(&mut ssr_state, script_res);
     }
 
     // 3. TERA SETUP
@@ -184,6 +209,10 @@ async fn render_view_core(
     let register_helpers = |t: &mut Tera| {
         t.register_filter("debug", |value: &Value, _: &HashMap<String, Value>| {
             Ok(serde_json::to_string_pretty(value).unwrap().into())
+        });
+        // Extra helper to easily stringify json if needed explicitly in Tera
+        t.register_filter("json", |value: &Value, _: &HashMap<String, Value>| {
+            Ok(serde_json::to_string(value).unwrap().into())
         });
     };
     register_helpers(&mut tera);
@@ -195,8 +224,6 @@ async fn render_view_core(
             (t.slug.clone(), html)
         })
         .collect();
-
-    // Replace the rendering and fallback compilation blocks inside render_view_core:
 
     // A. RESILIENT FALLBACK COMPILATION ERROR HANDLING
     if let Err(e) = tera.add_raw_templates(template_vec.clone()) {
@@ -266,26 +293,31 @@ async fn render_view_core(
         }
     })?;
 
-    // // 4. RENDER HTML
-    // let context = tera::Context::from_value(context_data)
-    //     .map_err(|e| AppError::UnknownError(format!("Context Error: {}", e)))?;
+    // --- AUTO-INJECT SCRIPTS ---
+    // Inject the combined SSR State globally so scripts can access it instantly
+    let state_script = format!(
+        "\n    <script>window.__SSR_STATE__ = {};</script>",
+        serde_json::to_string(&ssr_state).unwrap_or_else(|_| "{}".to_string())
+    );
+    let apex_script = "\n    <script src=\"/static/js/apex.js\"></script>";
 
-    // let mut rendered = tera
-    //     .render(&slug, &context)
-    //     .map_err(|e| AppError::UnknownError(format!("Render Error: {}", e)))?;
+    let injection = if rendered.contains("apex.js") {
+        state_script
+    } else {
+        format!("{}{}", state_script, apex_script)
+    };
 
-    if !rendered.contains("apex.js") {
-        let script_tag = "\n    <script src=\"/static/js/apex.js\"></script>";
-        if rendered.contains("</head>") {
-            rendered = rendered.replace("</head>", &format!("{}</head>", script_tag));
-        } else if rendered.contains("</body>") {
-            rendered = rendered.replace("</body>", &format!("{}</body>", script_tag));
-        } else if rendered.to_lowercase().contains("<html") {
-            rendered.push_str(script_tag);
-        }
+    if rendered.contains("</head>") {
+        rendered = rendered.replace("</head>", &format!("{}</head>", injection));
+    } else if rendered.contains("</body>") {
+        rendered = rendered.replace("</body>", &format!("{}</body>", injection));
+    } else if rendered.to_lowercase().contains("<html") {
+        rendered.push_str(&injection);
+    } else {
+        rendered.push_str(&injection);
     }
 
-    // --- NEW: DYNAMIC PATH-BASED SCOPE REWRITING ---
+    // --- DYNAMIC PATH-BASED SCOPE REWRITING ---
     let mut scope_prefix = String::new();
     let root_domain = std::env::var("APEX_ROOT_DOMAIN").unwrap_or_default();
     let host = headers
@@ -310,9 +342,9 @@ async fn render_view_core(
     }
 
     if !scope_prefix.is_empty() {
-        // Rewrite "/render/" links recursively to prepends scope prefix
+        // Rewrite "/render/" and "/styles.css" links recursively to prepend scope prefix
         let re_links = Regex::new(
-            r#"(href|action|hx-get|hx-post|hx-put|hx-patch|hx-delete)="(/render/[^"]*)""#,
+            r#"(href|action|hx-get|hx-post|hx-put|hx-patch|hx-delete)="(/render/[^"]*|/styles\.css)""#,
         )
         .unwrap();
         rendered = re_links
@@ -330,7 +362,7 @@ async fn render_view_core(
 // --- PUBLIC HANDLERS ---
 
 pub async fn render_view(
-    auth: Option<Extension<Claims>>, // [NEW]
+    auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,
@@ -358,7 +390,7 @@ pub async fn render_view(
 }
 
 pub async fn render_sandbox_view(
-    auth: Option<Extension<Claims>>, // [NEW]
+    auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,
@@ -387,7 +419,7 @@ pub async fn render_sandbox_view(
 }
 
 pub async fn render_tenant_view(
-    auth: Option<Extension<Claims>>, // [NEW]
+    auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     BaseUrl(base_url): BaseUrl,

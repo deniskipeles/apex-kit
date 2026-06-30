@@ -1,7 +1,8 @@
 use crate::AppError;
 use crate::AppState;
 use crate::DatabaseConnection;
-use axum::{extract::State, response::Response};
+use apexkit_core::realtime::EventScope;
+use axum::{Extension, extract::State, response::Response};
 
 #[utoipa::path(
     get,
@@ -11,14 +12,23 @@ use axum::{extract::State, response::Response};
 pub async fn serve_styles(
     State(state): State<AppState>,
     DatabaseConnection(db): DatabaseConnection,
+    scope: Option<Extension<EventScope>>, // <--- EXTRACT CURRENT EVENT SCOPE
 ) -> Result<Response, AppError> {
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let cache_key = match &event_scope {
+        EventScope::Root => "root".to_string(),
+        EventScope::Tenant(id) => format!("tenant:{}", id),
+        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+        _ => "root".to_string(),
+    };
+
     {
         let cache = state.css_cache.read().await;
-        if !cache.is_empty() {
+        if let Some(css) = cache.get(&cache_key) {
             return Ok(Response::builder()
                 .header("Content-Type", "text/css")
                 .header("Cache-Control", "public, max-age=60")
-                .body(axum::body::Body::from(cache.clone()))
+                .body(axum::body::Body::from(css.clone()))
                 .unwrap());
         }
     }
@@ -29,7 +39,7 @@ pub async fn serve_styles(
 
     {
         let mut cache = state.css_cache.write().await;
-        *cache = css.clone();
+        cache.insert(cache_key, css.clone());
     }
 
     Ok(Response::builder()

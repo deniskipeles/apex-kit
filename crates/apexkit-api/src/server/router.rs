@@ -341,6 +341,7 @@ pub fn app_router(state: AppState) -> Router {
 
     let sandbox_router = Router::new()
         .nest("/api/v1", core_api.clone())
+        .route("/styles.css", get(serve_css::serve_styles))
         // Explicit route for sandbox renderer (2 params)
         .route(
             "/render/{*slug}",
@@ -362,6 +363,7 @@ pub fn app_router(state: AppState) -> Router {
 
     let tenant_path_router = Router::new()
         .nest("/api/v1", core_api.clone())
+        .route("/styles.css", get(serve_css::serve_styles))
         // Explicit route for tenant renderer (2 params)
         .route(
             "/render/{*slug}",

@@ -48,6 +48,17 @@ pub enum Job {
         collection_id: i64,
         record_id: i64,
     },
+    // [NEW] Bulk job for revectorizing an entire collection sequentially
+    RevectorizeCollection {
+        tenant_id: Option<String>,
+        collection_id: i64,
+        force: bool,
+    },
+    // [NEW] Bulk job for rebuilding the Tantivy search index
+    ReindexCollection {
+        tenant_id: Option<String>,
+        collection_id: i64,
+    },
 }
 
 #[async_trait::async_trait]
@@ -96,7 +107,10 @@ pub fn start_background_worker(
             tokio::spawn(async move {
                 // Acquire a permit ONLY if the job is resource-intensive
                 let _permit = match &job {
-                    Job::GenerateEmbedding { .. } | Job::IndexRecord { .. } => {
+                    Job::GenerateEmbedding { .. }
+                    | Job::IndexRecord { .. }
+                    | Job::RevectorizeCollection { .. }
+                    | Job::ReindexCollection { .. } => {
                         Some(heavy_sem.acquire_owned().await.unwrap())
                     }
                     _ => None,
@@ -215,6 +229,36 @@ pub fn start_background_worker(
                                 "[Job] Search Index Deletion failed for {}: {}",
                                 record_id, e
                             );
+                        }
+                    }
+                    Job::RevectorizeCollection {
+                        tenant_id,
+                        collection_id,
+                        force,
+                    } => {
+                        if let Err(e) = super::tasks::vectorization::handle_revectorize_collection(
+                            resolver,
+                            tenant_id,
+                            collection_id,
+                            force,
+                        )
+                        .await
+                        {
+                            eprintln!("[Job] Bulk revectorization failed: {}", e);
+                        }
+                    }
+                    Job::ReindexCollection {
+                        tenant_id,
+                        collection_id,
+                    } => {
+                        if let Err(e) = super::tasks::vectorization::handle_reindex_collection(
+                            resolver,
+                            tenant_id,
+                            collection_id,
+                        )
+                        .await
+                        {
+                            eprintln!("[Job] Bulk reindexing failed: {}", e);
                         }
                     }
                     _ => {}

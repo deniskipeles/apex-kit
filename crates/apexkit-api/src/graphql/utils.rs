@@ -150,20 +150,10 @@ pub fn capitalize(s: &str) -> String {
     }
 }
 
+// [FIX] Leverages recursive json_to_gql helper to output real, fully nested structures
+// instead of defaulting to the "Complex JSON" placeholder string.
 pub fn map_json_to_gql(val: Option<serde_json::Value>) -> async_graphql::Result<Option<GqlValue>> {
-    match val {
-        Some(serde_json::Value::String(s)) => Ok(Some(GqlValue::from(s))),
-        Some(serde_json::Value::Number(n)) => {
-            if let Some(f) = n.as_f64() {
-                Ok(Some(GqlValue::from(f)))
-            } else {
-                Ok(Some(GqlValue::from(0)))
-            }
-        }
-        Some(serde_json::Value::Bool(b)) => Ok(Some(GqlValue::from(b))),
-        Some(_) => Ok(Some(GqlValue::from("Complex JSON"))),
-        None => Ok(None),
-    }
+    Ok(val.map(json_to_gql))
 }
 
 pub fn json_to_gql(json: serde_json::Value) -> GqlValue {
