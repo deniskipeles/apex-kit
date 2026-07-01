@@ -84,8 +84,6 @@ impl FilterNode {
 
     fn parse_field_condition(field: &str, val: &Value) -> FilterNode {
         if let Value::Object(map) = val {
-            // Check for operators: { "age": { "$gt": 18 } }
-            // Supports aliases: { "age": { "_gt": 18 } } or { "age": { "gt": 18 } }
             if let Some((op_key, op_val)) = map.iter().next() {
                 let op = match op_key.as_str() {
                     // Equality
@@ -106,7 +104,6 @@ impl FilterNode {
                     "$like" | "like" | "_like" => FilterOp::Like,
                     "$contains" | "contains" | "_contains" => FilterOp::Contains,
 
-                    // Default: Treat entire object as a literal equality match
                     _ => {
                         return FilterNode::Condition {
                             field: field.to_string(),
@@ -116,7 +113,6 @@ impl FilterNode {
                     }
                 };
 
-                // Return the condition using the detected operator and the INNER value
                 return FilterNode::Condition {
                     field: field.to_string(),
                     op,
@@ -125,7 +121,6 @@ impl FilterNode {
             }
         }
 
-        // Handle Primitive Values (Implicit Equality): { "status": "active" }
         FilterNode::Condition {
             field: field.to_string(),
             op: FilterOp::Eq,
@@ -169,17 +164,29 @@ impl FilterNode {
                             if arr.is_empty() {
                                 return Some("1=0".to_string());
                             }
-                            let placeholders: Vec<String> =
-                                arr.iter().map(|_| "?".to_string()).collect();
+                            // To support resilient UUID migrations or type mismatches (String "1" vs Int 1)
+                            // we build a composite match comparing both raw values and casted text values
+                            let mut sql_clauses = Vec::new();
                             for v in arr {
-                                params.push(json_to_sql_val(v));
+                                let val = json_to_sql_val(v);
+                                params.push(val.clone());
+                                params.push(val);
+                                sql_clauses.push(format!(
+                                    "({} = ? OR CAST({} AS TEXT) = CAST(? AS TEXT))",
+                                    column, column
+                                ));
                             }
-                            let not = if matches!(op, FilterOp::Nin) {
+                            let joiner = if matches!(op, FilterOp::Nin) {
+                                " AND NOT "
+                            } else {
+                                " OR "
+                            };
+                            let prefix = if matches!(op, FilterOp::Nin) {
                                 "NOT "
                             } else {
                                 ""
                             };
-                            Some(format!("{} {}IN ({})", column, not, placeholders.join(",")))
+                            Some(format!("({}{})", prefix, sql_clauses.join(joiner)))
                         } else {
                             None
                         }
@@ -194,7 +201,7 @@ impl FilterNode {
                             FilterOp::Lte => "<=",
                             FilterOp::Like => "LIKE",
                             FilterOp::Contains => "LIKE",
-                            _ => "=",
+                            _ => "=", // Fallback for exhaustive checking
                         };
 
                         let mut final_val = json_to_sql_val(value);
@@ -205,31 +212,50 @@ impl FilterNode {
                             final_val = rusqlite::types::Value::Text(format!("%{}%", s));
                         }
 
-                        params.push(final_val);
-                        Some(format!("{} {} ?", column, sql_op))
+                        // [CRITICAL DATABASE RESOLUTION]
+                        // Coerce operands to TEXT securely when executing dynamic JSON searches.
+                        // SQLite lacks column affinity for JSON extractions—this cast fallback
+                        // guarantees String IDs ("1") and Numeric IDs (1) evaluate as equivalent.
+                        if matches!(op, FilterOp::Eq) {
+                            params.push(final_val.clone());
+                            params.push(final_val);
+                            Some(format!(
+                                "({} = ? OR CAST({} AS TEXT) = CAST(? AS TEXT))",
+                                column, column
+                            ))
+                        } else if matches!(op, FilterOp::Neq) {
+                            params.push(final_val.clone());
+                            params.push(final_val);
+                            Some(format!(
+                                "({} != ? AND CAST({} AS TEXT) != CAST(? AS TEXT))",
+                                column, column
+                            ))
+                        } else {
+                            params.push(final_val);
+                            Some(format!("{} {} ?", column, sql_op))
+                        }
                     }
                 }
             }
         }
     }
 
-    // Handles dot notation: "address.zip" -> "data -> 'address' ->> 'zip'"
     fn format_json_column(key: &str) -> String {
         if key == "id" {
             return "id".to_string();
-        } // Native ID column
+        }
         if key == "created" {
             return "created".to_string();
-        } // TODO: Add created/updated columns to schema if not json
+        }
 
         let parts: Vec<&str> = key.split('.').collect();
         let mut sql = "data".to_string();
 
         for (i, part) in parts.iter().enumerate() {
             if i == parts.len() - 1 {
-                write!(sql, " ->> '{}'", part).unwrap(); // Last one extracts value
+                write!(sql, " ->> '{}'", part).unwrap();
             } else {
-                write!(sql, " -> '{}'", part).unwrap(); // Intermediates extract json object
+                write!(sql, " -> '{}'", part).unwrap();
             }
         }
         sql
@@ -260,29 +286,61 @@ impl FilterNode {
     }
 
     fn compare_values(actual: Option<&Value>, op: &FilterOp, expected: &Value) -> bool {
-        // Handle nulls
         if actual.is_none() {
             return matches!(op, FilterOp::Neq) && !expected.is_null();
         }
         let act = actual.unwrap();
 
+        // [CRITICAL SCRIPT ENGINE COERCION]
+        // Normalize primitive scalars to String representations.
+        // This makes in-memory matching on websocket/scripts highly resilient to stringified vs numeric states.
+        let act_str = match act {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => act.to_string(),
+        };
+
+        let exp_str = match expected {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => expected.to_string(),
+        };
+
         match op {
-            FilterOp::Eq => act == expected,
-            FilterOp::Neq => act != expected,
+            FilterOp::Eq => act_str == exp_str,
+            FilterOp::Neq => act_str != exp_str,
             FilterOp::Gt => json_cmp(act, expected).map(|r| r > 0).unwrap_or(false),
             FilterOp::Gte => json_cmp(act, expected).map(|r| r >= 0).unwrap_or(false),
             FilterOp::Lt => json_cmp(act, expected).map(|r| r < 0).unwrap_or(false),
             FilterOp::Lte => json_cmp(act, expected).map(|r| r <= 0).unwrap_or(false),
             FilterOp::In => {
                 if let Value::Array(arr) = expected {
-                    arr.contains(act)
+                    arr.iter().any(|item| {
+                        let item_str = match item {
+                            Value::String(s) => s.clone(),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            _ => item.to_string(),
+                        };
+                        act_str == item_str
+                    })
                 } else {
                     false
                 }
             }
             FilterOp::Nin => {
                 if let Value::Array(arr) = expected {
-                    !arr.contains(act)
+                    arr.iter().all(|item| {
+                        let item_str = match item {
+                            Value::String(s) => s.clone(),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            _ => item.to_string(),
+                        };
+                        act_str != item_str
+                    })
                 } else {
                     true
                 }

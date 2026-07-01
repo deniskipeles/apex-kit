@@ -293,18 +293,25 @@ pub async fn list_users_handler(
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
+    // [RESOLVED POLICIES DOUBLE-SERIALIZATION WRAPPING]
+    // Unwrap the configuration key if it was double-serialized into a JSON-escaped string
     let policies: apexkit_core::models::schema::CollectionPolicies = if let Some(val) = policy_json
     {
-        serde_json::from_value(val).unwrap_or_else(|_| {
+        let parsed_val = match val {
+            serde_json::Value::String(s) => {
+                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+            }
+            _ => val,
+        };
+        serde_json::from_value(parsed_val).unwrap_or_else(|_| {
             apexkit_core::models::schema::CollectionPolicies {
-                read: "admin".to_string(), // Default secure
+                read: "admin || owner:id".to_string(),
                 ..Default::default()
             }
         })
     } else {
-        // Fallback default
         apexkit_core::models::schema::CollectionPolicies {
-            read: "admin".to_string(),
+            read: "admin || owner:id".to_string(),
             ..Default::default()
         }
     };
@@ -435,12 +442,23 @@ pub async fn delete_user_handler(
         .get_config("policy_users")
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
-    let policies: apexkit_core::models::schema::CollectionPolicies = policy_json
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_else(|| apexkit_core::models::schema::CollectionPolicies {
+
+    // [RESOLVED POLICIES DOUBLE-SERIALIZATION WRAPPING]
+    let policies: apexkit_core::models::schema::CollectionPolicies = if let Some(val) = policy_json
+    {
+        let parsed = match val {
+            serde_json::Value::String(s) => {
+                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+            }
+            _ => val,
+        };
+        serde_json::from_value(parsed).unwrap_or_default()
+    } else {
+        apexkit_core::models::schema::CollectionPolicies {
             delete: "admin".to_string(),
             ..Default::default()
-        });
+        }
+    };
 
     // 3. Check "Delete" Policy
     let target_data = user_to_value(target_user);

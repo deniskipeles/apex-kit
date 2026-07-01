@@ -20,8 +20,10 @@ use axum::{
     extract::{Json, Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use serde_json::json;
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 // =========================================================
 // 2. RECORDS HANDLERS
@@ -103,7 +105,19 @@ pub async fn list_records(
         total: res.total,
     };
 
-    // [FIX 2] Use trigger_hooks for AFTER hook
+    // [SECURITY FIX]: Deeply sanitize expanded owner profiles based on the 'expand' query parameter
+    if let Some(schema) = &col.schema {
+        sanitize_expanded_records(
+            &db,
+            &mut response_data.items,
+            claims.as_ref(),
+            schema,
+            modified_q.expand.as_ref(),
+        )
+        .await;
+    }
+
+    // [TRIGGER]
     let response_json = json!(response_data);
     if let Some(modified_json) = trigger_hooks(
         &state,
@@ -146,11 +160,12 @@ pub async fn get_record(
 ) -> Result<Json<RecordResponse>, AppError> {
     let claims = auth.map(|Extension(c)| c);
 
-    // [UPDATED] Resolve Collection by ID or Name
+    // Resolve Collection by ID or Name
     let col = resolve_collection_by_id_or_name(&db, &path.id).await?;
 
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
     let query_json = json!(q);
+
     // [TRIGGER] Before Get
     trigger_hooks(
         &state,
@@ -165,7 +180,7 @@ pub async fn get_record(
     .await?;
 
     let r = db
-        .get_record(col.id, path.record_id, q.expand)
+        .get_record(col.id, path.record_id, q.expand.clone())
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?
         .ok_or(AppError::NotFound("Record not found".into()))?;
@@ -179,13 +194,27 @@ pub async fn get_record(
         return Err(AppError::Forbidden("Read denied".into()));
     }
 
-    let response = RecordResponse {
+    let mut response = RecordResponse {
         id: r.id,
         data: r.data,
         expand: r.expand,
         created: r.created,
         updated: r.updated,
     };
+
+    // [SECURITY FIX]: Deeply sanitize expanded owner profiles
+    if let Some(schema) = &col.schema {
+        let mut single_item = vec![response];
+        sanitize_expanded_records(
+            &db,
+            &mut single_item,
+            claims.as_ref(),
+            schema,
+            q.expand.as_ref(),
+        )
+        .await;
+        response = single_item.pop().unwrap();
+    }
 
     // [TRIGGER] After Get
     let response_json = json!(response);
@@ -361,7 +390,6 @@ pub async fn create_record(
     {
         let cache_key = format!("{:?}_{}", event_scope, col.id);
 
-        // 1. Get count (from Cache, or fallback to DB if Cache expired)
         let current_count =
             if let Some(cached_count) = state.record_count_cache.get(&cache_key).await {
                 cached_count + 1
@@ -374,17 +402,11 @@ pub async fn create_record(
                     .unwrap_or(1)
             };
 
-        // 2. Update Cache
         state
             .record_count_cache
             .insert(cache_key, current_count)
             .await;
 
-        // 3. Calculate Milestone
-        // Power logic:
-        // count 1..9    -> power 10^0 = 1    (all trigger)
-        // count 10..99  -> power 10^1 = 10   (triggers on 10, 20, 30...)
-        // count 100..   -> power 10^2 = 100  (triggers on 100, 200, 300...)
         let power = 10_i64.pow((current_count.to_string().len() as u32).saturating_sub(1));
         let is_milestone = current_count > 0 && current_count % power == 0;
 
@@ -397,7 +419,6 @@ pub async fn create_record(
             let db_clone = db.clone();
             let col_id = col.id;
 
-            // Spawn in background so it doesn't block the API response
             tokio::spawn(async move {
                 if let Err(e) = db_clone.reindex_collection(col_id).await {
                     tracing::error!("Auto re-index failed for col {}: {}", col_id, e);
@@ -417,7 +438,6 @@ pub async fn create_record(
         .log_audit_event("info", "Record Created", "api", Some(meta))
         .await;
 
-    // ... (broadcast, hooks, jobs) ...
     let _ = state.tx.send(DbEvent::Insert {
         collection_id: col.id,
         record_id: rid,
@@ -444,22 +464,19 @@ pub async fn create_record(
         for (field_name, def) in &schema.fields {
             if def.vectorize
                 && let Some(content_val) = data_to_save.get(field_name).and_then(|v| v.as_str())
-            // NOTE: use `data_updates` instead of `data_to_save` in update_record
             {
-                // Determine if this field is a File reference or raw Text
                 let c_type = if def.r#type == FieldType::File {
                     "file"
                 } else {
                     "text"
                 };
 
-                // Pass the content type!
                 let model_name = crate::utils::get_current_model(c_type);
 
                 let job = Job::GenerateEmbedding {
                     tenant_id: current_tenant.clone(),
                     collection_id: col.id,
-                    record_id: rid, // NOTE: path.record_id in update_record
+                    record_id: rid,
                     field_name: field_name.clone(),
                     content: content_val.to_string(),
                     content_type: c_type.to_string(),
@@ -527,7 +544,6 @@ pub async fn update_record(
 
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
 
-    // Create a clone for the hook so we don't move the original p.data
     let hook_data = p.data.clone();
 
     let data_updates = match trigger_hooks(
@@ -584,16 +600,13 @@ pub async fn update_record(
 
         for (field_name, def) in &schema.fields {
             if def.vectorize {
-                // Use data_updates which is the final payload being sent to DB
                 if let Some(content_val) = data_updates.get(field_name).and_then(|v| v.as_str()) {
-                    // Determine if this field is a File reference or raw Text
                     let c_type = if def.r#type == FieldType::File {
                         "file"
                     } else {
                         "text"
                     };
 
-                    // Pass the content type!
                     let model_name = crate::utils::get_current_model(c_type);
 
                     let job = Job::GenerateEmbedding {
@@ -818,4 +831,149 @@ pub async fn delete_relation(
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// --- [SECURITY REDESIGN] RECURSIVE SANITIZER FOR EXPANDED RELATION OWNERS ---
+async fn sanitize_expanded_records(
+    db: &Arc<dyn apexkit_core::Db>,
+    records: &mut [RecordResponse],
+    claims: Option<&Claims>,
+    root_schema: &CollectionSchema,
+    expand_str: Option<&String>,
+) {
+    let expand_str = match expand_str {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return, // Fast exit if no expand parameter provided
+    };
+
+    let expand_tree = apexkit_core::query::builder::build_expand_tree(expand_str);
+
+    let policy_json = db.get_config("policy_users").await.unwrap_or(None);
+    let user_read_policy = if let Some(val) = policy_json {
+        let parsed = match val {
+            serde_json::Value::String(s) => {
+                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+            }
+            _ => val,
+        };
+        serde_json::from_value::<apexkit_core::models::schema::CollectionPolicies>(parsed)
+            .map(|p| p.read)
+            .unwrap_or_else(|_| "admin || owner:id".to_string())
+    } else {
+        "admin || owner:id".to_string()
+    };
+
+    // Preload collection schemas to avoid sequential DB bottlenecks during tree traversal
+    let mut schema_cache = HashMap::new();
+    let mut col_map = HashMap::new();
+    if let Ok(all_cols) = db.list_collections().await {
+        for c in all_cols {
+            if let Some(s) = c.schema {
+                schema_cache.insert(c.id, s);
+            }
+            col_map.insert(c.name.clone(), c.id);
+        }
+    }
+
+    for rec in records {
+        if let Some(expand_obj) = &mut rec.expand {
+            sanitize_expand_node(
+                expand_obj,
+                root_schema,
+                &expand_tree,
+                claims,
+                &user_read_policy,
+                &schema_cache,
+                &col_map,
+            );
+        }
+    }
+}
+
+// Recursively walks down the JSON object mirroring the user's `expand` request
+fn sanitize_expand_node(
+    expand_obj: &mut Value,
+    current_schema: &CollectionSchema,
+    current_tree: &HashMap<String, Vec<String>>,
+    claims: Option<&Claims>,
+    user_read_policy: &str,
+    schema_cache: &HashMap<i64, CollectionSchema>,
+    col_map: &HashMap<String, i64>,
+) {
+    let owner_fields: Vec<String> = current_schema
+        .fields
+        .iter()
+        .filter(|(_, def)| def.r#type == FieldType::Owner)
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if let Value::Object(obj) = expand_obj {
+        // 1. Sanitize direct owner fields at this depth
+        for field in &owner_fields {
+            if let Some(user_val) = obj.get_mut(field) {
+                if !user_val.is_null()
+                    && !policies::check_access(user_read_policy, claims, Some(&*user_val))
+                {
+                    *user_val = Value::Null; // Denied by policy
+                }
+            }
+        }
+
+        // 2. Recurse down requested relations
+        for (rel_name, sub_paths) in current_tree {
+            if let Some(rel_val) = obj.get_mut(rel_name) {
+                let mut target_schema = None;
+
+                // Match against schema (forward relation) or reverse collection name
+                if let Some(rel_def) = current_schema.relations.get(rel_name) {
+                    let target_name = &rel_def.target_collection;
+                    let target_id_opt = col_map
+                        .get(target_name)
+                        .copied()
+                        .or_else(|| target_name.parse::<i64>().ok());
+
+                    if let Some(id) = target_id_opt {
+                        target_schema = schema_cache.get(&id);
+                    }
+                } else if let Some(id) = col_map.get(rel_name) {
+                    target_schema = schema_cache.get(id);
+                }
+
+                if let Some(t_schema) = target_schema {
+                    let sub_tree =
+                        apexkit_core::query::builder::build_expand_tree(&sub_paths.join(","));
+
+                    // rel_val is either a single wrapped record OR an array of wrapped records.
+                    // We must dive into the nested "expand" property of those records to continue the tree.
+                    if let Value::Array(arr) = rel_val {
+                        for item in arr.iter_mut() {
+                            if let Some(nested_expand) = item.get_mut("expand") {
+                                sanitize_expand_node(
+                                    nested_expand,
+                                    t_schema,
+                                    &sub_tree,
+                                    claims,
+                                    user_read_policy,
+                                    schema_cache,
+                                    col_map,
+                                );
+                            }
+                        }
+                    } else if let Value::Object(_) = rel_val {
+                        if let Some(nested_expand) = rel_val.get_mut("expand") {
+                            sanitize_expand_node(
+                                nested_expand,
+                                t_schema,
+                                &sub_tree,
+                                claims,
+                                user_read_policy,
+                                schema_cache,
+                                col_map,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

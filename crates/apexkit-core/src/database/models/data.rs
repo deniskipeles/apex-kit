@@ -105,7 +105,7 @@ pub struct Template {
     pub slug: String,
     pub content: String,
     pub script_id: Option<i64>,
-    pub created_at: String,
+    pub created_at: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]

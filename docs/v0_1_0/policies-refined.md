@@ -1,4 +1,4 @@
-# 🛡️ ApexKit Security Policies & RLS Guide
+# 🛡️ ApexKit Security Policies & RLS 
 
 **Version:** 0.1.0  
 **Architecture:** 100% SQL Pushdown (Row-Level Security)
@@ -7,99 +7,150 @@ ApexKit uses a high-performance **Policy Engine** that translates logical access
 
 ---
 
-## 1. How it Works
-When you define a policy on a collection (e.g., `read: "auth.id == field:owner_id"`), ApexKit intercepts every request and compiles that string into a SQL `WHERE` clause.
+## ApexKit Policy & Access Control Manual
 
-*   **Requesting a List**: `SELECT * FROM records WHERE collection_id = 5 AND (data ->> 'owner_id' = '10')`
-*   **Result**: Rows that you do not have permission to see are filtered out by the database engine itself. Your `total` count and `limit` remain accurate.
+This document outlines the architecture, syntax, and execution flow of ApexKit's declarative access control system. It is designed to help developers write secure policies, understand how they are evaluated across different boundaries (REST, SQL, GraphQL, and Scripting), and avoid common pitfalls.
 
 ---
 
-## 2. Available Keywords & Variables
+## 1. Core Concepts
 
-The engine provides access to the **Authentication Context** (who is asking) and the **Record Context** (what is being asked for).
+ApexKit uses a unified, declarative policy engine to enforce access control across all operations. Policies are defined as string expressions on a per-collection basis for four actions:
+*   **Read (List/Get):** Determines who can query or fetch records.
+*   **Create (Register/Insert):** Determines who can write new records.
+*   **Update (Edit):** Determines who can modify existing records.
+*   **Delete:** Determines who can remove records.
 
-### Authentication Context (`auth`)
-Extracted from the requester's JWT token.
+System-level entities (like the `_AuthUser` table) are governed by global settings (e.g., `policy_users`) but evaluate through the identical expression engine.
 
-| Variable | Type | Description |
+---
+
+## 2. Policy Language Syntax
+
+The policy engine parses logical expressions containing literals, variables, and comparison operators.
+
+### Standard Keywords
+*   `public`: Anyone can perform the action (unauthenticated or authenticated).
+*   `auth`: The requester must provide a valid JWT token (authenticated).
+*   `admin`: The requester must have the `admin` role in their claims.
+
+### Context Variables
+You can reference properties of the active requester (`auth`) or attributes of the record being evaluated (`field`):
+
+| Variable | Description | Example |
 | :--- | :--- | :--- |
-| `public` | Shorthand | Always returns `true`. Use for guest access. |
-| `auth` | Shorthand | Returns `true` if a valid token is present. |
-| `admin` | Shorthand | Returns `true` if the user has the `admin` role. |
-| `auth.id` | Number | The unique ID of the logged-in user. |
-| `auth.role` | String | The role string (e.g., `'user'`, `'editor'`). |
-| `auth.email`| String | The email address of the user. |
+| `auth.id` | The database ID (`uid`) of the authenticated user. | `owner:auth.id` |
+| `auth.role` | The role string of the authenticated user (e.g., `"editor"`). | `auth.role == "editor"` |
+| `auth.email` | The email address of the authenticated user. | `auth.email == "admin@apexkit.io"` |
+| `field:fieldName` | Accesses a specific JSON field on the record. | `field:status == "published"` |
+| `owner:fieldName` | Shorthand helper matching `record.data[fieldName] == auth.id`. | `owner:author_id` |
 
-### Record Context (`field`)
-Accesses the JSON data within the record.
+### Supported Operators
+*   **Logical:** `&&` (AND), `||` (OR), parenthesized groupings `()`
+*   **Comparison:** `==` (Equality), `!=` (Inequality)
 
-| Variable | SQL equivalent | Description |
-| :--- | :--- | :--- |
-| `field:name` | `data ->> 'name'` | Specific field in the current record. |
-| `status` | `data ->> 'status'` | (Implicit) same as `field:status`. |
+### Example Expressions
 
----
+```ini
+# Admins can do anything; owners can edit their own records
+admin || owner:author_id
 
-## 3. Syntax & Operators
+# Must be authenticated, and the record must be in "draft" status
+auth && field:status == "draft"
 
-You can build complex logic using standard programming operators.
+# Only users with the "editor" role can edit, unless they are the owner
+auth.role == "editor" || owner:manager_id
 
-| Operator | Description | Example |
-| :--- | :--- | :--- |
-| `&&` | Logical AND | `auth && field:active == 'true'` |
-| `||` | Logical OR | `admin || auth.id == field:user_id` |
-| `==` | Equality | `auth.role == 'manager'` |
-| `!=` | Inequality | `field:status != 'archived'` |
-| `( )` | Grouping | `admin || (auth && field:is_public == 'true')` |
-
----
-
-## 4. Common Patterns & Examples
-
-### Shorthands (The "Standard" Way)
-These cover 90% of use cases:
-*   **`public`**: Anyone can access (Great for blog posts, products).
-*   **`auth`**: Any logged-in user can access.
-*   **`admin`**: Only system administrators can access.
-*   **`owner:user_id`**: Only the user whose ID matches the `user_id` field can access.
-
-### Custom Ownership
-If your ownership field is named `author` or `creator_id`:
-```javascript
-"read": "auth.id == field:author"
-```
-
-### Role-Based Access (RBAC)
-Allow access only to specific roles:
-```javascript
-"create": "auth.role == 'editor' || auth.role == 'admin'"
-```
-
-### Content-State Access
-Allow anyone to read a post, but only if it's published:
-```javascript
-"read": "field:status == 'published' || admin"
-```
-
-### Multi-Tenant Ownership (Collaborative)
-Allow access if the user is the owner **OR** if the record belongs to their organization:
-```javascript
-"read": "auth.id == field:owner_id || auth.org_id == field:org_id"
+# Public can read if marked "public", otherwise must be the owner
+field:visibility == "public" || owner:author_id
 ```
 
 ---
 
-## 5. Security & Isolation
+## 3. Architectural Evaluation Flow
 
-1.  **Admin Bypass**: Users with the `admin` role in the **Root App** automatically bypass all collection policies for maintenance.
-2.  **Physical Isolation**: Policies are evaluated *within* a tenant's database. A user in `Tenant A` can never access `Tenant B` data, even if the policy is set to `public`.
-3.  **Update/Delete Checks**: For `UPDATE` and `DELETE` operations, the policy is evaluated against the **existing record** in the database before the action is performed. This prevents users from "taking over" records they don't own.
+When an API request (REST or GraphQL) is made, the policy is evaluated in three distinct phases:
+
+### Phase A: Table-Level Pre-Flight
+Before hitting the database, the API checks if the requester is allowed to perform the operation in general. This is done by evaluating the policy expression with no record context (`record_data = None`):
+*   If the policy is `"public"`, access is granted.
+*   If the policy contains `"owner:id"`, table-level check returns `false` (requiring a row-by-row check) but allows the request to proceed to the database phase.
+*   If the policy evaluates to false (e.g. `"admin"` for a public user), the request is rejected immediately with a `403 Forbidden` status.
+
+### Phase B: Database RLS (Row-Level Security) Pushdown
+For read operations (such as listing records), evaluating the policy in-memory for millions of records is highly inefficient. Instead, ApexKit compiles the policy expression directly into a SQL `WHERE` clause.
+
+```rust
+// policies::compile_to_sql("admin || owner:author_id", Some(Claims { uid: 42, role: "user" }))
+```
+Compiles to:
+```sql
+(1=0 OR (json_extract(records.data, '$.author_id') = '42' OR CAST(json_extract(records.data, '$.author_id') AS TEXT) = '42'))
+```
+
+#### Type-Coercion Resilience
+SQLite does not enforce strict type affinity on JSON extractions. To prevent failures where a database record stores an ID as a string (`"42"`) but a filter queries for a number (`42`), the compiler automatically wraps JSON equality checks with a `CAST` fallback:
+```sql
+(col = ? OR CAST(col AS TEXT) = CAST(? AS TEXT))
+```
+This guarantees that numeric-to-string comparisons succeed seamlessly and provides compatibility for future UUID transitions.
+
+### Phase C: Recursive Deep Expansion Sanitization
+When using the REST API's `expand` parameter (e.g. `?expand=author_id,likes.user_id`) or querying relationships in GraphQL, related data is populated in memory. 
+
+To prevent data leaks, the API layer implements a **Deep Recursive Security Sanitizer** that traverses down the returned JSON tree alongside the schema:
+1. It parses the requested `expand` path into a structured tree.
+2. It walks through each JSON object and checks if any `Owner` fields (`FieldType::Owner`) are populated.
+3. It evaluates the user-level policy (`policy_users`) against the expanded profile.
+4. If the requester is unauthorized, it redacts the nested record entirely (setting it to `null`) before sending the response back to the client.
+
+```
+Request ?expand=author_id,likes.user_id
+   │
+   ├── [DB Layer] Fetches Records & Hydrates JSON data
+   │
+   └── [API Layer] Recursive Sanitization
+         ├── Is author_id readable? Yes -> Keep
+         └── Is likes[0].user_id readable? No -> Set user_id to null
+```
 
 ---
 
-## 6. Pro-Tips
+## 4. GraphQL Integration
 
-*   **JSON Strings**: When comparing against a string in the database, use single quotes: `field:type == 'internal'`.
-*   **Booleans**: ApexKit treats JSON booleans as literals. Use `field:is_active == true`.
-*   **Performance**: Because policies are now compiled to SQL, they are extremely fast. However, avoid creating expressions with dozens of `||` chains; use a sidecar collection with roles if your logic gets too complex.
+The dynamic GraphQL schema automatically respects your collection policies and system configuration:
+
+*   **List Queries:** When you query a collection, the resolver compiles the read policy into SQL RLS parameters and executes it against the database. If the policy results in `1=0` (completely blocked), a `Forbidden` error is returned.
+*   **Bidirectional Traversal:** Reverse relationships (e.g., querying `likes` inside `pins`, or `pins` inside `_AuthUser`) are bound to the exact same SQL RLS filters, ensuring that nested lists are automatically filtered to show only records the requester has the right to see.
+*   **Auto-rebuilds:** To prevent stale configurations, whenever you update a collection schema or policies, the system automatically invalidates the cache and schedules a safe, async reload of the GraphQL schema.
+
+---
+
+## 5. System Fields and the `_AuthUser` Table
+
+To prevent namespace collisions with your custom tables, all system-level GraphQL objects, queries, and mutations are prefixed with an underscore (`_`):
+
+*   The user table type is `_AuthUser` (instead of `User`).
+*   The query field to list users is `_users` (instead of `users`).
+*   Standard system mutations like ping are `_ping`.
+
+To configure read, create, update, or delete rules for the user table, navigate to **Settings -> Security -> User Data Policies** in the Dashboard, or modify the `"policy_users"` key in the Config Registry.
+
+```json
+// Example "policy_users" JSON Value
+{
+  "read": "public",
+  "create": "public",
+  "update": "admin || owner:id",
+  "delete": "admin"
+}
+```
+
+---
+
+## 6. Developers Best Practices
+
+1.  **Use `owner:fieldName` Shorthand:** For simple ownership checks, prefer `owner:author_id` rather than writing `field:author_id == auth.id`. It compiles to highly optimized SQL.
+2.  **Avoid Mixed Operations in Single Policies:** Keep expressions readable. If a policy is too complex, write a server-side script hook (e.g., `before_create_record`) to handle the security validation procedurally.
+3.  **Remember Sandbox Ephemerality:** Workspaces spawned inside a Sandbox (`/sandbox/{session_id}`) copy schemas and data but run completely isolated in-memory indexes and local databases. Ensure you publish the sandbox to persist changes back to the production environment.
+4.  **Cooperative Yielding:** If you are writing a custom background script that processes database records in a loop, insert a small sleep interval (`await $util.sleep(50)`) between iterations. This releases the JS runtime thread and allows live API requests to interleave smoothly.
