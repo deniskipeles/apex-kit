@@ -16,6 +16,10 @@ jobs:
   build:
     name: Build ${{ matrix.os_name }}
     runs-on: ubuntu-latest
+    # Define these globally at the job level so both "check" and "build" steps inherit them
+    env:
+      CFLAGS: "-msse4.1 -mssse3 -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+      CXXFLAGS: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +40,6 @@ jobs:
       - name: Download Tailwind CSS
         run: |
           mkdir -p static
-          # curl -L -o static/tailwind-dark.full.css https://unpkg.com/tailwindcss@2.2.19/dist/tailwind-dark.css
 
       - name: Install System Dependencies
         run: |
@@ -88,15 +91,6 @@ jobs:
           ln -sf "$XWIN_UM_DIR/pathcch.lib" "$XWIN_UM_DIR/PathCch.lib"
 
       - name: Build (${{ matrix.target }})
-        env:
-          # Compiler optimizations and the Windows STL compiler mismatch bypass
-          CFLAGS: "-msse4.1 -mssse3 -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
-          CXXFLAGS: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
-          # Instruct cc-rs to use the LLVM wrappers
-          CC_x86_64_pc_windows_msvc: "clang-cl"
-          CXX_x86_64_pc_windows_msvc: "clang-cl"
-          AR_x86_64_pc_windows_msvc: "llvm-lib"
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: "lld-link"
         run: |
           if [ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]; then
             cargo xwin build --target ${{ matrix.target }} --release -p apexkit-cli
@@ -144,7 +138,6 @@ jobs:
           path: private-repo
 
       # 2. Checkout the PUBLIC repo to push files
-      # CHANGE 'deniskipeles/apexkit' to your exact public repository name
       - name: Checkout Public Repo
         uses: actions/checkout@v4
         with:
@@ -175,7 +168,7 @@ jobs:
           cp -r private-repo/docs public-repo/ 2>/dev/null || :
           cp -r private-repo/hosting public-repo/ 2>/dev/null || :
           
-          # 2. NEW: Copy the logo file
+          # 2. Copy the logo file
           # Ensure the directory exists in the public repo first
           mkdir -p public-repo/static/images
           cp private-repo/static/images/apexkit-logo.svg public-repo/static/images/
@@ -196,7 +189,6 @@ jobs:
           git push origin ${{ github.ref_name }} || true
 
       # 6. Create the Release on the PUBLIC Repo using the PAT
-      # CHANGE 'deniskipeles/apexkit' to your exact public repository name
       - name: Create Release on Public Repo
         uses: softprops/action-gh-release@v1
         with:
