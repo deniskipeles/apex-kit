@@ -1,18 +1,21 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
+
+# Disable interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
 
 # 1. Install dependencies
-# tar is included in debian by default, but we ensure curl, jq, and sendmail are present
+# msmtp-mta is installed to automatically configure the standard sendmail symlink.
 RUN apt-get update && \
-    apt-get install -y curl jq ca-certificates sendmail tar && \
+    apt-get install -y --no-install-recommends curl jq ca-certificates msmtp msmtp-mta tar && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # 2. Download & Extract Logic (Public Repository)
-# Fetches the latest 'linux-musl.tar.gz' archive directly from the public GitHub releases.
+# Fetches the latest 'linux-gnu.tar.gz' archive directly from the public GitHub releases.
 RUN echo "Downloading latest public release archive..." && \
     LATEST_URL=$(curl -s https://api.github.com/repos/deniskipeles/apexkit/releases/latest | \
-    jq -r '.assets[] | select(.name | contains("linux-musl.tar.gz")) | .browser_download_url') && \
+    jq -r '.assets[] | select(.name | contains("linux-gnu.tar.gz")) | .browser_download_url') && \
     echo "URL: $LATEST_URL" && \
     curl -L -o apexkit.tar.gz "$LATEST_URL" && \
     echo "Extracting binary..." && \

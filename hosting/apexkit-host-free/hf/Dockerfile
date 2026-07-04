@@ -1,18 +1,29 @@
-FROM alpine:3.19
+FROM ubuntu:24.04
 
-# 1. Install dependencies including rsync and bash for the entrypoint script
-RUN apk add --no-cache curl jq msmtp ca-certificates tar rsync bash && \
-    ln -sf /usr/bin/msmtp /usr/sbin/sendmail
+# Disable interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
 
-# 2. Create a non-root user (UID 1000) required by Hugging Face Spaces
-RUN adduser -D -u 1000 user
+# 1. Install dependencies (using msmtp-mta to auto-create the sendmail symlink)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    jq \
+    msmtp \
+    msmtp-mta \
+    ca-certificates \
+    tar \
+    rsync \
+    bash \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Delete the pre-created 'ubuntu' user (UID 1000) and create your custom 'user' (UID 1000)
+RUN userdel -r ubuntu && useradd -m -u 1000 user
 
 WORKDIR /app
 
 # 3. Download & Extract ApexKit Binary
 RUN echo "Downloading latest public release archive..." && \
     LATEST_URL=$(curl -s https://api.github.com/repos/deniskipeles/apexkit/releases/latest | \
-    jq -r '.assets[] | select(.name | contains("linux-musl.tar.gz")) | .browser_download_url') && \
+    jq -r '.assets[] | select(.name | contains("linux-gnu.tar.gz")) | .browser_download_url') && \
     echo "URL: $LATEST_URL" && \
     curl -L -o apexkit.tar.gz "$LATEST_URL" && \
     tar -xzf apexkit.tar.gz && \

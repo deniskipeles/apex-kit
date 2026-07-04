@@ -1,10 +1,26 @@
-FROM alpine:3.19
+FROM ubuntu:24.04
 
-# 1. Install pure-bash dependencies (curl, openssl for HMAC signing, tar)
-RUN apk add --no-cache curl openssl tar bash jq ca-certificates minio-client
+# Disable interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. Install pure-bash and other utilities
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    openssl \
+    tar \
+    bash \
+    jq \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the official MinIO Client (mc) and symlink it to "minio-client" for script compatibility
+RUN curl -L -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && \
+    chmod +x /usr/local/bin/mc && \
+    ln -sf /usr/local/bin/mc /usr/local/bin/minio-client
 
 # 2. Add non-root user for security (Koyeb/Render friendly)
-RUN adduser -D -u 1000 user
+# Ubuntu 24.04 pre-creates a user named 'ubuntu' (UID 1000). We delete it first.
+RUN userdel -r ubuntu && useradd -m -u 1000 user
 USER user
 ENV HOME=/home/user
 WORKDIR $HOME/app
@@ -12,7 +28,7 @@ WORKDIR $HOME/app
 # 3. Download latest ApexKit release from GitHub
 RUN echo "Downloading latest public release archive..." && \
     LATEST_URL=$(curl -s https://api.github.com/repos/deniskipeles/apexkit/releases/latest | \
-    jq -r '.assets[] | select(.name | contains("linux-musl.tar.gz")) | .browser_download_url') && \
+    jq -r '.assets[] | select(.name | contains("linux-gnu.tar.gz")) | .browser_download_url') && \
     curl -L -o apexkit.tar.gz "$LATEST_URL" && \
     tar -xzf apexkit.tar.gz && \
     chmod +x apexkit && \

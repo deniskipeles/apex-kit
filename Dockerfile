@@ -1,16 +1,24 @@
-FROM alpine:3.19
+FROM ubuntu:24.04
 
-# 1. Install dependencies
-# We install libc6-compat just in case our binary has any dynamic linking needs,
-# and install curl, jq, tar, and msmtp (the Alpine alternative to sendmail)
-RUN apk add --no-cache curl jq msmtp ca-certificates tar gcompat libstdc++ && \
-    ln -sf /usr/bin/msmtp /usr/sbin/sendmail
+# Disable interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. Install dependencies (using msmtp-mta to auto-create the sendmail symlink)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    jq \
+    msmtp \
+    msmtp-mta \
+    ca-certificates \
+    tar \
+    rsync \
+    bash \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # 2. Download & Extract Logic (Public Repository)
 # Fetches the latest 'linux-gnu.tar.gz' archive directly from your public GitHub releases.
-# linux-musl was depreciated 
 RUN echo "Downloading latest public release archive..." && \
     LATEST_URL=$(curl -s https://api.github.com/repos/deniskipeles/apexkit/releases/latest | \
     jq -r '.assets[] | select(.name | contains("linux-gnu.tar.gz")) | .browser_download_url') && \

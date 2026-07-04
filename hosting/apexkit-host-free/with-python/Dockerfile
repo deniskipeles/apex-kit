@@ -1,10 +1,27 @@
-FROM alpine:3.19
+FROM ubuntu:24.04
+
+# Disable interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
 
 # 1. Install dependencies
-RUN apk add --no-cache curl jq msmtp ca-certificates tar python3 py3-pip bash
+# We include python3-venv on Ubuntu to support virtual environments natively,
+# and msmtp-mta to auto-create the standard sendmail symlink.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    jq \
+    msmtp \
+    msmtp-mta \
+    ca-certificates \
+    tar \
+    python3 \
+    python3-pip \
+    python3-venv \
+    bash \
+    && rm -rf /var/lib/apt/lists/*
 
 # 2. Create non-root user (Required for Hugging Face, safe for Render/Koyeb)
-RUN adduser -D -u 1000 user
+# Ubuntu 24.04 pre-creates a user named 'ubuntu' (UID 1000). We delete it first.
+RUN userdel -r ubuntu && useradd -m -u 1000 user
 USER user
 ENV HOME=/home/user
 WORKDIR $HOME/app
@@ -14,10 +31,10 @@ RUN python3 -m venv $HOME/venv
 ENV PATH="$HOME/venv/bin:$PATH"
 RUN pip install --no-cache-dir flask boto3
 
-# 4. Download latest ApexKit release from GitHub
+# 4. Download latest ApexKit release from GitHub (using the native glibc binary)
 RUN echo "Downloading latest public release archive..." && \
     LATEST_URL=$(curl -s https://api.github.com/repos/deniskipeles/apexkit/releases/latest | \
-    jq -r '.assets[] | select(.name | contains("linux-musl.tar.gz")) | .browser_download_url') && \
+    jq -r '.assets[] | select(.name | contains("linux-gnu.tar.gz")) | .browser_download_url') && \
     curl -L -o apexkit.tar.gz "$LATEST_URL" && \
     tar -xzf apexkit.tar.gz && \
     chmod +x apexkit && \
