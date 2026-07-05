@@ -58,7 +58,12 @@ fn make_api_router() -> Router<AppState> {
             "/auth/roles",
             get(crate::api::auth::user_rud_ops::list_roles_handler),
         )
-        .route("/auth/me", get(crate::api::auth::user_rud_ops::get_me))
+        .route(
+            "/auth/me",
+            get(crate::api::auth::user_rud_ops::get_me)
+                .patch(crate::api::auth::user_rud_ops::update_me)
+                .put(crate::api::auth::user_rud_ops::update_me),
+        )
         // Github Auth Routes
         .route("/auth/github", get(crate::api::auth::oauth2::github_login))
         .route(
@@ -469,6 +474,7 @@ pub fn app_router(state: AppState) -> Router {
         config_routes::set_config,
         settings::get_settings,settings::update_settings,
         crate::api::auth::user_rud_ops::list_users_handler,crate::api::auth::user_rud_ops::delete_user_handler,
+        crate::api::auth::user_rud_ops::update_me, crate::api::auth::user_rud_ops::get_me,
         crate::api::system::list_audit_logs,
         crate::api::system::reload_system,
         ai_routes::list_actions,ai_routes::create_action,ai_routes::delete_action,ai_routes::run_action,ai_routes::edit_code,
@@ -532,6 +538,7 @@ pub fn app_router(state: AppState) -> Router {
         crate::api::migration::import::ImportSchemaResponseDto,
         crate::api::migration::export::ExportQuery,
         crate::api::auth::verification::RequestPasswordResetReq,crate::api::auth::verification::ConfirmPasswordResetReq,
+        crate::api::auth::user_rud_ops::UpdateMeReq,
         vector_routes::VectorSearchReq,
         vector_routes::ImageVectorSearchReq,
         vector_routes::TextImageVectorSearchReq,

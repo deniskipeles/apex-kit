@@ -79,7 +79,8 @@ export const VectorSearchPanel = () => {
     try {
       let data;
       if (searchType === 'text') {
-        data = (await apiClient.records.searchVectorWithText(selectedColId, query, { limit: 10 })).items;
+        data = (await apiClient.records.searchVectorWithText(selectedColId, query, { limit: 10 }))
+          .items;
       } else {
         data = await apiClient.records.searchImageVectorWithImage(selectedColId, imageBase64, 10);
       }

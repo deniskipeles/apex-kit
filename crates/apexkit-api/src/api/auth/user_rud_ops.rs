@@ -59,6 +59,69 @@ pub async fn get_me(
     }))
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateMeReq {
+    #[schema(value_type = Object)]
+    pub metadata: serde_json::Value,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/auth/me",
+    request_body = UpdateMeReq,
+    responses((status = 200, body = UserDto))
+)]
+pub async fn update_me(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    Json(payload): Json<UpdateMeReq>,
+) -> Result<Json<UserDto>, AppError> {
+    // 1. Authenticate user
+    let claims = auth
+        .ok_or(AppError::Unauthorized("Login required".into()))?
+        .0;
+
+    // 2. Fetch current user data to perform a safe metadata merge
+    let users = db
+        .get_users_by_ids(&[claims.uid])
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    let current_user = users
+        .first()
+        .ok_or(AppError::NotFound("User not found".into()))?;
+
+    // 3. Perform a recursive JSON merge of old and new metadata to avoid overwriting unrelated keys
+    let mut merged_metadata = current_user
+        .metadata
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let (Some(merged_obj), Some(new_obj)) = (
+        merged_metadata.as_object_mut(),
+        payload.metadata.as_object(),
+    ) {
+        for (k, v) in new_obj {
+            merged_obj.insert(k.clone(), v.clone());
+        }
+    } else {
+        merged_metadata = payload.metadata;
+    }
+
+    // 4. Update the user in the database
+    let updated_user = db
+        .update_user(claims.uid, None, None, Some(merged_metadata), None)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(Json(UserDto {
+        id: updated_user.id,
+        email: updated_user.email,
+        role: updated_user.role,
+        metadata: updated_user.metadata,
+        scope: Some(claims.scope),
+    }))
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct RolesResponse {
     pub roles: Vec<String>,

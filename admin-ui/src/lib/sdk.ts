@@ -407,10 +407,14 @@ export class ApexKit {
         return res;
       },
 
-      register: async (email: string, password: string): Promise<AuthResponse> => {
+      register: async (
+        email: string,
+        password: string,
+        metadata: Record<string, any> = {}
+      ): Promise<AuthResponse> => {
         const res = await this._request<AuthResponse>('/auth/register', {
           method: 'POST',
-          body: { email, password },
+          body: { email, password, metadata },
         });
         this.token = res.token;
         this.currentUser = res.user;
@@ -420,6 +424,25 @@ export class ApexKit {
       getMe: async (): Promise<User> => {
         const user = await this._request<User>('/auth/me');
         if (user.scope) this.setScopeFromTag(user.scope);
+        return user;
+      },
+
+      /**
+       * Update the current authenticated user's profile or metadata.
+       * @param payload - Object containing optional fields to update.
+       */
+      updateMe: async (metadata?: Record<string, any>): Promise<User> => {
+        const user = await this._request<User>('/auth/me', {
+          method: 'PATCH',
+          body: { metadata },
+        });
+
+        // Synchronize the local SDK client state
+        this.currentUser = user;
+        if (user.scope) {
+          this.setScopeFromTag(user.scope);
+        }
+
         return user;
       },
 
@@ -1302,7 +1325,7 @@ export class ApexKitRealtimeWSClient {
         JSON.stringify({
           type: 'Search',
           payload: {
-            collection_id: Number(collectionId),
+            collection_id: isNaN(Number(collectionId)) ? collectionId : Number(collectionId),
             query,
             limit,
             request_id: requestId,
