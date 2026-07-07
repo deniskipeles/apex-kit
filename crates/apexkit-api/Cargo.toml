@@ -80,7 +80,8 @@ railwind = "0.1.2"
 
 chrono = { version = "0.4", features = ["serde"] }
 # Image processing and Caching
-image = { version = "0.24", features = ["avif-encoder", "webp-encoder", "jpeg", "png", "gif"] }
+image = { version = "0.24", features = ["avif-encoder", "jpeg", "png", "gif"] }
+webp = "0.2"
 moka = { version = "0.12", features = ["future"] } # High performance cache
 md5 = "0.7"
 base64 = "0.21"

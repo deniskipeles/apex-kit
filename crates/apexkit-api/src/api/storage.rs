@@ -1242,6 +1242,15 @@ async fn process_image(
 
             let mut buffer = Cursor::new(Vec::new());
             let encoding_success = match target_format {
+                image::ImageFormat::WebP => {
+                    if let Ok(encoder) = webp::Encoder::from_image(&processed_img) {
+                        // Pass the quality value (0.0 to 100.0) for lossy compression
+                        let webp_memory = encoder.encode(quality as f32);
+                        std::io::Write::write_all(&mut buffer, &webp_memory).is_ok()
+                    } else {
+                        false
+                    }
+                }
                 image::ImageFormat::Jpeg => JpegEncoder::new_with_quality(&mut buffer, quality)
                     .encode_image(&processed_img)
                     .is_ok(),
