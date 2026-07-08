@@ -47,6 +47,9 @@ pub struct RelationDefinition {
     // Stable Index of target collection
     #[serde(default)]
     pub target_index: Option<String>,
+    // If true, when the target record is deleted, THIS record is also deleted.
+    #[serde(default)]
+    pub cascade_on_target_delete: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema, PartialEq)]

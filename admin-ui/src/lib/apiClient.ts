@@ -156,6 +156,7 @@ const transformCollection = (col: any): Collection => {
         originalName: name,
         position: def.position || 999,
         uid: def.uid || 'gen_rel',
+        cascade_on_target_delete: def.cascade_on_target_delete || false,
       });
     });
   }
@@ -184,6 +185,10 @@ const transformCollection = (col: any): Collection => {
   };
 };
 
+const isSearchableType = (type: string): boolean => {
+  return ['string', 'text', 'email', 'url', 'select'].includes(type);
+};
+
 const transformToBackendSchema = (data: Partial<Collection>) => {
   const schema: any = {
     fields: {},
@@ -203,6 +208,7 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
           position: field.position,
           required: field.required,
           uid: field.uid,
+          cascade_on_target_delete: field.cascade_on_target_delete || false,
         };
         return;
       }
@@ -210,13 +216,14 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
         type: field.type,
         required: field.required,
         unique: field.unique,
-        ose_indexed: field.ose_indexed,
-        sql_indexed: field.sql_indexed,
+        // Only allow ose_indexed to be true for searchable text fields. Force false for files, booleans, etc.
+        ose_indexed: isSearchableType(field.type) ? (field.ose_indexed || false) : false,
+        sql_indexed: field.sql_indexed || false,
+        vectorize: field.vectorize || false,
+        auto: field.auto !== undefined ? field.auto : false,
         default: field.default,
-        auto: field.auto,
         uid: field.uid,
         position: field.position,
-        vectorize: field.vectorize,
         min: field.min,
         max: field.max,
         min_length: field.minLength,
@@ -784,15 +791,16 @@ export const apiClient = {
     ): Promise<{ items: StoredFile[]; totalItems: number }> => {
       try {
         const res = await pb.files.list(page, perPage);
-        const items = res.items.map((f: any) => ({
-          id: f.id.toString(),
-          name: f.original_name,
-          size: f.size,
-          mimeType: f.mime_type,
-          url: pb.files.getFileUrl(f.filename),
-          created: f.created_at,
-          updated: f.created_at,
-        }));
+        const items = await Promise.all(
+          res.items.map(async (f) => ({
+            id: f.id.toString(),
+            name: f.original_name,
+            size: f.size,
+            mimeType: f.mime_type,
+            url: await pb.files.getFileUrl(f.filename),
+            created: f.created_at,
+            updated: f.created_at,
+          })));
         return { items, totalItems: res.total || items.length };
       } catch (e) {
         console.error('File list error', e);

@@ -2,7 +2,7 @@ use super::ApexKit;
 use crate::database::sqlite::utils::{
     commit_uniqueness, enforce_uniqueness, row_to_collection, row_to_record,
 };
-use crate::database::traits::{IntoSqlVal, RecordStore};
+use crate::database::traits::{CollectionStore, IntoSqlVal, RecordStore};
 use crate::models::schema::CollectionSchema;
 use crate::models::{ListResult, Record};
 use crate::query::QueryOptions;
@@ -307,29 +307,75 @@ impl RecordStore for ApexKit {
             Box::new(std::io::Error::other(e))
         };
 
-        let f1 = self.data_batcher.execute(
-            "DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(),
-            vec![collection_id.into_val(), record_id.into_val()],
-        );
-        let f2 = self.data_batcher.execute(
-            "DELETE FROM _unique_values WHERE record_id = ?1".into(),
-            vec![record_id.into_val()],
-        );
-        let f3 = self.data_batcher.execute(
-            "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(),
-            vec![collection_id.into_val(), record_id.into_val()],
-        );
-        let f4 = self.data_batcher.execute(
-            "DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id=?2".into(),
-            vec![collection_id.into_val(), record_id.into_val()],
-        );
-        let f5 = self.vector_batcher.execute(
-            "DELETE FROM vectors WHERE collection_id = ?1 AND record_id = ?2".into(),
-            vec![collection_id.into_val(), record_id.into_val()],
-        );
+        let mut to_delete = vec![(collection_id, record_id)];
+        let mut visited = std::collections::HashSet::new();
 
-        let _ = tokio::try_join!(f1, f2, f3, f4).map_err(map_err)?;
-        let _ = f5.await.map_err(map_err)?;
+        // Pre-load schemas to quickly analyze cascade conditions
+        let collections = self.list_collections().await?;
+        let mut schema_map = std::collections::HashMap::new();
+        let mut name_to_id = std::collections::HashMap::new();
+
+        for c in collections {
+            if let Some(s) = c.schema {
+                schema_map.insert(c.id, s);
+            }
+            name_to_id.insert(c.name.clone(), c.id);
+            name_to_id.insert(c.id.to_string(), c.id);
+        }
+
+        // Process Deletions iteratively (Graph Traversal)
+        while let Some((col_id, rec_id)) = to_delete.pop() {
+            if visited.contains(&(col_id, rec_id)) {
+                continue;
+            }
+            visited.insert((col_id, rec_id));
+
+            // Find any records that point to THIS record and have cascade_on_target_delete = true
+            for (other_col_id, other_schema) in &schema_map {
+                for (rel_name, rel_def) in &other_schema.relations {
+                    if rel_def.cascade_on_target_delete {
+                        let targets_us = match name_to_id.get(&rel_def.target_collection) {
+                            Some(id) => *id == col_id,
+                            None => false,
+                        };
+                        
+                        if targets_us {
+                            let origin_ids: Vec<i64> = {
+                                let conn = self.get_data_read().await;
+                                let mut stmt = conn.prepare("SELECT origin_rec_id FROM _relations WHERE origin_col_id = ?1 AND target_col_id = ?2 AND target_rec_id = ?3 AND rel_name = ?4").map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                let mut rows = stmt.query(rusqlite::params![other_col_id, col_id, rec_id, rel_name]).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                let mut ids = Vec::new();
+                                while let Some(row) = rows.next().map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)? {
+                                    ids.push(row.get(0).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?);
+                                }
+                                ids
+                            };
+                            
+                            for origin_rec_id in origin_ids {
+                                if !visited.contains(&(*other_col_id, origin_rec_id)) {
+                                    to_delete.push((*other_col_id, origin_rec_id));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Execute all collected deletions
+        for (del_col_id, del_rec_id) in visited {
+            let f1 = self.data_batcher.execute("DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(), vec![del_col_id.into_val(), del_rec_id.into_val()]);
+            let f2 = self.data_batcher.execute("DELETE FROM _unique_values WHERE record_id = ?1".into(), vec![del_rec_id.into_val()]);
+            let f3 = self.data_batcher.execute("DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(), vec![del_col_id.into_val(), del_rec_id.into_val()]);
+            let f4 = self.data_batcher.execute("DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id=?2".into(), vec![del_col_id.into_val(), del_rec_id.into_val()]);
+            let f5 = self.vector_batcher.execute("DELETE FROM vectors WHERE collection_id = ?1 AND record_id = ?2".into(), vec![del_col_id.into_val(), del_rec_id.into_val()]);
+
+            let _ = tokio::try_join!(f1, f2, f3, f4).map_err(map_err)?;
+            let _ = f5.await.map_err(map_err)?;
+            
+            // Keep Tantivy Search Engine in sync
+            let _ = self.search.delete_record(del_col_id, del_rec_id);
+        }
 
         Ok(())
     }

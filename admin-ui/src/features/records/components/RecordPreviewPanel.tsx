@@ -31,18 +31,32 @@ const getExpandedLabel = (item: any): string => {
   const data = item.data || item;
 
   // 1. Try explicit descriptive fields first
-  const explicit =
-    data.email || data.name || data.title || data.slug || data.username || data.label;
-  if (explicit) return explicit;
+  const fallbackKeys = ['title', 'name', 'subject', 'label', 'email', 'slug', 'username', 'heading'];
+  for (const key of fallbackKeys) {
+    if (data[key] && typeof data[key] === 'string' && data[key].trim()) {
+      return data[key];
+    }
+  }
 
   // 2. Scan for the first reasonable string/text field (heuristic)
-  // We ignore fields that look like IDs, Timestamps, or FKs to find "content"
+  // We ignore fields that look like IDs, Timestamps, raw files, or FKs to find the best descriptor
+  const systemKeysPattern = /^(id|_id|uuid|created|updated|created_at|updated_at|deleted_at)$/i;
+  const fileExtensionsPattern = /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|bin|txt|json)$/i;
+  const dateISOStringsPattern = /^\d{4}-\d{2}-\d{2}/;
+
   const genericField = Object.entries(data).find(([key, val]) => {
+    if (typeof val !== 'string') return false;
+    const s = val.trim().slice(0,100);
     const k = key.toLowerCase();
+
     return (
-      typeof val === 'string' &&
-      val.length > 0 &&
-      val.length < 60 && // Avoid long text blocks
+      s.length > 0 &&
+      !systemKeysPattern.test(key) &&
+      !fileExtensionsPattern.test(s) &&
+      !dateISOStringsPattern.test(s) &&
+      !s.startsWith('http://') &&
+      !s.startsWith('https://') &&
+      !s.startsWith('data:') &&
       !k.includes('id') &&
       !k.includes('date') &&
       !k.includes('created') &&

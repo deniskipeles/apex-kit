@@ -501,15 +501,45 @@ export const RecordsListPage = () => {
           case 'owner': {
             const expanded = r.expand?.[f.name];
             let label = String(val);
-            // Try to find a human-readable label from the expanded data
+            
             if (expanded) {
-              const getDisplay = (obj: any) =>
-                obj.data?.title ||
-                obj.data?.name ||
-                obj.data?.email ||
-                obj.data?.slug ||
-                obj.email ||
-                obj.id;
+              const getDisplay = (obj: any) => {
+                if (!obj) return '';
+                const data = obj.data || obj;
+                
+                // 1. Fast Path: Prioritize standard naming conventions first
+                const prioritizedKeys = ['title', 'name', 'subject', 'label', 'email', 'slug', 'username', 'heading'];
+                for (const key of prioritizedKeys) {
+                  if (data[key] && typeof data[key] === 'string' && data[key].trim()) {
+                    return data[key];
+                  }
+                }
+
+                // 2. Dynamic Heuristic Path: Find the first meaningful string field
+                const systemKeysPattern = /^(id|_id|uuid|created|updated|created_at|updated_at|deleted_at)$/i;
+                const fileExtensionsPattern = /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|bin|txt|json)$/i;
+                const dateISOStringsPattern = /^\d{4}-\d{2}-\d{2}/; // e.g., 2026-07-08
+
+                const candidateEntries = Object.entries(data).filter(([key, val]) => {
+                  if (typeof val !== 'string') return false;
+                  const s = val.trim();
+                  if (!s) return false;
+                  if (systemKeysPattern.test(key)) return false;
+                  if (fileExtensionsPattern.test(s)) return false;
+                  if (dateISOStringsPattern.test(s)) return false;
+                  if (s.startsWith('http://') || s.startsWith('https://')) return false; // skip URLs
+                  if (s.startsWith('data:')) return false; // skip raw base64 data
+                  return true;
+                });
+
+                if (candidateEntries.length > 0) {
+                  return candidateEntries[0][1]; // Returns the value of the first discovered text field (e.g. caption, message, post_body)
+                }
+
+                // 3. Ultimate Fallback
+                return obj.email || obj.id || String(obj);
+              };
+
               if (Array.isArray(expanded)) {
                 if (expanded.length > 0) {
                   const first = getDisplay(expanded[0]);

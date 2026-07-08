@@ -50,6 +50,7 @@ export interface SchemaField {
 
   // Relation / Owner
   relationTo?: string; // Target Collection ID/Name
+  cascade_on_target_delete?: boolean;
 
   // Frontend Internal (for renaming tracking)
   originalName?: string;

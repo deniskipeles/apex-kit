@@ -375,8 +375,7 @@ const FieldEditorDialog = ({
                       onCheckedChange={(c) =>
                         setData({
                           ...data,
-                          vectorize: c,
-                          ose_indexed: c ? true : data.ose_indexed, // Often useful to have keyword search too
+                          vectorize: c
                         })
                       }
                     />
@@ -579,84 +578,83 @@ const FieldEditorDialog = ({
 
                 {/* RELATION / OWNER */}
                 {(data.type === 'relation' || data.type === 'owner') && (
-                  <div className="space-y-2">
-                    <Label required>
-                      {data.type === 'owner' ? 'User Collection' : 'Related Collection'}
-                    </Label>
-                    <div className="relative">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        className="w-full justify-between text-left font-normal px-3 h-9"
-                        onClick={() => setIsColPickerOpen(true)}
-                      >
-                        {data.relationTo ? (
-                          <span className="flex items-center gap-2">
-                            <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
-                            <span className="font-semibold text-foreground">
-                              {collections.find(
-                                (c) => c.id === data.relationTo || c.name === data.relationTo
-                              )?.name || data.relationTo}
+                  <div className="space-y-4 animate-in fade-in duration-300">
+                    <div className="space-y-2">
+                      <Label required>
+                        {data.type === 'owner' ? 'User Collection' : 'Related Collection'}
+                      </Label>
+                      <div className="relative">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="w-full justify-between text-left font-normal px-3 h-9"
+                          onClick={() => setIsColPickerOpen(true)}
+                        >
+                          {data.relationTo ? (
+                            <span className="flex items-center gap-2">
+                              <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
+                              <span className="font-semibold text-foreground">
+                                {collections.find(
+                                  (c) => c.id === data.relationTo || c.name === data.relationTo
+                                )?.name || data.relationTo}
+                              </span>
                             </span>
-                          </span>
-                        ) : (
-                          <span className="text-muted-foreground">Select Collection...</span>
-                        )}
-                        <ChevronDown className="h-4 w-4 opacity-50" />
-                      </Button>
+                          ) : (
+                            <span className="text-muted-foreground">Select Collection...</span>
+                          )}
+                          <ChevronDown className="h-4 w-4 opacity-50" />
+                        </Button>
 
-                      {isColPickerOpen && (
-                        <div className="absolute top-full left-0 right-0 z-50 mt-1 max-h-48 overflow-y-auto rounded-md border bg-popover p-1 shadow-md">
-                          {collections.map((c) => (
+                        {isColPickerOpen && (
+                          <div className="absolute top-full left-0 right-0 z-50 mt-1 max-h-48 overflow-y-auto rounded-md border bg-popover p-1 shadow-md">
+                            {collections.map((c) => (
+                              <button
+                                key={c.id}
+                                className="w-full rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent flex items-center justify-between"
+                                onClick={() => {
+                                  setData({ ...data, relationTo: c.id });
+                                  setIsColPickerOpen(false);
+                                }}
+                              >
+                                <span>{c.name}</span>
+                                <Badge variant="secondary" className="text-[10px]">
+                                  {c.type}
+                                </Badge>
+                              </button>
+                            ))}
                             <button
-                              key={c.id}
-                              className="w-full rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent flex items-center justify-between"
+                              className="w-full rounded-sm px-2 py-1.5 text-left text-sm text-primary hover:bg-accent font-medium flex items-center gap-1 border-t mt-1 pt-2"
                               onClick={() => {
-                                setData({ ...data, relationTo: c.id });
                                 setIsColPickerOpen(false);
+                                setIsCollectionCreatorOpen(true);
                               }}
                             >
-                              <span>{c.name}</span>
-                              <Badge variant="secondary" className="text-[10px]">
-                                {c.type}
-                              </Badge>
+                              <Plus className="h-3 w-3" /> Create New
                             </button>
-                          ))}
-                          <button
-                            className="w-full rounded-sm px-2 py-1.5 text-left text-sm text-primary hover:bg-accent font-medium flex items-center gap-1 border-t mt-1 pt-2"
-                            onClick={() => {
-                              setIsColPickerOpen(false);
-                              setIsCollectionCreatorOpen(true);
-                            }}
-                          >
-                            <Plus className="h-3 w-3" /> Create New
-                          </button>
-                        </div>
-                      )}
-
-                      <Dialog
-                        isOpen={isCollectionCreatorOpen}
-                        onClose={() => setIsCollectionCreatorOpen(false)}
-                        size="xl"
-                        title="New Collection"
-                        zIndex={zIndex + 20}
-                      >
-                        <Suspense
-                          fallback={
-                            <div className="flex justify-center p-8">
-                              <Loader2 className="animate-spin" />
-                            </div>
-                          }
-                        >
-                          <CollectionForm
-                            onSave={handleCreateCollection}
-                            onCancel={() => setIsCollectionCreatorOpen(false)}
-                            isEmbedded
-                            zIndex={zIndex + 20}
-                          />
-                        </Suspense>
-                      </Dialog>
+                          </div>
+                        )}
+                      </div>
                     </div>
+
+                    {data.type === 'relation' && (
+                      <div className="flex items-center justify-between p-3 rounded-lg border border-border bg-secondary/5">
+                        <div className="space-y-0.5">
+                          <Label
+                            className="text-xs cursor-pointer flex items-center gap-1"
+                            onClick={() => setData({ ...data, cascade_on_target_delete: !data.cascade_on_target_delete })}
+                          >
+                            <Trash2 className="h-3 w-3 text-muted-foreground" /> Cascade Delete
+                          </Label>
+                          <p className="text-[10px] text-muted-foreground leading-relaxed max-w-[250px]">
+                            When the target record is deleted, delete this record automatically.
+                          </p>
+                        </div>
+                        <Switch
+                          checked={data.cascade_on_target_delete || false}
+                          onCheckedChange={(c) => setData({ ...data, cascade_on_target_delete: c })}
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -810,6 +808,15 @@ export const SchemaEditor = ({ value, onChange, zIndex = 60 }: SchemaEditorProps
                       title={`Renamed from ${field.originalName}`}
                     >
                       <History className="h-3 w-3" /> RENAMED
+                    </Badge>
+                  )}
+                  {field.cascade_on_target_delete && (
+                    <Badge
+                      variant="secondary"
+                      className="text-[10px] h-5 px-1.5 rounded-sm font-mono flex items-center gap-0.5 bg-red-500/10 text-red-400 border-red-500/20"
+                      title="Cascades on Target Delete"
+                    >
+                      <Trash2 className="h-2 w-2" /> CASCADE
                     </Badge>
                   )}
                 </div>
