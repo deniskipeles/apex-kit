@@ -6,6 +6,17 @@ use crate::models::schema::CollectionSchema;
 use async_trait::async_trait;
 use rusqlite::params;
 
+fn validate_identifier(name: &str) -> Result<(), String> {
+    let re = regex::Regex::new(r"^[a-zA-Z0-9_]+$").unwrap();
+    if !re.is_match(name) {
+        return Err(format!(
+            "Invalid identifier '{}'. Only alphanumeric characters (a-z, A-Z, 0-9) and underscores are allowed.",
+            name
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl CollectionStore for ApexKit {
     async fn create_collection(
@@ -14,6 +25,20 @@ impl CollectionStore for ApexKit {
         schema: &Option<CollectionSchema>,
         index: Option<String>,
     ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        // Enforce strict name constraint
+        validate_identifier(name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if let Some(s) = schema {
+            // Enforce strict field name constraints
+            for field_name in s.fields.keys() {
+                validate_identifier(field_name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+            // Enforce strict relation name constraints
+            for rel_name in s.relations.keys() {
+                validate_identifier(rel_name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+        }
+
         let schema_str = serde_json::to_string(&schema)?;
         let idx = index.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -70,6 +95,19 @@ impl CollectionStore for ApexKit {
         name: Option<String>,
         schema: Option<CollectionSchema>,
     ) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(n) = &name {
+            validate_identifier(n).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+
+        if let Some(s) = &schema {
+            for field_name in s.fields.keys() {
+                validate_identifier(field_name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+            for rel_name in s.relations.keys() {
+                validate_identifier(rel_name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+        }
+
         let existing = self.get_collection(id).await?.ok_or("Not found")?;
         let old_schema = existing.schema;
 
