@@ -1,15 +1,14 @@
-# Admin & System
+# Admin, System & Files SDK Reference
 
-The `apex.admins`, `apex.files`, and `apex.logs` namespaces provide management and diagnostic tools for the ApexKit system.
+The `apex.admins`, `apex.files`, `apex.logs`, and `apex.sites` namespaces provide complete administrative, system diagnostics, S3/Local file attachments, and static site deployment features.
 
 ---
 
-## Collections Management
+## 1. Collection & Schema Management
 
-The `admins` namespace allows for defining and managing the schema of your collections.
+The `admins` namespace allows platform administrators to programmatically manipulate schemas and trigger system-wide index maintenance.
 
-### Methods
-
+### Method Signatures
 - `admins.listCollections()`
 - `admins.getCollection(id)`
 - `admins.createCollection(name, schema)`
@@ -17,154 +16,50 @@ The `admins` namespace allows for defining and managing the schema of your colle
 - `admins.patchCollection(id, payload)`
 - `admins.deleteCollection(id)`
 - `admins.reIndex(collectionId?)`
-- `admins.revectorizeCollection(collectionId)`
+- `admins.revectorizeCollection(collectionId, force?)`
 - `admins.importSchema(file, strategy?)`
 - `admins.exportSchema()`
 
-### Defining a Collection Schema
-
-```typescript
-const schema = {
-    fields: {
-        title: { name: "title", type: "string", required: true },
-        content: { name: "content", type: "text", required: true },
-        status: { name: "status", type: "string", options: ["draft", "published"], required: true }
-    }
-};
-
-const collection = await apex.admins.createCollection("posts", schema);
-```
-
 ---
 
-## Configuration
+## 2. Configuration Store
 
-Manage system-wide configuration keys.
+Manage persistent server settings securely.
 
-### Methods
-
+### Method Signatures
 - `admins.listConfigs()`
 - `admins.setConfig(key, value, encrypt)`
 - `admins.deleteConfig(key)`
 
 ---
 
-## User Management
+## 3. User & Role Management
 
-Manage users and roles within the current scope.
+Query, create, update, or revoke user accounts.
 
-### Methods
-
+### Method Signatures
 - `admins.listUsers(options?)`
 - `admins.registerUser(email, password?, role?, metadata?)`
 - `admins.updateUser(id, email?, password?, role?, metadata?)`
 - `admins.deleteUser(id)`
-- `admins.listRoles()`
 
 ```typescript
-// Create a new user with a specific role
-const newUser = await apex.admins.registerUser('admin@test.com', 'secure-password', 'admin');
+// Create a new Administrator user
+const user = await apex.admins.registerUser(
+  'staff@my-saas.com',
+  'ultraSecurePass1!',
+  'admin',
+  { department: 'finance' }
+);
 ```
 
 ---
 
-## Storage & Files
+## 4. Multi-Tenant Operations (Root Scoped)
 
-The `files` namespace handles file uploads and retrievals across local and S3 storage.
+Create and manage isolated customer databases. Typically requires a `root` authenticated JWT.
 
-### Methods
-
-- `files.list(page?, perPage?)`
-- `files.upload(file: File)`
-- `files.delete(id)`
-- `files.getFileUrl(filename)`
-
-### Uploading and Retrieving Files
-
-```typescript
-// 1. Upload
-const fileInput = document.getElementById('upload');
-const storedFile = await apex.files.upload(fileInput.files[0]);
-
-// 2. Get Scoped URL
-const url = apex.files.getFileUrl(storedFile.filename);
-
-// 3. Dynamic Transformations (Resizing)
-const thumbUrl = `${url}?thumb=100x100`;
-```
-
----
-
-## Backups & API Keys
-
-Manage system health, data exports, and programmatic access.
-
-### Backups
-
-- `admins.listBackups()`
-- `admins.createBackup()`
-- `admins.restoreBackup(file)`
-- `admins.restoreFromFile(filename)`
-- `admins.downloadBackup(filename)`
-
-### API Keys
-
-- `admins.listApiKeys()`
-- `admins.createApiKey(name, role?, scope?, bypass_cors?)`
-- `admins.updateApiKey(id, updates)`
-- `admins.deleteApiKey(id)`
-
-### System Utilities
-
-- `admins.getSettings()`
-- `admins.updateSettings(settings)`
-- `admins.patchSettings(settings)`
-- `admins.reloadSystem(target?)`
-- `admins.testS3StorageConnection(config)`
-- `admins.testEmail(email)`
-- `admins.getDashboardStats()`
-- `admins.importData(collectionName, file)`
-
----
-
-## Logs
-
-Monitor system activity and errors.
-
-### Methods
-
-- `logs.list()`
-
-```typescript
-const logs = await apex.logs.list();
-logs.forEach(log => console.log(`[${log.level}] ${log.message}`));
-```
-
----
-
-## Sites (Deployment)
-
-Deploy static websites to your ApexKit instance.
-
-### Methods
-
-- `sites.deploy(file: File)`
-- `sites.listFiles()`
-- `sites.delete(path)`
-
-```typescript
-// Deploy a zip archive of your site
-await apex.sites.deploy(zipFile);
-```
-
----
-
-## Multi-Tenant Operations
-
-These operations are typically available only in the `root` scope.
-
-### Methods
-
+### Method Signatures
 - `admins.listTenants()`
 - `admins.createTenant(tenantId)`
 - `admins.updateTenant(id, data)`
@@ -172,20 +67,122 @@ These operations are typically available only in the `root` scope.
 - `admins.deleteTenant(id)`
 
 ```typescript
-// Create a new tenant
-await apex.admins.createTenant('client-beta');
+// Register new tenant "tenant-beta"
+await apex.admins.createTenant('tenant-beta');
 
-// Suspend a tenant
-await apex.admins.updateTenantStatus('client-beta', 'suspended');
+// Suspend a tenant instantly (Disables database access)
+await apex.admins.updateTenantStatus('tenant-beta', 'suspended');
 ```
 
 ---
 
-## Utilities
+## 5. Ephemeral Sandboxes (Scout & Create)
 
-- `utils.stripHtmlTags(html: string): string`
+Create, delete, or publish isolated sandboxes programmatically.
+
+### Method Signatures
+- `admins.listSandboxes()`
+- `admins.createSandbox(name, cloneStrategy, cloneRecordLimit?, model?, initialPrompt?, collections?, scripts?, templates?)`
+- `admins.deleteSandbox(id)`
+- `admins.publishSandbox(id)`
 
 ```typescript
-const text = apex.utils.stripHtmlTags('<p>Hello <b>World</b></p>');
-// returns "Hello World"
+// Spin up a sandbox, copying schemas and up to 20 records per collection
+const sandbox = await apex.admins.createSandbox(
+  'Feature-Test-Sandbox',
+  'Partial',
+  20
+);
+console.log(`Sandbox session created with ID: ${sandbox.id}`);
+```
+
+---
+
+## 6. S3 & Local Storage Files
+
+Upload and manage assets. ApexKit seamlessly handles public and signed URL generation, plus on-the-fly thumbnail transformations.
+
+### Method Signatures
+- `files.list(page?, perPage?)`
+- `files.upload(file)`
+- `files.delete(id)`
+- `files.getFileUrl(filename, options?)`
+
+### File Handling with Thumbnails & Signed URLs:
+
+```typescript
+// 1. Upload a binary file
+const fileInput = document.getElementById('file-picker') as HTMLInputElement;
+const uploadedFile = await apex.files.upload(fileInput.files![0]);
+
+// 2. Resolve Public URL synchronously
+const publicUrl = apex.files.getFileUrl(uploadedFile.filename);
+
+// 3. Resolve Public Thumbnail with width resizing (synchronous)
+const thumbUrl = apex.files.getFileUrl(uploadedFile.filename, {
+    thumb: '300x300',
+    format: 'webp',
+    quality: 85
+});
+
+// 4. Resolve Private/Secure S3 URL with pre-signature (asynchronous)
+const signedUrl = await apex.files.getFileUrl(uploadedFile.filename, {
+    signed: true,
+    expiresIn: 3600 // 1 hour expiry
+});
+```
+
+---
+
+## 7. API Keys (Composite Scopes)
+
+Programmatically provision, update, or delete composite scoped API keys.
+
+### Method Signatures
+- `admins.listApiKeys()`
+- `admins.createApiKey(name, role?, scope?, bypass_cors?, env_type?, roles?, target_tenant?)`
+- `admins.updateApiKey(id, updates)`
+- `admins.deleteApiKey(id)`
+
+```typescript
+// Provision an API Key for direct client integration (PK environment) for tenant-alpha
+const { key, info } = await apex.admins.createApiKey(
+  "React Web Key",
+  "user",          // Role
+  "tenant",        // Scope
+  true,            // Bypass CORS
+  "pk",            // Key environment type (pk, sk, tnnt, sys)
+  ["user"],        // Roles array
+  "tenant-alpha"   // Target tenant
+);
+console.log(`Your client API Key: ${key}`);
+```
+
+---
+
+## 8. Backups & Restores
+
+```typescript
+// Create system backup
+await apex.admins.createBackup();
+
+// Restore from a backup archive file
+await apex.admins.restoreFromFile("backup_2026_01_01.zip");
+```
+
+---
+
+## 9. Site Deployment (Static Hosting)
+
+Deploy fully functional Single Page Apps (SPAs) directly on your ApexKit server node.
+
+### Method Signatures
+- `sites.deploy(zipFile)`
+- `sites.listFiles()`
+- `sites.delete(path)`
+
+```typescript
+// Deploy static HTML site bundle
+const zipFile = fileInput.files![0];
+await apex.sites.deploy(zipFile);
 ```

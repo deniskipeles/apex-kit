@@ -1,63 +1,114 @@
-# Pro Guide: Internals and Optimization
+# ApexKit Advanced Architecture, Internals, and Performance Optimization
 
-This guide is for developers who want to push ApexKit to its limits, understand its internals, and optimize performance for high-scale applications.
+This guide is a deep dive into the engineering, architecture, and internals of ApexKit. It is designed for platform engineers and advanced developers seeking to optimize, extend, and deploy ApexKit at enterprise scale.
 
-## 1. The Boa Engine (JavaScript Runtime)
+---
 
-ApexKit uses **Boa**, an embeddable JavaScript engine written in Rust.
+## 1. System Architecture & Request Flow
 
-### Why Boa?
-- **Safety**: Unlike V8, Boa is written in 100% safe Rust. There are no memory-safety vulnerabilities.
-- **In-process**: Scripts run directly in the Axum request handler, meaning zero context switching between the OS and a separate process (like Node.js).
+ApexKit is compiled as a unified, highly optimized Rust binary containing an embedded Axum HTTP/gRPC server, a Rust-native JS execution context (Boa), a full-text indexing engine (Tantivy), and concurrent SQLite connection pools.
 
-### Limitations to Consider:
-- **Event Loop**: Boa's event loop is currently single-threaded within a script execution context. While ApexKit scales by running many scripts in parallel across Rust threads, a single long-running script can block its own execution.
-- **Library Support**: Boa does not support Node.js native modules (C++ add-ons) or the full NPM ecosystem. Use standard ES Modules whenever possible.
-- **WASM**: WebAssembly support within Boa is experimental.
+### Flowchart: Internal Request Flow
 
-## 2. Tantivy Search Tuning
-
-ApexKit uses **Tantivy** for full-text search. To get the best performance:
-
-### Indexing Strategies:
-- **Field Storing**: By default, ApexKit stores field values in the index for snippets. For very large text fields, disable `Stored` and only use `Indexed` to keep the index size small.
-- **Tokenization**: Use the `Raw` tokenizer for IDs or emails, and the `Standard` (Stemming) tokenizer for body text to support "word variant" matching (e.g., "running" matches "run").
-
-### Optimization:
-ApexKit periodically runs a "Merge" operation on Tantivy segments. You can manually trigger a full compaction via the Admin API if you notice search latency increasing after massive bulk imports.
-
-## 3. High Availability and Replication
-
-ApexKit supports a **Master-Replica** replication model via gRPC.
-
-### Custom gRPC Replication:
-- **Snapshot Sync**: Replicas download a full SQLite snapshot on startup.
-- **Streaming Changesets**: The Master streams every transaction (WAL frames) to connected Replicas in real-time.
-- **Read-Scaling**: Use Replicas to handle 100% of `GET` requests, leaving the Master to focus on `POST/PUT/DELETE`.
-
-### Setup:
-```bash
-# Master
-APEXKIT_MASTER_KEY=secret ./apexkit --port 5000
-
-# Replica
-APEXKIT_MASTER_URL=http://master-ip:5000 APEXKIT_MASTER_KEY=secret ./apexkit --port 5001
+```mermaid
+graph TD
+    Client[HTTP / WebSocket Client] -->|1. Incoming Request| Axum[Axum Web Server]
+    Axum -->|2. Scoping & Auth| AuthMiddleware[Auth & Scope Resolver Middleware]
+    AuthMiddleware -->|3. Route Handlers| Router[API Router / GraphQL Controller]
+    Router -->|4. If Hook / Script Triggers| Boa[Boa JS Engine Context]
+    Boa -->|5. $db Namespaced API| DbBridge[Database Bridge]
+    Router -->|4b. Standard CRUD / Query| DbBridge
+    DbBridge -->|6. WAL Writes Queue| Batcher[WriteManager WAL Batching Queue]
+    Batcher -->|7. Multi-DB Connection Pool| SQLite[(SQLite Files: core.db, data.db, logs.db, ...)]
+    DbBridge -->|8b. Index Search Keys| Tantivy[Tantivy Full-Text Search Engine]
+    DbBridge -->|8c. Match Distances| HNSW[HNSW Vector Search Index]
 ```
 
-## 4. SQLite Performance Optimization
+### Request Processing Lifecycle:
+1. **Axum Ingress**: The client connects via HTTP/WebSocket/SSE to the Axum engine.
+2. **Scope Resolution**: The Scoping Middleware decodes the Authorization Bearer JWT. It extracts the `scope` claim (e.g. `tenant:client_alpha` or `sandbox:session_123`) and maps the request's connection paths and environment keys strictly to `/storage/tenants/client_alpha/` or `/storage/sandboxes/session_123/`.
+3. **Interception (Boa Runtime)**: If database triggers or endpoint hooks are registered (e.g. `before_user_create`), Axum boots a lightweight, sandboxed `Boa` execution context.
+4. **Storage Orchestration**: Operations are marshaled to the unified `Db` traits, multiplexing writes into WAL batching queues (`WriteManager`) and routing read queries to open connection pools.
 
-### WAL Mode
-ApexKit runs SQLite in **Write-Ahead Logging (WAL)** mode by default. This allows multiple readers to operate simultaneously with one writer.
+---
 
-### Busy Timeout
-If you encounter "Database is locked" errors during high write concurrency, increase the `busy_timeout` in your settings. However, the best approach is to:
-1. **Batch Writes**: Use the `/query` endpoint for bulk inserts.
-2. **Move Logic to Rust**: If a script is doing too many individual DB calls, consider writing a custom Rust plugin for that specific high-load path.
+## 2. Dynamic Storage Abstraction: Local vs. S3
 
-## 5. Vector Search Tuning (HNSW)
+ApexKit decouples file metadata from physical file storage, providing a unified storage manager capable of switching or migrating backends transparently.
 
-The Vector Search uses the **HNSW (Hierarchical Navigable Small Worlds)** algorithm.
-- **M (Max Links)**: Increasing `M` improves search accuracy but increases memory usage and build time.
-- **efConstruction**: Controls the tradeoff between index speed and search quality.
+```mermaid
+graph LR
+    API[Storage API Controller] -->|Unified Interface| StorageBackend[StorageBackend Trait]
+    StorageBackend -->|Local FS Driver| Local[Local File System storage/system/uploads/]
+    StorageBackend -->|AWS SDK S3 Driver| S3[S3-Compatible Cloud Storage AWS, MinIO, Cloudflare R2]
+```
 
-For datasets > 1M vectors, we recommend externalizing the Vector index to a dedicated service or using ApexKit's "Quantization" settings to reduce vector size.
+### Storage Backends:
+- **Local Filesystem Backend**: Saves uploaded files directly to scoped folders on disk (e.g., `storage/system/uploads/{filename}`). It handles instant thumbnail generation via the `image` and `webp` crates, caching output files in an in-memory `thumb_cache` (Moka).
+- **S3-Compatible Backend**: Hooks directly into AWS S3, Cloudflare R2, MinIO, or DigitalOcean Spaces. It automatically signs download URLs (`getFileUrl(filename, { signed: true, expiresIn: 3600 })`) and executes upload streams directly.
+- **Online Migration**: Admins can migrate live storage directories between Local FS and S3 using the `/admin/storage/migrate` API endpoint without losing metadata references.
+
+---
+
+## 3. The Boa JavaScript Engine (Scripting Runtime)
+
+Server-side scripts and event triggers in ApexKit are executed by **Boa**, an embeddable, Rust-native JavaScript engine.
+
+### Architectural Benefits over V8:
+- **Absolute Memory Safety**: Because Boa is written in 100% Rust, it is immune to V8-level memory vulnerabilities, buffer overflows, and pointer corruption.
+- **Super-fast Cold Starts**: Boa contexts spin up in sub-microseconds without the huge memory/warmup overhead of Node.js or V8 isolates.
+- **In-Process Thread Scheduling**: Scripts run directly on Axum's Tokio worker threads, avoiding inter-process communication (IPC) context-switching overhead.
+
+### Engine Limitations & Workarounds:
+- **Single-Threaded Context Execution**: Within a single script invocation, code runs sequentially. Long-running or infinite loops (`while(true)`) can block that specific thread. ApexKit safeguards this by running script executions inside a monitored Tokio blocking pool with timeouts.
+- **No Node.js Native Modules**: Standard NPM packages using C++ extensions or Node-specific built-ins (like `fs` or `net`) will not run. Developers must use pure ES Modules (ES6).
+- **Namespaced Database Access**: Scripts access databases strictly via the namespaced `$db` API (e.g., `$db.records.create`, `$db.records.list`). This is intercepted by Rust bindings and executed with tenant-level scoping.
+
+---
+
+## 4. Tantivy Search Engine Tuning & Optimization
+
+Full-text search in ApexKit is driven by **Tantivy**, a high-performance, Lucene-like search engine written in Rust.
+
+### Index Compilation & Compaction:
+- **Segment Compaction**: When documents are inserted, Tantivy creates small "segments" on disk. To maintain low-latency query results, Tantivy periodically merges these segments into larger ones. You can manually force complete index compaction and segment pruning by invoking the `/admin/collections/{id}/reindex` endpoint.
+- **Memory Tuning**: Tantivy utilizes a memory index buffer for write operations. In high-concurrency write environments, increase the indexing buffer limit in your `.env` config file:
+  ```env
+  TANTIVY_INDEXING_BUDGET_MB=64
+  ```
+
+---
+
+## 5. SQLite Write WAL Batching & Concurrency
+
+SQLite traditionally allows multiple simultaneous readers, but blocks them during a write operation. ApexKit overcomes this limitation using two advanced techniques:
+
+### 1. Write-Ahead Logging (WAL) Mode
+By enforcing `PRAGMA journal_mode = WAL` and `PRAGMA synchronous = NORMAL`, readers can continue accessing the database without being blocked while a write is committed.
+
+### 2. WriteManager Batching Queue
+To maximize write throughput and eliminate database locking contention, all write operations (`INSERT`, `UPDATE`, `DELETE`) are processed through ApexKit's `WriteManager` channel batcher. Writes are queued, scheduled, and committed sequentially through dedicated write threads, allowing hundreds of concurrent clients to submit changes without ever hitting a `SQLITE_BUSY` lock.
+
+---
+
+## 6. Master-Replica gRPC Replication
+
+For horizontal scaling, ApexKit supports a low-latency, real-time Master-Replica replication model utilizing high-performance gRPC channels.
+
+```mermaid
+graph TD
+    Client[Write Request] -->|1| Master[ApexKit Master Node]
+    Master -->|2. Commit WAL Frame| LocalDb[(Local SQLite)]
+    Master -->|3. Stream WAL Changeset| grpc[gRPC stream: ExecuteWrite]
+    grpc -->|4. Apply Changset| Replica1[Replica Node 1]
+    grpc -->|4. Apply Changset| Replica2[Replica Node 2]
+    Replica1 -->|5. Serve Read Queries| RClient[Reader Client]
+```
+
+### Key Replication Dynamics:
+- **gRPC Snapshots**: Replicas download raw SQLite database snapshots directly from the Master over gRPC during startup.
+- **Changeset Streaming**: The Master hooks into SQLite's WAL session changesets, streaming incremental binary differences over gRPC connections in real-time.
+- **Write Forwarding**: Replicas act as read-only caches. If a Replica receives a write request, it automatically forwards it via gRPC to the Master, which commits the write and streams the resulting changesets back to all Replicas.
+- **Configuration**:
+  - **Master**: Run with an `APEXKIT_MASTER_KEY` environment secret.
+  - **Replica**: Point to the Master endpoint using `APEX_MASTER_URL=http://<master_ip>:<port>` and authenticate with the matching `APEXKIT_MASTER_KEY`.
