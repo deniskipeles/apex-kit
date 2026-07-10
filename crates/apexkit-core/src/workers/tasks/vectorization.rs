@@ -14,6 +14,35 @@ pub async fn handle_generate_embedding(
     content_type: String,
     model: Option<String>,
 ) -> Result<(), String> {
+    // --- VERIFY VECTOR QUOTA ---
+    if let Some(tid) = &tenant_id {
+        if let Some((root_db, _)) = resolver.resolve(None).await {
+            if tid.starts_with("session_") {
+                let sid = tid.replace("session_", "");
+                let sandboxes = root_db.list_sandboxes(None).await.unwrap_or_default();
+                if let Some(sb) = sandboxes.iter().find(|s| s.id == sid) {
+                    if sb.current_vectors >= sb.max_vectors {
+                        return Err(format!(
+                            "Sandbox {} vector limit exceeded ({} max)",
+                            sid, sb.max_vectors
+                        ));
+                    }
+                }
+            } else {
+                let tenants = root_db.list_tenants().await.unwrap_or_default();
+                if let Some(t) = tenants.iter().find(|t| &t.id == tid) {
+                    if t.stats.vector_count >= t.stats.max_vectors {
+                        return Err(format!(
+                            "Tenant {} vector limit exceeded ({} max)",
+                            tid, t.stats.max_vectors
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // ----------------------------
+
     if let Some((db, vector_provider)) = resolver.resolve(tenant_id.as_deref()).await {
         let mut is_image_embedding = false;
 

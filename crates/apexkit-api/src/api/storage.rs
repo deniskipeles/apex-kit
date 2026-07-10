@@ -1,5 +1,5 @@
 use crate::hooks::trigger_void_hook;
-use crate::utils::extract_log_meta;
+use crate::utils::{check_storage_quota, extract_log_meta};
 use axum::extract::ConnectInfo;
 use axum::{
     Extension, Json,
@@ -853,6 +853,7 @@ pub async fn upload_file(
     }
 
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+    check_storage_quota(&state, &event_scope).await?;
 
     trigger_void_hook(
         &state,

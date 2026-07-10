@@ -118,6 +118,11 @@ pub trait VectorProvider: Send + Sync {
     fn get_and_reset_metrics(&self) -> u64 {
         0
     }
+
+    /// Returns the current number of embedding requests without resetting.
+    fn get_metrics(&self) -> u64 {
+        0
+    }
 }
 
 /// Operations for registering, retrieving, and organizing data schemas and tables.

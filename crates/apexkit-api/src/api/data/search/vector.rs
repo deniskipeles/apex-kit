@@ -1,4 +1,4 @@
-use crate::utils::resolve_vector_provider_from_scope;
+use crate::utils::{check_ai_quota, resolve_vector_provider_from_scope};
 use crate::{AppError, AppState, DatabaseConnection, IdPath, RecordResponse};
 use crate::{BaseUrl, RecordListResponse};
 use crate::{
@@ -236,6 +236,7 @@ pub async fn query_vector_with_text(
     }
 
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    check_ai_quota(&state, &event_scope).await?;
     let vector_provider = resolve_vector_provider_from_scope(&state, &event_scope).await?;
 
     let query_vector = vector_provider
@@ -377,6 +378,7 @@ pub async fn query_image_vector_search(
     }
 
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    check_ai_quota(&state, &event_scope).await?;
     let vector_provider = resolve_vector_provider_from_scope(&state, &event_scope).await?;
 
     let query_vector = vector_provider
@@ -486,6 +488,7 @@ pub async fn query_text_image_vector_search(
     }
 
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    check_ai_quota(&state, &event_scope).await?;
     let vector_provider = resolve_vector_provider_from_scope(&state, &event_scope).await?;
 
     let query_vector = vector_provider

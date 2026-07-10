@@ -16,9 +16,38 @@ use apexkit_core::{
 use async_graphql::dataloader::*;
 use async_graphql::extensions::Analyzer;
 use async_graphql::{Value as GqlValue, dynamic::*};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::info;
+
+// --- COLLISION TRACKER HELPER ---
+// Ensures we never panic on "Field already exists". If a collision occurs,
+// it preserves the data by appending the requested suffix (e.g. __rrc_list1)
+fn get_unique_field_name(
+    object_name: &str,
+    desired_name: &str,
+    tracker: &mut HashMap<String, HashSet<String>>,
+) -> String {
+    let set = tracker.entry(object_name.to_string()).or_default();
+    if set.insert(desired_name.to_string()) {
+        return desired_name.to_string();
+    }
+
+    let mut counter = 1;
+    loop {
+        let candidate = format!("{}___rrc_list{}", desired_name, counter);
+        if set.insert(candidate.clone()) {
+            tracing::warn!(
+                "⚠️ [GraphQL] Field '{}' conflicted on object '{}'. Renamed to '{}' to prevent data loss.",
+                desired_name,
+                object_name,
+                candidate
+            );
+            return candidate;
+        }
+        counter += 1;
+    }
+}
 
 // --- SCHEMA BUILDER ---
 
@@ -46,7 +75,7 @@ pub async fn build_schema(
         .map(|c| (c.id.to_string(), c.name.clone()))
         .collect();
 
-    // 0. FETCH USER POLICIES (With Robust Double-Serialization Parsing)
+    // 0. FETCH USER POLICIES
     let policy_users_json = state.db.get_config("policy_users").await.unwrap_or(None);
     let user_read_policy = if let Some(val) = policy_users_json {
         let parsed_val = match val {
@@ -65,6 +94,9 @@ pub async fn build_schema(
     } else {
         "admin || owner:id".to_string()
     };
+
+    // --- FIELD TRACKER ---
+    let mut field_tracker: HashMap<String, HashSet<String>> = HashMap::new();
 
     // --- 1. PRE-CALCULATE REVERSE RELATIONS & TARGET POLICIES ---
 
@@ -122,45 +154,48 @@ pub async fn build_schema(
     let mut user_object = Object::new("_AuthUser");
     let mut collection_objects: HashMap<String, Object> = HashMap::new();
 
-    // Standard System Fields (Prefix with _)
-    query_root = query_root.field(Field::new(
-        "_status",
-        TypeRef::named(TypeRef::STRING),
-        |_| FieldFuture::new(async { Ok(Some(GqlValue::from("ApexKit is running"))) }),
-    ));
+    // Standard System Fields
+    let fname = get_unique_field_name("Query", "_status", &mut field_tracker);
+    query_root = query_root.field(Field::new(fname, TypeRef::named(TypeRef::STRING), |_| {
+        FieldFuture::new(async { Ok(Some(GqlValue::from("ApexKit is running"))) })
+    }));
 
-    mutation_root =
-        mutation_root.field(Field::new("_ping", TypeRef::named(TypeRef::STRING), |_| {
-            FieldFuture::new(async { Ok(Some(GqlValue::from("pong"))) })
-        }));
+    let fname = get_unique_field_name("Mutation", "_ping", &mut field_tracker);
+    mutation_root = mutation_root.field(Field::new(fname, TypeRef::named(TypeRef::STRING), |_| {
+        FieldFuture::new(async { Ok(Some(GqlValue::from("pong"))) })
+    }));
 
-    user_object = user_object
-        .field(Field::new("id", TypeRef::named_nn(TypeRef::ID), |ctx| {
+    let fname = get_unique_field_name("_AuthUser", "id", &mut field_tracker);
+    user_object = user_object.field(Field::new(fname, TypeRef::named_nn(TypeRef::ID), |ctx| {
+        FieldFuture::new(async move {
+            let u = ctx.parent_value.try_downcast_ref::<User>()?;
+            Ok(Some(GqlValue::from(u.id.to_string())))
+        })
+    }));
+
+    let fname = get_unique_field_name("_AuthUser", "email", &mut field_tracker);
+    user_object = user_object.field(Field::new(
+        fname,
+        TypeRef::named_nn(TypeRef::STRING),
+        |ctx| {
             FieldFuture::new(async move {
                 let u = ctx.parent_value.try_downcast_ref::<User>()?;
-                Ok(Some(GqlValue::from(u.id.to_string())))
+                Ok(Some(GqlValue::from(u.email.clone())))
             })
-        }))
-        .field(Field::new(
-            "email",
-            TypeRef::named_nn(TypeRef::STRING),
-            |ctx| {
-                FieldFuture::new(async move {
-                    let u = ctx.parent_value.try_downcast_ref::<User>()?;
-                    Ok(Some(GqlValue::from(u.email.clone())))
-                })
-            },
-        ))
-        .field(Field::new(
-            "role",
-            TypeRef::named_nn(TypeRef::STRING),
-            |ctx| {
-                FieldFuture::new(async move {
-                    let u = ctx.parent_value.try_downcast_ref::<User>()?;
-                    Ok(Some(GqlValue::from(u.role.clone())))
-                })
-            },
-        ));
+        },
+    ));
+
+    let fname = get_unique_field_name("_AuthUser", "role", &mut field_tracker);
+    user_object = user_object.field(Field::new(
+        fname,
+        TypeRef::named_nn(TypeRef::STRING),
+        |ctx| {
+            FieldFuture::new(async move {
+                let u = ctx.parent_value.try_downcast_ref::<User>()?;
+                Ok(Some(GqlValue::from(u.role.clone())))
+            })
+        },
+    ));
 
     // --- 3. HYDRATE USER REVERSE RELATIONS ---
     for (col_id, col_name, owner_field, target_policy) in &user_reverse_fields {
@@ -169,16 +204,17 @@ pub async fn build_schema(
         let t_policy = target_policy.clone();
         let list_type = format!("{}List", capitalize(col_name));
 
-        // disambiguate if multiple owner fields are registered on the same collection
         let is_duplicate = *user_field_names_count.get(col_name).unwrap_or(&0) > 1;
-        let field_key = if is_duplicate {
+        let base_key = if is_duplicate {
             format!("{}_via_{}", col_name, owner_field)
         } else {
             col_name.clone()
         };
 
+        let fname = get_unique_field_name("_AuthUser", &base_key, &mut field_tracker);
+
         user_object = user_object.field(
-            Field::new(field_key, TypeRef::named(&list_type), move |ctx| {
+            Field::new(fname, TypeRef::named(&list_type), move |ctx| {
                 let s_col_id = col_id;
                 let s_owner_field = owner_field_clone.clone();
                 let policy_rule = t_policy.clone();
@@ -242,9 +278,12 @@ pub async fn build_schema(
     }
 
     let mut user_list = Object::new("_AuthUserList");
+    let fname_total = get_unique_field_name("_AuthUserList", "total", &mut field_tracker);
+    let fname_items = get_unique_field_name("_AuthUserList", "items", &mut field_tracker);
+
     user_list = user_list
         .field(Field::new(
-            "total",
+            fname_total,
             TypeRef::named_nn(TypeRef::INT),
             |ctx| {
                 FieldFuture::new(async move {
@@ -254,7 +293,7 @@ pub async fn build_schema(
             },
         ))
         .field(Field::new(
-            "items",
+            fname_items,
             TypeRef::named_nn_list("_AuthUser"),
             |ctx| {
                 FieldFuture::new(async move {
@@ -268,8 +307,10 @@ pub async fn build_schema(
     schema_builder = schema_builder.register(user_list);
 
     let u_list_policy = user_read_policy.clone();
+    let fname_users = get_unique_field_name("Query", "_users", &mut field_tracker);
+
     query_root = query_root.field(
-        Field::new("_users", TypeRef::named("_AuthUserList"), move |ctx| {
+        Field::new(fname_users, TypeRef::named("_AuthUserList"), move |ctx| {
             let state = ctx.data::<AppState>().unwrap().clone();
             let policy = u_list_policy.clone();
 
@@ -319,7 +360,6 @@ pub async fn build_schema(
     for col in &collections {
         let type_name = capitalize(&col.name);
         let col_id = col.id;
-        let _col_name = col.name.clone();
 
         let mut object = Object::new(&type_name);
 
@@ -347,12 +387,17 @@ pub async fn build_schema(
             .map(|s| s.policies.delete.clone())
             .unwrap_or("admin".to_string());
 
-        object = object.field(Field::new("id", TypeRef::named_nn(TypeRef::ID), |ctx| {
-            FieldFuture::new(async move {
-                let record = ctx.parent_value.try_downcast_ref::<Record>()?;
-                Ok(Some(GqlValue::from(record.id.to_string())))
-            })
-        }));
+        let fname_id = get_unique_field_name(&type_name, "id", &mut field_tracker);
+        object = object.field(Field::new(
+            fname_id,
+            TypeRef::named_nn(TypeRef::ID),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let record = ctx.parent_value.try_downcast_ref::<Record>()?;
+                    Ok(Some(GqlValue::from(record.id.to_string())))
+                })
+            },
+        ));
 
         let create_input_name = format!("Create{}Input", type_name);
         let update_input_name = format!("Update{}Input", type_name);
@@ -371,18 +416,18 @@ pub async fn build_schema(
 
                 let name_clone = field_name.clone();
                 let is_owner = def.r#type == FieldType::Owner;
+                let fname = get_unique_field_name(&type_name, field_name, &mut field_tracker);
 
                 if is_owner {
                     let u_read_policy = user_read_policy.clone();
 
-                    let field = Field::new(field_name, TypeRef::named("_AuthUser"), move |ctx| {
+                    let field = Field::new(fname, TypeRef::named("_AuthUser"), move |ctx| {
                         let name = name_clone.clone();
                         let policy_rule = u_read_policy.clone();
 
                         FieldFuture::new(async move {
                             let record = ctx.parent_value.try_downcast_ref::<Record>()?;
 
-                            // [FIXED] Robust ID Extractor (Supports Int, Float and String representations from DB)
                             let user_id = record
                                 .data
                                 .get(&name)
@@ -437,7 +482,7 @@ pub async fn build_schema(
                         FieldType::Json => "JSON",
                         _ => TypeRef::STRING,
                     };
-                    let field = Field::new(field_name, TypeRef::named(gql_type), move |ctx| {
+                    let field = Field::new(fname, TypeRef::named(gql_type), move |ctx| {
                         let name = name_clone.clone();
                         FieldFuture::new(async move {
                             let record = ctx.parent_value.try_downcast_ref::<Record>()?;
@@ -490,7 +535,9 @@ pub async fn build_schema(
                     TypeRef::named(&target_type_name)
                 };
 
-                let field = Field::new(rel_name, type_ref, move |ctx| {
+                let fname = get_unique_field_name(&type_name, rel_name, &mut field_tracker);
+
+                let field = Field::new(fname, type_ref, move |ctx| {
                     let r_name = r_name.clone();
                     let t_col_name = t_col_name.clone();
                     let policy_rule = target_read_policy.clone();
@@ -578,14 +625,16 @@ pub async fn build_schema(
                 let list_type = format!("{}List", capitalize(origin_col_name));
 
                 let is_duplicate = *field_names_count.get(origin_col_name).unwrap_or(&0) > 1;
-                let field_key = if is_duplicate {
+                let base_key = if is_duplicate {
                     format!("{}_via_{}", origin_col_name, rel_field)
                 } else {
                     origin_col_name.clone()
                 };
 
+                let fname = get_unique_field_name(&type_name, &base_key, &mut field_tracker);
+
                 object = object.field(
-                    Field::new(field_key, TypeRef::named(&list_type), move |ctx| {
+                    Field::new(fname, TypeRef::named(&list_type), move |ctx| {
                         let s_col_id = origin_col_id;
                         let s_rel_field = rel_field_clone.clone();
                         let policy_rule = o_policy.clone();
@@ -670,8 +719,10 @@ pub async fn build_schema(
         // List Type
         let list_type_name = format!("{}List", type_name);
         let mut list_object = Object::new(&list_type_name);
+
+        let fname_total = get_unique_field_name(&list_type_name, "total", &mut field_tracker);
         list_object = list_object.field(Field::new(
-            "total",
+            fname_total,
             TypeRef::named_nn(TypeRef::INT),
             |ctx| {
                 FieldFuture::new(async move {
@@ -680,8 +731,10 @@ pub async fn build_schema(
                 })
             },
         ));
+
+        let fname_items = get_unique_field_name(&list_type_name, "items", &mut field_tracker);
         list_object = list_object.field(Field::new(
-            "items",
+            fname_items,
             TypeRef::named_nn_list(&type_name),
             move |ctx| {
                 FieldFuture::new(async move {
@@ -701,7 +754,8 @@ pub async fn build_schema(
         let query_name = col.name.clone();
         let policy_clone = read_policy.clone();
 
-        let list_field = Field::new(query_name, TypeRef::named(&list_type_name), move |ctx| {
+        let fname_q = get_unique_field_name("Query", &query_name, &mut field_tracker);
+        let list_field = Field::new(fname_q, TypeRef::named(&list_type_name), move |ctx| {
             let state = ctx.data::<AppState>().unwrap().clone();
 
             FieldFuture::new({
@@ -757,7 +811,8 @@ pub async fn build_schema(
         let c_schema = col.schema.clone().unwrap_or_default();
         let c_col_id = col_id;
 
-        let create_mutation = Field::new(create_name, TypeRef::named(&type_name), move |ctx| {
+        let fname_c = get_unique_field_name("Mutation", &create_name, &mut field_tracker);
+        let create_mutation = Field::new(fname_c, TypeRef::named(&type_name), move |ctx| {
             let state = ctx.data::<AppState>().unwrap().clone();
             let claims = ctx.data::<Claims>().ok().cloned();
             let p = c_policy.clone();
@@ -804,7 +859,8 @@ pub async fn build_schema(
         let u_policy = update_policy.clone();
         let u_col_id = col_id;
 
-        let update_mutation = Field::new(update_name, TypeRef::named(&type_name), move |ctx| {
+        let fname_u = get_unique_field_name("Mutation", &update_name, &mut field_tracker);
+        let update_mutation = Field::new(fname_u, TypeRef::named(&type_name), move |ctx| {
             let state = ctx.data::<AppState>().unwrap().clone();
             let claims = ctx.data::<Claims>().ok().cloned();
             let p = u_policy.clone();
@@ -858,44 +914,44 @@ pub async fn build_schema(
         let d_policy = delete_policy.clone();
         let d_col_id = col_id;
 
-        let delete_mutation =
-            Field::new(delete_name, TypeRef::named(TypeRef::BOOLEAN), move |ctx| {
-                let state = ctx.data::<AppState>().unwrap().clone();
-                let claims = ctx.data::<Claims>().ok().cloned();
-                let p = d_policy.clone();
+        let fname_d = get_unique_field_name("Mutation", &delete_name, &mut field_tracker);
+        let delete_mutation = Field::new(fname_d, TypeRef::named(TypeRef::BOOLEAN), move |ctx| {
+            let state = ctx.data::<AppState>().unwrap().clone();
+            let claims = ctx.data::<Claims>().ok().cloned();
+            let p = d_policy.clone();
 
-                FieldFuture::new(async move {
-                    let id_str: String = ctx
-                        .args
-                        .get("id")
-                        .and_then(|v| v.string().ok().map(|s| s.to_string()))
-                        .ok_or(async_graphql::Error::new("ID required"))?;
+            FieldFuture::new(async move {
+                let id_str: String = ctx
+                    .args
+                    .get("id")
+                    .and_then(|v| v.string().ok().map(|s| s.to_string()))
+                    .ok_or(async_graphql::Error::new("ID required"))?;
 
-                    let id = id_str
-                        .parse::<i64>()
-                        .map_err(|_| async_graphql::Error::new("Invalid ID format"))?;
+                let id = id_str
+                    .parse::<i64>()
+                    .map_err(|_| async_graphql::Error::new("Invalid ID format"))?;
 
-                    let existing = state
-                        .db
-                        .get_record(d_col_id, id, None)
-                        .await
-                        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                        .ok_or(async_graphql::Error::new("Record not found"))?;
+                let existing = state
+                    .db
+                    .get_record(d_col_id, id, None)
+                    .await
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                    .ok_or(async_graphql::Error::new("Record not found"))?;
 
-                    if !policies::check_access(&p, claims.as_ref(), Some(&existing.data)) {
-                        return Err(async_graphql::Error::new("Forbidden: Delete denied"));
-                    }
+                if !policies::check_access(&p, claims.as_ref(), Some(&existing.data)) {
+                    return Err(async_graphql::Error::new("Forbidden: Delete denied"));
+                }
 
-                    state
-                        .db
-                        .delete_record(d_col_id, id)
-                        .await
-                        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                state
+                    .db
+                    .delete_record(d_col_id, id)
+                    .await
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-                    Ok(Some(FieldValue::owned_any(true)))
-                })
+                Ok(Some(FieldValue::owned_any(true)))
             })
-            .argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID)));
+        })
+        .argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID)));
         mutation_root = mutation_root.field(delete_mutation);
     }
 
@@ -911,9 +967,11 @@ pub async fn build_schema(
             let args_def = config.args.clone().unwrap_or_default();
             let return_type = map_type_ref(&config.return_type);
 
-            let field_name = config.name.clone();
+            // Create Field
+            let parent_obj_name = config.parent.clone();
+            let fname = get_unique_field_name(&parent_obj_name, &config.name, &mut field_tracker);
 
-            let mut field = Field::new(field_name, return_type, move |ctx| {
+            let mut field = Field::new(fname, return_type, move |ctx| {
                 let s_name = script_name.clone();
                 let a_def = args_def.clone();
                 FieldFuture::new(async move {
@@ -980,10 +1038,16 @@ pub async fn build_schema(
                 }
             }
 
-            match config.parent.as_str() {
-                "Query" => query_root = query_root.field(field),
-                "Mutation" => mutation_root = mutation_root.field(field),
-                "User" | "_AuthUser" => user_object = user_object.field(field),
+            match parent_obj_name.as_str() {
+                "Query" => {
+                    query_root = query_root.field(field);
+                }
+                "Mutation" => {
+                    mutation_root = mutation_root.field(field);
+                }
+                "User" | "_AuthUser" => {
+                    user_object = user_object.field(field);
+                }
                 other => {
                     if let Some(obj) = collection_objects.get_mut(other) {
                         let new_obj = std::mem::replace(obj, Object::new(other));

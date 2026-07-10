@@ -15,6 +15,9 @@ pub fn register_ai(ctx: &mut Context) -> Result<(), String> {
         let res = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, _, _, _)) = &*c.borrow() {
                 handle.block_on(async {
+                    // Verify Quota first
+                    app.check_quota("ai").await.map_err(|e| e.to_string())?;
+
                     let provider = app.get_scoped_vector_provider().await;
                     provider.embed(&text).await
                 })

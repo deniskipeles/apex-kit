@@ -83,7 +83,13 @@ pub async fn tenant_resolver_middleware(
         }
 
         if tenant_id.is_empty() {
-            if !root_domain.is_empty() && host == root_domain {
+            // Check if host is a raw IP Address or "localhost" to prevent wrong subdomain parsing
+            let is_ip_or_localhost =
+                host == "localhost" || host.parse::<std::net::IpAddr>().is_ok();
+
+            if is_ip_or_localhost {
+                tenant_id = String::new();
+            } else if !root_domain.is_empty() && host == root_domain {
                 tenant_id = String::new();
             } else {
                 let parts: Vec<&str> = host.split('.').collect();

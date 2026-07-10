@@ -129,6 +129,10 @@ impl VectorProvider for ApexBridge {
     fn get_and_reset_metrics(&self) -> u64 {
         self.ai_request_counter.swap(0, Ordering::Relaxed)
     }
+
+    fn get_metrics(&self) -> u64 {
+        self.ai_request_counter.load(Ordering::Relaxed)
+    }
 }
 
 pub struct FallbackVectorProvider;

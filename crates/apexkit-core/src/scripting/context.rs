@@ -32,6 +32,10 @@ pub trait ScriptContext: Send + Sync {
     fn get_scoped_vector_provider(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Arc<dyn VectorProvider>> + Send>>;
+    fn check_quota(
+        &self,
+        metric: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
     fn get_shared_script(
         &self,
         name: &str,

@@ -272,3 +272,91 @@ pub async fn sandbox_scalar_html(Path(params): Path<HashMap<String, String>>) ->
     );
     axum::response::Html(html)
 }
+
+// Verify real-time storage bounds before file write commits
+pub async fn check_storage_quota(state: &AppState, scope: &EventScope) -> Result<(), AppError> {
+    match scope {
+        EventScope::Root => Ok(()),
+        EventScope::Tenant(id) => {
+            let tenants = state
+                .db
+                .list_tenants()
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+            if let Some(t) = tenants.iter().find(|t| &t.id == id) {
+                if t.stats.storage_mb >= t.stats.max_storage_mb as f64 {
+                    return Err(AppError::Forbidden(format!(
+                        "Tenant storage quota exceeded ({} MB max)",
+                        t.stats.max_storage_mb
+                    )));
+                }
+            }
+            Ok(())
+        }
+        EventScope::Sandbox(id) => {
+            let sandboxes = state
+                .db
+                .list_sandboxes(None)
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+            if let Some(sb) = sandboxes.iter().find(|s| &s.id == id) {
+                if sb.current_storage_mb >= sb.max_storage_mb as f64 {
+                    return Err(AppError::Forbidden(format!(
+                        "Sandbox storage quota exceeded ({} MB max)",
+                        sb.max_storage_mb
+                    )));
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// Verify real-time AI quota (Aggregated persistent database + live active memory)
+pub async fn check_ai_quota(state: &AppState, scope: &EventScope) -> Result<(), AppError> {
+    match scope {
+        EventScope::Root => Ok(()),
+        EventScope::Tenant(id) => {
+            let tenants = state
+                .db
+                .list_tenants()
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+            if let Some(t) = tenants.iter().find(|t| &t.id == id) {
+                let mut live_requests = 0;
+                if let Ok(ctx) = state.tenant_manager.get_tenant_context(id).await {
+                    live_requests = ctx.vector_provider.get_metrics() as i64;
+                }
+                if t.stats.ai_requests + live_requests >= t.stats.max_ai_requests {
+                    return Err(AppError::Forbidden(format!(
+                        "Tenant AI request limit exceeded ({} max per 30m)",
+                        t.stats.max_ai_requests
+                    )));
+                }
+            }
+            Ok(())
+        }
+        EventScope::Sandbox(id) => {
+            let sandboxes = state
+                .db
+                .list_sandboxes(None)
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+            if let Some(sb) = sandboxes.iter().find(|s| &s.id == id) {
+                let mut live_requests = 0;
+                if let Ok(ctx) = state.sandbox_manager.get_sandbox_context(id).await {
+                    live_requests = ctx.vector_provider.get_metrics() as i64;
+                }
+                if sb.current_ai_requests + live_requests >= sb.max_ai_requests {
+                    return Err(AppError::Forbidden(format!(
+                        "Sandbox AI request limit exceeded ({} max per 30m)",
+                        sb.max_ai_requests
+                    )));
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}

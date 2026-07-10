@@ -126,6 +126,26 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
         })
     }
 
+    fn check_quota(
+        &self,
+        metric: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        let state = self.state.clone();
+        let scope = self.scope.clone();
+        let metric_str = metric.to_string();
+
+        Box::pin(async move {
+            if metric_str == "ai" {
+                match crate::utils::check_ai_quota(&state, &scope).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e.to_string()),
+                }
+            } else {
+                Ok(())
+            }
+        })
+    }
+
     fn get_shared_script(
         &self,
         name: &str,
