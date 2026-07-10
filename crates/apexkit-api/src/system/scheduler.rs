@@ -12,6 +12,24 @@ pub struct SchedulerService {
     scheduler: JobScheduler,
 }
 
+fn calculate_dir_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut total_size = 0;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                total_size += calculate_dir_size(&entry.path())?;
+            } else {
+                total_size += metadata.len();
+            }
+        }
+    } else if path.exists() {
+        total_size = path.metadata()?.len();
+    }
+    Ok(total_size)
+}
+
 impl SchedulerService {
     pub async fn new() -> Self {
         let scheduler = JobScheduler::new().await.unwrap();
@@ -111,6 +129,192 @@ impl SchedulerService {
             })
         });
         if let Ok(j) = sandbox_ticker {
+            self.scheduler.add(j).await.ok();
+        }
+
+        // ---------------------------------------------------------
+        // 4. RESOURCE ANALYTICS (Tenants & Sandboxes)
+        // ---------------------------------------------------------
+        let state_analytics = state.clone();
+
+        let analytics_cron = std::env::var("RESOURCE_ANALYTICS_CRON")
+            .unwrap_or_else(|_| "0 */30 * * * *".to_string());
+        let window_mins =
+            std::env::var("RESOURCE_ANALYTICS_WINDOW_MINS").unwrap_or_else(|_| "30".to_string());
+        let log_penalty_threshold: i64 = std::env::var("SYSTEM_LOGS_PENALTY_THRESHOLD")
+            .unwrap_or_else(|_| "1000".to_string())
+            .parse()
+            .unwrap_or(1000);
+
+        let analytics_job = Job::new_async(analytics_cron.as_str(), move |_uuid, _l| {
+            let s = state_analytics.clone();
+            let window = window_mins.clone();
+            let threshold = log_penalty_threshold;
+
+            Box::pin(async move {
+                tracing::info!("[Root] Running Resource Analytics for Tenants & Sandboxes...");
+
+                // --- PROCESS TENANTS ---
+                if let Ok(tenants) = s.db.list_tenants().await {
+                    for t in tenants {
+                        let base_path = format!("storage/tenants/{}", t.id);
+                        if !std::path::Path::new(&base_path).exists() {
+                            continue;
+                        }
+
+                        let mut total_bytes =
+                            calculate_dir_size(std::path::Path::new(&base_path)).unwrap_or(0);
+
+                        // Logs.db is free from quotas by default (to exclude audit logs)
+                        let logs_db_path = format!("{}/logs.db", base_path);
+                        if let Ok(meta) = std::fs::metadata(&logs_db_path) {
+                            total_bytes = total_bytes.saturating_sub(meta.len());
+
+                            if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                                &logs_db_path,
+                                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                            ) {
+                                // Check if tenant is dumping unreasonable amounts of system logs in the time window
+                                let query = format!(
+                                    "SELECT COUNT(*) FROM _system_logs WHERE timestamp >= datetime('now', '-{} minute')",
+                                    window
+                                );
+                                let recent_sys_logs: i64 =
+                                    conn.query_row(&query, [], |r| r.get(0)).unwrap_or(0);
+
+                                // Penalize by adding the physical footprint of the system logs back to their storage total
+                                if recent_sys_logs > threshold {
+                                    if let Ok(sys_size) = conn.query_row("SELECT COALESCE(SUM(length(level) + length(target) + length(message) + 50), 0) FROM _system_logs", [], |r| r.get::<_, i64>(0)) {
+                                        total_bytes += sys_size.max(0) as u64;
+                                    }
+                                }
+                            }
+                        }
+
+                        let current_storage_mb = (total_bytes as f64) / (1024.0 * 1024.0);
+                        let mut current_vectors = 0;
+                        let mut current_ai_requests = 0;
+
+                        // Calculate Vectors
+                        let vec_db_path = format!("{}/vectors.db", base_path);
+                        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                            &vec_db_path,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        ) {
+                            current_vectors = conn
+                                .query_row("SELECT COUNT(*) FROM vectors", [], |r| {
+                                    r.get::<_, i64>(0)
+                                })
+                                .unwrap_or(0);
+
+                            // 1. Add Database-persisted vector generations in window
+                            let ai_query = format!(
+                                "SELECT COUNT(*) FROM vectors WHERE created_at >= datetime('now', '-{} minute')",
+                                window
+                            );
+                            current_ai_requests += conn
+                                .query_row(&ai_query, [], |r| r.get::<_, i64>(0))
+                                .unwrap_or(0);
+                        }
+
+                        // 2. Add Memory-tracked API/Script search generations in window
+                        if let Ok(ctx) = s.tenant_manager.get_tenant_context(&t.id).await {
+                            current_ai_requests +=
+                                ctx.vector_provider.get_and_reset_metrics() as i64;
+                        }
+
+                        let _ =
+                            s.db.update_tenant_stats(
+                                &t.id,
+                                current_storage_mb,
+                                current_vectors,
+                                current_ai_requests,
+                            )
+                            .await;
+                    }
+                }
+
+                // --- PROCESS SANDBOXES ---
+                if let Ok(sandboxes) = s.db.list_sandboxes(None).await {
+                    for sb in sandboxes {
+                        let base_path = format!("storage/sandboxes/session_{}", sb.id);
+                        if !std::path::Path::new(&base_path).exists() {
+                            continue;
+                        }
+
+                        let mut total_bytes =
+                            calculate_dir_size(std::path::Path::new(&base_path)).unwrap_or(0);
+
+                        // Penalize system logs, exclude audit logs
+                        let logs_db_path = format!("{}/logs.db", base_path);
+                        if let Ok(meta) = std::fs::metadata(&logs_db_path) {
+                            total_bytes = total_bytes.saturating_sub(meta.len());
+                            if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                                &logs_db_path,
+                                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                            ) {
+                                let query = format!(
+                                    "SELECT COUNT(*) FROM _system_logs WHERE timestamp >= datetime('now', '-{} minute')",
+                                    window
+                                );
+                                let recent_sys_logs: i64 =
+                                    conn.query_row(&query, [], |r| r.get(0)).unwrap_or(0);
+
+                                if recent_sys_logs > threshold {
+                                    if let Ok(sys_size) = conn.query_row("SELECT COALESCE(SUM(length(level) + length(target) + length(message) + 50), 0) FROM _system_logs", [], |r| r.get::<_, i64>(0)) {
+                                        total_bytes += sys_size.max(0) as u64;
+                                    }
+                                }
+                            }
+                        }
+
+                        let current_storage_mb = (total_bytes as f64) / (1024.0 * 1024.0);
+
+                        let mut current_vectors = 0;
+                        let mut current_ai_requests = 0;
+
+                        // Calculate Vectors
+                        let vec_db_path = format!("{}/vectors.db", base_path);
+                        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                            &vec_db_path,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        ) {
+                            current_vectors = conn
+                                .query_row("SELECT COUNT(*) FROM vectors", [], |r| {
+                                    r.get::<_, i64>(0)
+                                })
+                                .unwrap_or(0);
+
+                            // 1. Add Database-persisted vector generations in window
+                            let ai_query = format!(
+                                "SELECT COUNT(*) FROM vectors WHERE created_at >= datetime('now', '-{} minute')",
+                                window
+                            );
+                            current_ai_requests += conn
+                                .query_row(&ai_query, [], |r| r.get::<_, i64>(0))
+                                .unwrap_or(0);
+                        }
+
+                        // 2. Add Memory-tracked API/Script search generations in window
+                        if let Ok(ctx) = s.sandbox_manager.get_sandbox_context(&sb.id).await {
+                            current_ai_requests +=
+                                ctx.vector_provider.get_and_reset_metrics() as i64;
+                        }
+
+                        let _ =
+                            s.db.update_sandbox_stats(
+                                &sb.id,
+                                current_storage_mb,
+                                current_vectors,
+                                current_ai_requests,
+                            )
+                            .await;
+                    }
+                }
+            })
+        });
+
+        if let Ok(j) = analytics_job {
             self.scheduler.add(j).await.ok();
         }
     }

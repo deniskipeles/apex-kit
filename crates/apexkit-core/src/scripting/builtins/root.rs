@@ -87,9 +87,35 @@ pub fn register_root(ctx: &mut Context) -> Result<(), String> {
                             .await
                             .map_err(|e| e.to_string())?;
 
+                        // --- FETCH GLOBAL LIMITS ---
+                        let general_config =
+                            app.get_db().get_config("general").await.unwrap_or_default();
+                        let max_storage_mb = general_config
+                            .as_ref()
+                            .and_then(|v| v.get("max_sandbox_storage_mb").and_then(|n| n.as_i64()))
+                            .unwrap_or(100);
+                        let max_vectors = general_config
+                            .as_ref()
+                            .and_then(|v| v.get("max_sandbox_vectors").and_then(|n| n.as_i64()))
+                            .unwrap_or(10000);
+                        let max_ai_requests = general_config
+                            .as_ref()
+                            .and_then(|v| v.get("max_sandbox_ai_requests").and_then(|n| n.as_i64()))
+                            .unwrap_or(100);
+
                         // 2. Register Metadata
                         app.get_db()
-                            .register_sandbox(&id, owner_id, name, expires_at, "root", None)
+                            .register_sandbox(
+                                &id,
+                                owner_id,
+                                name,
+                                expires_at,
+                                "root",
+                                None,
+                                max_storage_mb,
+                                max_vectors,
+                                max_ai_requests,
+                            )
                             .await
                             .map_err(|e| e.to_string())?;
 

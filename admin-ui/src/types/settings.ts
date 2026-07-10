@@ -131,6 +131,9 @@ export interface AppSettings {
   security: SecurityConfig;
   logRetentionDays: number;
   maxSiteSizeMb?: number;
+  maxSandboxStorageMb?: number;
+  maxSandboxVectors?: number;
+  maxSandboxAiRequests?: number;
   ai: AIProvider;
 }
 
@@ -161,4 +164,8 @@ export interface SandboxMetadata {
   tenant_id: string | null;
   current_storage_mb: number;
   max_storage_mb: number;
+  current_vectors: number;
+  max_vectors: number;
+  current_ai_requests: number;
+  max_ai_requests: number;
 }

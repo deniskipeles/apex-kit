@@ -12,6 +12,9 @@ const mapToFrontend = (apiData: any): AppSettings => {
     logoHeight: apiData.logo_height || '',
     logRetentionDays: apiData.log_retention_days || 30,
     maxSiteSizeMb: apiData.max_site_size_mb || 5,
+    maxSandboxStorageMb: apiData.max_sandbox_storage_mb || 100,
+    maxSandboxVectors: apiData.max_sandbox_vectors || 1000,
+    maxSandboxAiRequests: apiData.max_sandbox_ai_requests || 100,
     smtp: {
       enabled: apiData.smtp?.enabled || false,
       blockSmtp: apiData.smtp?.block_smtp || false, // <--- NEW MAPPING
@@ -80,6 +83,9 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
   if (settings.logRetentionDays !== undefined)
     payload.log_retention_days = settings.logRetentionDays;
   if (settings.maxSiteSizeMb !== undefined) payload.max_site_size_mb = settings.maxSiteSizeMb;
+  if (settings.maxSandboxStorageMb !== undefined) payload.max_sandbox_storage_mb = settings.maxSandboxStorageMb;
+  if (settings.maxSandboxVectors !== undefined) payload.max_sandbox_vectors = settings.maxSandboxVectors;
+  if (settings.maxSandboxAiRequests !== undefined) payload.max_sandbox_ai_requests = settings.maxSandboxAiRequests;
 
   if (settings.smtp) {
     payload.smtp = {

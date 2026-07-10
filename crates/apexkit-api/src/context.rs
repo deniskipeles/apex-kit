@@ -95,6 +95,37 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
         self.scope.clone()
     }
 
+    fn get_scoped_vector_provider(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Arc<dyn VectorProvider>> + Send>> {
+        let tm = self.state.tenant_manager.clone();
+        let sm = self.state.sandbox_manager.clone();
+        let root_vp = self.state.vector_provider.clone();
+        let scope = self.scope.clone();
+
+        Box::pin(async move {
+            match scope {
+                EventScope::Root => root_vp,
+                EventScope::Tenant(id) => {
+                    if let Ok(ctx) = tm.get_tenant_context(&id).await {
+                        ctx.vector_provider
+                    } else {
+                        root_vp
+                    }
+                }
+                EventScope::Sandbox(id) => {
+                    // Requires get_sandbox_context to be accessible/implemented in SandboxManager
+                    if let Ok(ctx) = sm.get_sandbox_context(&id).await {
+                        ctx.vector_provider
+                    } else {
+                        root_vp
+                    }
+                }
+                _ => root_vp,
+            }
+        })
+    }
+
     fn get_shared_script(
         &self,
         name: &str,
@@ -226,11 +257,23 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
         let db = self.state.db.clone();
         let scope = self.scope.clone();
         Box::pin(async move {
+            let general_config = db.get_config("general").await.unwrap_or_default();
+            let max_storage_mb = general_config
+                .as_ref()
+                .and_then(|v| v.get("max_sandbox_storage_mb").and_then(|n| n.as_i64()))
+                .unwrap_or(100);
+
             // Default strategy for script creation
-            sm.create_sandbox(&id, sandbox_manager::CloneStrategy::None, db, scope)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            sm.create_sandbox(
+                &id,
+                sandbox_manager::CloneStrategy::None,
+                db,
+                scope,
+                max_storage_mb,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         })
     }
 

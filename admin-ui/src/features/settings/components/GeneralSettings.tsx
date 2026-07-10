@@ -72,6 +72,9 @@ export const GeneralSettings = ({ settings, onChange, onSave }: GeneralSettingsP
         logoHeight: settings.logoHeight,
         logRetentionDays: settings.logRetentionDays,
         maxSiteSizeMb: settings.maxSiteSizeMb,
+        maxSandboxStorageMb: settings.maxSandboxStorageMb,
+        maxSandboxVectors: settings.maxSandboxVectors,
+        maxSandboxAiRequests: settings.maxSandboxAiRequests,
       });
     } finally {
       setIsSaving(false);
@@ -189,17 +192,51 @@ export const GeneralSettings = ({ settings, onChange, onSave }: GeneralSettingsP
           </div>
           {/* Max Site Size (Root Only) */}
           {isRoot && (
-            <div className="space-y-2">
-              <Label>Max Static Site Size (MB)</Label>
-              <Input
-                type="number"
-                value={settings.maxSiteSizeMb || 50}
-                onChange={(e: any) => onChange({ maxSiteSizeMb: Number(e.target.value) })}
-              />
-              <p className="text-[10px] text-muted-foreground">
-                Global limit for 'Hosting' deployments. Enforced for all tenants.
-              </p>
-            </div>
+            <>
+              <div className="space-y-2">
+                <Label>Max Static Site Size (MB)</Label>
+                <Input
+                  type="number"
+                  value={settings.maxSiteSizeMb || 50}
+                  onChange={(e: any) => onChange({ maxSiteSizeMb: Number(e.target.value) })}
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Global limit for 'Hosting' deployments. Enforced for all tenants.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label>Max Sandbox Storage (MB)</Label>
+                <Input
+                  type="number"
+                  value={settings.maxSandboxStorageMb || 100}
+                  onChange={(e: any) => onChange({ maxSandboxStorageMb: Number(e.target.value) })}
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Global limit for all Sandbox sessions.
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label>Max Sandbox Vectors</Label>
+                  <Input
+                    type="number"
+                    value={settings.maxSandboxVectors || 10000}
+                    onChange={(e: any) => onChange({ maxSandboxVectors: Number(e.target.value) })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Max Sandbox AI Requests</Label>
+                  <Input
+                    type="number"
+                    value={settings.maxSandboxAiRequests || 100}
+                    onChange={(e: any) => onChange({ maxSandboxAiRequests: Number(e.target.value) })}
+                  />
+                  <p className="text-[10px] text-muted-foreground whitespace-nowrap">
+                    Per 30min window
+                  </p>
+                </div>
+              </div>
+            </>
           )}
         </div>
 

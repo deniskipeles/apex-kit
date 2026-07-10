@@ -99,6 +99,8 @@ export const generateTypeScriptDefs = (collections: Collection[]): string => {
 
     declare const $ai: {
         embed(text: string, provider?: string): Promise<number[]>;
+        meanVector(vectors: number[][]): number[];
+        cosineSimilarity(v1: number[], v2: number[]): number;
     };
 
     declare const $env: {

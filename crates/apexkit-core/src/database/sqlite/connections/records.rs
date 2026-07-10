@@ -338,19 +338,32 @@ impl RecordStore for ApexKit {
                             Some(id) => *id == col_id,
                             None => false,
                         };
-                        
+
                         if targets_us {
                             let origin_ids: Vec<i64> = {
                                 let conn = self.get_data_read().await;
                                 let mut stmt = conn.prepare("SELECT origin_rec_id FROM _relations WHERE origin_col_id = ?1 AND target_col_id = ?2 AND target_rec_id = ?3 AND rel_name = ?4").map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                                let mut rows = stmt.query(rusqlite::params![other_col_id, col_id, rec_id, rel_name]).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                let mut rows = stmt
+                                    .query(rusqlite::params![
+                                        other_col_id,
+                                        col_id,
+                                        rec_id,
+                                        rel_name
+                                    ])
+                                    .map_err(|e| {
+                                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                                    })?;
                                 let mut ids = Vec::new();
-                                while let Some(row) = rows.next().map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)? {
-                                    ids.push(row.get(0).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?);
+                                while let Some(row) = rows.next().map_err(|e| {
+                                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                                })? {
+                                    ids.push(row.get(0).map_err(|e| {
+                                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                                    })?);
                                 }
                                 ids
                             };
-                            
+
                             for origin_rec_id in origin_ids {
                                 if !visited.contains(&(*other_col_id, origin_rec_id)) {
                                     to_delete.push((*other_col_id, origin_rec_id));
@@ -364,15 +377,30 @@ impl RecordStore for ApexKit {
 
         // Execute all collected deletions
         for (del_col_id, del_rec_id) in visited {
-            let f1 = self.data_batcher.execute("DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(), vec![del_col_id.into_val(), del_rec_id.into_val()]);
-            let f2 = self.data_batcher.execute("DELETE FROM _unique_values WHERE record_id = ?1".into(), vec![del_rec_id.into_val()]);
-            let f3 = self.data_batcher.execute("DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(), vec![del_col_id.into_val(), del_rec_id.into_val()]);
-            let f4 = self.data_batcher.execute("DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id=?2".into(), vec![del_col_id.into_val(), del_rec_id.into_val()]);
-            let f5 = self.vector_batcher.execute("DELETE FROM vectors WHERE collection_id = ?1 AND record_id = ?2".into(), vec![del_col_id.into_val(), del_rec_id.into_val()]);
+            let f1 = self.data_batcher.execute(
+                "DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(),
+                vec![del_col_id.into_val(), del_rec_id.into_val()],
+            );
+            let f2 = self.data_batcher.execute(
+                "DELETE FROM _unique_values WHERE record_id = ?1".into(),
+                vec![del_rec_id.into_val()],
+            );
+            let f3 = self.data_batcher.execute(
+                "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(),
+                vec![del_col_id.into_val(), del_rec_id.into_val()],
+            );
+            let f4 = self.data_batcher.execute(
+                "DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id=?2".into(),
+                vec![del_col_id.into_val(), del_rec_id.into_val()],
+            );
+            let f5 = self.vector_batcher.execute(
+                "DELETE FROM vectors WHERE collection_id = ?1 AND record_id = ?2".into(),
+                vec![del_col_id.into_val(), del_rec_id.into_val()],
+            );
 
             let _ = tokio::try_join!(f1, f2, f3, f4).map_err(map_err)?;
             let _ = f5.await.map_err(map_err)?;
-            
+
             // Keep Tantivy Search Engine in sync
             let _ = self.search.delete_record(del_col_id, del_rec_id);
         }

@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -47,11 +48,13 @@ pub struct SandboxContext {
 pub struct SandboxVectorProvider {
     pub embedder: Option<Arc<CandleEmbedder>>,
     pub index: Arc<VectorIndex>,
+    pub ai_request_counter: Arc<AtomicU64>,
 }
 
 #[async_trait::async_trait]
 impl VectorProvider for SandboxVectorProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.ai_request_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(embedder) = &self.embedder {
             let embedder = embedder.clone();
             let t = text.to_string();
@@ -64,6 +67,7 @@ impl VectorProvider for SandboxVectorProvider {
     }
 
     async fn embed_image(&self, base64_image: &str) -> Result<Vec<f32>, String> {
+        self.ai_request_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(embedder) = &self.embedder {
             let embedder = embedder.clone();
             let img = base64_image.to_string();
@@ -78,6 +82,7 @@ impl VectorProvider for SandboxVectorProvider {
     }
 
     async fn embed_text_for_image_search(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.ai_request_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(embedder) = &self.embedder {
             let embedder = embedder.clone();
             let txt = text.to_string();
@@ -106,6 +111,10 @@ impl VectorProvider for SandboxVectorProvider {
     async fn index(&self, c: i64, r: i64, f: &str, v: &[f32]) -> Result<(), String> {
         self.index.insert(c, r, f, v);
         Ok(())
+    }
+
+    fn get_and_reset_metrics(&self) -> u64 {
+        self.ai_request_counter.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -162,13 +171,14 @@ impl SandboxManager {
 
     /// Creates a fresh sandbox by copying the main DB schema/structure.
     /// Immediately loads it into the cache.
-    // [UPDATED] create_sandbox now takes a strategy and a source DB
+    // [UPDATED] create_sandbox now takes a strategy, source DB, and storage limit
     pub async fn create_sandbox(
         &self,
         session_id: &str,
         strategy: CloneStrategy,
         parent_db: Arc<dyn Db>,
         parent_scope: EventScope,
+        max_storage_mb: i64, // <--- NEW PARAMETER
     ) -> Result<Arc<dyn Db>, String> {
         let sandbox_dir = format!("storage/sandboxes/session_{}", session_id);
 
@@ -191,7 +201,39 @@ impl SandboxManager {
                 "Performing fast physical Full Clone for sandbox '{}'...",
                 session_id
             );
+
+            // --- ENFORCE LIMIT BEFORE COPYING ---
+            let mut total_bytes_to_copy: u64 = 0;
             let dbs_to_copy = vec!["core.db", "data.db", "system.db"];
+
+            for db_file in &dbs_to_copy {
+                let src_path = Path::new(&parent_dir).join(db_file);
+                if let Ok(meta) = std::fs::metadata(&src_path) {
+                    total_bytes_to_copy += meta.len();
+                }
+            }
+
+            let dirs_to_copy = vec!["uploads", "public"];
+            for dir in &dirs_to_copy {
+                let src_path = Path::new(&parent_dir).join(dir);
+                if src_path.exists() {
+                    total_bytes_to_copy +=
+                        apexkit_core::database::sqlite::utils::calculate_dir_size(&src_path)
+                            .unwrap_or(0);
+                }
+            }
+
+            let max_bytes = (max_storage_mb as u64) * 1024 * 1024;
+            if total_bytes_to_copy > max_bytes {
+                let _ = fs::remove_dir_all(&sandbox_dir);
+                return Err(format!(
+                    "Source data size ({:.2} MB) exceeds sandbox storage limit ({} MB). Cannot perform Full Clone.",
+                    (total_bytes_to_copy as f64) / 1024.0 / 1024.0,
+                    max_storage_mb
+                ));
+            }
+            // ------------------------------------
+
             for db_file in dbs_to_copy {
                 let src_path = Path::new(&parent_dir).join(db_file);
                 let dest_path = Path::new(&sandbox_dir).join(db_file);
@@ -202,7 +244,6 @@ impl SandboxManager {
             }
 
             // Copy uploads and public directories if they exist
-            let dirs_to_copy = vec!["uploads", "public"];
             for dir in dirs_to_copy {
                 let src_path = Path::new(&parent_dir).join(dir);
                 let dest_path = Path::new(&sandbox_dir).join(dir);
@@ -251,6 +292,7 @@ impl SandboxManager {
         let vector_provider = Arc::new(SandboxVectorProvider {
             embedder: self.shared_embedder.clone(),
             index: Arc::new(VectorIndex::new()),
+            ai_request_counter: Arc::new(AtomicU64::new(0)),
         });
 
         // Pass the forwarder here
@@ -551,6 +593,7 @@ impl SandboxManager {
         let vec_provider = Arc::new(SandboxVectorProvider {
             embedder: self.shared_embedder.clone(),
             index: vector_index.clone(),
+            ai_request_counter: Arc::new(AtomicU64::new(0)),
         });
 
         // B. Connect to SQLite Files (using rusqlite directly)

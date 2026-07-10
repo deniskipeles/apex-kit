@@ -167,4 +167,26 @@ impl TenantStore for ApexKit {
 
         Ok(size)
     }
+
+    async fn update_tenant_stats(
+        &self,
+        tenant_id: &str,
+        storage_mb: f64,
+        vectors: i64,
+        ai_requests: i64,
+    ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.core_batcher
+            .execute(
+                "UPDATE _tenants SET current_storage_mb = ?1, current_vectors = ?2, current_ai_requests = ?3 WHERE id = ?4".into(),
+                vec![
+                    storage_mb.into_val(),
+                    vectors.into_val(),
+                    ai_requests.into_val(),
+                    tenant_id.into_val(),
+                ],
+            )
+            .await
+            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn StdError + Send + Sync>)?;
+        Ok(())
+    }
 }

@@ -18,6 +18,9 @@ pub struct AppSettingsDto {
     pub logo_height: Option<String>,
     pub log_retention_days: Option<u64>,
     pub max_site_size_mb: Option<u64>,
+    pub max_sandbox_storage_mb: Option<u64>,
+    pub max_sandbox_vectors: Option<i64>,
+    pub max_sandbox_ai_requests: Option<i64>,
     pub backups: Option<BackupConfigDto>,
 }
 

@@ -75,7 +75,7 @@ export const CodeEditor = ({
                 declare const console: { log(...args: any[]): void; error(...args: any[]): void; };
                 declare const $http: { get(url: string): Promise<string>; post(url: string, body: object): Promise<string>; };
                 declare const $util: { uuid(): string; slugify(text: string): string; hash(text: string, alg: 'sha256' | 'sha512'): string; hmac(text: string, key: string): string; sleep(ms: number): Promise<void>; };
-                declare const $ai: { embed(text: string): Promise<number[]>; };
+                declare const $ai: { embed(text: string): Promise<number[]>; meanVector(vectors: number[][]): number[]; cosineSimilarity(v1: number[], v2: number[]): number; };
                 declare const $env: { get(key: string): Promise<string>; APP_URL: string; };
                 declare const $fs: { readText(filename: string): Promise<string>; };
                 interface QueryOptions { filter?: string | object; sort?: string; page?: number; per_page?: number; expand?: string; }

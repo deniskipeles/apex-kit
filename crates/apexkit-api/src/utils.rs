@@ -1,6 +1,7 @@
 use crate::ApiDoc;
 use crate::AppError;
 use crate::AppState;
+use apexkit_core::VectorProvider;
 use apexkit_core::models::Collection;
 use apexkit_core::realtime::EventScope;
 use apexkit_core::{Db, storage::StorageBackend};
@@ -103,6 +104,29 @@ pub async fn resolve_db_from_scope(
             .await
             .map_err(AppError::UnknownError),
         _ => Ok(state.db.clone()),
+    }
+}
+
+// Helper to resolve the scoped Vector Provider (async)
+pub async fn resolve_vector_provider_from_scope(
+    state: &AppState,
+    scope: &EventScope,
+) -> Result<Arc<dyn VectorProvider>, AppError> {
+    match scope {
+        EventScope::Root => Ok(state.vector_provider.clone()),
+        EventScope::Tenant(id) => state
+            .tenant_manager
+            .get_tenant_context(id)
+            .await
+            .map(|ctx| ctx.vector_provider)
+            .map_err(AppError::UnknownError),
+        EventScope::Sandbox(id) => state
+            .sandbox_manager
+            .get_sandbox_context(id)
+            .await
+            .map(|ctx| ctx.vector_provider)
+            .map_err(AppError::UnknownError),
+        _ => Ok(state.vector_provider.clone()),
     }
 }
 

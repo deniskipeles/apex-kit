@@ -203,6 +203,10 @@ pub struct SandboxMetadata {
     pub tenant_id: Option<String>,
     pub current_storage_mb: f64,
     pub max_storage_mb: i64,
+    pub current_vectors: i64,
+    pub max_vectors: i64,
+    pub current_ai_requests: i64,
+    pub max_ai_requests: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

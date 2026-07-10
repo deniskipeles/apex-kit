@@ -420,6 +420,18 @@ impl TenantStore for CachedDb {
     ) -> std::result::Result<u64, Box<dyn StdError + Send + Sync>> {
         self.inner.get_tenant_disk_usage(tenant_id).await
     }
+
+    async fn update_tenant_stats(
+        &self,
+        tenant_id: &str,
+        storage_mb: f64,
+        vectors: i64,
+        ai_requests: i64,
+    ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner
+            .update_tenant_stats(tenant_id, storage_mb, vectors, ai_requests)
+            .await
+    }
 }
 
 #[async_trait]
@@ -432,9 +444,22 @@ impl SandboxStore for CachedDb {
         expires_at: Option<String>,
         scope: &str,
         tenant_id: Option<String>,
+        max_storage_mb: i64,
+        max_vectors: i64,
+        max_ai_requests: i64,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner
-            .register_sandbox(id, owner_id, name, expires_at, scope, tenant_id)
+            .register_sandbox(
+                id,
+                owner_id,
+                name,
+                expires_at,
+                scope,
+                tenant_id,
+                max_storage_mb,
+                max_vectors,
+                max_ai_requests,
+            )
             .await
     }
 
@@ -470,6 +495,18 @@ impl SandboxStore for CachedDb {
         id: &str,
     ) -> std::result::Result<u64, Box<dyn StdError + Send + Sync>> {
         self.inner.get_sandbox_disk_usage(id).await
+    }
+
+    async fn update_sandbox_stats(
+        &self,
+        id: &str,
+        storage_mb: f64,
+        vectors: i64,
+        ai_requests: i64,
+    ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner
+            .update_sandbox_stats(id, storage_mb, vectors, ai_requests)
+            .await
     }
 }
 

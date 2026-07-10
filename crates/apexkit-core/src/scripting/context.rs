@@ -29,6 +29,9 @@ pub trait ScriptContext: Send + Sync {
     fn get_realtime_tx(&self) -> tokio::sync::broadcast::Sender<crate::realtime::DbEvent>;
     fn get_storage(&self) -> Arc<dyn StorageBackend>;
     fn get_scope(&self) -> EventScope;
+    fn get_scoped_vector_provider(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Arc<dyn VectorProvider>> + Send>>;
     fn get_shared_script(
         &self,
         name: &str,

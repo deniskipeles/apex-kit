@@ -54,6 +54,7 @@ use crate::replication::{
 };
 use crate::server::router::app_router;
 use crate::workspaces_manager::{sandbox::SandboxManager, tenant::TenantManager};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
 // VECTOR ENGINE BRIDGES
@@ -62,11 +63,13 @@ use crate::workspaces_manager::{sandbox::SandboxManager, tenant::TenantManager};
 #[derive(Clone)]
 pub struct ApexBridge {
     pub engine: VectorEngine,
+    pub ai_request_counter: Arc<AtomicU64>,
 }
 
 #[async_trait::async_trait]
 impl VectorProvider for ApexBridge {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.ai_request_counter.fetch_add(1, Ordering::Relaxed);
         let engine = self.engine.clone();
         let text = text.to_string();
         tokio::task::spawn_blocking(move || engine.embedder.embed(&text).map_err(|e| e.to_string()))
@@ -75,19 +78,21 @@ impl VectorProvider for ApexBridge {
     }
 
     async fn embed_image(&self, base64_image: &str) -> Result<Vec<f32>, String> {
+        self.ai_request_counter.fetch_add(1, Ordering::Relaxed);
         let engine = self.engine.clone();
         let image = base64_image.to_string();
         tokio::task::spawn_blocking(move || {
             engine
                 .embedder
                 .embed_image(&image)
-                .map_err(|e| format!("{:?}", e)) // was: e.to_string()
+                .map_err(|e| format!("{:?}", e))
         })
         .await
         .map_err(|e| e.to_string())?
     }
 
     async fn embed_text_for_image_search(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.ai_request_counter.fetch_add(1, Ordering::Relaxed);
         let engine = self.engine.clone();
         let text = text.to_string();
         tokio::task::spawn_blocking(move || {
@@ -119,6 +124,10 @@ impl VectorProvider for ApexBridge {
     ) -> Result<(), String> {
         self.engine.index.insert(col_id, rec_id, field, vec);
         Ok(())
+    }
+
+    fn get_and_reset_metrics(&self) -> u64 {
+        self.ai_request_counter.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -237,7 +246,13 @@ pub async fn start(port: u16) {
             Ok(engine) => {
                 tracing::info!("✅ Apex Vector Engine (Candle + HNSW) ready.");
                 let embedder_ref = engine.embedder.clone();
-                (Arc::new(ApexBridge { engine }), Some(embedder_ref))
+                (
+                    Arc::new(ApexBridge {
+                        engine,
+                        ai_request_counter: Arc::new(AtomicU64::new(0)),
+                    }),
+                    Some(embedder_ref),
+                )
             }
             Err(e) => {
                 tracing::error!(

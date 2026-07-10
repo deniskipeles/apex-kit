@@ -184,6 +184,22 @@ pub fn setup_core(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE _sandboxes ADD COLUMN tenant_id TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE _sandboxes ADD COLUMN max_vectors INTEGER DEFAULT 10000",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE _sandboxes ADD COLUMN current_vectors INTEGER DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE _sandboxes ADD COLUMN max_ai_requests INTEGER DEFAULT 100",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE _sandboxes ADD COLUMN current_ai_requests INTEGER DEFAULT 0",
+        [],
+    );
 
     Ok(())
 }

@@ -1,3 +1,4 @@
+use crate::utils::resolve_vector_provider_from_scope;
 use crate::{AppError, AppState, DatabaseConnection, IdPath, RecordResponse};
 use crate::{BaseUrl, RecordListResponse};
 use crate::{
@@ -218,6 +219,7 @@ pub async fn query_vector_with_text(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>,
     Path(path): Path<IdPath>,
     Json(payload): Json<TextVectorSearchReq>,
 ) -> Result<Json<RecordListResponse>, AppError> {
@@ -233,8 +235,10 @@ pub async fn query_vector_with_text(
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
-    let query_vector = state
-        .vector_provider
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let vector_provider = resolve_vector_provider_from_scope(&state, &event_scope).await?;
+
+    let query_vector = vector_provider
         .embed(&payload.query_text)
         .await
         .map_err(|e| AppError::UnknownError(format!("Embedding generation failed: {}", e)))?;
@@ -356,6 +360,7 @@ pub async fn query_image_vector_search(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>,
     Path(path): Path<IdPath>,
     Json(payload): Json<ImageVectorSearchReq>,
 ) -> Result<Json<Vec<RecordResponse>>, AppError> {
@@ -371,8 +376,10 @@ pub async fn query_image_vector_search(
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
-    let query_vector = state
-        .vector_provider
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let vector_provider = resolve_vector_provider_from_scope(&state, &event_scope).await?;
+
+    let query_vector = vector_provider
         .embed_image(&payload.image_data)
         .await
         .map_err(|e| AppError::UnknownError(format!("Image Embedding failed: {}", e)))?;
@@ -457,6 +464,7 @@ pub async fn query_text_image_vector_search(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
+    scope: Option<Extension<EventScope>>,
     Path(path): Path<IdPath>,
     Json(payload): Json<TextImageVectorSearchReq>,
 ) -> Result<Json<Vec<RecordResponse>>, AppError> {
@@ -477,8 +485,10 @@ pub async fn query_text_image_vector_search(
         clean_query.push('.');
     }
 
-    let query_vector = state
-        .vector_provider
+    let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
+    let vector_provider = resolve_vector_provider_from_scope(&state, &event_scope).await?;
+
+    let query_vector = vector_provider
         .embed_text_for_image_search(&clean_query)
         .await
         .map_err(|e| AppError::UnknownError(format!("Text-image embedding failed: {}", e)))?;

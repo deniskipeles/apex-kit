@@ -90,9 +90,31 @@ pub async fn create_sandbox_handler(
         )));
     }
 
+    // --- FETCH GLOBAL LIMITS FIRST ---
+    let general_config = state.db.get_config("general").await.unwrap_or_default();
+    let max_storage_mb = general_config
+        .as_ref()
+        .and_then(|v| v.get("max_sandbox_storage_mb").and_then(|n| n.as_i64()))
+        .unwrap_or(100);
+    let max_vectors = general_config
+        .as_ref()
+        .and_then(|v| v.get("max_sandbox_vectors").and_then(|n| n.as_i64()))
+        .unwrap_or(10000);
+    let max_ai_requests = general_config
+        .as_ref()
+        .and_then(|v| v.get("max_sandbox_ai_requests").and_then(|n| n.as_i64()))
+        .unwrap_or(100);
+
+    // --- PASS LIMIT TO MANAGER ---
     state
         .sandbox_manager
-        .create_sandbox(&id, strategy, parent_db, event_scope.clone())
+        .create_sandbox(
+            &id,
+            strategy,
+            parent_db,
+            event_scope.clone(),
+            max_storage_mb,
+        )
         .await
         .map_err(AppError::UnknownError)?;
 
@@ -109,6 +131,9 @@ pub async fn create_sandbox_handler(
             expires_at.clone(),
             scope_str,
             tenant_id.clone(),
+            max_storage_mb,
+            max_vectors,
+            max_ai_requests,
         )
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
@@ -155,7 +180,11 @@ pub async fn create_sandbox_handler(
         scope: scope_str.into(),
         tenant_id,
         current_storage_mb: 0.0,
-        max_storage_mb: 100,
+        max_storage_mb,
+        current_vectors: 0,
+        max_vectors,
+        current_ai_requests: 0,
+        max_ai_requests,
     }))
 }
 

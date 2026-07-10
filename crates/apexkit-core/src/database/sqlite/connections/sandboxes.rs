@@ -15,16 +15,22 @@ impl SandboxStore for ApexKit {
         expires_at: Option<String>,
         scope: &str,
         tenant_id: Option<String>,
+        max_storage_mb: i64,
+        max_vectors: i64,
+        max_ai_requests: i64,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.core_batcher
             .execute(
-                "INSERT INTO _sandboxes (id,owner_id,name,expires_at,scope,tenant_id) VALUES (?1,?2,?3,?4,?5,?6) \
+                "INSERT INTO _sandboxes (id,owner_id,name,expires_at,scope,tenant_id,max_storage_mb,max_vectors,max_ai_requests) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
                  ON CONFLICT(id) DO UPDATE SET \
                     owner_id=excluded.owner_id, \
                     name=excluded.name, \
                     expires_at=excluded.expires_at, \
                     scope=excluded.scope, \
-                    tenant_id=excluded.tenant_id"
+                    tenant_id=excluded.tenant_id, \
+                    max_storage_mb=excluded.max_storage_mb, \
+                    max_vectors=excluded.max_vectors, \
+                    max_ai_requests=excluded.max_ai_requests"
                     .into(),
                 vec![
                     id.into_val(),
@@ -33,6 +39,9 @@ impl SandboxStore for ApexKit {
                     expires_at.into_val(),
                     scope.into_val(),
                     tenant_id.into_val(),
+                    max_storage_mb.into_val(),
+                    max_vectors.into_val(),
+                    max_ai_requests.into_val(),
                 ],
             )
             .await
@@ -45,7 +54,7 @@ impl SandboxStore for ApexKit {
         tenant_id: Option<String>,
     ) -> std::result::Result<Vec<SandboxMetadata>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_core_read().await;
-        let mut sql = "SELECT id,name,status,expires_at,scope,tenant_id,current_storage_mb,max_storage_mb FROM _sandboxes".to_string();
+        let mut sql = "SELECT id,name,status,expires_at,scope,tenant_id,current_storage_mb,max_storage_mb,current_vectors,max_vectors,current_ai_requests,max_ai_requests FROM _sandboxes".to_string();
         let mut params: Vec<rusqlite::types::Value> = vec![];
 
         if let Some(tid) = tenant_id {
@@ -69,6 +78,10 @@ impl SandboxStore for ApexKit {
                 tenant_id: row.get(5).unwrap_or(None),
                 current_storage_mb: row.get(6).unwrap_or(0.0),
                 max_storage_mb: row.get(7).unwrap_or(100),
+                current_vectors: row.get(8).unwrap_or(0),
+                max_vectors: row.get(9).unwrap_or(10000),
+                current_ai_requests: row.get(10).unwrap_or(0),
+                max_ai_requests: row.get(11).unwrap_or(100),
             });
         }
         Ok(res)
@@ -138,5 +151,22 @@ impl SandboxStore for ApexKit {
                 })??;
 
         Ok(size)
+    }
+
+    async fn update_sandbox_stats(
+        &self,
+        id: &str,
+        storage_mb: f64,
+        vectors: i64,
+        ai_requests: i64,
+    ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.core_batcher
+            .execute(
+                "UPDATE _sandboxes SET current_storage_mb = ?1, current_vectors = ?2, current_ai_requests = ?3 WHERE id = ?4".into(),
+                vec![storage_mb.into_val(), vectors.into_val(), ai_requests.into_val(), id.into_val()],
+            )
+            .await
+            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn StdError + Send + Sync>)?;
+        Ok(())
     }
 }

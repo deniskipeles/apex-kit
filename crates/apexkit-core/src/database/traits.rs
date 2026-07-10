@@ -43,6 +43,21 @@ impl IntoSqlVal for Option<i64> {
     }
 }
 
+impl IntoSqlVal for f64 {
+    fn into_val(self) -> rusqlite::types::Value {
+        rusqlite::types::Value::Real(self)
+    }
+}
+
+impl IntoSqlVal for Option<f64> {
+    fn into_val(self) -> rusqlite::types::Value {
+        match self {
+            Some(v) => rusqlite::types::Value::Real(v),
+            None => rusqlite::types::Value::Null,
+        }
+    }
+}
+
 impl IntoSqlVal for bool {
     fn into_val(self) -> rusqlite::types::Value {
         rusqlite::types::Value::Integer(if self { 1 } else { 0 })
@@ -98,6 +113,11 @@ pub trait VectorProvider: Send + Sync {
         field: &str,
         vec: &[f32],
     ) -> std::result::Result<(), String>;
+
+    /// Returns the number of embedding requests since last check, and resets the counter.
+    fn get_and_reset_metrics(&self) -> u64 {
+        0
+    }
 }
 
 /// Operations for registering, retrieving, and organizing data schemas and tables.
@@ -384,6 +404,15 @@ pub trait TenantStore: Send + Sync {
         &self,
         tenant_id: &str,
     ) -> std::result::Result<u64, Box<dyn StdError + Send + Sync>>;
+
+    /// Updates the aggregated statistics for a tenant.
+    async fn update_tenant_stats(
+        &self,
+        tenant_id: &str,
+        storage_mb: f64,
+        vectors: i64,
+        ai_requests: i64,
+    ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
 }
 
 /// Store operations for managing ephemeral sandbox lifecycles.
@@ -398,6 +427,9 @@ pub trait SandboxStore: Send + Sync {
         expires_at: Option<String>,
         scope: &str,
         tenant_id: Option<String>,
+        max_storage_mb: i64,
+        max_vectors: i64,
+        max_ai_requests: i64,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Lists active workspaces matching context filters.
@@ -429,6 +461,15 @@ pub trait SandboxStore: Send + Sync {
         &self,
         sandbox_id: &str,
     ) -> std::result::Result<u64, Box<dyn StdError + Send + Sync>>;
+
+    /// Updates the aggregated statistics for a sandbox.
+    async fn update_sandbox_stats(
+        &self,
+        sandbox_id: &str,
+        storage_mb: f64,
+        vectors: i64,
+        ai_requests: i64,
+    ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
 }
 
 /// Store operations for physical storage assets metadata.

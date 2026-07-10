@@ -22,6 +22,10 @@ export const architectService = {
         expires_at: s.expires_at,
         current_storage_mb: s.current_storage_mb,
         max_storage_mb: s.max_storage_mb,
+        current_vectors: s.current_vectors,
+        max_vectors: s.max_vectors,
+        current_ai_requests: s.current_ai_requests,
+        max_ai_requests: s.max_ai_requests,
       })) as any;
     } catch (e) {
       console.error('Failed to load listSessions:', e);

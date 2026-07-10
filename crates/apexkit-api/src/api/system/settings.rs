@@ -106,6 +106,13 @@ pub async fn get_settings(
             .map(String::from),
         log_retention_days: general.get("log_retention_days").and_then(|v| v.as_u64()),
         max_site_size_mb: general.get("max_site_size_mb").and_then(|v| v.as_u64()),
+        max_sandbox_storage_mb: general
+            .get("max_sandbox_storage_mb")
+            .and_then(|v| v.as_u64()),
+        max_sandbox_vectors: general.get("max_sandbox_vectors").and_then(|v| v.as_i64()),
+        max_sandbox_ai_requests: general
+            .get("max_sandbox_ai_requests")
+            .and_then(|v| v.as_i64()),
         smtp: None,
         storage: None,
         security: None,
@@ -259,6 +266,17 @@ pub async fn update_settings(
     }
     if let Some(v) = &payload.max_site_size_mb {
         general["max_site_size_mb"] = json!(v);
+    }
+
+    if let Some(v) = &payload.max_sandbox_storage_mb {
+        general["max_sandbox_storage_mb"] = json!(v);
+    }
+
+    if let Some(v) = &payload.max_sandbox_vectors {
+        general["max_sandbox_vectors"] = json!(v);
+    }
+    if let Some(v) = &payload.max_sandbox_ai_requests {
+        general["max_sandbox_ai_requests"] = json!(v);
     }
 
     db.set_config("general", &general, false)

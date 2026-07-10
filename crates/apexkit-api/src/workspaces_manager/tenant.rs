@@ -7,6 +7,7 @@ use apexkit_vector::{CandleEmbedder, VectorIndex};
 use moka::future::Cache;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::info;
 
@@ -14,11 +15,13 @@ use tracing::info;
 struct TenantVectorProvider {
     embedder: Option<Arc<CandleEmbedder>>,
     index: Arc<VectorIndex>,
+    ai_request_counter: Arc<AtomicU64>,
 }
 
 #[async_trait::async_trait]
 impl VectorProvider for TenantVectorProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.ai_request_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(embedder) = &self.embedder {
             let embedder = embedder.clone();
             let t = text.to_string();
@@ -31,6 +34,7 @@ impl VectorProvider for TenantVectorProvider {
     }
 
     async fn embed_image(&self, base64_image: &str) -> Result<Vec<f32>, String> {
+        self.ai_request_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(embedder) = &self.embedder {
             let embedder = embedder.clone();
             let img = base64_image.to_string();
@@ -45,6 +49,7 @@ impl VectorProvider for TenantVectorProvider {
     }
 
     async fn embed_text_for_image_search(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.ai_request_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(embedder) = &self.embedder {
             let embedder = embedder.clone();
             let txt = text.to_string();
@@ -73,6 +78,10 @@ impl VectorProvider for TenantVectorProvider {
     async fn index(&self, c: i64, r: i64, f: &str, v: &[f32]) -> Result<(), String> {
         self.index.insert(c, r, f, v);
         Ok(())
+    }
+
+    fn get_and_reset_metrics(&self) -> u64 {
+        self.ai_request_counter.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -260,6 +269,7 @@ impl TenantManager {
         let tenant_vector_provider = Arc::new(TenantVectorProvider {
             embedder: self.shared_embedder.clone(),
             index: vector_index.clone(),
+            ai_request_counter: Arc::new(AtomicU64::new(0)),
         });
 
         // Pass None for forwarder and event_tx
