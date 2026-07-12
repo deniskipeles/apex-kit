@@ -301,12 +301,15 @@ pub async fn update_user_handler(
         .parse::<i64>()
         .map_err(|_| AppError::JsonError("Invalid User ID".into()))?;
 
+    // Normalize the role if provided
+    let clean_role = payload.role.map(|r| r.trim().to_lowercase());
+
     // Pass password to DB layer
     let u = db
         .update_user(
             user_id,
             payload.email,
-            payload.role,
+            clean_role,
             payload.metadata,
             payload.password,
         )

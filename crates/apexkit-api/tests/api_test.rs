@@ -120,9 +120,7 @@ async fn setup_test_state(base_path: &std::path::Path) -> AppState {
     });
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Job>(100);
     // Drain background jobs
-    tokio::spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let queue = JobQueue::new(tx);
 
     let tenant_manager = Arc::new(apexkit_api::workspaces_manager::tenant::TenantManager::new(
@@ -133,11 +131,8 @@ async fn setup_test_state(base_path: &std::path::Path) -> AppState {
         None,
     ));
 
-    let sandbox_manager = Arc::new(apexkit_api::workspaces_manager::sandbox::SandboxManager::new(
-        None,
-        None,
-        None,
-    ));
+    let sandbox_manager =
+        Arc::new(apexkit_api::workspaces_manager::sandbox::SandboxManager::new(None, None, None));
 
     let (db_event_tx, _db_event_rx) = broadcast::channel(100);
 
@@ -146,20 +141,25 @@ async fn setup_test_state(base_path: &std::path::Path) -> AppState {
             async_graphql::dynamic::Field::new(
                 "status",
                 async_graphql::dynamic::TypeRef::named(async_graphql::dynamic::TypeRef::STRING),
-                |_| async_graphql::dynamic::FieldFuture::new(async { Ok(Some(async_graphql::Value::from("Initializing..."))) }),
-            )
+                |_| {
+                    async_graphql::dynamic::FieldFuture::new(async {
+                        Ok(Some(async_graphql::Value::from("Initializing...")))
+                    })
+                },
+            ),
         ))
         .finish()
         .unwrap();
 
     let scheduler = apexkit_api::system::scheduler::SchedulerService::new().await;
 
-    let storage: Arc<dyn apexkit_core::storage::StorageBackend> = Arc::new(apexkit_api::api::storage::DynamicStorage::new(
-        cached_db.clone(),
-        vault.clone(),
-        None,
-        "/api/v1/storage/file/".to_string(),
-    ));
+    let storage: Arc<dyn apexkit_core::storage::StorageBackend> =
+        Arc::new(apexkit_api::api::storage::DynamicStorage::new(
+            cached_db.clone(),
+            vault.clone(),
+            None,
+            "/api/v1/storage/file/".to_string(),
+        ));
 
     AppState {
         db: cached_db.clone(),
@@ -199,7 +199,9 @@ async fn test_api_health_check() {
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(body, "OK");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -220,7 +222,9 @@ async fn test_api_version() {
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let body_json: Value = serde_json::from_slice(&body).unwrap();
     assert!(body_json["core"].is_string());
 
@@ -238,7 +242,11 @@ async fn test_api_auth_register_and_login() {
         "allow_public_registration": true
     });
     // Write directly to DB config store
-    state.db.set_config("general", &general_settings, false).await.unwrap();
+    state
+        .db
+        .set_config("general", &general_settings, false)
+        .await
+        .unwrap();
 
     // 2. Register a new user
     let register_payload = json!({
@@ -255,12 +263,16 @@ async fn test_api_auth_register_and_login() {
         .body(Body::from(serde_json::to_vec(&register_payload).unwrap()))
         .unwrap();
 
-    register_request.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
+    register_request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
 
     let register_response = app.clone().oneshot(register_request).await.unwrap();
     assert_eq!(register_response.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(register_response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(register_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let register_res: Value = serde_json::from_slice(&body).unwrap();
     assert!(register_res["token"].is_string());
     assert_eq!(register_res["user"]["email"], "test@apexkit.io");
@@ -279,12 +291,16 @@ async fn test_api_auth_register_and_login() {
         .body(Body::from(serde_json::to_vec(&login_payload).unwrap()))
         .unwrap();
 
-    login_request.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
+    login_request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
 
     let login_response = app.oneshot(login_request).await.unwrap();
     assert_eq!(login_response.status(), StatusCode::OK);
 
-    let login_body = axum::body::to_bytes(login_response.into_body(), usize::MAX).await.unwrap();
+    let login_body = axum::body::to_bytes(login_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let login_res: Value = serde_json::from_slice(&login_body).unwrap();
     assert!(login_res["token"].is_string());
     assert_eq!(login_res["user"]["email"], "test@apexkit.io");

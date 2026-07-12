@@ -1,6 +1,6 @@
 use apexkit_core::database::sqlite::connections::ApexKit;
 use apexkit_core::database::traits::{
-    CollectionStore, RecordStore, UserStore, ConfigStore, ApiKeyStore, AuditStore, VectorProvider
+    ApiKeyStore, AuditStore, CollectionStore, ConfigStore, RecordStore, UserStore, VectorProvider,
 };
 use apexkit_core::models::schema::CollectionSchema;
 use rusqlite::Connection;
@@ -176,7 +176,10 @@ async fn test_database_records() {
     });
     let schema: CollectionSchema = serde_json::from_value(schema_val).unwrap();
 
-    let col_id = db.create_collection("items", &Some(schema), None).await.unwrap();
+    let col_id = db
+        .create_collection("items", &Some(schema), None)
+        .await
+        .unwrap();
 
     // 1. Create record
     let data = json!({ "name": "Apple", "price": 1.2 });
@@ -188,10 +191,7 @@ async fn test_database_records() {
     assert_eq!(rec.data["name"], "Apple");
 
     // 3. List records
-    let list = db
-        .list_records(col_id, Default::default())
-        .await
-        .unwrap();
+    let list = db.list_records(col_id, Default::default()).await.unwrap();
     assert_eq!(list.total, 1);
     assert_eq!(list.items[0].data["name"], "Apple");
 
@@ -224,7 +224,11 @@ async fn test_database_users() {
     assert_eq!(user.email, "user@example.com");
 
     // 2. Get user by email
-    let user_by_email = db.get_user_by_email("user@example.com").await.unwrap().unwrap();
+    let user_by_email = db
+        .get_user_by_email("user@example.com")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(user_by_email.role, "user");
 
     // 3. Count users
@@ -316,9 +320,15 @@ async fn test_database_api_keys() {
     assert!(verified.is_some());
 
     // 5. Update API Key details
-    db.update_api_key(api_key.id, Some("Renamed Key".to_string()), None, None, None)
-        .await
-        .unwrap();
+    db.update_api_key(
+        api_key.id,
+        Some("Renamed Key".to_string()),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let list_after_update = db.list_api_keys().await.unwrap();
     assert_eq!(list_after_update[0].name, "Renamed Key");
@@ -337,9 +347,14 @@ async fn test_database_audit_logs() {
     let db = create_test_db(&dir).await;
 
     // 1. Log audit event
-    db.log_audit_event("info", "User Registered", "auth", Some(json!({"user_id": 1})))
-        .await
-        .unwrap();
+    db.log_audit_event(
+        "info",
+        "User Registered",
+        "auth",
+        Some(json!({"user_id": 1})),
+    )
+    .await
+    .unwrap();
 
     // 2. List audit logs
     let logs = db.list_audit_logs().await.unwrap();

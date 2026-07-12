@@ -169,14 +169,45 @@ pub async fn register(
         _ => "root".to_string(),
     };
 
-    // [NEW] Use role from request or default to "user"
-    // Security Note: In a real app, you might want to block "admin" registration via public endpoint
-    // unless allow_public_registration is true AND we filter roles.
-    // For this dev setup, we allow requested role if not validated elsewhere.
-    let role = p.role.unwrap_or_else(|| "user".to_string());
+    // --- NEW: STRICT ROLE VALIDATION ---
+    let mut final_role = "user".to_string();
+
+    if let Some(requested_role) = p.role {
+        let req_role = requested_role.trim().to_lowercase();
+
+        if is_admin {
+            // Admins can assign any role they want, no restrictions
+            final_role = req_role;
+        } else {
+            // Public users cannot request system/hidden roles prefixed with _
+            if !req_role.starts_with('_') {
+                // Check if the requested role exists in the allowed APEX_AUTH_ROLES
+                let allowed_roles: Vec<String> =
+                    if let Ok(Some(val)) = db.get_config("APEX_AUTH_ROLES").await {
+                        if let Some(s) = val.as_str() {
+                            serde_json::from_str(s)
+                                .unwrap_or_else(|_| vec!["admin".to_string(), "user".to_string()])
+                        } else if val.is_array() {
+                            serde_json::from_value(val)
+                                .unwrap_or_else(|_| vec!["admin".to_string(), "user".to_string()])
+                        } else {
+                            vec!["admin".to_string(), "user".to_string()]
+                        }
+                    } else {
+                        vec!["admin".to_string(), "user".to_string()]
+                    };
+
+                // Prevent public users from registering as admin
+                if allowed_roles.contains(&req_role) && req_role != "admin" {
+                    final_role = req_role;
+                }
+            }
+        }
+    }
+    // -----------------------------------
 
     // [TRIGGER] before_user_create
-    let input_data = json!({ "email": p.email, "role": role, "metadata": p.metadata });
+    let input_data = json!({ "email": p.email, "role": final_role, "metadata": p.metadata });
     trigger_void_hook(
         &state,
         "before_user_create",
@@ -190,9 +221,9 @@ pub async fn register(
     let hash =
         auth::hash_password(&p.password).map_err(|_| AppError::UnknownError("Hash fail".into()))?;
 
-    // [FIX] Pass metadata
+    // Pass final_role and metadata
     let u = db
-        .create_user(&p.email, &hash, &role, p.metadata)
+        .create_user(&p.email, &hash, &final_role, p.metadata)
         .await
         .map_err(|_| AppError::UnknownError("User exists".into()))?;
 
@@ -200,7 +231,7 @@ pub async fn register(
     let meta = extract_log_meta(
         &headers,
         Some(addr),
-        json!({ "email": u.email, "user_id": u.id }),
+        json!({ "email": u.email, "user_id": u.id, "role": u.role }),
     );
     let _ = db
         .log_audit_event("info", "Register", "auth", Some(meta))
@@ -218,7 +249,7 @@ pub async fn register(
     )
     .await;
 
-    // [FIX] Pass scope to JWT
+    // Pass scope to JWT
     let token = auth::create_jwt(u.id, &u.email, &u.role, &scope_str)
         .map_err(|_| AppError::UnknownError("JWT fail".into()))?;
 

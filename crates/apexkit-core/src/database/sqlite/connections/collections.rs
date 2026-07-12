@@ -26,16 +26,25 @@ impl CollectionStore for ApexKit {
         index: Option<String>,
     ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         // Enforce strict name constraint
-        validate_identifier(name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+        validate_identifier(name).map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
 
         if let Some(s) = schema {
             // Enforce strict field name constraints
             for field_name in s.fields.keys() {
-                validate_identifier(field_name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+                validate_identifier(field_name).map_err(|e| {
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                        as Box<dyn std::error::Error + Send + Sync>
+                })?;
             }
             // Enforce strict relation name constraints
             for rel_name in s.relations.keys() {
-                validate_identifier(rel_name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+                validate_identifier(rel_name).map_err(|e| {
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                        as Box<dyn std::error::Error + Send + Sync>
+                })?;
             }
         }
 
@@ -96,15 +105,24 @@ impl CollectionStore for ApexKit {
         schema: Option<CollectionSchema>,
     ) -> std::result::Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(n) = &name {
-            validate_identifier(n).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            validate_identifier(n).map_err(|e| {
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                    as Box<dyn std::error::Error + Send + Sync>
+            })?;
         }
 
         if let Some(s) = &schema {
             for field_name in s.fields.keys() {
-                validate_identifier(field_name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+                validate_identifier(field_name).map_err(|e| {
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                        as Box<dyn std::error::Error + Send + Sync>
+                })?;
             }
             for rel_name in s.relations.keys() {
-                validate_identifier(rel_name).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<dyn std::error::Error + Send + Sync>)?;
+                validate_identifier(rel_name).map_err(|e| {
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                        as Box<dyn std::error::Error + Send + Sync>
+                })?;
             }
         }
 
