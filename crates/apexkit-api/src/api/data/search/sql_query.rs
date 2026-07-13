@@ -52,7 +52,8 @@ pub async fn query_records_handler(
         .unwrap_or("public");
 
     // Compile Policy to SQL
-    let rls_sql = policies::compile_to_sql(policy, claims.as_ref())
+    let rls_sql = policies::compile_to_sql(policy, claims.as_ref(), None, Some(db.clone()))
+        .await
         .map_err(|e| AppError::UnknownError(format!("Policy Compilation Failed: {}", e)))?;
 
     if rls_sql == "1=0" {

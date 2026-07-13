@@ -1,5 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { Shield, Globe, Lock, Save, Plus, X, Database, Activity } from 'lucide-react';
+import {
+  Shield,
+  Globe,
+  Lock,
+  Save,
+  Plus,
+  X,
+  Database,
+  Activity,
+  FileJson,
+  Type,
+} from 'lucide-react';
 import {
   Card,
   CardHeader,
@@ -17,6 +28,7 @@ import { Users } from 'lucide-react';
 import { configService } from '@/src/features/settings/services/configService';
 import { useToast } from '@/src/components/feedback/Toast';
 import { apiClient } from '@/src/lib/apiClient';
+import { JSONEditor } from '../../../components/form/JsonEditor'; // <--- IMPORT JSON EDITOR
 
 interface SecuritySettingsProps {
   settings: AppSettings;
@@ -24,12 +36,23 @@ interface SecuritySettingsProps {
   onSave: (data: Partial<AppSettings>) => Promise<void>;
 }
 
+// Helper to check if a string is valid JSON
+const isJsonString = (str: string) => {
+  try {
+    const parsed = JSON.parse(str);
+    return typeof parsed === 'object' && parsed !== null;
+  } catch (e) {
+    return false;
+  }
+};
+
 export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySettingsProps) => {
   const [isSaving, setIsSaving] = useState(false);
   // State for roles
   const [roles, setRoles] = useState<string[]>([]);
   const [newRole, setNewRole] = useState('');
   const { toast } = useToast();
+
   //  User Policy State
   const [userPolicies, setUserPolicies] = useState({
     read: 'admin || owner:id',
@@ -37,6 +60,15 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
     update: 'admin || owner:id',
     delete: 'admin',
   });
+
+  // [NEW] Mode states for each policy field (true = JSON, false = Legacy String)
+  const [policyModes, setPolicyModes] = useState({
+    read: false,
+    create: false,
+    update: false,
+    delete: false,
+  });
+
   const [isLoadingPolicies, setIsLoadingPolicies] = useState(true);
 
   // Load Policies on mount
@@ -48,6 +80,14 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
         if (policyConf && policyConf.value) {
           const parsed = JSON.parse(policyConf.value);
           setUserPolicies(parsed);
+
+          // Auto-detect if saved policies are JSON objects or legacy strings
+          setPolicyModes({
+            read: isJsonString(parsed.read),
+            create: isJsonString(parsed.create),
+            update: isJsonString(parsed.update),
+            delete: isJsonString(parsed.delete),
+          });
         }
       } catch (e) {
         console.error(e);
@@ -58,12 +98,10 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
     loadPolicies();
   }, []);
 
-  // Load roles on mount
+  // ... (Load Roles and Role functions remain exactly the same) ...
   useEffect(() => {
     const loadRoles = async () => {
       try {
-        // We can use the listRoles endpoint we created
-        // Or fetch the config directly. Let's use config service for editing.
         const list = await configService.list();
         const roleConfig = list.find((c) => c.key === 'APEX_AUTH_ROLES');
         if (roleConfig && roleConfig.value) {
@@ -120,9 +158,23 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
     }
   };
 
-  // Save Handler for Policies (Separate from main settings save for clarity/modularity)
+  // Save Handler for Policies
   const savePolicies = async () => {
     try {
+      // Validate JSON fields before saving
+      for (const key of ['read', 'create', 'update', 'delete'] as const) {
+        if (policyModes[key]) {
+          try {
+            const parsed = JSON.parse(userPolicies[key]);
+            // Minify for clean DB storage
+            userPolicies[key] = JSON.stringify(parsed);
+          } catch (e) {
+            toast(`Invalid JSON in ${key} policy`, 'error');
+            return;
+          }
+        }
+      }
+
       await configService.set('policy_users', JSON.stringify(userPolicies), false);
       toast('User policies updated', 'success');
     } catch (e) {
@@ -130,9 +182,68 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
     }
   };
 
+  // [NEW] Helper to render the unified policy input
+  const renderPolicyInput = (
+    key: 'read' | 'create' | 'update' | 'delete',
+    label: string,
+    placeholder: string
+  ) => {
+    const isJson = policyModes[key];
+    const value = userPolicies[key];
+
+    const toggleMode = (toJson: boolean) => {
+      if (toJson && !isJson) {
+        // Attempt to stringify if it's somehow already an object, or provide default JSON
+        setUserPolicies({ ...userPolicies, [key]: '{\n  \n}' });
+      } else if (!toJson && isJson) {
+        setUserPolicies({ ...userPolicies, [key]: '' });
+      }
+      setPolicyModes({ ...policyModes, [key]: toJson });
+    };
+
+    return (
+      <div className="space-y-1.5 flex flex-col h-full">
+        <div className="flex justify-between items-center mb-1">
+          <Label className="capitalize">{label}</Label>
+          <div className="flex items-center gap-1 bg-secondary/30 p-0.5 rounded-lg border border-border">
+            <button
+              onClick={() => toggleMode(false)}
+              className={`px-2 py-0.5 rounded text-[10px] flex items-center gap-1 transition-all ${!isJson ? 'bg-background shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+            >
+              <Type className="h-3 w-3" /> Legacy
+            </button>
+            <button
+              onClick={() => toggleMode(true)}
+              className={`px-2 py-0.5 rounded text-[10px] flex items-center gap-1 transition-all ${isJson ? 'bg-background shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+            >
+              <FileJson className="h-3 w-3" /> JSON (Advanced)
+            </button>
+          </div>
+        </div>
+
+        {isJson ? (
+          <div className="border border-input rounded-md overflow-hidden flex-1 min-h-[120px]">
+            <JSONEditor
+              value={value}
+              onChange={(val) => setUserPolicies({ ...userPolicies, [key]: val })}
+              height="100%"
+            />
+          </div>
+        ) : (
+          <Input
+            value={value}
+            onChange={(e: any) => setUserPolicies({ ...userPolicies, [key]: e.target.value })}
+            className="font-mono text-xs"
+            placeholder={placeholder}
+          />
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-6">
-      {/* Roles Management Card */}
+      {/* ... Roles Management Card ... */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -172,7 +283,7 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
         </CardContent>
       </Card>
 
-      {/* Access Control Card */}
+      {/* ... Access Control Card ... */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -212,7 +323,7 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
         </CardContent>
       </Card>
 
-      {/* [NEW] User Data Policies Card */}
+      {/* [UPDATED] User Data Policies Card */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -221,9 +332,12 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
         </CardHeader>
         <CardContent>
           <div className="space-y-4">
-            <div className="text-sm text-muted-foreground bg-secondary/10 p-3 rounded-md border border-border">
-              Define who can access the system `users` table. Use rules like <code>admin</code>,{' '}
-              <code>auth</code>, <code>public</code>, or <code>owner:id</code>.
+            <div className="text-sm text-muted-foreground bg-secondary/10 p-3 rounded-md border border-border leading-relaxed">
+              Define who can access the system `users` table.
+              <br />- <b>Legacy Mode:</b> Use strings like <code>admin</code>, <code>auth</code>,{' '}
+              <code>public</code>, or <code>owner:id</code>.
+              <br />- <b>JSON Mode:</b> Build advanced relational queries using{' '}
+              <code>{`{ "$in": { "@get()": { ... } } }`}</code> syntax.
             </div>
 
             {isLoadingPolicies ? (
@@ -231,54 +345,14 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
                 Loading policies...
               </div>
             ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="space-y-1">
-                  <Label>Read (List/Get)</Label>
-                  <Input
-                    value={userPolicies.read}
-                    onChange={(e: any) =>
-                      setUserPolicies({ ...userPolicies, read: e.target.value })
-                    }
-                    className="font-mono text-xs"
-                    placeholder="admin"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label>Create (Register)</Label>
-                  <Input
-                    value={userPolicies.create}
-                    onChange={(e: any) =>
-                      setUserPolicies({ ...userPolicies, create: e.target.value })
-                    }
-                    className="font-mono text-xs"
-                    placeholder="public"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label>Update (Edit)</Label>
-                  <Input
-                    value={userPolicies.update}
-                    onChange={(e: any) =>
-                      setUserPolicies({ ...userPolicies, update: e.target.value })
-                    }
-                    className="font-mono text-xs"
-                    placeholder="admin || owner:id"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label>Delete</Label>
-                  <Input
-                    value={userPolicies.delete}
-                    onChange={(e: any) =>
-                      setUserPolicies({ ...userPolicies, delete: e.target.value })
-                    }
-                    className="font-mono text-xs"
-                    placeholder="admin"
-                  />
-                </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {renderPolicyInput('read', 'Read (List/Get)', 'admin')}
+                {renderPolicyInput('create', 'Create (Register)', 'public')}
+                {renderPolicyInput('update', 'Update (Edit)', 'admin || owner:id')}
+                {renderPolicyInput('delete', 'Delete', 'admin')}
               </div>
             )}
-            <div className="flex justify-end pt-2">
+            <div className="flex justify-end pt-2 border-t border-border mt-2">
               <Button size="sm" variant="outline" onClick={savePolicies}>
                 Update Policies
               </Button>
@@ -287,7 +361,7 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
         </CardContent>
       </Card>
 
-      {/* [NEW] Rate Limiting Card */}
+      {/* ... Rate Limiting Card ... */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -332,7 +406,7 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
         </CardContent>
       </Card>
 
-      {/* CORS Settings Card */}
+      {/* ... CORS Settings Card ... */}
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">

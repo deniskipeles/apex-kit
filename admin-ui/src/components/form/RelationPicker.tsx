@@ -10,12 +10,21 @@ import { RecordUpsertPanel } from '../../features/records/components/RecordUpser
 // Helper to intelligently resolve a descriptive label from a record's properties
 const getRecordLabel = (rec: AppRecord): string => {
   if (!rec) return 'Unknown';
-  
+
   // AppRecord properties might be flat or nested under .data
   const d = rec.data || rec;
 
   // 1. Try explicit descriptive fields first
-  const fallbackKeys = ['title', 'name', 'subject', 'label', 'email', 'slug', 'username', 'heading'];
+  const fallbackKeys = [
+    'title',
+    'name',
+    'subject',
+    'label',
+    'email',
+    'slug',
+    'username',
+    'heading',
+  ];
   for (const key of fallbackKeys) {
     if (d[key] && typeof d[key] === 'string' && d[key].trim()) {
       const valLower = d[key].trim().toLowerCase();
@@ -33,7 +42,7 @@ const getRecordLabel = (rec: AppRecord): string => {
 
   const genericField = Object.entries(d).find(([key, val]) => {
     if (typeof val !== 'string') return false;
-    const s = val.trim().slice(0,100);
+    const s = val.trim().slice(0, 100);
     const k = key.toLowerCase();
     const sLower = s.toLowerCase();
 
@@ -172,9 +181,7 @@ const ForeignListModal = ({
                 className={`p-3 rounded-md cursor-pointer hover:bg-secondary flex justify-between items-center group ${currentValue === rec.id ? 'bg-primary/10 border border-primary/20' : ''}`}
               >
                 <div className="overflow-hidden">
-                  <div className="font-medium truncate">
-                    {getRecordLabel(rec)}
-                  </div>
+                  <div className="font-medium truncate">{getRecordLabel(rec)}</div>
                   <div className="text-xs text-muted-foreground font-mono">{rec.id}</div>
                 </div>
                 {currentValue === rec.id && <Check className="h-4 w-4 text-primary" />}

@@ -83,9 +83,12 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
   if (settings.logRetentionDays !== undefined)
     payload.log_retention_days = settings.logRetentionDays;
   if (settings.maxSiteSizeMb !== undefined) payload.max_site_size_mb = settings.maxSiteSizeMb;
-  if (settings.maxSandboxStorageMb !== undefined) payload.max_sandbox_storage_mb = settings.maxSandboxStorageMb;
-  if (settings.maxSandboxVectors !== undefined) payload.max_sandbox_vectors = settings.maxSandboxVectors;
-  if (settings.maxSandboxAiRequests !== undefined) payload.max_sandbox_ai_requests = settings.maxSandboxAiRequests;
+  if (settings.maxSandboxStorageMb !== undefined)
+    payload.max_sandbox_storage_mb = settings.maxSandboxStorageMb;
+  if (settings.maxSandboxVectors !== undefined)
+    payload.max_sandbox_vectors = settings.maxSandboxVectors;
+  if (settings.maxSandboxAiRequests !== undefined)
+    payload.max_sandbox_ai_requests = settings.maxSandboxAiRequests;
 
   if (settings.smtp) {
     payload.smtp = {

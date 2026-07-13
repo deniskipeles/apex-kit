@@ -174,7 +174,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                         if let Some(col_id) = resolved_search_id
                                             && let Ok(Some(col)) = current_db.get_collection(col_id).await {
                                                 let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-                                                allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref(), None);
+
+                                                // [FIXED]: Added missing arguments and .await
+                                                allowed = apexkit_core::auth::policies::check_access(
+                                                    policy,
+                                                    current_claims.as_ref(),
+                                                    None,
+                                                    None,
+                                                    Some(current_db.clone())
+                                                ).await;
                                             }
 
                                         if !allowed || resolved_search_id.is_none() {
@@ -219,13 +227,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                         DbEvent::Insert { collection_id, data, .. } | DbEvent::Update { collection_id, data, .. } => {
                             if let Ok(Some(col)) = state.db.get_collection(*collection_id).await {
                                 let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-                                allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref(), Some(data));
+                                allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref(), Some(data), None, Some(state.db.clone())).await;
                             }
                         }
                         DbEvent::Delete { collection_id, .. } => {
                             if let Ok(Some(col)) = state.db.get_collection(*collection_id).await {
                                 let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-                                allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref(), None);
+                                allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref(), None, None, Some(state.db.clone())).await;
                             }
                         }
                         _ => {}

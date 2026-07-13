@@ -95,7 +95,14 @@ pub async fn get_record_vector(
             .map_err(|e| AppError::UnknownError(e.to_string()))?
             .ok_or(AppError::NotFound("Record not found".into()))?;
 
-        apexkit_core::auth::policies::check_access(policy, claims.as_ref(), Some(&rec.data))
+        apexkit_core::auth::policies::check_access(
+            policy,
+            claims.as_ref(),
+            Some(&rec.data),
+            None,
+            Some(db.clone()),
+        )
+        .await
     };
 
     if !access_granted {
@@ -132,7 +139,15 @@ pub async fn query_vector_with_vector(
         .as_ref()
         .map(|s| s.policies.read.as_str())
         .unwrap_or("public");
-    if !apexkit_core::auth::policies::check_access(policy, claims.as_ref(), None) {
+    if !apexkit_core::auth::policies::check_access(
+        policy,
+        claims.as_ref(),
+        None,
+        None,
+        Some(db.clone()),
+    )
+    .await
+    {
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
@@ -231,7 +246,15 @@ pub async fn query_vector_with_text(
         .as_ref()
         .map(|s| s.policies.read.as_str())
         .unwrap_or("public");
-    if !apexkit_core::auth::policies::check_access(policy, claims.as_ref(), None) {
+    if !apexkit_core::auth::policies::check_access(
+        policy,
+        claims.as_ref(),
+        None,
+        None,
+        Some(db.clone()),
+    )
+    .await
+    {
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
@@ -373,7 +396,15 @@ pub async fn query_image_vector_search(
         .as_ref()
         .map(|s| s.policies.read.as_str())
         .unwrap_or("public");
-    if !apexkit_core::auth::policies::check_access(policy, claims.as_ref(), None) {
+    if !apexkit_core::auth::policies::check_access(
+        policy,
+        claims.as_ref(),
+        None,
+        None,
+        Some(db.clone()),
+    )
+    .await
+    {
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
@@ -478,7 +509,15 @@ pub async fn query_text_image_vector_search(
         .as_ref()
         .map(|s| s.policies.read.as_str())
         .unwrap_or("public");
-    if !apexkit_core::auth::policies::check_access(policy, claims.as_ref(), None) {
+    if !apexkit_core::auth::policies::check_access(
+        policy,
+        claims.as_ref(),
+        None,
+        None,
+        Some(db.clone()),
+    )
+    .await
+    {
         return Err(AppError::Forbidden("Search denied".into()));
     }
 

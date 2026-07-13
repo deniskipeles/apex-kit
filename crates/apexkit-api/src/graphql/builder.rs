@@ -224,8 +224,14 @@ pub async fn build_schema(
                     let parent_user = ctx.parent_value.try_downcast_ref::<User>()?;
                     let claims = ctx.data::<Claims>().ok();
 
-                    let rls_sql =
-                        policies::compile_to_sql(&policy_rule, claims).unwrap_or("1=0".to_string());
+                    let rls_sql = policies::compile_to_sql(
+                        &policy_rule,
+                        claims,
+                        None,
+                        Some(state.db.clone()),
+                    )
+                    .await
+                    .unwrap_or("1=0".to_string());
                     if rls_sql == "1=0" {
                         return Ok(Some(FieldValue::owned_any(ListResult {
                             items: vec![],
@@ -317,7 +323,9 @@ pub async fn build_schema(
             FieldFuture::new(async move {
                 let claims = ctx.data::<Claims>().ok();
 
-                if !policies::check_access(&policy, claims, None) {
+                if !policies::check_access(&policy, claims, None, None, Some(state.db.clone()))
+                    .await
+                {
                     return Err(async_graphql::Error::new(
                         "Forbidden: Access denied by policy",
                     ));
@@ -425,6 +433,10 @@ pub async fn build_schema(
                         let name = name_clone.clone();
                         let policy_rule = u_read_policy.clone();
 
+                        // Extract state from the GraphQL Context dynamically
+                        let state = ctx.data::<AppState>().unwrap().clone();
+                        let db_for_policy = state.db.clone();
+
                         FieldFuture::new(async move {
                             let record = ctx.parent_value.try_downcast_ref::<Record>()?;
 
@@ -464,7 +476,16 @@ pub async fn build_schema(
                                         "metadata": u.metadata
                                     });
 
-                                    if policies::check_access(&policy_rule, claims, Some(&u_val)) {
+                                    // Pass the extracted db_for_policy
+                                    if policies::check_access(
+                                        &policy_rule,
+                                        claims,
+                                        Some(&u_val),
+                                        None,
+                                        Some(db_for_policy),
+                                    )
+                                    .await
+                                    {
                                         return Ok(Some(FieldValue::owned_any(u)));
                                     }
                                 }
@@ -542,6 +563,10 @@ pub async fn build_schema(
                     let t_col_name = t_col_name.clone();
                     let policy_rule = target_read_policy.clone();
 
+                    // Extract state from the GraphQL Context dynamically
+                    let state = ctx.data::<AppState>().unwrap().clone();
+                    let db_for_policy = state.db.clone();
+
                     FieldFuture::new(async move {
                         let record = ctx.parent_value.try_downcast_ref::<Record>()?.clone();
                         let claims = ctx.data::<Claims>().ok();
@@ -562,10 +587,21 @@ pub async fn build_schema(
                             .map_err(async_graphql::Error::new)?
                             .unwrap_or_default();
 
-                        let filtered_records: Vec<_> = records
-                            .into_iter()
-                            .filter(|r| policies::check_access(&policy_rule, claims, Some(&r.data)))
-                            .collect();
+                        let mut filtered_records = Vec::new();
+                        for r in records {
+                            // Clone the extracted db_for_policy per loop iteration
+                            if policies::check_access(
+                                &policy_rule,
+                                claims,
+                                Some(&r.data),
+                                None,
+                                Some(db_for_policy.clone()),
+                            )
+                            .await
+                            {
+                                filtered_records.push(r);
+                            }
+                        }
 
                         if is_list {
                             Ok(Some(FieldValue::list(
@@ -644,8 +680,14 @@ pub async fn build_schema(
                             let parent_record = ctx.parent_value.try_downcast_ref::<Record>()?;
                             let claims = ctx.data::<Claims>().ok();
 
-                            let rls_sql = policies::compile_to_sql(&policy_rule, claims)
-                                .unwrap_or("1=0".to_string());
+                            let rls_sql = policies::compile_to_sql(
+                                &policy_rule,
+                                claims,
+                                None,
+                                Some(state.db.clone()),
+                            )
+                            .await
+                            .unwrap_or("1=0".to_string());
                             if rls_sql == "1=0" {
                                 return Ok(Some(FieldValue::owned_any(ListResult {
                                     items: vec![],
@@ -763,8 +805,10 @@ pub async fn build_schema(
                 async move {
                     let claims = ctx.data::<Claims>().ok();
 
-                    let rls_sql = policies::compile_to_sql(&value, claims)
-                        .map_err(|e| async_graphql::Error::new(e))?;
+                    let rls_sql =
+                        policies::compile_to_sql(&value, claims, None, Some(state.db.clone()))
+                            .await
+                            .map_err(|e| async_graphql::Error::new(e))?;
                     if rls_sql == "1=0" {
                         return Err(async_graphql::Error::new("Forbidden"));
                     }
@@ -819,7 +863,21 @@ pub async fn build_schema(
             let sch = c_schema.clone();
 
             FieldFuture::new(async move {
-                if !policies::check_access(&p, claims.as_ref(), None) {
+                let input_val = ctx
+                    .args
+                    .get("data")
+                    .ok_or(async_graphql::Error::new("Missing data"))?;
+                let json_data = gql_input_to_json(input_val.as_value().clone());
+
+                if !policies::check_access(
+                    &p,
+                    claims.as_ref(),
+                    None,
+                    Some(&json_data),
+                    Some(state.db.clone()),
+                )
+                .await
+                {
                     return Err(async_graphql::Error::new("Forbidden: Create denied"));
                 }
 
@@ -889,7 +947,15 @@ pub async fn build_schema(
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?
                     .ok_or(async_graphql::Error::new("Record not found"))?;
 
-                if !policies::check_access(&p, claims.as_ref(), Some(&existing.data)) {
+                if !policies::check_access(
+                    &p,
+                    claims.as_ref(),
+                    Some(&existing.data),
+                    Some(&json_data),
+                    Some(state.db.clone()),
+                )
+                .await
+                {
                     return Err(async_graphql::Error::new("Forbidden: Update denied"));
                 }
 
@@ -938,7 +1004,15 @@ pub async fn build_schema(
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?
                     .ok_or(async_graphql::Error::new("Record not found"))?;
 
-                if !policies::check_access(&p, claims.as_ref(), Some(&existing.data)) {
+                if !policies::check_access(
+                    &p,
+                    claims.as_ref(),
+                    Some(&existing.data),
+                    None,
+                    Some(state.db.clone()),
+                )
+                .await
+                {
                     return Err(async_graphql::Error::new("Forbidden: Delete denied"));
                 }
 

@@ -217,7 +217,7 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
         required: field.required,
         unique: field.unique,
         // Only allow ose_indexed to be true for searchable text fields. Force false for files, booleans, etc.
-        ose_indexed: isSearchableType(field.type) ? (field.ose_indexed || false) : false,
+        ose_indexed: isSearchableType(field.type) ? field.ose_indexed || false : false,
         sql_indexed: field.sql_indexed || false,
         vectorize: field.vectorize || false,
         auto: field.auto !== undefined ? field.auto : false,
@@ -800,7 +800,8 @@ export const apiClient = {
             url: await pb.files.getFileUrl(f.filename),
             created: f.created_at,
             updated: f.created_at,
-          })));
+          }))
+        );
         return { items, totalItems: res.total || items.length };
       } catch (e) {
         console.error('File list error', e);

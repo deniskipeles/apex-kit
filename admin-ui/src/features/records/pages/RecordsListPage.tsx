@@ -501,14 +501,23 @@ export const RecordsListPage = () => {
           case 'owner': {
             const expanded = r.expand?.[f.name];
             let label = String(val);
-            
+
             if (expanded) {
               const getDisplay = (obj: any) => {
                 if (!obj) return '';
                 const data = obj.data || obj;
-                
+
                 // 1. Fast Path: Prioritize standard naming conventions first
-                const prioritizedKeys = ['title', 'name', 'subject', 'label', 'email', 'slug', 'username', 'heading'];
+                const prioritizedKeys = [
+                  'title',
+                  'name',
+                  'subject',
+                  'label',
+                  'email',
+                  'slug',
+                  'username',
+                  'heading',
+                ];
                 for (const key of prioritizedKeys) {
                   if (data[key] && typeof data[key] === 'string' && data[key].trim()) {
                     return data[key];
@@ -516,8 +525,10 @@ export const RecordsListPage = () => {
                 }
 
                 // 2. Dynamic Heuristic Path: Find the first meaningful string field
-                const systemKeysPattern = /^(id|_id|uuid|created|updated|created_at|updated_at|deleted_at)$/i;
-                const fileExtensionsPattern = /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|bin|txt|json)$/i;
+                const systemKeysPattern =
+                  /^(id|_id|uuid|created|updated|created_at|updated_at|deleted_at)$/i;
+                const fileExtensionsPattern =
+                  /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|bin|txt|json)$/i;
                 const dateISOStringsPattern = /^\d{4}-\d{2}-\d{2}/; // e.g., 2026-07-08
 
                 const candidateEntries = Object.entries(data).filter(([key, val]) => {

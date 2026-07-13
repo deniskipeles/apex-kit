@@ -92,13 +92,13 @@ pub async fn sse_handler(
                     DbEvent::Insert { collection_id, data, .. } | DbEvent::Update { collection_id, data, .. } => {
                         if let Ok(Some(col)) = db.get_collection(*collection_id).await {
                             let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-                            allowed = apexkit_core::auth::policies::check_access(policy, claims.as_ref(), Some(data));
+                            allowed = apexkit_core::auth::policies::check_access(policy, claims.as_ref(), Some(data), None, Some(db.clone())).await;
                         }
                     }
                     DbEvent::Delete { collection_id, .. } => {
                         if let Ok(Some(col)) = db.get_collection(*collection_id).await {
                             let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-                            allowed = apexkit_core::auth::policies::check_access(policy, claims.as_ref(), None);
+                            allowed = apexkit_core::auth::policies::check_access(policy, claims.as_ref(), None, None, Some(db.clone())).await;
                         }
                     }
                     _ => {}

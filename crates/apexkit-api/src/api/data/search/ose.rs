@@ -28,7 +28,7 @@ pub async fn search_records(
         .as_ref()
         .map(|s| s.policies.read.as_str())
         .unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) {
+    if !policies::check_access(policy, claims.as_ref(), None, None, Some(db.clone())).await {
         return Err(AppError::Forbidden("Search denied".into()));
     }
 
@@ -113,7 +113,7 @@ pub async fn instant_search_handler(
         .as_ref()
         .map(|s| s.policies.read.as_str())
         .unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), None) {
+    if !policies::check_access(policy, claims.as_ref(), None, None, Some(db.clone())).await {
         return Err(AppError::Forbidden("Search denied by policy".into()));
     }
     let results = db

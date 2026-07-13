@@ -384,7 +384,15 @@ pub async fn list_users_handler(
 
     // 2. Check Global Read Access
     // Passing None for record_data checks if user has general read access
-    if !apexkit_core::auth::policies::check_access(&policies.read, claims.as_ref(), None) {
+    if !apexkit_core::auth::policies::check_access(
+        &policies.read,
+        claims.as_ref(),
+        None,
+        None,
+        Some(db.clone()),
+    )
+    .await
+    {
         return Err(AppError::Forbidden("Access denied".into()));
     }
 
@@ -528,7 +536,15 @@ pub async fn delete_user_handler(
 
     // 3. Check "Delete" Policy
     let target_data = user_to_value(target_user);
-    if !policies::check_access(&policies.delete, claims.as_ref(), Some(&target_data)) {
+    if !policies::check_access(
+        &policies.delete,
+        claims.as_ref(),
+        Some(&target_data),
+        None,
+        Some(db.clone()),
+    )
+    .await
+    {
         return Err(AppError::Forbidden("Delete denied".into()));
     }
 

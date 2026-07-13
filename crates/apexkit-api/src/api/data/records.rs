@@ -57,7 +57,8 @@ pub async fn list_records(
         .unwrap_or("public");
 
     // Compile Policy to SQL
-    let rls_sql = policies::compile_to_sql(policy, claims.as_ref())
+    let rls_sql = policies::compile_to_sql(policy, claims.as_ref(), None, Some(db.clone()))
+        .await
         .map_err(|e| AppError::UnknownError(format!("Policy Compilation Failed: {}", e)))?;
 
     // Block table-level rejections early
@@ -190,7 +191,15 @@ pub async fn get_record(
         .as_ref()
         .map(|s| s.policies.read.as_str())
         .unwrap_or("public");
-    if !policies::check_access(policy, claims.as_ref(), Some(&r.data)) {
+    if !policies::check_access(
+        policy,
+        claims.as_ref(),
+        Some(&r.data),
+        None,
+        Some(db.clone()),
+    )
+    .await
+    {
         return Err(AppError::Forbidden("Read denied".into()));
     }
 
@@ -339,7 +348,16 @@ pub async fn create_record(
         .as_ref()
         .map(|s| s.policies.create.as_str())
         .unwrap_or("auth");
-    if !policies::check_access(policy, claims.as_ref(), None) {
+    let request_data_json = serde_json::to_value(&p.data).ok();
+    if !policies::check_access(
+        policy,
+        claims.as_ref(),
+        None,
+        request_data_json.as_ref(),
+        Some(db.clone()),
+    )
+    .await
+    {
         // [LOG] Failed
         let meta = extract_log_meta(
             &headers,
@@ -538,7 +556,16 @@ pub async fn update_record(
         .as_ref()
         .map(|s| s.policies.update.as_str())
         .unwrap_or("admin");
-    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) {
+    let request_data_json = serde_json::to_value(&p.data).ok();
+    if !policies::check_access(
+        policy,
+        claims.as_ref(),
+        Some(&existing.data),
+        request_data_json.as_ref(),
+        Some(db.clone()),
+    )
+    .await
+    {
         return Err(AppError::Forbidden("Update denied".into()));
     }
 
@@ -664,7 +691,15 @@ pub async fn delete_record(
         .as_ref()
         .map(|s| s.policies.delete.as_str())
         .unwrap_or("admin");
-    if !policies::check_access(policy, claims.as_ref(), Some(&existing.data)) {
+    if !policies::check_access(
+        policy,
+        claims.as_ref(),
+        Some(&existing.data),
+        None,
+        Some(db.clone()),
+    )
+    .await
+    {
         return Err(AppError::Forbidden("Delete denied".into()));
     }
 
@@ -834,6 +869,9 @@ pub async fn delete_relation(
 }
 
 // --- [SECURITY REDESIGN] RECURSIVE SANITIZER FOR EXPANDED RELATION OWNERS ---
+use std::future::Future;
+use std::pin::Pin;
+
 async fn sanitize_expanded_records(
     db: &Arc<dyn apexkit_core::Db>,
     records: &mut [RecordResponse],
@@ -885,69 +923,93 @@ async fn sanitize_expanded_records(
                 &user_read_policy,
                 &schema_cache,
                 &col_map,
-            );
+                db,
+            )
+            .await;
         }
     }
 }
 
 // Recursively walks down the JSON object mirroring the user's `expand` request
-fn sanitize_expand_node(
-    expand_obj: &mut Value,
-    current_schema: &CollectionSchema,
-    current_tree: &HashMap<String, Vec<String>>,
-    claims: Option<&Claims>,
-    user_read_policy: &str,
-    schema_cache: &HashMap<i64, CollectionSchema>,
-    col_map: &HashMap<String, i64>,
-) {
-    let owner_fields: Vec<String> = current_schema
-        .fields
-        .iter()
-        .filter(|(_, def)| def.r#type == FieldType::Owner)
-        .map(|(name, _)| name.clone())
-        .collect();
+fn sanitize_expand_node<'a>(
+    expand_obj: &'a mut Value,
+    current_schema: &'a CollectionSchema,
+    current_tree: &'a HashMap<String, Vec<String>>,
+    claims: Option<&'a Claims>,
+    user_read_policy: &'a str,
+    schema_cache: &'a HashMap<i64, CollectionSchema>,
+    col_map: &'a HashMap<String, i64>,
+    db: &'a Arc<dyn apexkit_core::Db>,
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let owner_fields: Vec<String> = current_schema
+            .fields
+            .iter()
+            .filter(|(_, def)| def.r#type == FieldType::Owner)
+            .map(|(name, _)| name.clone())
+            .collect();
 
-    if let Value::Object(obj) = expand_obj {
-        // 1. Sanitize direct owner fields at this depth
-        for field in &owner_fields {
-            if let Some(user_val) = obj.get_mut(field) {
-                if !user_val.is_null()
-                    && !policies::check_access(user_read_policy, claims, Some(&*user_val))
-                {
-                    *user_val = Value::Null; // Denied by policy
+        if let Value::Object(obj) = expand_obj {
+            // 1. Sanitize direct owner fields at this depth
+            for field in &owner_fields {
+                if let Some(user_val) = obj.get_mut(field) {
+                    if !user_val.is_null()
+                        && !policies::check_access(
+                            user_read_policy,
+                            claims,
+                            Some(&*user_val),
+                            None,
+                            Some(db.clone()),
+                        )
+                        .await
+                    {
+                        *user_val = Value::Null; // Denied by policy
+                    }
                 }
             }
-        }
 
-        // 2. Recurse down requested relations
-        for (rel_name, sub_paths) in current_tree {
-            if let Some(rel_val) = obj.get_mut(rel_name) {
-                let mut target_schema = None;
+            // 2. Recurse down requested relations
+            for (rel_name, sub_paths) in current_tree {
+                if let Some(rel_val) = obj.get_mut(rel_name) {
+                    let mut target_schema = None;
 
-                // Match against schema (forward relation) or reverse collection name
-                if let Some(rel_def) = current_schema.relations.get(rel_name) {
-                    let target_name = &rel_def.target_collection;
-                    let target_id_opt = col_map
-                        .get(target_name)
-                        .copied()
-                        .or_else(|| target_name.parse::<i64>().ok());
+                    // Match against schema (forward relation) or reverse collection name
+                    if let Some(rel_def) = current_schema.relations.get(rel_name) {
+                        let target_name = &rel_def.target_collection;
+                        let target_id_opt = col_map
+                            .get(target_name)
+                            .copied()
+                            .or_else(|| target_name.parse::<i64>().ok());
 
-                    if let Some(id) = target_id_opt {
-                        target_schema = schema_cache.get(&id);
+                        if let Some(id) = target_id_opt {
+                            target_schema = schema_cache.get(&id);
+                        }
+                    } else if let Some(id) = col_map.get(rel_name) {
+                        target_schema = schema_cache.get(id);
                     }
-                } else if let Some(id) = col_map.get(rel_name) {
-                    target_schema = schema_cache.get(id);
-                }
 
-                if let Some(t_schema) = target_schema {
-                    let sub_tree =
-                        apexkit_core::query::builder::build_expand_tree(&sub_paths.join(","));
+                    if let Some(t_schema) = target_schema {
+                        let sub_tree =
+                            apexkit_core::query::builder::build_expand_tree(&sub_paths.join(","));
 
-                    // rel_val is either a single wrapped record OR an array of wrapped records.
-                    // We must dive into the nested "expand" property of those records to continue the tree.
-                    if let Value::Array(arr) = rel_val {
-                        for item in arr.iter_mut() {
-                            if let Some(nested_expand) = item.get_mut("expand") {
+                        if let Value::Array(arr) = rel_val {
+                            for item in arr.iter_mut() {
+                                if let Some(nested_expand) = item.get_mut("expand") {
+                                    sanitize_expand_node(
+                                        nested_expand,
+                                        t_schema,
+                                        &sub_tree,
+                                        claims,
+                                        user_read_policy,
+                                        schema_cache,
+                                        col_map,
+                                        db,
+                                    )
+                                    .await;
+                                }
+                            }
+                        } else if let Value::Object(_) = rel_val {
+                            if let Some(nested_expand) = rel_val.get_mut("expand") {
                                 sanitize_expand_node(
                                     nested_expand,
                                     t_schema,
@@ -956,24 +1018,14 @@ fn sanitize_expand_node(
                                     user_read_policy,
                                     schema_cache,
                                     col_map,
-                                );
+                                    db,
+                                )
+                                .await;
                             }
-                        }
-                    } else if let Value::Object(_) = rel_val {
-                        if let Some(nested_expand) = rel_val.get_mut("expand") {
-                            sanitize_expand_node(
-                                nested_expand,
-                                t_schema,
-                                &sub_tree,
-                                claims,
-                                user_read_policy,
-                                schema_cache,
-                                col_map,
-                            );
                         }
                     }
                 }
             }
         }
-    }
+    })
 }

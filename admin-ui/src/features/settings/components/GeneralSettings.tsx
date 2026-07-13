@@ -229,7 +229,9 @@ export const GeneralSettings = ({ settings, onChange, onSave }: GeneralSettingsP
                   <Input
                     type="number"
                     value={settings.maxSandboxAiRequests || 100}
-                    onChange={(e: any) => onChange({ maxSandboxAiRequests: Number(e.target.value) })}
+                    onChange={(e: any) =>
+                      onChange({ maxSandboxAiRequests: Number(e.target.value) })
+                    }
                   />
                   <p className="text-[10px] text-muted-foreground whitespace-nowrap">
                     Per 30min window

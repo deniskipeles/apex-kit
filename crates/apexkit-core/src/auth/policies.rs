@@ -1,7 +1,14 @@
+use std::future::Future;
+use std::pin::Pin;
+
+use crate::Db;
 use crate::auth::Claims;
-use serde_json::Value;
+use crate::query::ApexQuery;
+use crate::query::filter::FilterNode;
+use serde_json::{Value, json};
 use std::iter::Peekable;
 use std::str::Chars;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -11,10 +18,12 @@ pub enum Action {
     Delete,
 }
 
-pub fn check_access(
+pub async fn check_access(
     policy_string: &str,
     user: Option<&Claims>,
     record_data: Option<&Value>,
+    request_data: Option<&Value>,
+    db: Option<Arc<dyn Db>>,
 ) -> bool {
     let policy = policy_string.trim();
     if policy.is_empty() {
@@ -33,6 +42,25 @@ pub fn check_access(
         return false;
     }
 
+    // --- NEW JSON POLICY EVALUATION ---
+    if policy.starts_with('{') || policy.starts_with('[') {
+        let mut json_val: Value = match serde_json::from_str(policy) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        if preprocess_policy(&mut json_val, user, request_data, db.as_ref())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        let node = FilterNode::parse(&json_val);
+        return node.matches(record_data.unwrap_or(&json!({})));
+    }
+
+    // --- LEGACY STRING POLICY EVALUATION ---
     let tokens = match Tokenizer::new(policy).tokenize() {
         Ok(t) => t,
         Err(_) => {
@@ -55,6 +83,139 @@ pub fn check_access(
     };
 
     evaluate(&ast, user, record_data)
+}
+
+// Recursively processes the JSON Policy to resolve `@` prefixed variables dynamically.
+// Uses std::pin::Pin and std::future::Future for zero-dependency async recursion.
+pub fn preprocess_policy<'a>(
+    val: &'a mut Value,
+    user: Option<&'a Claims>,
+    request_data: Option<&'a Value>,
+    db: Option<&'a Arc<dyn Db>>,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut is_get = false;
+        let mut get_payload = None;
+
+        match val {
+            Value::Object(map) => {
+                // 1. Recurse into children first.
+                // This ensures any variables (like @request.auth.id) used INSIDE
+                // the @get() query payload are resolved before we run the query!
+                for (_, v) in map.iter_mut() {
+                    preprocess_policy(v, user, request_data, db).await?;
+                }
+
+                // 2. Check if this specific object is an @get() command
+                if let Some(payload) = map.remove("@get()") {
+                    is_get = true;
+                    get_payload = Some(payload);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr.iter_mut() {
+                    preprocess_policy(v, user, request_data, db).await?;
+                }
+            }
+            Value::String(s) => {
+                // If we match a string literal starting with @, resolve it dynamically
+                if let Some(new_val) = resolve_literal(s, user, request_data).await? {
+                    *val = new_val;
+                }
+            }
+            _ => {}
+        }
+
+        // 3. Execute the @get() query and replace the current JSON node with the result array
+        if is_get {
+            if let Some(payload) = get_payload {
+                let apex_query: ApexQuery = serde_json::from_value(payload)
+                    .map_err(|e| format!("Invalid @get() query payload: {}", e))?;
+
+                if let Some(d) = db {
+                    // Execute the query using the shared Query Engine on the database
+                    let res = d
+                        .query_engine(apex_query)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    if let Value::Array(arr) = res {
+                        let mut flat = Vec::new();
+                        for item in arr {
+                            if let Value::Object(item_map) = item {
+                                // Extract first key-value mapping to flatten array results
+                                // e.g., [{"workspace_id": 1}, {"workspace_id": 2}] -> [1, 2]
+                                if let Some((_, v)) = item_map.into_iter().next() {
+                                    flat.push(v);
+                                }
+                            } else {
+                                flat.push(item);
+                            }
+                        }
+                        // Overwrite the entire {"@get()": {...}} object with the final Array
+                        *val = Value::Array(flat);
+                    }
+                } else {
+                    return Err(
+                        "@get() is not supported in this context (missing db reference)".into(),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    })
+}
+
+// Evaluates and translates individual context string variables
+async fn resolve_literal(
+    s: &str,
+    user: Option<&Claims>,
+    request_data: Option<&Value>,
+) -> Result<Option<Value>, String> {
+    // 1. Resolve Auth Contexts
+    if s == "@request.auth.id" {
+        return Ok(Some(user.map(|u| json!(u.uid)).unwrap_or(Value::Null)));
+    }
+    if s == "@request.auth.role" {
+        return Ok(Some(
+            user.map(|u| json!(u.role.clone())).unwrap_or(Value::Null),
+        ));
+    }
+    if s == "@request.auth.email" {
+        return Ok(Some(
+            user.map(|u| json!(u.sub.clone())).unwrap_or(Value::Null),
+        ));
+    }
+    if s == "@request.auth" {
+        return Ok(Some(
+            user.map(|u| json!({ "id": u.uid, "role": u.role, "email": u.sub }))
+                .unwrap_or(Value::Null),
+        ));
+    }
+
+    // 2. Resolve Incoming Request Payload Contexts
+    if s.starts_with("@request.record.") {
+        let path = s.strip_prefix("@request.record.").unwrap();
+        // Allow `@request.record.data.field` or `@request.record.field`
+        let clean_path = path.strip_prefix("data.").unwrap_or(path);
+
+        if let Some(req_data) = request_data {
+            let mut current = req_data;
+            for key in clean_path.split('.') {
+                if let Some(v) = current.get(key) {
+                    current = v;
+                } else {
+                    return Ok(Some(Value::Null));
+                }
+            }
+            return Ok(Some(current.clone()));
+        } else {
+            return Ok(Some(Value::Null));
+        }
+    }
+
+    Ok(None)
 }
 
 fn check_owner_policy(rule: &str, user: Option<&Claims>, record_data: Option<&Value>) -> bool {
@@ -377,7 +538,7 @@ fn extract_field(field_name: &str, record: Option<&Value>) -> Option<String> {
     None
 }
 
-// --- NEW: COMPILER FOR SQL PUSHDOWN ---
+// --- COMPILER FOR SQL PUSHDOWN ---
 
 impl Expr {
     pub fn to_sql(&self, user: Option<&Claims>) -> String {
@@ -437,18 +598,21 @@ impl Expr {
     }
 }
 
-pub fn compile_to_sql(policy_string: &str, user: Option<&Claims>) -> Result<String, String> {
+pub async fn compile_to_sql(
+    policy_string: &str,
+    user: Option<&Claims>,
+    request_data: Option<&Value>,
+    db: Option<Arc<dyn Db>>,
+) -> Result<String, String> {
     let policy = policy_string.trim();
     if policy == "public" || policy.is_empty() {
         return Ok("1=1".to_string());
     }
 
-    // Admins bypass RLS natively
     if user.is_some_and(|u| u.role == "admin") {
         return Ok("1=1".to_string());
     }
 
-    // Admin check failed above
     if policy == "admin" {
         return Ok("1=0".to_string());
     }
@@ -458,6 +622,23 @@ pub fn compile_to_sql(policy_string: &str, user: Option<&Claims>) -> Result<Stri
         } else {
             Ok("1=0".to_string())
         };
+    }
+
+    // --- NEW JSON POLICY SQL COMPILATION ---
+    if policy.starts_with('{') || policy.starts_with('[') {
+        let mut json_val: Value = match serde_json::from_str(policy) {
+            Ok(v) => v,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        preprocess_policy(&mut json_val, user, request_data, db.as_ref()).await?;
+
+        let node = FilterNode::parse(&json_val);
+        if let Some(inline_sql) = node.to_inline_sql() {
+            return Ok(inline_sql);
+        } else {
+            return Ok("1=1".to_string()); // Empty filter
+        }
     }
 
     if let Some(field_name) = policy.strip_prefix("owner:") {
@@ -472,7 +653,6 @@ pub fn compile_to_sql(policy_string: &str, user: Option<&Claims>) -> Result<Stri
         }
     }
 
-    // Compile AST to SQL
     let mut tokenizer = Tokenizer::new(policy);
     let tokens = tokenizer.tokenize()?;
     let mut parser = Parser::new(tokens);

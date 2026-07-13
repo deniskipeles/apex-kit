@@ -31,7 +31,16 @@ const getExpandedLabel = (item: any): string => {
   const data = item.data || item;
 
   // 1. Try explicit descriptive fields first
-  const fallbackKeys = ['title', 'name', 'subject', 'label', 'email', 'slug', 'username', 'heading'];
+  const fallbackKeys = [
+    'title',
+    'name',
+    'subject',
+    'label',
+    'email',
+    'slug',
+    'username',
+    'heading',
+  ];
   for (const key of fallbackKeys) {
     if (data[key] && typeof data[key] === 'string' && data[key].trim()) {
       return data[key];
@@ -46,7 +55,7 @@ const getExpandedLabel = (item: any): string => {
 
   const genericField = Object.entries(data).find(([key, val]) => {
     if (typeof val !== 'string') return false;
-    const s = val.trim().slice(0,100);
+    const s = val.trim().slice(0, 100);
     const k = key.toLowerCase();
 
     return (

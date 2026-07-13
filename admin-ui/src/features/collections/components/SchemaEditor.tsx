@@ -375,7 +375,7 @@ const FieldEditorDialog = ({
                       onCheckedChange={(c) =>
                         setData({
                           ...data,
-                          vectorize: c
+                          vectorize: c,
                         })
                       }
                     />
@@ -641,7 +641,12 @@ const FieldEditorDialog = ({
                         <div className="space-y-0.5">
                           <Label
                             className="text-xs cursor-pointer flex items-center gap-1"
-                            onClick={() => setData({ ...data, cascade_on_target_delete: !data.cascade_on_target_delete })}
+                            onClick={() =>
+                              setData({
+                                ...data,
+                                cascade_on_target_delete: !data.cascade_on_target_delete,
+                              })
+                            }
                           >
                             <Trash2 className="h-3 w-3 text-muted-foreground" /> Cascade Delete
                           </Label>
