@@ -1,3 +1,4 @@
+// =========================== apex-kit/crates/apexkit-core/src/auth/policies.rs start here ===========================
 use std::future::Future;
 use std::pin::Pin;
 
@@ -49,7 +50,22 @@ pub async fn check_access(
             Err(_) => return false,
         };
 
-        if preprocess_policy(&mut json_val, user, request_data, db.as_ref())
+        // Extract and resolve @log() parameters
+        let mut log_mode = None;
+        if let Value::Object(ref mut map) = json_val {
+            if let Some(inner) = map.remove("@log()") {
+                log_mode = Some("JSON");
+                json_val = inner;
+            } else if let Some(inner) = map.remove("@log(JSON)") {
+                log_mode = Some("JSON");
+                json_val = inner;
+            } else if let Some(inner) = map.remove("@log(SQL)") {
+                log_mode = Some("SQL");
+                json_val = inner;
+            }
+        }
+
+        if preprocess_policy(&mut json_val, user, record_data, request_data, db.as_ref())
             .await
             .is_err()
         {
@@ -57,7 +73,36 @@ pub async fn check_access(
         }
 
         let node = FilterNode::parse(&json_val);
-        return node.matches(record_data.unwrap_or(&json!({})));
+        
+        // Reverted to strict record_data evaluation
+        let result = node.matches(record_data.unwrap_or(&json!({})));
+
+        // Output and persist logs if requested
+        if let Some(mode) = log_mode {
+            let log_msg = if mode == "SQL" {
+                let sql = node.to_inline_sql().unwrap_or_else(|| "1=1".to_string());
+                format!(
+                    "Memory Evaluation Triggered Log(SQL):\n  Resolved JSON: {}\n  Compiled SQL: {}\n  Matches Record: {}",
+                    serde_json::to_string(&json_val).unwrap_or_default(),
+                    sql,
+                    result
+                )
+            } else {
+                format!(
+                    "Memory Evaluation Triggered Log(JSON):\n  Resolved JSON: {}\n  Matches Record: {}",
+                    serde_json::to_string_pretty(&json_val).unwrap_or_default(),
+                    result
+                )
+            };
+
+            println!("\n🔍 [Policy @log]\n{}\n", log_msg);
+
+            if let Some(ref d) = db {
+                let _ = d.log_system_event("info", "policy_debugger", &log_msg).await;
+            }
+        }
+
+        return result;
     }
 
     // --- LEGACY STRING POLICY EVALUATION ---
@@ -90,6 +135,7 @@ pub async fn check_access(
 pub fn preprocess_policy<'a>(
     val: &'a mut Value,
     user: Option<&'a Claims>,
+    record_data: Option<&'a Value>,
     request_data: Option<&'a Value>,
     db: Option<&'a Arc<dyn Db>>,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
@@ -99,14 +145,33 @@ pub fn preprocess_policy<'a>(
 
         match val {
             Value::Object(map) => {
-                // 1. Recurse into children first.
-                // This ensures any variables (like @request.auth.id) used INSIDE
-                // the @get() query payload are resolved before we run the query!
+                // 1. Recurse into child values first
                 for (_, v) in map.iter_mut() {
-                    preprocess_policy(v, user, request_data, db).await?;
+                    preprocess_policy(v, user, record_data, request_data, db).await?;
                 }
 
-                // 2. Check if this specific object is an @get() command
+                // 2. Statically resolve explicit context keys (@request.record or @request.auth)
+                let mut new_map = serde_json::Map::new();
+                let old_map = std::mem::take(map); // Safely take ownership of the map's content
+                
+                for (k, v) in old_map {
+                    if k.starts_with("@request.record.") || k.starts_with("@request.auth.") {
+                        let lhs_val = resolve_literal(&k, user, record_data, request_data).await?.unwrap_or(Value::Null);
+                        let matched = eval_static_condition(&lhs_val, &v);
+                        
+                        if !matched {
+                            // Safe cross-crate trick to force false on empty/missing record targets
+                            new_map.insert("id".to_string(), json!("_force_false_for_missing_field"));
+                        }
+                        // If matched is true, we omit it from new_map. 
+                        // An empty map parses to FilterNode::Empty, which always evaluates to true.
+                    } else {
+                        new_map.insert(k, v);
+                    }
+                }
+                *map = new_map;
+
+                // 3. Check if this specific object is an @get() command
                 if let Some(payload) = map.remove("@get()") {
                     is_get = true;
                     get_payload = Some(payload);
@@ -114,26 +179,24 @@ pub fn preprocess_policy<'a>(
             }
             Value::Array(arr) => {
                 for v in arr.iter_mut() {
-                    preprocess_policy(v, user, request_data, db).await?;
+                    preprocess_policy(v, user, record_data, request_data, db).await?;
                 }
             }
             Value::String(s) => {
-                // If we match a string literal starting with @, resolve it dynamically
-                if let Some(new_val) = resolve_literal(s, user, request_data).await? {
+                if let Some(new_val) = resolve_literal(s, user, record_data, request_data).await? {
                     *val = new_val;
                 }
             }
             _ => {}
         }
 
-        // 3. Execute the @get() query and replace the current JSON node with the result array
+        // 3. Execute the @get() query
         if is_get {
             if let Some(payload) = get_payload {
                 let apex_query: ApexQuery = serde_json::from_value(payload)
                     .map_err(|e| format!("Invalid @get() query payload: {}", e))?;
 
                 if let Some(d) = db {
-                    // Execute the query using the shared Query Engine on the database
                     let res = d
                         .query_engine(apex_query)
                         .await
@@ -143,8 +206,6 @@ pub fn preprocess_policy<'a>(
                         let mut flat = Vec::new();
                         for item in arr {
                             if let Value::Object(item_map) = item {
-                                // Extract first key-value mapping to flatten array results
-                                // e.g., [{"workspace_id": 1}, {"workspace_id": 2}] -> [1, 2]
                                 if let Some((_, v)) = item_map.into_iter().next() {
                                     flat.push(v);
                                 }
@@ -152,7 +213,6 @@ pub fn preprocess_policy<'a>(
                                 flat.push(item);
                             }
                         }
-                        // Overwrite the entire {"@get()": {...}} object with the final Array
                         *val = Value::Array(flat);
                     }
                 } else {
@@ -171,6 +231,7 @@ pub fn preprocess_policy<'a>(
 async fn resolve_literal(
     s: &str,
     user: Option<&Claims>,
+    record_data: Option<&Value>,
     request_data: Option<&Value>,
 ) -> Result<Option<Value>, String> {
     // 1. Resolve Auth Contexts
@@ -197,11 +258,30 @@ async fn resolve_literal(
     // 2. Resolve Incoming Request Payload Contexts
     if s.starts_with("@request.record.") {
         let path = s.strip_prefix("@request.record.").unwrap();
-        // Allow `@request.record.data.field` or `@request.record.field`
         let clean_path = path.strip_prefix("data.").unwrap_or(path);
 
         if let Some(req_data) = request_data {
             let mut current = req_data;
+            for key in clean_path.split('.') {
+                if let Some(v) = current.get(key) {
+                    current = v;
+                } else {
+                    return Ok(Some(Value::Null));
+                }
+            }
+            return Ok(Some(current.clone()));
+        } else {
+            return Ok(Some(Value::Null));
+        }
+    }
+
+    // 3. Resolve Existing Database Record Contexts
+    if s.starts_with("@record.") {
+        let path = s.strip_prefix("@record.").unwrap();
+        let clean_path = path.strip_prefix("data.").unwrap_or(path);
+
+        if let Some(rec_data) = record_data {
+            let mut current = rec_data;
             for key in clean_path.split('.') {
                 if let Some(v) = current.get(key) {
                     current = v;
@@ -631,14 +711,52 @@ pub async fn compile_to_sql(
             Err(e) => return Err(e.to_string()),
         };
 
-        preprocess_policy(&mut json_val, user, request_data, db.as_ref()).await?;
+        let mut log_mode = None;
+        if let Value::Object(ref mut map) = json_val {
+            if let Some(inner) = map.remove("@log()") {
+                log_mode = Some("JSON");
+                json_val = inner;
+            } else if let Some(inner) = map.remove("@log(JSON)") {
+                log_mode = Some("JSON");
+                json_val = inner;
+            } else if let Some(inner) = map.remove("@log(SQL)") {
+                log_mode = Some("SQL");
+                json_val = inner;
+            }
+        }
+
+        preprocess_policy(&mut json_val, user, None, request_data, db.as_ref()).await?;
 
         let node = FilterNode::parse(&json_val);
-        if let Some(inline_sql) = node.to_inline_sql() {
-            return Ok(inline_sql);
+        let sql = if let Some(inline_sql) = node.to_inline_sql() {
+            inline_sql
         } else {
-            return Ok("1=1".to_string()); // Empty filter
+            "1=1".to_string() // Empty filter
+        };
+
+        if let Some(mode) = log_mode {
+            let log_msg = if mode == "SQL" {
+                format!(
+                    "SQL Compile Triggered Log(SQL):\n  Resolved JSON: {}\n  Compiled SQL: {}",
+                    serde_json::to_string(&json_val).unwrap_or_default(),
+                    sql
+                )
+            } else {
+                format!(
+                    "SQL Compile Triggered Log(JSON):\n  Resolved JSON: {}\n  Compiled SQL: {}",
+                    serde_json::to_string_pretty(&json_val).unwrap_or_default(),
+                    sql
+                )
+            };
+
+            println!("\n🔍 [Policy @log]\n{}\n", log_msg);
+
+            if let Some(ref d) = db {
+                let _ = d.log_system_event("info", "policy_debugger", &log_msg).await;
+            }
         }
+
+        return Ok(sql);
     }
 
     if let Some(field_name) = policy.strip_prefix("owner:") {
@@ -658,4 +776,50 @@ pub async fn compile_to_sql(
     let mut parser = Parser::new(tokens);
     let ast = parser.parse()?;
     Ok(ast.to_sql(user))
+}
+
+fn eval_static_condition(lhs: &Value, rhs: &Value) -> bool {
+    if let Value::Object(map) = rhs {
+        if let Some((op, val)) = map.iter().next() {
+            match op.as_str() {
+                "$eq" => compare_static_vals(lhs, val),
+                "$neq" => !compare_static_vals(lhs, val),
+                "$in" => {
+                    if let Value::Array(arr) = val {
+                        arr.iter().any(|item| compare_static_vals(lhs, item))
+                    } else {
+                        false
+                    }
+                }
+                "$nin" => {
+                    if let Value::Array(arr) = val {
+                        arr.iter().all(|item| !compare_static_vals(lhs, item))
+                    } else {
+                        true
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    } else {
+        compare_static_vals(lhs, rhs)
+    }
+}
+
+fn compare_static_vals(a: &Value, b: &Value) -> bool {
+    let a_str = match a {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => a.to_string(),
+    };
+    let b_str = match b {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => b.to_string(),
+    };
+    a_str == b_str
 }
