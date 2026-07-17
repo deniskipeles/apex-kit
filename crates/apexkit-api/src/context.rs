@@ -95,6 +95,10 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
         self.scope.clone()
     }
 
+    fn get_port(&self) -> u16 {
+        self.state.port
+    }
+
     fn get_scoped_vector_provider(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Arc<dyn VectorProvider>> + Send>> {

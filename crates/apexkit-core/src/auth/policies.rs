@@ -1,4 +1,3 @@
-// =========================== apex-kit/crates/apexkit-core/src/auth/policies.rs start here ===========================
 use std::future::Future;
 use std::pin::Pin;
 
@@ -73,7 +72,7 @@ pub async fn check_access(
         }
 
         let node = FilterNode::parse(&json_val);
-        
+
         // Reverted to strict record_data evaluation
         let result = node.matches(record_data.unwrap_or(&json!({})));
 
@@ -98,7 +97,9 @@ pub async fn check_access(
             println!("\n🔍 [Policy @log]\n{}\n", log_msg);
 
             if let Some(ref d) = db {
-                let _ = d.log_system_event("info", "policy_debugger", &log_msg).await;
+                let _ = d
+                    .log_system_event("info", "policy_debugger", &log_msg)
+                    .await;
             }
         }
 
@@ -153,17 +154,20 @@ pub fn preprocess_policy<'a>(
                 // 2. Statically resolve explicit context keys (@request.record or @request.auth)
                 let mut new_map = serde_json::Map::new();
                 let old_map = std::mem::take(map); // Safely take ownership of the map's content
-                
+
                 for (k, v) in old_map {
                     if k.starts_with("@request.record.") || k.starts_with("@request.auth.") {
-                        let lhs_val = resolve_literal(&k, user, record_data, request_data).await?.unwrap_or(Value::Null);
+                        let lhs_val = resolve_literal(&k, user, record_data, request_data)
+                            .await?
+                            .unwrap_or(Value::Null);
                         let matched = eval_static_condition(&lhs_val, &v);
-                        
+
                         if !matched {
                             // Safe cross-crate trick to force false on empty/missing record targets
-                            new_map.insert("id".to_string(), json!("_force_false_for_missing_field"));
+                            new_map
+                                .insert("id".to_string(), json!("_force_false_for_missing_field"));
                         }
-                        // If matched is true, we omit it from new_map. 
+                        // If matched is true, we omit it from new_map.
                         // An empty map parses to FilterNode::Empty, which always evaluates to true.
                     } else {
                         new_map.insert(k, v);
@@ -752,7 +756,9 @@ pub async fn compile_to_sql(
             println!("\n🔍 [Policy @log]\n{}\n", log_msg);
 
             if let Some(ref d) = db {
-                let _ = d.log_system_event("info", "policy_debugger", &log_msg).await;
+                let _ = d
+                    .log_system_event("info", "policy_debugger", &log_msg)
+                    .await;
             }
         }
 

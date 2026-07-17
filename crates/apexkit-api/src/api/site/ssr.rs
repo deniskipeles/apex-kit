@@ -162,17 +162,27 @@ async fn render_view_core(
                 .await
                 .map_err(|e| AppError::UnknownError(format!("Linked Script Error: {}", e)))?;
 
+            // THE FIX: Handle new __is_apex_response format
             if let Some(obj) = script_res.as_object()
-                && obj.contains_key("error")
-                && obj.contains_key("status")
+                && obj
+                    .get("__is_apex_response")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
             {
-                let status =
-                    StatusCode::from_u16(obj.get("status").unwrap().as_u64().unwrap_or(400) as u16)
-                        .unwrap_or(StatusCode::BAD_REQUEST);
-                return Ok((status, Json(script_res)).into_response());
+                let status_code = obj.get("status").and_then(|v| v.as_u64()).unwrap_or(400) as u16;
+                let body = obj.get("body").cloned().unwrap_or_default();
+                let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
+
+                if status.is_client_error() || status.is_server_error() {
+                    return Ok((status, Json(body)).into_response());
+                } else {
+                    merge_json(&mut context_data, body.clone());
+                    merge_json(&mut ssr_state, body);
+                }
+            } else {
+                merge_json(&mut context_data, script_res.clone());
+                merge_json(&mut ssr_state, script_res);
             }
-            merge_json(&mut context_data, script_res.clone());
-            merge_json(&mut ssr_state, script_res);
         }
     }
 
@@ -191,17 +201,27 @@ async fn render_view_core(
             .await
             .map_err(|e| AppError::UnknownError(format!("Template JS Error: {}", e)))?;
 
+        // THE FIX: Handle new __is_apex_response format
         if let Some(obj) = script_res.as_object()
-            && obj.contains_key("error")
-            && obj.contains_key("status")
+            && obj
+                .get("__is_apex_response")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
         {
-            let status =
-                StatusCode::from_u16(obj.get("status").unwrap().as_u64().unwrap_or(400) as u16)
-                    .unwrap_or(StatusCode::BAD_REQUEST);
-            return Ok((status, Json(script_res)).into_response());
+            let status_code = obj.get("status").and_then(|v| v.as_u64()).unwrap_or(400) as u16;
+            let body = obj.get("body").cloned().unwrap_or_default();
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
+
+            if status.is_client_error() || status.is_server_error() {
+                return Ok((status, Json(body)).into_response());
+            } else {
+                merge_json(&mut context_data, body.clone());
+                merge_json(&mut ssr_state, body);
+            }
+        } else {
+            merge_json(&mut context_data, script_res.clone());
+            merge_json(&mut ssr_state, script_res);
         }
-        merge_json(&mut context_data, script_res.clone());
-        merge_json(&mut ssr_state, script_res);
     }
 
     // 3. TERA SETUP

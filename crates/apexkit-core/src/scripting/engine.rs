@@ -72,6 +72,29 @@ const JS_PRELUDE: &str = r#"
                 this.headers = new Headers(init.headers || {});
             }
             this.args = this.bodyData || {};
+
+            // Auto-resolve JWT Auth claims
+            this.auth = null;
+            const authHeader = this.headers.get("authorization");
+            if (authHeader && authHeader.startsWith("Bearer ")) {
+                try {
+                    const token = authHeader.split(" ")[1];
+                    const payload = token.split(".")[1];
+                    // Safely pad and format Base64Url to standard Base64
+                    let b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+                    while (b64.length % 4) b64 += '=';
+                    
+                    const decoded = JSON.parse(globalThis.$util ? globalThis.$util.base64Decode(b64) : atob(b64));
+                    this.auth = {
+                        id: decoded.uid,
+                        email: decoded.sub,
+                        role: decoded.role,
+                        scope: decoded.scope
+                    };
+                } catch (e) {
+                    console.error("[ApexKit] Failed to decode auth token in Request:", e);
+                }
+            }
         }
         async json() { return typeof this.bodyData === 'string' ? JSON.parse(this.bodyData) : this.bodyData; }
         async text() { return typeof this.bodyData === 'string' ? this.bodyData : JSON.stringify(this.bodyData); }
@@ -251,17 +274,35 @@ impl ScriptEngine {
             let _ = ctx.run_jobs();
             let final_val = Self::resolve_promise(promise, ctx)?;
 
+            // THE FIX: Intercept JS Response objects, extract status, and parse stringified bodies safely
             if let Some(obj) = final_val.as_object()
                 && obj
                     .has_property(JsString::from("body"), ctx)
                     .unwrap_or(false)
+                && obj
+                    .has_property(JsString::from("status"), ctx)
+                    .unwrap_or(false)
             {
                 let body = obj.get(JsString::from("body"), ctx).unwrap_or_default();
-                let json = body
-                    .to_json(ctx)
-                    .unwrap_or(None)
-                    .unwrap_or(serde_json::Value::Null);
-                return Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null));
+                let status = obj.get(JsString::from("status"), ctx).unwrap_or_default();
+
+                let status_code = status.to_number(ctx).unwrap_or(200.0) as u16;
+
+                // Safely parse body if it is a stringified JSON (fixes double stringification)
+                let body_json = if let Some(js_str) = body.as_string() {
+                    let rust_str = js_str.to_std_string_escaped();
+                    serde_json::from_str(&rust_str).unwrap_or(serde_json::Value::String(rust_str))
+                } else {
+                    body.to_json(ctx)
+                        .unwrap_or(None)
+                        .unwrap_or(serde_json::Value::Null)
+                };
+
+                return Ok(serde_json::json!({
+                    "__is_apex_response": true,
+                    "status": status_code,
+                    "body": body_json
+                }));
             }
 
             let json = final_val

@@ -300,7 +300,10 @@ fn make_api_router() -> Router<AppState> {
             "/admin/scripts/{id}",
             axum::routing::delete(script_routes::delete_script),
         )
+        // LEGACY COMPATIBILITY
         .route("/run/{script_name}", post(script_routes::run_script))
+        // NEW script endpoint
+        .route("/webhook/{script_name}", post(script_routes::run_script))
         .route(
             "/admin/templates",
             get(template_routes::list_templates).post(template_routes::create_template),

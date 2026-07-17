@@ -2,6 +2,8 @@ use crate::BaseUrl;
 use crate::{AppError, AppState, DatabaseConnection};
 use apexkit_core::realtime::EventScope;
 use apexkit_core::{Db, auth::Claims, models::script::CreateScriptReq};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::{
     Extension,
     extract::{Json, Path, State},
@@ -129,7 +131,7 @@ async fn run_script_core(
     base_url: Option<String>,
     scope: EventScope,
     headers: Option<HashMap<String, String>>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     info!("[ScriptRunner] Running '{}' in {}", script_name, source);
 
     let script = db
@@ -159,7 +161,23 @@ async fn run_script_core(
         .await
         .map_err(|e| AppError::UnknownError(format!("Script Execution Error: {}", e)))?;
 
-    Ok(Json(result))
+    // THE FIX: Unpack the intercepted Response object and apply the correct HTTP Status
+    if let Some(obj) = result.as_object() {
+        if obj
+            .get("__is_apex_response")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let status_code = obj.get("status").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
+            let body = obj.get("body").cloned().unwrap_or(serde_json::Value::Null);
+
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
+            return Ok((status, Json(body)).into_response());
+        }
+    }
+
+    // Default return
+    Ok(Json(result).into_response())
 }
 
 // --- PUBLIC HANDLERS ---
@@ -180,10 +198,10 @@ pub async fn run_script(
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     scope: Option<Extension<EventScope>>,
-    headers: HeaderMap, // <--- Extract Headers
+    headers: HeaderMap,
     Path(path): Path<ScriptNamePath>,
     Json(payload): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     let headers_map = headers_to_map(&headers);
     run_script_core(
@@ -204,10 +222,10 @@ pub async fn run_sandbox_script(
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     scope: Option<Extension<EventScope>>,
-    headers: HeaderMap, // <--- Extract Headers
+    headers: HeaderMap,
     Path(path): Path<ScriptNamePath>,
     Json(payload): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     let headers_map = headers_to_map(&headers);
     run_script_core(
