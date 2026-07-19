@@ -1098,6 +1098,8 @@ pub async fn build_schema(
                             context,
                             None,
                             None,
+                            None,
+                            None,
                         )
                         .await
                         .map_err(async_graphql::Error::new)?;

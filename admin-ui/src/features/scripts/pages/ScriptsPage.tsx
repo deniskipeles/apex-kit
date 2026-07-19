@@ -172,7 +172,7 @@ export const ScriptsPage = () => {
           </p>
         </div>
         <div className="flex gap-2">
-          <ImportExportToolbar onExport={scriptsService.export} onImport={scriptsService.import} />
+          <ImportExportToolbar onExport={(format) => scriptsService.export(format)} onImport={scriptsService.import} />
           <Button
             onClick={() => {
               setSelectedScript(null);

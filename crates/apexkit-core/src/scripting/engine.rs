@@ -220,7 +220,9 @@ impl ScriptEngine {
         input_data: JsonValue,
         context: Arc<dyn ScriptContext>,
         base_url: Option<String>,
-        headers: Option<HashMap<String, String>>, // <--- NEW ARGUMENT
+        headers: Option<HashMap<String, String>>,
+        method: Option<String>,
+        url: Option<String>,
     ) -> Result<JsonValue, String> {
         self.execute_js_task(code, context, base_url, move |ctx| {
             let js_body = JsValue::from_json(&input_data, ctx).map_err(|e| e.to_string())?;
@@ -242,18 +244,23 @@ impl ScriptEngine {
             let req_init = ObjectInitializer::new(ctx)
                 .property(
                     JsString::from("method"),
-                    JsString::from("POST"),
+                    JsString::from(method.unwrap_or_else(|| "POST".to_string())),
                     Attribute::all(),
                 )
                 .property(JsString::from("body"), js_body, Attribute::all())
-                .property(JsString::from("headers"), js_headers, Attribute::all()) // <--- INJECT HEADERS
+                .property(JsString::from("headers"), js_headers, Attribute::all())
                 .build();
+
+            let url_val = url.unwrap_or_else(|| "http://localhost".to_string());
 
             let request_obj = request_cls
                 .as_constructor()
                 .unwrap()
                 .construct(
-                    &[JsValue::undefined(), JsValue::from(req_init)],
+                    &[
+                        JsValue::from(JsString::from(url_val)),
+                        JsValue::from(req_init),
+                    ],
                     Some(&request_cls.as_object().unwrap()),
                     ctx,
                 )

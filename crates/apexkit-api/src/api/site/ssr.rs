@@ -158,6 +158,8 @@ async fn render_view_core(
                     context.clone(),
                     base_url.clone(),
                     Some(headers_to_map(&headers)),
+                    None,
+                    None,
                 )
                 .await
                 .map_err(|e| AppError::UnknownError(format!("Linked Script Error: {}", e)))?;
@@ -197,6 +199,8 @@ async fn render_view_core(
                 context.clone(),
                 base_url.clone(),
                 Some(headers_to_map(&headers)),
+                None,
+                None,
             )
             .await
             .map_err(|e| AppError::UnknownError(format!("Template JS Error: {}", e)))?;

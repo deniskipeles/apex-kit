@@ -15,6 +15,11 @@ pub fn register_env(ctx: &mut Context) -> Result<(), String> {
         let result = ACTIVE_CONTEXT.with(|c| {
             if let Some((app, handle, base_url_opt, _, scope)) = &*c.borrow() {
                 handle.block_on(async {
+                    // THE FIX 1: Resolve the contextual database (Tenant/Sandbox) instead of hardcoding to Root
+                    let db = super::db::resolve_db(None, app.clone())
+                        .await
+                        .unwrap_or_else(|_| app.get_db());
+
                     // 1. Intercept APP_URL and LOCAL_APP_URL to apply scoping rules
                     if key == "APP_URL" || key == "LOCAL_APP_URL" {
                         // Determine the scoped path suffix
@@ -26,12 +31,12 @@ pub fn register_env(ctx: &mut Context) -> Result<(), String> {
                         };
 
                         let origin = if key == "LOCAL_APP_URL" {
-                            // THE FIX: Natively construct the local URL using the context's port
+                            // Natively construct the local URL using the context's port
                             format!("http://127.0.0.1:{}", app.get_port())
                         } else {
                             // Try DB config general.app_url
                             let mut configured = None;
-                            if let Ok(Some(val)) = app.get_db().get_config("general").await {
+                            if let Ok(Some(val)) = db.get_config("general").await {
                                 if let Some(url) = val
                                     .get("app_url")
                                     .and_then(|v| v.as_str())
@@ -54,7 +59,7 @@ pub fn register_env(ctx: &mut Context) -> Result<(), String> {
                     }
 
                     // 2. Attempt to fetch from Database Secrets
-                    if let Ok(Some(val)) = app.get_db().get_config(&key).await {
+                    if let Ok(Some(val)) = db.get_config(&key).await {
                         // Check if it's an encrypted wrapper
                         if let Ok(enc) = serde_json::from_value::<
                             crate::security::vault::EncryptedValue,
@@ -62,7 +67,16 @@ pub fn register_env(ctx: &mut Context) -> Result<(), String> {
                         {
                             return app.get_vault().decrypt(&enc).map_err(|e| e.to_string());
                         }
-                        return Ok(val.as_str().unwrap_or("").to_string());
+
+                        // THE FIX 2: Safely convert boolean and number JSON values to String.
+                        // If `val` is a boolean `true`, `val.as_str()` used to return `None`.
+                        let val_str = match val {
+                            serde_json::Value::String(s) => s,
+                            serde_json::Value::Bool(b) => b.to_string(),
+                            serde_json::Value::Number(n) => n.to_string(),
+                            _ => val.to_string(),
+                        };
+                        return Ok(val_str);
                     }
 
                     // 3. Fallback to reading from the .env file / system process environment

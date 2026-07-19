@@ -180,7 +180,11 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
             scope: scope.clone(),
         });
 
-        Box::pin(async move { engine.run_script(&code, payload, new_ctx, None, None).await })
+        Box::pin(async move {
+            engine
+                .run_script(&code, payload, new_ctx, None, None, None, None)
+                .await
+        })
     }
 
     // Dynamic Resolution for Tenant Switching

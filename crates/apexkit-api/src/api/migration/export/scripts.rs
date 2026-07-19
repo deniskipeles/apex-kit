@@ -1,36 +1,78 @@
 use crate::AppError;
 use crate::DatabaseConnection;
+use crate::api::migration::export::ExportQuery;
 use apexkit_core::auth::Claims;
-use axum::{Extension, http::header, response::Response};
+use apexkit_core::realtime::EventScope;
+use axum::{Extension, extract::Query, http::header, response::Response};
 
 // Handler: Export Scripts
 #[utoipa::path(
     get,
     path = "/api/v1/admin/export-scripts",
-    responses((status = 200, description = "Scripts JSON"))
+    params(ExportQuery),
+    responses((status = 200, description = "Scripts JSON or TXT"))
 )]
 pub async fn export_scripts_handler(
     Extension(claims): Extension<Claims>,
+    scope: Option<Extension<EventScope>>,
     DatabaseConnection(db): DatabaseConnection,
+    Query(params): Query<ExportQuery>,
 ) -> Result<Response, AppError> {
     if claims.role != "admin" {
         return Err(AppError::Forbidden("Admins only".into()));
     }
+
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+    let (scope_type, scope_id) = match event_scope {
+        EventScope::Root => ("root", "root".to_string()),
+        EventScope::Tenant(id) => ("tenant", id),
+        EventScope::Sandbox(id) => ("sandbox", id),
+        _ => ("unknown", "unknown".to_string()),
+    };
+
+    let date_str = chrono::Utc::now().format("%Y%m%d").to_string();
+    let format_ext = if params.format.to_lowercase() == "txt" {
+        "txt"
+    } else {
+        "json"
+    };
+    let filename = format!(
+        "apexkit-script-{}-{}-{}.{}",
+        scope_type, scope_id, date_str, format_ext
+    );
 
     let scripts = db
         .list_scripts()
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    let json_bytes = serde_json::to_vec_pretty(&scripts)
-        .map_err(|e| AppError::UnknownError(format!("Serialization Error: {}", e)))?;
+    let (content_type, body_bytes) = if format_ext == "txt" {
+        let mut output = String::new();
+        for script in &scripts {
+            let mut meta = serde_json::to_value(script).unwrap();
+            if let Some(obj) = meta.as_object_mut() {
+                obj.remove("code");
+            }
+            output.push_str("//====================start-metadata====================\n");
+            output.push_str(&format!("// {}\n", serde_json::to_string(&meta).unwrap()));
+            output.push_str("//====================end-metadata====================\n");
+            output.push_str("//====================start-code====================\n");
+            output.push_str(&script.code);
+            output.push_str("\n//====================end-code====================\n\n");
+        }
+        ("text/plain; charset=utf-8", output.into_bytes())
+    } else {
+        let json_bytes = serde_json::to_vec_pretty(&scripts)
+            .map_err(|e| AppError::UnknownError(format!("Serialization Error: {}", e)))?;
+        ("application/json; charset=utf-8", json_bytes)
+    };
 
     Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, content_type)
         .header(
             header::CONTENT_DISPOSITION,
-            "attachment; filename=\"scripts.json\"",
+            format!("attachment; filename=\"{}\"", filename),
         )
-        .body(json_bytes.into())
+        .body(body_bytes.into())
         .map_err(|e| AppError::UnknownError(format!("Response build failed: {}", e)))
 }

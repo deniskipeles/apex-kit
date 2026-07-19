@@ -4,7 +4,7 @@ import { Button } from './ui/Elements';
 import { useToast } from './feedback/Toast';
 
 interface Props {
-  onExport: () => Promise<void>;
+  onExport: (format: 'json' | 'txt') => Promise<void>;
   onImport: (file: File) => Promise<any>;
 }
 
@@ -36,11 +36,14 @@ export const ImportExportToolbar = ({ onExport, onImport }: Props) => {
         type="file"
         ref={fileInput}
         className="hidden"
-        accept=".json"
+        accept=".json,.txt"
         onChange={handleFileChange}
       />
-      <Button variant="outline" size="sm" onClick={onExport}>
-        <Download className="mr-2 h-3 w-3" /> Export
+      <Button variant="outline" size="sm" onClick={() => onExport('json')}>
+        <Download className="mr-2 h-3 w-3" /> JSON
+      </Button>
+      <Button variant="outline" size="sm" onClick={() => onExport('txt')}>
+        <Download className="mr-2 h-3 w-3" /> TXT
       </Button>
       <Button variant="outline" size="sm" onClick={handleImportClick}>
         <Upload className="mr-2 h-3 w-3" /> Import

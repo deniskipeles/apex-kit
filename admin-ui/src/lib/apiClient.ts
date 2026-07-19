@@ -881,9 +881,18 @@ export const apiClient = {
     run: async (name: string, variables: any): Promise<any> => {
       return await pb.scripts.run(name, variables);
     },
-    export: async () => {
-      const res = await rawFetch('/admin/export-scripts');
-      downloadBlob(await res.blob(), 'scripts.json');
+    export: async (format: 'json' | 'txt' = 'json') => {
+      const res = await rawFetch(`/admin/export-scripts?format=${format}`);
+      const blob = await res.blob();
+      const disposition = res.headers.get('Content-Disposition');
+      let filename = `scripts.${format}`;
+      if (disposition && disposition.indexOf('filename=') !== -1) {
+        const matches = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(disposition);
+        if (matches != null && matches[1]) {
+          filename = matches[1].replace(/['"]/g, '');
+        }
+      }
+      downloadBlob(blob, filename);
     },
     import: async (file: File) => {
       const formData = new FormData();
@@ -911,9 +920,18 @@ export const apiClient = {
     delete: async (id: string) => {
       await pb.templates.delete(id);
     },
-    export: async () => {
-      const res = await rawFetch('/admin/export-templates');
-      downloadBlob(await res.blob(), 'templates.json');
+    export: async (format: 'json' | 'txt' = 'json') => {
+      const res = await rawFetch(`/admin/export-templates?format=${format}`);
+      const blob = await res.blob();
+      const disposition = res.headers.get('Content-Disposition');
+      let filename = `templates.${format}`;
+      if (disposition && disposition.indexOf('filename=') !== -1) {
+        const matches = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(disposition);
+        if (matches != null && matches[1]) {
+          filename = matches[1].replace(/['"]/g, '');
+        }
+      }
+      downloadBlob(blob, filename);
     },
     import: async (file: File) => {
       const formData = new FormData();

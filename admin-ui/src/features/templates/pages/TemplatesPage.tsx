@@ -136,7 +136,7 @@ export const TemplatesPage = () => {
         </div>
         <div className="flex gap-2">
           <ImportExportToolbar
-            onExport={templatesService.export}
+            onExport={(format) => templatesService.export(format)}
             onImport={templatesService.import}
           />
           <Button

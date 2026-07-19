@@ -131,6 +131,8 @@ async fn run_script_core(
     base_url: Option<String>,
     scope: EventScope,
     headers: Option<HashMap<String, String>>,
+    method: Option<String>,
+    url: Option<String>,
 ) -> Result<Response, AppError> {
     info!("[ScriptRunner] Running '{}' in {}", script_name, source);
 
@@ -157,6 +159,8 @@ async fn run_script_core(
             context, // Pass AppState
             base_url,
             headers,
+            method,
+            url,
         )
         .await
         .map_err(|e| AppError::UnknownError(format!("Script Execution Error: {}", e)))?;
@@ -198,21 +202,35 @@ pub async fn run_script(
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     scope: Option<Extension<EventScope>>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     Path(path): Path<ScriptNamePath>,
-    Json(payload): Json<Value>,
+    body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     let headers_map = headers_to_map(&headers);
+
+    let payload = if body.is_empty() {
+        json!({})
+    } else {
+        let body_str = String::from_utf8_lossy(&body);
+        serde_json::from_str(&body_str).unwrap_or_else(|_| json!(body_str.to_string()))
+    };
+
+    let full_url = format!("{}{}", base_url, uri.to_string());
+
     run_script_core(
         db,
         state,
         path.script_name,
         payload,
         "API",
-        Some(base_url),
+        Some(base_url.clone()),
         event_scope,
         Some(headers_map),
+        Some(method.to_string()),
+        Some(full_url),
     )
     .await
 }
@@ -222,21 +240,35 @@ pub async fn run_sandbox_script(
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     scope: Option<Extension<EventScope>>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     Path(path): Path<ScriptNamePath>,
-    Json(payload): Json<Value>,
+    body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     let event_scope = scope.map(|e| e.0).unwrap_or(EventScope::Root);
     let headers_map = headers_to_map(&headers);
+
+    let payload = if body.is_empty() {
+        json!({})
+    } else {
+        let body_str = String::from_utf8_lossy(&body);
+        serde_json::from_str(&body_str).unwrap_or_else(|_| json!(body_str.to_string()))
+    };
+
+    let full_url = format!("{}{}", base_url, uri.to_string());
+
     run_script_core(
         db,
         state,
         path.script_name,
         payload,
         "Sandbox",
-        Some(base_url),
+        Some(base_url.clone()),
         event_scope,
         Some(headers_map),
+        Some(method.to_string()),
+        Some(full_url),
     )
     .await
 }
