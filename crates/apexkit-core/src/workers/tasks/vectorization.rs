@@ -4,6 +4,16 @@ use std::sync::Arc;
 use super::super::queue::JobContext;
 use crate::models::schema::CollectionSchema;
 
+fn get_storage_path(subpath: &str) -> String {
+    if let Ok(base) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
+        let clean_base = base.trim_end_matches('/');
+        let clean_sub = subpath.trim_start_matches('/');
+        format!("{}/{}", clean_base, clean_sub)
+    } else {
+        subpath.to_string()
+    }
+}
+
 pub async fn handle_generate_embedding(
     resolver: Arc<dyn JobContext>,
     tenant_id: Option<String>,
@@ -52,10 +62,10 @@ pub async fn handle_generate_embedding(
                     format!("storage/sandboxes/{}/uploads", id)
                 }
                 Some(id) => format!("storage/tenants/{}/uploads", id),
-                None => "./storage/system/uploads".to_string(),
+                None => "storage/system/uploads".to_string(),
             };
 
-            let file_path = std::path::Path::new(&fs_root).join(&content);
+            let file_path = std::path::Path::new(&get_storage_path(&fs_root)).join(&content);
             if let Ok(bytes) = tokio::fs::read(&file_path).await {
                 let ext = file_path
                     .extension()

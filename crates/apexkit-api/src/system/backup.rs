@@ -11,6 +11,16 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+fn get_storage_path(subpath: &str) -> String {
+    if let Ok(base) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
+        let clean_base = base.trim_end_matches('/');
+        let clean_sub = subpath.trim_start_matches('/');
+        format!("{}/{}", clean_base, clean_sub)
+    } else {
+        subpath.to_string()
+    }
+}
+
 fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
     fs::create_dir_all(&dst)?;
     for entry in fs::read_dir(src)? {
@@ -44,7 +54,7 @@ pub async fn perform_backup(
         EventScope::Root => (
             "storage/system".to_string(),
             "storage/backups".to_string(),
-            "backups".to_string(),
+            "__root_app__/backups".to_string(),
         ),
         EventScope::Tenant(id) => (
             format!("storage/tenants/{}", id),
@@ -114,9 +124,11 @@ pub async fn perform_backup(
 
     // --- 4. UPLOADS ---
     if config.include_uploads {
-        let uploads_src = Path::new(&source_dir).join("uploads");
+        let base_uploads = format!("{}/uploads", source_dir);
+        let path_str = get_storage_path(&base_uploads);
+        let uploads_src = Path::new(&path_str);
         if uploads_src.exists() {
-            copy_dir_all(&uploads_src, Path::new(&temp_dir).join("uploads")).ok();
+            copy_dir_all(uploads_src, Path::new(&temp_dir).join("uploads")).ok();
         }
     }
 
@@ -286,7 +298,7 @@ pub async fn restore_backup(
         };
 
         let s3_prefix = match &scope {
-            EventScope::Root => "backups".to_string(),
+            EventScope::Root => "__root_app__/backups".to_string(),
             EventScope::Tenant(id) => format!("tenants/{}/backups", id),
             EventScope::Sandbox(id) => format!("sandboxes/{}/backups", id),
             _ => return Err("Invalid scope".into()),
@@ -363,12 +375,21 @@ pub async fn restore_backup(
     let dirs_to_restore = vec!["uploads", "indexes", "public"];
     for dir in dirs_to_restore {
         let staged = Path::new(&temp_restore_dir).join(dir);
-        let live = Path::new(&target_dir).join(dir);
+
+        let live_path_str = if dir == "uploads" {
+            get_storage_path(&format!("{}/{}", target_dir, dir))
+        } else {
+            format!("{}/{}", target_dir, dir)
+        };
+        let live = Path::new(&live_path_str);
 
         if staged.exists() {
             if live.exists() {
-                let backup_path = Path::new(&target_dir).join(format!("{}_bak_{}", dir, timestamp));
+                let backup_path =
+                    Path::new(&live_path_str).with_extension(format!("bak_{}", timestamp));
                 fs::rename(&live, &backup_path).ok();
+            } else if let Some(p) = live.parent() {
+                fs::create_dir_all(p).ok();
             }
             fs::rename(&staged, &live).ok();
             info!("Restored directory: {}", dir);

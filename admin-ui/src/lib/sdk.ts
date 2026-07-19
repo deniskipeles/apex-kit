@@ -411,7 +411,7 @@ export class ApexKit {
         email: string,
         password: string,
         metadata: Record<string, any> = {},
-        role?: string,
+        role?: string
       ): Promise<AuthResponse> => {
         const res = await this._request<AuthResponse>('/auth/register', {
           method: 'POST',

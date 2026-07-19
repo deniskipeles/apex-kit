@@ -249,7 +249,7 @@ pub async fn list_backups_handler(
                 .await;
 
                 let prefix = match &event_scope {
-                    EventScope::Root => "backups/".to_string(),
+                    EventScope::Root => "__root_app__/backups/".to_string(),
                     EventScope::Tenant(id) => format!("tenants/{}/backups/", id),
                     EventScope::Sandbox(id) => format!("sandboxes/{}/backups/", id),
                     _ => return Ok(Json(vec![])),

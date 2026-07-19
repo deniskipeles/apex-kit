@@ -35,6 +35,16 @@ use apexkit_core::{
 
 use async_trait::async_trait;
 
+fn get_storage_path(subpath: &str) -> String {
+    if let Ok(base) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
+        let clean_base = base.trim_end_matches('/');
+        let clean_sub = subpath.trim_start_matches('/');
+        format!("{}/{}", clean_base, clean_sub)
+    } else {
+        subpath.to_string()
+    }
+}
+
 // --- DTOs ---
 #[derive(Serialize, ToSchema)]
 pub struct FileResponse {
@@ -169,7 +179,7 @@ impl DynamicStorage {
                     &self.get_public_url_base(),
                     &config.s3.access_key,
                     &secret_key,
-                    "",
+                    "__root_app__/",
                 )
                 .await;
                 (Arc::new(s3), false)
@@ -177,7 +187,7 @@ impl DynamicStorage {
                 let path = self
                     .fs_root_override
                     .clone()
-                    .unwrap_or_else(|| "./storage/system/uploads".to_string());
+                    .unwrap_or_else(|| get_storage_path("storage/system/uploads"));
                 let local = LocalStorage::new(&path, &self.get_public_url_base()).await;
                 (Arc::new(local), true)
             };
@@ -401,7 +411,7 @@ impl ScopedDynamicStorage {
                 let isolation_prefix = match &self.scope {
                     EventScope::Tenant(id) => format!("tenants/{}/uploads/", id),
                     EventScope::Sandbox(id) => format!("sandboxes/session_{}/uploads/", id),
-                    _ => "".to_string(),
+                    _ => "__root_app__/".to_string(),
                 };
 
                 let s3 = S3Storage::new_with_creds(
@@ -419,9 +429,11 @@ impl ScopedDynamicStorage {
         }
 
         let fs_root = match &self.scope {
-            EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
-            EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
-            _ => "./storage/tmp".to_string(),
+            EventScope::Tenant(id) => get_storage_path(&format!("storage/tenants/{}/uploads", id)),
+            EventScope::Sandbox(id) => {
+                get_storage_path(&format!("storage/sandboxes/session_{}/uploads", id))
+            }
+            _ => get_storage_path("storage/tmp"),
         };
         Ok((
             Arc::new(LocalStorage::new(&fs_root, &url_prefix).await),
@@ -486,9 +498,13 @@ impl StorageBackend for ScopedDynamicStorage {
         // If S3 failed, try local fallback first
         if result.is_err() && is_reseller {
             let fs_root = match &self.scope {
-                EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
-                EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
-                _ => "./storage/system/uploads".to_string(),
+                EventScope::Tenant(id) => {
+                    get_storage_path(&format!("storage/tenants/{}/uploads", id))
+                }
+                EventScope::Sandbox(id) => {
+                    get_storage_path(&format!("storage/sandboxes/session_{}/uploads", id))
+                }
+                _ => get_storage_path("storage/system/uploads"),
             };
             let local = LocalStorage::new(&fs_root, "/").await;
             result = local.get(name).await;
@@ -554,9 +570,11 @@ impl StorageBackend for ScopedDynamicStorage {
         let _ = active.delete(name).await;
 
         let fs_root = match &self.scope {
-            EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
-            EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
-            _ => "./storage/system/uploads".to_string(),
+            EventScope::Tenant(id) => get_storage_path(&format!("storage/tenants/{}/uploads", id)),
+            EventScope::Sandbox(id) => {
+                get_storage_path(&format!("storage/sandboxes/session_{}/uploads", id))
+            }
+            _ => get_storage_path("storage/system/uploads"),
         };
         let local = LocalStorage::new(&fs_root, "/").await;
         let _ = local.delete(name).await;
@@ -682,7 +700,7 @@ pub async fn test_s3_connection(
         "",
         &access_key,
         &raw_secret_key,
-        "",
+        "__root_app__/",
     )
     .await;
 
@@ -742,7 +760,7 @@ pub async fn migrate_storage(
     let build_backend = |req_type: &str| -> Result<Arc<dyn StorageBackend>, AppError> {
         match req_type {
             "local" => Ok(Arc::new(futures::executor::block_on(LocalStorage::new(
-                "./storage/system/uploads",
+                &get_storage_path("storage/system/uploads"),
                 "/api/v1/storage/file/",
             )))),
             "s3" => {
@@ -772,7 +790,7 @@ pub async fn migrate_storage(
                     "",
                     &config.s3.access_key,
                     &secret_key,
-                    "",
+                    "__root_app__/",
                 ));
                 Ok(Arc::new(s3))
             }
@@ -949,7 +967,7 @@ pub async fn serve_file(
             "Primary storage failed for '{}'. Attempting Root Local Fallback...",
             clean_filename
         );
-        let root_local = LocalStorage::new("./storage/system/uploads", "/").await;
+        let root_local = LocalStorage::new(&get_storage_path("storage/system/uploads"), "/").await;
         original_bytes = root_local.get(clean_filename).await;
     }
 
@@ -1338,7 +1356,8 @@ pub async fn serve_app_logo(
                     (b, m.to_string(), logo_filename.to_string())
                 }
                 Err(_) => {
-                    let root_local = LocalStorage::new("./storage/system/uploads", "/").await;
+                    let root_local =
+                        LocalStorage::new(&get_storage_path("storage/system/uploads"), "/").await;
                     match root_local.get(logo_filename).await {
                         Ok(b) => {
                             let m = mime_guess::from_path(logo_filename).first_or_octet_stream();

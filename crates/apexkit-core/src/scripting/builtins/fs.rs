@@ -13,6 +13,16 @@ use std::time::UNIX_EPOCH;
 use zip::write::FileOptions;
 use zip::{ZipArchive, ZipWriter};
 
+fn get_storage_path(subpath: &str) -> String {
+    if let Ok(base) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
+        let clean_base = base.trim_end_matches('/');
+        let clean_sub = subpath.trim_start_matches('/');
+        format!("{}/{}", clean_base, clean_sub)
+    } else {
+        subpath.to_string()
+    }
+}
+
 // 1. Resolve READ Path (Scope Root)
 fn resolve_read_path(scope: &EventScope, requested_path: &str) -> Result<PathBuf, String> {
     if requested_path.contains("..") {
@@ -43,7 +53,7 @@ fn resolve_read_path(scope: &EventScope, requested_path: &str) -> Result<PathBuf
         _ => return Err("Invalid scope".into()),
     };
 
-    Ok(PathBuf::from(base_dir))
+    Ok(PathBuf::from(get_storage_path(&base_dir)))
 }
 
 // 2. Resolve WRITE Path (Scope TMP Only)
@@ -81,7 +91,7 @@ fn resolve_write_path(scope: &EventScope, requested_path: &str) -> Result<PathBu
         _ => return Err("Invalid scope".into()),
     };
 
-    Ok(PathBuf::from(base_dir))
+    Ok(PathBuf::from(get_storage_path(&base_dir)))
 }
 
 pub fn register_file_tools(ctx: &mut Context) -> Result<(), String> {
@@ -498,12 +508,13 @@ pub fn register_fs(ctx: &mut Context) -> Result<(), String> {
 
 pub fn register_zip(ctx: &mut Context) -> Result<(), String> {
     fn _resolve_storage_path(scope: &EventScope) -> String {
-        match scope {
+        let base = match scope {
             EventScope::Root => "storage/system/uploads".to_string(),
             EventScope::Tenant(id) => format!("storage/tenants/{}/uploads", id),
             EventScope::Sandbox(id) => format!("storage/sandboxes/session_{}/uploads", id),
             _ => "storage/tmp".to_string(),
-        }
+        };
+        get_storage_path(&base)
     }
 
     let get_limit = || -> usize {
