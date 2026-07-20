@@ -1042,6 +1042,11 @@ pub struct StoredFileWithSignedUrl {
     pub signed_url: String,
 }
 
+#[derive(Deserialize)]
+pub struct GetFileParams {
+    pub id: String,
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/storage/files/{id}",
@@ -1055,10 +1060,12 @@ pub async fn get_file(
     auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     StorageConnection(storage): StorageConnection,
-    Path(id_or_name): Path<String>,
+    Path(params): Path<GetFileParams>,
     Query(q): Query<GetFileQuery>,
 ) -> Result<Json<StoredFileWithSignedUrl>, AppError> {
     let _claims = auth.ok_or(AppError::Unauthorized("Login required".into()))?;
+
+    let id_or_name = params.id;
 
     // Resolves either an integer ID or a raw string filename
     let file_meta = if let Ok(id) = id_or_name.parse::<i64>() {

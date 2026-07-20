@@ -41,12 +41,6 @@ pub async fn perform_backup(
     config: BackupConfigDto,
     scope: EventScope,
 ) -> Result<(), String> {
-    if !config.enabled {
-        return Ok(());
-    }
-
-    info!("Starting backup for scope {:?}...", scope);
-
     let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
     let backup_filename = format!("backup_{}.tar.gz", timestamp);
 
@@ -72,178 +66,192 @@ pub async fn perform_backup(
     let temp_dir = format!("{}/backup_staging_{}", source_dir, timestamp);
     let archive_path = format!("{}/{}", source_dir, backup_filename);
 
-    fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
-
-    // --- 1. DATABASES & JSON BUNDLE ---
-    if config.include_databases {
-        // Copy DB files
-        let db_files = vec!["core.db", "data.db", "system.db", "logs.db"];
-        for filename in db_files {
-            let src = Path::new(&source_dir).join(filename);
-            if src.exists() {
-                fs::copy(&src, Path::new(&temp_dir).join(filename)).ok();
-            }
+    // Inner block isolates critical steps so we can handle errors and perform cleanup reliably
+    let backup_result = async {
+        if !config.enabled {
+            return Ok(());
         }
 
-        // Export readable JSON bundle alongside databases
-        let bundle_dir = Path::new(&temp_dir).join("apex_bundle");
-        fs::create_dir_all(&bundle_dir).ok();
+        info!("Starting backup for scope {:?}...", scope);
+        fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
 
-        if let Ok(cols) = db.list_collections().await {
-            let schema_json = serde_json::to_string_pretty(&serde_json::json!({
-                "collections": cols,
-                "strategy": "overwrite"
-            }))
-            .unwrap_or_default();
-            fs::write(bundle_dir.join("apex_schema.json"), schema_json).ok();
-        }
-
-        if let Ok(scripts) = db.list_scripts().await {
-            let scripts_json = serde_json::to_string_pretty(&scripts).unwrap_or_default();
-            fs::write(bundle_dir.join("apex_scripts.json"), scripts_json).ok();
-        }
-
-        if let Ok(templates) = db.list_templates().await {
-            let templates_json = serde_json::to_string_pretty(&templates).unwrap_or_default();
-            fs::write(bundle_dir.join("apex_templates.json"), templates_json).ok();
-        }
-
-        if let Ok(actions) = db.list_ai_actions().await {
-            let actions_json = serde_json::to_string_pretty(&actions).unwrap_or_default();
-            fs::write(bundle_dir.join("apex_ai_actions.json"), actions_json).ok();
-        }
-    }
-
-    // --- 2. VECTOR DB ---
-    if config.include_vectors {
-        let src = Path::new(&source_dir).join("vectors.db");
-        if src.exists() {
-            fs::copy(&src, Path::new(&temp_dir).join("vectors.db")).ok();
-        }
-    }
-
-    // --- 4. UPLOADS ---
-    if config.include_uploads {
-        let base_uploads = format!("{}/uploads", source_dir);
-        let path_str = get_storage_path(&base_uploads);
-        let uploads_src = Path::new(&path_str);
-        if uploads_src.exists() {
-            copy_dir_all(uploads_src, Path::new(&temp_dir).join("uploads")).ok();
-        }
-    }
-
-    // --- 5. STATIC SITE ---
-    if config.include_static_site {
-        let public_src = Path::new(&source_dir).join("public");
-        if public_src.exists() {
-            copy_dir_all(&public_src, Path::new(&temp_dir).join("public")).ok();
-        }
-    }
-
-    // --- 6. INDEXES ---
-    if config.include_indexes {
-        let indexes_src = Path::new(&source_dir).join("indexes");
-        if indexes_src.exists() {
-            copy_dir_all(&indexes_src, Path::new(&temp_dir).join("indexes")).ok();
-        }
-    }
-
-    // CREATE ARCHIVE
-    let output = std::process::Command::new("tar")
-        .arg("-czf")
-        .arg(&archive_path)
-        .arg("-C")
-        .arg(&temp_dir)
-        .arg(".")
-        .output()
-        .map_err(|e| format!("Tar execution failed: {}", e))?;
-
-    if !output.status.success() {
-        let _ = fs::remove_dir_all(&temp_dir);
-        return Err(format!(
-            "Tar failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    // UPLOAD / MOVE
-    match config.destination.as_str() {
-        "s3" => {
-            let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
-            if let Some(val) = storage_settings {
-                let storage_conf: StorageConfigDto =
-                    serde_json::from_value(val).unwrap_or_default();
-                if storage_conf.s3.enabled {
-                    let secret = if let Some(enc_str) = storage_conf.s3.secret_key {
-                        let enc: EncryptedValue = serde_json::from_str(&enc_str).unwrap();
-                        vault.decrypt(&enc).unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-
-                    let s3 = apexkit_core::storage::S3Storage::new_with_creds(
-                        &storage_conf.s3.bucket,
-                        &storage_conf.s3.region,
-                        &storage_conf.s3.endpoint,
-                        "",
-                        &storage_conf.s3.access_key,
-                        &secret,
-                        "",
-                    )
-                    .await;
-
-                    let bytes = fs::read(&archive_path).map_err(|e| e.to_string())?;
-                    s3.save(
-                        &format!("{}/{}", s3_prefix, backup_filename),
-                        &bytes,
-                        "application/gzip",
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                    info!("Backup uploaded to S3: {}/{}", s3_prefix, backup_filename);
-                } else {
-                    return Err("S3 not enabled".into());
+        // --- 1. DATABASES & JSON BUNDLE ---
+        if config.include_databases {
+            // Copy DB files
+            let db_files = vec!["core.db", "data.db", "system.db", "logs.db"];
+            for filename in db_files {
+                let src = Path::new(&source_dir).join(filename);
+                if src.exists() {
+                    fs::copy(&src, Path::new(&temp_dir).join(filename)).ok();
                 }
             }
-        }
-        "local" | _ => {
-            fs::create_dir_all(&backup_dir_local).ok();
-            fs::rename(
-                &archive_path,
-                format!("{}/{}", backup_dir_local, backup_filename),
-            )
-            .map_err(|e| e.to_string())?;
-            info!(
-                "Backup saved locally: {}/{}",
-                backup_dir_local, backup_filename
-            );
 
-            // Prune
-            if config.retention > 0 {
-                let cutoff = Utc::now() - chrono::Duration::days(config.retention as i64);
-                if let Ok(entries) = fs::read_dir(&backup_dir_local) {
-                    for entry in entries.flatten() {
-                        if let Ok(meta) = entry.metadata()
-                            && let Ok(modified) = meta.modified()
-                        {
-                            let dt: chrono::DateTime<Utc> = modified.into();
-                            if dt < cutoff {
-                                let _ = fs::remove_file(entry.path());
+            // Export readable JSON bundle alongside databases
+            let bundle_dir = Path::new(&temp_dir).join("apex_bundle");
+            fs::create_dir_all(&bundle_dir).ok();
+
+            if let Ok(cols) = db.list_collections().await {
+                let schema_json = serde_json::to_string_pretty(&serde_json::json!({
+                    "collections": cols,
+                    "strategy": "overwrite"
+                }))
+                .unwrap_or_default();
+                fs::write(bundle_dir.join("apex_schema.json"), schema_json).ok();
+            }
+
+            if let Ok(scripts) = db.list_scripts().await {
+                let scripts_json = serde_json::to_string_pretty(&scripts).unwrap_or_default();
+                fs::write(bundle_dir.join("apex_scripts.json"), scripts_json).ok();
+            }
+
+            if let Ok(templates) = db.list_templates().await {
+                let templates_json = serde_json::to_string_pretty(&templates).unwrap_or_default();
+                fs::write(bundle_dir.join("apex_templates.json"), templates_json).ok();
+            }
+
+            if let Ok(actions) = db.list_ai_actions().await {
+                let actions_json = serde_json::to_string_pretty(&actions).unwrap_or_default();
+                fs::write(bundle_dir.join("apex_ai_actions.json"), actions_json).ok();
+            }
+        }
+
+        // --- 2. VECTOR DB ---
+        if config.include_vectors {
+            let src = Path::new(&source_dir).join("vectors.db");
+            if src.exists() {
+                fs::copy(&src, Path::new(&temp_dir).join("vectors.db")).ok();
+            }
+        }
+
+        // --- 4. UPLOADS ---
+        if config.include_uploads {
+            let base_uploads = format!("{}/uploads", source_dir);
+            let path_str = get_storage_path(&base_uploads);
+            let uploads_src = Path::new(&path_str);
+            if uploads_src.exists() {
+                copy_dir_all(uploads_src, Path::new(&temp_dir).join("uploads")).ok();
+            }
+        }
+
+        // --- 5. STATIC SITE ---
+        if config.include_static_site {
+            let public_src = Path::new(&source_dir).join("public");
+            if public_src.exists() {
+                copy_dir_all(&public_src, Path::new(&temp_dir).join("public")).ok();
+            }
+        }
+
+        // --- 6. INDEXES ---
+        if config.include_indexes {
+            let indexes_src = Path::new(&source_dir).join("indexes");
+            if indexes_src.exists() {
+                copy_dir_all(&indexes_src, Path::new(&temp_dir).join("indexes")).ok();
+            }
+        }
+
+        // CREATE ARCHIVE
+        let output = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&temp_dir)
+            .arg(".")
+            .output()
+            .map_err(|e| format!("Tar execution failed: {}", e))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "Tar failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        // UPLOAD / MOVE
+        match config.destination.as_str() {
+            "s3" => {
+                let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
+                if let Some(val) = storage_settings {
+                    let storage_conf: StorageConfigDto =
+                        serde_json::from_value(val).unwrap_or_default();
+                    if storage_conf.s3.enabled {
+                        // Safe decryption check
+                        let secret = if let Some(enc_str) = storage_conf.s3.secret_key {
+                            if let Ok(enc) = serde_json::from_str::<EncryptedValue>(&enc_str) {
+                                vault.decrypt(&enc).unwrap_or_default()
+                            } else {
+                                enc_str // Fallback to plain text
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        let s3 = apexkit_core::storage::S3Storage::new_with_creds(
+                            &storage_conf.s3.bucket,
+                            &storage_conf.s3.region,
+                            &storage_conf.s3.endpoint,
+                            "",
+                            &storage_conf.s3.access_key,
+                            &secret,
+                            "",
+                        )
+                        .await;
+
+                        let bytes = fs::read(&archive_path).map_err(|e| e.to_string())?;
+                        s3.save(
+                            &format!("{}/{}", s3_prefix, backup_filename),
+                            &bytes,
+                            "application/gzip",
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                        info!("Backup uploaded to S3: {}/{}", s3_prefix, backup_filename);
+                    } else {
+                        return Err("S3 not enabled".into());
+                    }
+                }
+            }
+            "local" | _ => {
+                fs::create_dir_all(&backup_dir_local).ok();
+                fs::rename(
+                    &archive_path,
+                    format!("{}/{}", backup_dir_local, backup_filename),
+                )
+                .map_err(|e| e.to_string())?;
+                info!(
+                    "Backup saved locally: {}/{}",
+                    backup_dir_local, backup_filename
+                );
+
+                // Prune
+                if config.retention > 0 {
+                    let cutoff = Utc::now() - chrono::Duration::days(config.retention as i64);
+                    if let Ok(entries) = fs::read_dir(&backup_dir_local) {
+                        for entry in entries.flatten() {
+                            if let Ok(meta) = entry.metadata()
+                                && let Ok(modified) = meta.modified()
+                            {
+                                let dt: chrono::DateTime<Utc> = modified.into();
+                                if dt < cutoff {
+                                    let _ = fs::remove_file(entry.path());
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
+    .await;
 
+    // --- ALWAYS RUN CLEANUP STEPS REGARDLESS OF THE BACKUP RESULT ---
     let _ = fs::remove_dir_all(&temp_dir);
     if config.destination == "s3" {
         let _ = fs::remove_file(&archive_path);
     }
 
-    Ok(())
+    backup_result
 }
 
 pub async fn restore_backup(
