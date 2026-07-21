@@ -15,8 +15,8 @@ async-stream = "0.3"
 # Data & Database
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.117"
-apexkit-core = { path = "../apexkit-core" }
-apexkit-vector = { path = "../apexkit-vector" }
+apexkit-core = { path = "../apexkit-core", default-features = false }
+apexkit-vector = { path = "../apexkit-vector", default-features = false }
 
 # Data Import
 csv = "1.3"
@@ -114,9 +114,10 @@ assert-json-diff = "2.0.2"
 hyper = "1.8.1"
 
 [features]
-default = []
-cuda = ["apexkit-vector/cuda"]
-metal = ["apexkit-vector/metal"]
+default = ["onnx"]
+onnx = ["apexkit-core/onnx", "apexkit-vector/onnx"]
+cuda = ["apexkit-core/cuda", "apexkit-vector/cuda"]
+metal = ["apexkit-core/metal", "apexkit-vector/metal"]
 
 # Profile optimizations for release
 [profile.release]

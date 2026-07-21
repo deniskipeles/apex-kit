@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 # Custom Crate
-apexkit-vector = { path = "../apexkit-vector" }
+apexkit-vector = { path = "../apexkit-vector", default-features = false }
 # Database
 rusqlite = { version = "0.39.0", features = ["bundled", "hooks", "serde_json", "blob", "session"] }
 serde_sqlite_jsonb = "0.2.1" # Zero-copy JSONB wrapper
@@ -78,3 +78,9 @@ walkdir = "2.4"
 regex = "1.10"
 url = "2.5"
 ring = "0.17.14"
+
+[features]
+default = ["onnx"]
+onnx = ["apexkit-vector/onnx"]
+cuda = ["apexkit-vector/cuda"]
+metal = ["apexkit-vector/metal"]

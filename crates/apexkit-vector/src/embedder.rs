@@ -15,8 +15,11 @@ use crate::models::gemma_embed::{
 };
 // imports: swap onnx_text -> onnx_vision_text for the cross-modal tower,
 // add new onnx_text for the stand-alone text-embed models
+#[cfg(feature = "onnx")]
 use crate::models::onnx_text::{OnnxTextConfig, OnnxTextEmbedder};
+#[cfg(feature = "onnx")]
 use crate::models::onnx_vision::{OnnxVisionConfig, OnnxVisionEmbedder, VisionFamily};
+#[cfg(feature = "onnx")]
 use crate::models::onnx_vision_text::{OnnxVisionTextConfig, OnnxVisionTextEmbedder};
 use crate::models::qwen_embed::{QwenEmbedConfig, QwenEmbedModel, last_token_pool};
 use crate::models::siglip2::{Siglip2VisionModel, SiglipVisionConfig};
@@ -160,6 +163,7 @@ enum ModelBackend {
     Bert(Box<BertModel>),
     Gemma(Box<GemmaEmbedModel>),
     Qwen(Box<QwenEmbedModel>),
+    #[cfg(feature = "onnx")]
     OnnxText(Box<OnnxTextEmbedder>),
 }
 
@@ -198,6 +202,7 @@ enum ModelBackend {
 // - APEXKIT_VISION_TEXT_* env vars are ignored when APEXKIT_VISION_MODEL=dinov2.
 
 enum VisionBackend {
+    #[cfg(feature = "onnx")]
     Onnx {
         family: VisionFamily,
         vision: OnnxVisionEmbedder,
@@ -213,6 +218,8 @@ enum VisionBackend {
     },
 }
 
+#[cfg(feature = "onnx")]
+#[derive(Clone, Debug)]
 struct ResolvedVisionConfig {
     family: VisionFamily,
     vision_repo: String,
@@ -224,12 +231,14 @@ struct ResolvedVisionConfig {
     text_cfg: OnnxVisionTextConfig,
 }
 
+#[cfg(feature = "onnx")]
 fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
+#[cfg(feature = "onnx")]
 fn parse_csv_f32_3(s: &str) -> Result<[f32; 3]> {
     let parts: Vec<f32> = s
         .split(',')
@@ -246,6 +255,7 @@ fn parse_csv_f32_3(s: &str) -> Result<[f32; 3]> {
     Ok([parts[0], parts[1], parts[2]])
 }
 
+#[cfg(feature = "onnx")]
 fn resolve_vision_config() -> Result<ResolvedVisionConfig> {
     let selection_str =
         std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2".to_string());
@@ -420,48 +430,50 @@ impl CandleEmbedder {
         let is_onnx_text = lower_repo.contains("-onnx") || lower_repo.contains("_onnx");
 
         let (backend, backend_kind) = if is_onnx_text && (is_gemma || is_qwen) {
-            tracing::info!("Apex Vector: Loading ONNX text-embedding model (ort backend).");
-            let onnx_file = std::env::var("APEXKIT_TEXT_MODEL_FILE")
-                .unwrap_or_else(|_| "onnx/model.onnx".to_string());
-            let onnx_path = repo.get(&onnx_file).with_context(|| {
-        format!(
-            "failed to fetch text-embed onnx file '{onnx_file}' - if the default path doesn't \
-             exist in this repo, set APEXKIT_TEXT_MODEL_FILE (e.g. onnx/model_quantized.onnx)"
-        )
-    })?;
+            #[cfg(feature = "onnx")]
+            {
+                tracing::info!("Apex Vector: Loading ONNX text-embedding model (ort backend).");
+                let onnx_file = std::env::var("APEXKIT_TEXT_MODEL_FILE")
+                    .unwrap_or_else(|_| "onnx/model.onnx".to_string());
+                let onnx_path = repo.get(&onnx_file).with_context(|| {
+                    format!(
+                        "failed to fetch text-embed onnx file '{onnx_file}' - if the default path doesn't \
+                         exist in this repo, set APEXKIT_TEXT_MODEL_FILE (e.g. onnx/model_quantized.onnx)"
+                    )
+                })?;
 
-            let onnx_data_file = format!("{onnx_file}_data");
-            match repo.get(&onnx_data_file) {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!(
-                        "Apex Vector: no external-data sidecar '{onnx_data_file}' found ({e}) - \
-                 assuming this export is self-contained (small enough to not need one)."
-                    );
+                let onnx_data_file = format!("{onnx_file}_data");
+                match repo.get(&onnx_data_file) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            "Apex Vector: no external-data sidecar '{onnx_data_file}' found ({e}) - \
+                             assuming this export is self-contained (small enough to not need one)."
+                        );
+                    }
                 }
+
+                let config_filename = repo.get(&actual_config.config_file)?;
+                let config_str = std::fs::read_to_string(&config_filename)?;
+                let raw_config: serde_json::Value = serde_json::from_str(&config_str)?;
+
+                let cfg = if is_gemma {
+                    OnnxTextConfig::gemma_embed_onnx()
+                } else {
+                    OnnxTextConfig::qwen3_embed_onnx_with_kv_shape(&raw_config)?
+                };
+                let embedder = OnnxTextEmbedder::load(&onnx_path, &tokenizer_filename, cfg)?;
+                let kind = if is_gemma {
+                    BackendKind::Gemma
+                } else {
+                    BackendKind::Qwen
+                };
+                (ModelBackend::OnnxText(Box::new(embedder)), kind)
             }
-
-            // Qwen3's exported graph is decoder-with-cache (built for generation), so it
-            // unconditionally expects past_key_values.{i}.key/.value inputs even on a single
-            // forward pass. Need num_hidden_layers/num_key_value_heads/head_dim for that, so
-            // fetch config.json here too (skip model.safetensors only).
-            let config_filename = repo.get(&actual_config.config_file)?;
-            let config_str = std::fs::read_to_string(&config_filename)?;
-            let raw_config: serde_json::Value = serde_json::from_str(&config_str)?;
-
-            let cfg = if is_gemma {
-                OnnxTextConfig::gemma_embed_onnx()
-            } else {
-                OnnxTextConfig::qwen3_embed_onnx_with_kv_shape(&raw_config)?
-            };
-            // Pass tokenizer_filename to the load function
-            let embedder = OnnxTextEmbedder::load(&onnx_path, &tokenizer_filename, cfg)?;
-            let kind = if is_gemma {
-                BackendKind::Gemma
-            } else {
-                BackendKind::Qwen
-            };
-            (ModelBackend::OnnxText(Box::new(embedder)), kind)
+            #[cfg(not(feature = "onnx"))]
+            {
+                bail!("ONNX support is disabled in this build. Cannot load an ONNX model.");
+            }
         } else {
             // Only candle (safetensors) backends need weights_file/config_file - fetch
             // them here, not unconditionally up top, since ONNX repos don't ship a
@@ -579,6 +591,7 @@ impl CandleEmbedder {
         let clean_text = from_read(html_content.as_bytes(), usize::MAX);
         let clean_text = apply_prefix(self.backend_kind, task, &clean_text);
 
+        #[cfg(feature = "onnx")]
         {
             let backend_lock = self.backend.lock().unwrap();
             if let ModelBackend::OnnxText(onnx) = &*backend_lock {
@@ -680,6 +693,7 @@ impl CandleEmbedder {
                 let normalized = normalize_l2(&pooled)?;
                 Ok(normalized.squeeze(0)?.to_vec1::<f32>()?)
             }
+            #[cfg(feature = "onnx")]
             ModelBackend::OnnxText(_) => {
                 bail!(
                     "internal error: OnnxText backend should never reach run_model_pass_with_mask"
@@ -694,6 +708,7 @@ impl CandleEmbedder {
             .map(|t| apply_prefix(self.backend_kind, TaskKind::Document, t))
             .collect();
 
+        #[cfg(feature = "onnx")]
         {
             let backend_lock = self.backend.lock().unwrap();
             if let ModelBackend::OnnxText(onnx) = &*backend_lock {
@@ -725,8 +740,8 @@ impl CandleEmbedder {
             return Ok(());
         }
 
-        let selection =
-            std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2".to_string());
+        let default_model = if cfg!(feature = "onnx") { "siglip2" } else { "candle-siglip2" };
+        let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| default_model.to_string());
 
         if selection == "candle-siglip2" {
             tracing::info!(
@@ -765,75 +780,82 @@ impl CandleEmbedder {
             return Ok(());
         }
 
-        let resolved = resolve_vision_config()?;
-        tracing::info!(
-            "Apex Vector: Loading ONNX vision family '{}' - vision repo='{}' file='{}', text repo={:?} file={:?}",
-            resolved.family.as_str(),
-            resolved.vision_repo,
-            resolved.vision_file,
-            resolved.text_repo,
-            resolved.text_file
-        );
+        #[cfg(feature = "onnx")]
+        {
+            let resolved = resolve_vision_config()?;
+            tracing::info!(
+                "Apex Vector: Loading ONNX vision family '{}' - vision repo='{}' file='{}', text repo={:?} file={:?}",
+                resolved.family.as_str(),
+                resolved.vision_repo,
+                resolved.vision_file,
+                resolved.text_repo,
+                resolved.text_file
+            );
 
-        let api = ApiBuilder::new().build()?;
-        let vision_repo = api.repo(Repo::new(resolved.vision_repo.clone(), RepoType::Model));
-        let vision_model_path: PathBuf =
-            vision_repo.get(&resolved.vision_file).with_context(|| {
-                format!(
-                    "failed to fetch vision tower '{}' from repo '{}' - if this preset's default \
-                 filename doesn't exist in that repo, set APEXKIT_VISION_MODEL_FILE to the \
-                 correct path (check the repo's file listing on HF)",
-                    resolved.vision_file, resolved.vision_repo
-                )
-            })?;
-        let vision_embedder = OnnxVisionEmbedder::load(&vision_model_path, resolved.onnx_cfg)?;
+            let api = ApiBuilder::new().build()?;
+            let vision_repo = api.repo(Repo::new(resolved.vision_repo.clone(), RepoType::Model));
+            let vision_model_path: PathBuf =
+                vision_repo.get(&resolved.vision_file).with_context(|| {
+                    format!(
+                        "failed to fetch vision tower '{}' from repo '{}' - if this preset's default \
+                     filename doesn't exist in that repo, set APEXKIT_VISION_MODEL_FILE to the \
+                     correct path (check the repo's file listing on HF)",
+                        resolved.vision_file, resolved.vision_repo
+                    )
+                })?;
+            let vision_embedder = OnnxVisionEmbedder::load(&vision_model_path, resolved.onnx_cfg)?;
 
-        let text_embedder = match (
-            &resolved.text_repo,
-            &resolved.text_file,
-            &resolved.text_tokenizer_file,
-        ) {
-            (Some(text_repo_id), Some(text_file), Some(text_tok_file)) => {
-                let text_repo = api.repo(Repo::new(text_repo_id.clone(), RepoType::Model));
-                match (text_repo.get(text_file), text_repo.get(text_tok_file)) {
-                    (Ok(text_model_path), Ok(text_tok_path)) => {
-                        match OnnxVisionTextEmbedder::load(
-                            &text_model_path,
-                            &text_tok_path,
-                            resolved.text_cfg.clone(),
-                        ) {
-                            Ok(t) => Some(t),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Apex Vector: text tower failed to load ({e}) - text-image search will be \
-                                     unavailable for this session. Image-image search is unaffected."
-                                );
-                                None
+            let text_embedder = match (
+                &resolved.text_repo,
+                &resolved.text_file,
+                &resolved.text_tokenizer_file,
+            ) {
+                (Some(text_repo_id), Some(text_file), Some(text_tok_file)) => {
+                    let text_repo = api.repo(Repo::new(text_repo_id.clone(), RepoType::Model));
+                    match (text_repo.get(text_file), text_repo.get(text_tok_file)) {
+                        (Ok(text_model_path), Ok(text_tok_path)) => {
+                            match OnnxVisionTextEmbedder::load(
+                                &text_model_path,
+                                &text_tok_path,
+                                resolved.text_cfg.clone(),
+                            ) {
+                                Ok(t) => Some(t),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Apex Vector: text tower failed to load ({e}) - text-image search will be \
+                                         unavailable for this session. Image-image search is unaffected."
+                                    );
+                                    None
+                                }
                             }
                         }
-                    }
-                    (Err(e), _) | (_, Err(e)) => {
-                        tracing::warn!(
-                            "Apex Vector: text tower files not found in repo '{}' ({e}) - text-image search \
-                             will be unavailable. Set APEXKIT_VISION_TEXT_REPO/_FILE/_TOKENIZER if the text \
-                             tower lives elsewhere, or APEXKIT_VISION_TEXT_DISABLE=1 to silence this warning.",
-                            text_repo_id
-                        );
-                        None
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::warn!(
+                                "Apex Vector: text tower files not found in repo '{}' ({e}) - text-image search \
+                                 will be unavailable. Set APEXKIT_VISION_TEXT_REPO/_FILE/_TOKENIZER if the text \
+                                 tower lives elsewhere, or APEXKIT_VISION_TEXT_DISABLE=1 to silence this warning.",
+                                text_repo_id
+                            );
+                            None
+                        }
                     }
                 }
-            }
-            _ => None,
-        };
+                _ => None,
+            };
 
-        *vision_lock = Some(VisionBackend::Onnx {
-            family: resolved.family,
-            vision: vision_embedder,
-            text: text_embedder,
-            vision_repo: resolved.vision_repo,
-            vision_file: resolved.vision_file,
-        });
-        Ok(())
+            *vision_lock = Some(VisionBackend::Onnx {
+                family: resolved.family,
+                vision: vision_embedder,
+                text: text_embedder,
+                vision_repo: resolved.vision_repo,
+                vision_file: resolved.vision_file,
+            });
+            return Ok(());
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            bail!("ONNX support is disabled. Set APEXKIT_VISION_MODEL=candle-siglip2 to use pure Rust vision engine.");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -854,6 +876,7 @@ impl CandleEmbedder {
         let img = image::load_from_memory(&image_bytes).map_err(E::msg)?;
 
         match backend {
+            #[cfg(feature = "onnx")]
             VisionBackend::Onnx { vision, .. } => {
                 let cfg = vision.config();
                 let size = cfg.image_size;
@@ -922,6 +945,7 @@ impl CandleEmbedder {
         let backend = vision_lock.as_ref().unwrap();
 
         match backend {
+            #[cfg(feature = "onnx")]
             VisionBackend::Onnx {
                 text: Some(text_embedder),
                 ..
@@ -930,6 +954,7 @@ impl CandleEmbedder {
                 l2_normalize_in_place(&mut pooled);
                 Ok(pooled)
             }
+            #[cfg(feature = "onnx")]
             VisionBackend::Onnx {
                 family, text: None, ..
             } => {
@@ -970,6 +995,7 @@ impl CandleEmbedder {
         let vision_lock = self.vision_backend.lock().unwrap();
         let backend = vision_lock.as_ref().unwrap();
         Ok(match backend {
+            #[cfg(feature = "onnx")]
             VisionBackend::Onnx {
                 family,
                 vision_repo,
@@ -1039,12 +1065,14 @@ pub fn get_current_text_model() -> String {
 /// so callers can compute it cheaply (e.g. to decide whether stored vectors need
 /// re-embedding) without paying the cost of actually loading the ONNX session.
 pub fn get_current_vision_model() -> String {
-    let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| "siglip2".to_string());
+    let default_model = if cfg!(feature = "onnx") { "siglip2" } else { "candle-siglip2" };
+    let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| default_model.to_string());
 
     if selection == "candle-siglip2" {
         return "candle-siglip2:google/siglip2-base-patch16-224:model.safetensors".to_string();
     }
 
+    #[cfg(feature = "onnx")]
     match resolve_vision_config() {
         Ok(resolved) => format!(
             "{}:{}:{}",
@@ -1054,6 +1082,8 @@ pub fn get_current_vision_model() -> String {
         ),
         Err(e) => format!("unresolved:{selection}:error={e}"),
     }
+    #[cfg(not(feature = "onnx"))]
+    format!("unresolved:onnx_disabled_for_{selection}")
 }
 
 fn l2_normalize_in_place(v: &mut [f32]) {

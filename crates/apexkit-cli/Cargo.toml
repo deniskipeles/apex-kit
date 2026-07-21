@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-apexkit-api = { path = "../apexkit-api" }
-apexkit-core = { path = "../apexkit-core" }
+apexkit-api = { path = "../apexkit-api", default-features = false }
+apexkit-core = { path = "../apexkit-core", default-features = false }
 tokio = { version = "1.37.0", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
@@ -17,3 +17,9 @@ uuid = { version = "1.8", features = ["v4"] } # <--- ADD THIS LINE (used in back
 serde_json = "1.0"  # <--- ADD THIS LINE
 rusqlite = "0.39.0" # <--- ADD THIS LINE (used in data.rs)
 dotenvy = "0.15"
+
+[features]
+default = ["onnx"]
+onnx = ["apexkit-api/onnx", "apexkit-core/onnx"]
+cuda = ["apexkit-api/cuda", "apexkit-core/cuda"]
+metal = ["apexkit-api/metal", "apexkit-core/metal"]

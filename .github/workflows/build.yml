@@ -93,7 +93,7 @@ jobs:
       - name: Build (${{ matrix.target }})
         run: |
           if [ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]; then
-            cargo xwin build --target ${{ matrix.target }} --release -p apexkit-cli
+            OPENSSL_NO_ASM=1 RUSTFLAGS="-C target-feature=+crt-static" cargo xwin build --target ${{ matrix.target }} --release -p apexkit-cli  --no-default-features
           else
             cargo build --target ${{ matrix.target }} --release -p apexkit-cli
           fi

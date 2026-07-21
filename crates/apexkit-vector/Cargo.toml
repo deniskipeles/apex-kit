@@ -40,10 +40,14 @@ base64 = "0.21"
 # is exactly the "multiple different versions of crate `ndarray`" error. If you ever bump
 # the `ort` version, check its Cargo.toml for whatever ndarray version it pins and match it
 # here too.
-ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
-ndarray = { version = "0.17", default-features = false }
+# 
+# OPTIONAL FLAG ADDED: We make ORT optional so we can compile a "Universal CPU" binary 
+# without C++ AVX restrictions causing STATUS_ILLEGAL_INSTRUCTION crashes on older CPUs like Celeron.
+ort = { version = "2.0.0-rc.12", features = ["ndarray"], optional = true }
+ndarray = { version = "0.17", default-features = false, optional = true }
 
 [features]
-default = []
+default = ["onnx"]
+onnx = ["dep:ort", "dep:ndarray"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
