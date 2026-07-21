@@ -63,6 +63,14 @@ impl JobContext for TestJobContext {
     ) -> Option<(Arc<dyn Db>, Arc<dyn VectorProvider>)> {
         Some((self.db.clone(), self.vp.clone()))
     }
+
+    async fn get_file_bytes(
+        &self,
+        _tenant_id: Option<&str>,
+        _filename: &str,
+    ) -> Result<Vec<u8>, String> {
+        Ok(vec![])
+    }
 }
 
 fn generate_temp_dir() -> std::path::PathBuf {

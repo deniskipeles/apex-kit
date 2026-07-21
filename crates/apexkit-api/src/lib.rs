@@ -375,6 +375,7 @@ pub async fn start(port: u16) {
         root_vector_provider: vector_provider.clone(),
         tenant_manager: tenant_manager.clone(),
         sandbox_manager: sandbox_manager.clone(),
+        vault: vault.clone(),
     });
 
     let job_queue = jobs::start_background_worker(job_context, vault.clone());

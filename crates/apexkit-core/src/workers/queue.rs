@@ -67,6 +67,12 @@ pub trait JobContext: Send + Sync {
         &self,
         tenant_id: Option<&str>,
     ) -> Option<(Arc<dyn Db>, Arc<dyn VectorProvider>)>;
+
+    async fn get_file_bytes(
+        &self,
+        tenant_id: Option<&str>,
+        filename: &str,
+    ) -> Result<Vec<u8>, String>;
 }
 
 #[derive(Clone)]

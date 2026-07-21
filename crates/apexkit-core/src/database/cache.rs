@@ -397,8 +397,9 @@ impl TenantStore for CachedDb {
         n: Option<String>,
         s: Option<String>,
         t: Option<String>,
+        mv: Option<i64>,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
-        self.inner.update_tenant_full(id, n, s, t).await
+        self.inner.update_tenant_full(id, n, s, t, mv).await
     }
 
     async fn delete_tenant_metadata(

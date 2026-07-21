@@ -8,11 +8,22 @@ use apexkit_core::{Db, VectorProvider, security::vault::Vault, storage::StorageB
 use std::sync::Arc;
 
 // --- JOB CONTEXT ---
+fn get_storage_path(subpath: &str) -> String {
+    if let Ok(base) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
+        let clean_base = base.trim_end_matches('/');
+        let clean_sub = subpath.trim_start_matches('/');
+        format!("{}/{}", clean_base, clean_sub)
+    } else {
+        subpath.to_string()
+    }
+}
+
 pub struct GlobalJobContext {
     pub root_db: Arc<dyn Db>,
     pub root_vector_provider: Arc<dyn VectorProvider>,
     pub tenant_manager: Arc<TenantManager>,
     pub sandbox_manager: Arc<SandboxManager>,
+    pub vault: Arc<Vault>,
 }
 
 #[async_trait::async_trait]
@@ -35,6 +46,129 @@ impl JobContext for GlobalJobContext {
             }
             None => Some((self.root_db.clone(), self.root_vector_provider.clone())),
         }
+    }
+
+    async fn get_file_bytes(
+        &self,
+        tenant_id: Option<&str>,
+        filename: &str,
+    ) -> Result<Vec<u8>, String> {
+        let (db, scope, base_dir) = match tenant_id {
+            Some(id) if id.starts_with("session_") => {
+                let sid = id.trim_start_matches("session_");
+                let db = self.sandbox_manager.get_sandbox(sid).await?;
+                (
+                    db,
+                    EventScope::Sandbox(sid.to_string()),
+                    format!("storage/sandboxes/session_{}/uploads", sid),
+                )
+            }
+            Some(id) => {
+                let db = self.tenant_manager.get_tenant(id.to_string()).await?;
+                (
+                    db,
+                    EventScope::Tenant(id.to_string()),
+                    format!("storage/tenants/{}/uploads", id),
+                )
+            }
+            None => (
+                self.root_db.clone(),
+                EventScope::Root,
+                "storage/system/uploads".to_string(),
+            ),
+        };
+
+        // 1. Check if DB has S3 configured
+        let config_val = db.get_config("storage").await.map_err(|e| e.to_string())?;
+        if let Some(val) = config_val {
+            let conf: crate::system::dto::StorageConfigDto =
+                serde_json::from_value(val).unwrap_or_default();
+            if conf.active_driver == "s3" && conf.s3.enabled {
+                let secret_key = if let Some(enc_str) = conf.s3.secret_key {
+                    if let Ok(enc) = serde_json::from_str::<
+                        apexkit_core::security::vault::EncryptedValue,
+                    >(&enc_str)
+                    {
+                        self.vault.decrypt(&enc).unwrap_or_default()
+                    } else {
+                        enc_str
+                    }
+                } else {
+                    String::new()
+                };
+
+                // If a Tenant or Sandbox configures their own S3 bucket, they own the root of it.
+                // No isolation prefix is needed.
+                let isolation_prefix = match scope {
+                    EventScope::Root => "__root_app__/".to_string(),
+                    _ => "".to_string(),
+                };
+
+                let s3 = apexkit_core::storage::S3Storage::new_with_creds(
+                    &conf.s3.bucket,
+                    &conf.s3.region,
+                    &conf.s3.endpoint,
+                    "",
+                    &conf.s3.access_key,
+                    &secret_key,
+                    &isolation_prefix,
+                )
+                .await;
+
+                return s3.get(filename).await.map_err(|e| e.to_string());
+            }
+        }
+
+        // 2. Check Root S3 (if Tenant/Sandbox fallback)
+        if !matches!(scope, EventScope::Root) {
+            let root_val = self
+                .root_db
+                .get_config("storage")
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Some(val) = root_val {
+                let conf: crate::system::dto::StorageConfigDto =
+                    serde_json::from_value(val).unwrap_or_default();
+                if conf.active_driver == "s3" && conf.s3.enabled {
+                    let secret_key = if let Some(enc_str) = conf.s3.secret_key {
+                        if let Ok(enc) = serde_json::from_str::<
+                            apexkit_core::security::vault::EncryptedValue,
+                        >(&enc_str)
+                        {
+                            self.vault.decrypt(&enc).unwrap_or_default()
+                        } else {
+                            enc_str
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    let isolation_prefix = match scope {
+                        EventScope::Tenant(ref id) => format!("tenants/{}/uploads/", id),
+                        EventScope::Sandbox(ref id) => format!("sandboxes/session_{}/uploads/", id),
+                        _ => "".to_string(),
+                    };
+
+                    let s3 = apexkit_core::storage::S3Storage::new_with_creds(
+                        &conf.s3.bucket,
+                        &conf.s3.region,
+                        &conf.s3.endpoint,
+                        "",
+                        &conf.s3.access_key,
+                        &secret_key,
+                        &isolation_prefix,
+                    )
+                    .await;
+
+                    return s3.get(filename).await.map_err(|e| e.to_string());
+                }
+            }
+        }
+
+        // 3. Fallback to Local Storage
+        let fs_root = get_storage_path(&base_dir);
+        let local = apexkit_core::storage::LocalStorage::new(&fs_root, "").await;
+        local.get(filename).await.map_err(|e| e.to_string())
     }
 }
 
@@ -236,8 +370,10 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
+            let max_vectors = updates.get("max_vectors").and_then(|v| v.as_i64());
+
             // 1. Update Metadata
-            db.update_tenant_full(&id, name, status, tier)
+            db.update_tenant_full(&id, name, status, tier, max_vectors)
                 .await
                 .map_err(|e| e.to_string())?;
 

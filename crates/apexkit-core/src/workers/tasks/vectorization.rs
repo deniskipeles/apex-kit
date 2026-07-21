@@ -4,16 +4,6 @@ use std::sync::Arc;
 use super::super::queue::JobContext;
 use crate::models::schema::CollectionSchema;
 
-fn get_storage_path(subpath: &str) -> String {
-    if let Ok(base) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
-        let clean_base = base.trim_end_matches('/');
-        let clean_sub = subpath.trim_start_matches('/');
-        format!("{}/{}", clean_base, clean_sub)
-    } else {
-        subpath.to_string()
-    }
-}
-
 pub async fn handle_generate_embedding(
     resolver: Arc<dyn JobContext>,
     tenant_id: Option<String>,
@@ -57,17 +47,11 @@ pub async fn handle_generate_embedding(
         let mut is_image_embedding = false;
 
         let vec_res = if content_type == "file" {
-            let fs_root = match tenant_id.as_deref() {
-                Some(id) if id.starts_with("session_") => {
-                    format!("storage/sandboxes/{}/uploads", id)
-                }
-                Some(id) => format!("storage/tenants/{}/uploads", id),
-                None => "storage/system/uploads".to_string(),
-            };
-
-            let file_path = std::path::Path::new(&get_storage_path(&fs_root)).join(&content);
-            if let Ok(bytes) = tokio::fs::read(&file_path).await {
-                let ext = file_path
+            if let Ok(bytes) = resolver
+                .get_file_bytes(tenant_id.as_deref(), &content)
+                .await
+            {
+                let ext = std::path::Path::new(&content)
                     .extension()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
@@ -82,7 +66,7 @@ pub async fn handle_generate_embedding(
                 }
             } else {
                 Err(format!(
-                    "File {} not found on disk for vectorization.",
+                    "File {} not found in storage for vectorization.",
                     content
                 ))
             }

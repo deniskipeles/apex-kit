@@ -214,12 +214,6 @@ pub async fn update_tenant_status(
     ))
 }
 
-#[derive(Deserialize, ToSchema)]
-pub struct UpdateTenantReq {
-    pub name: Option<String>,
-    pub tier: Option<String>,
-}
-
 #[utoipa::path(
     delete,
     path = "/api/v1/admin/tenants/{id}",
@@ -264,6 +258,13 @@ pub async fn delete_tenant_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateTenantReq {
+    pub name: Option<String>,
+    pub tier: Option<String>,
+    pub max_vectors: Option<i64>,
+}
+
 #[utoipa::path(
     patch,
     path = "/api/v1/admin/tenants/{id}",
@@ -282,7 +283,7 @@ pub async fn update_tenant_details(
 
     state
         .db
-        .update_tenant_full(&id, payload.name, None, payload.tier)
+        .update_tenant_full(&id, payload.name, None, payload.tier, payload.max_vectors)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
