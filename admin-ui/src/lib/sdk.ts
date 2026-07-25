@@ -432,7 +432,7 @@ export class ApexKit {
        * Update the current authenticated user's profile or metadata.
        * @param payload - Object containing optional fields to update.
        */
-      updateMe: async (metadata?: Record<string, any>): Promise<User> => {
+      updateMeMetadata: async (metadata?: Record<string, any>): Promise<User> => {
         const user = await this._request<User>('/auth/me', {
           method: 'PATCH',
           body: { metadata },
@@ -987,6 +987,30 @@ export class ApexKit {
 
       delete: (id: string | number) => this._request(`/storage/files/${id}`, { method: 'DELETE' }),
 
+      // --- [NEW] OPENGRAPH URL BUILDER ---
+      /**
+       * Generates a fully encoded URL for the OpenGraph image GET endpoint.
+       * Perfect for placing directly into <meta property="og:image" content="..."> tags.
+       */
+      getOpenGraphUrl: (
+        templateSlugOrBase64: string,
+        data: Array<{ type: 'text' | 'image'; value: string; target: string }>,
+        options?: { format?: 'png' | 'webp' | 'jpeg'; quality?: number }
+      ): string => {
+        if (data.length > 8) throw new Error('Maximum of 8 OpenGraph data objects allowed.');
+
+        const base = this.baseUrl.replace(/\/$/, '');
+        const url = new URL(`${base}/api/v1/storage/files/opengraph`);
+
+        url.searchParams.append('template', templateSlugOrBase64);
+        url.searchParams.append('data', JSON.stringify(data));
+
+        if (options?.format) url.searchParams.append('format', options.format);
+        if (options?.quality) url.searchParams.append('quality', String(options.quality));
+
+        return url.toString();
+      },
+
       getFileUrl: (
         filename: string,
         options?:
@@ -995,6 +1019,7 @@ export class ApexKit {
               thumb?: string;
               format?: string;
               quality?: number;
+              blur?: number; // <--- [NEW] Blur parameter (e.g., 5 or 10.5)
               signed?: boolean;
               expiresIn?: number;
             }
@@ -1021,6 +1046,7 @@ export class ApexKit {
             if (options.thumb) extraParams.append('thumb', options.thumb);
             if (options.format) extraParams.append('format', options.format);
             if (options.quality) extraParams.append('quality', String(options.quality));
+            if (options.blur) extraParams.append('blur', String(options.blur)); // <--- [NEW]
 
             const queryStr = extraParams.toString();
             if (queryStr) {
@@ -1030,7 +1056,7 @@ export class ApexKit {
           });
         }
 
-        // Synchronous Public URL Resolution (No Network Request)
+        // Synchronous Public URL Resolution
         const base = this.baseUrl.replace(/\/$/, '');
         const name = filename.replace(/^\//, '');
         const url = new URL(`${base}/api/v1/storage/file/${name}`);
@@ -1042,6 +1068,7 @@ export class ApexKit {
             if (options.thumb) url.searchParams.append('thumb', options.thumb);
             if (options.format) url.searchParams.append('format', options.format);
             if (options.quality) url.searchParams.append('quality', String(options.quality));
+            if (options.blur) url.searchParams.append('blur', String(options.blur)); // <--- [NEW]
           }
         }
         return url.toString();

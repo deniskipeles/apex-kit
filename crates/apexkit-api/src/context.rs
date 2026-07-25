@@ -371,11 +371,22 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
                 .map(String::from);
 
             let max_vectors = updates.get("max_vectors").and_then(|v| v.as_i64());
+            // --- NEW ---
+            let max_storage_mb = updates.get("max_storage_mb").and_then(|v| v.as_i64());
+            let max_ai_requests = updates.get("max_ai_requests").and_then(|v| v.as_i64());
 
             // 1. Update Metadata
-            db.update_tenant_full(&id, name, status, tier, max_vectors)
-                .await
-                .map_err(|e| e.to_string())?;
+            db.update_tenant_full(
+                &id,
+                name,
+                status,
+                tier,
+                max_vectors,
+                max_storage_mb,
+                max_ai_requests,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
             // 2. Invalidate Cache so new status/settings take effect immediately
             tm.invalidate(&id).await;

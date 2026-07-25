@@ -148,6 +148,9 @@ fn make_api_router() -> Router<AppState> {
             "/collections/{id}/records/{record_id}/relations",
             post(records::create_relation).delete(records::delete_relation),
         )
+        // --- [NEW] OpenGraph GET Endpoint ---
+        .route("/storage/files/opengraph", get(storage::generate_opengraph))
+        // ------------------------------------
         .route("/storage/upload", post(storage::upload_file))
         .route("/storage/file/{*filename}", get(storage::serve_file))
         .route("/storage/files", get(storage::list_files))
@@ -478,6 +481,7 @@ pub fn app_router(state: AppState) -> Router {
         records::list_records,records::create_record,records::get_record,records::update_record,records::delete_record,
         ose::search_records,ose::instant_search_handler,
         sql_query::query_records_handler,
+        storage::generate_opengraph,
         storage::upload_file, storage::serve_file, storage::list_files, storage::get_file, storage::delete_file,
         records::create_relation,records::delete_relation,
         config_routes::set_config,
@@ -517,6 +521,7 @@ pub fn app_router(state: AppState) -> Router {
         CreateCollectionReq,UpdateCollection,RelationRequest,SearchQuery,RecordListResponse,
         sql_query::AdvancedQueryRequest,
         config_routes::SetConfigRequest,
+        storage::OpenGraphQuery,
         storage::FileResponse,storage::FileUploadRequest,storage::FileListResponse,storage::FileListQuery,
         crate::system::dto::AppSettingsDto,crate::system::dto::SmtpConfigDto,crate::system::dto::StorageConfigDto,crate::system::dto::S3ConfigDto,crate::system::dto::SecurityConfigDto,crate::system::dto::AiConfigDto,
         apexkit_core::models::Record,

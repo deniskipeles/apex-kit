@@ -392,6 +392,8 @@ pub trait TenantStore: Send + Sync {
         status: Option<String>,
         tier: Option<String>,
         max_vectors: Option<i64>,
+        max_storage_mb: Option<i64>,
+        max_ai_requests: Option<i64>,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
 
     /// Removes tenant metadata reference objects.

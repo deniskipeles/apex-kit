@@ -263,6 +263,8 @@ pub struct UpdateTenantReq {
     pub name: Option<String>,
     pub tier: Option<String>,
     pub max_vectors: Option<i64>,
+    pub max_storage_mb: Option<i64>,
+    pub max_ai_requests: Option<i64>,
 }
 
 #[utoipa::path(
@@ -283,7 +285,15 @@ pub async fn update_tenant_details(
 
     state
         .db
-        .update_tenant_full(&id, payload.name, None, payload.tier, payload.max_vectors)
+        .update_tenant_full(
+            &id,
+            payload.name,
+            None,
+            payload.tier,
+            payload.max_vectors,
+            payload.max_storage_mb,
+            payload.max_ai_requests,
+        )
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
