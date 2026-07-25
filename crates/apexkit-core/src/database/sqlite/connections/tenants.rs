@@ -75,6 +75,8 @@ impl TenantStore for ApexKit {
         status: Option<String>,
         tier: Option<String>,
         max_vectors: Option<i64>,
+        max_storage_mb: Option<i64>,
+        max_ai_requests: Option<i64>,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         let mut sets = Vec::new();
         let mut params: Vec<rusqlite::types::Value> = vec![];
@@ -95,6 +97,16 @@ impl TenantStore for ApexKit {
             sets.push("max_vectors = ?");
             params.push(mv.into_val());
         }
+        // --- NEW CONFIGS ---
+        if let Some(ms) = max_storage_mb {
+            sets.push("max_storage_mb = ?");
+            params.push(ms.into_val());
+        }
+        if let Some(ma) = max_ai_requests {
+            sets.push("max_ai_requests = ?");
+            params.push(ma.into_val());
+        }
+        // -------------------
 
         if sets.is_empty() {
             return Ok(());

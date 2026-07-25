@@ -9,6 +9,7 @@ import {
   X,
   Copy,
   FileIcon,
+  Sparkles,
 } from 'lucide-react';
 import {
   Button,
@@ -31,6 +32,7 @@ import { formatFileSize } from '../lib/formatters';
 import { useToast } from '../components/feedback/Toast';
 import { ConfirmDialog } from '../components/feedback/ConfirmDialog';
 import { usePagination } from '../hooks/usePagination';
+import { OpenGraphTesterModal } from '../features/files/components/OpenGraphTesterModal';
 
 export const FilesPage = () => {
   const [files, setFiles] = useState<StoredFile[]>([]);
@@ -40,6 +42,7 @@ export const FilesPage = () => {
   const [selectedFile, setSelectedFile] = useState<StoredFile | null>(null);
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [fileToDelete, setFileToDelete] = useState<StoredFile | null>(null);
+  const [isOgModalOpen, setIsOgModalOpen] = useState(false);
 
   const { page, perPage, setPage, setPerPage } = usePagination(1, 24); // 24 fits nicely in grids
   const [totalItems, setTotalItems] = useState(0);
@@ -201,6 +204,14 @@ export const FilesPage = () => {
               <ListIcon className="h-4 w-4" />
             </Button>
           </div>
+          {/* --- [NEW] OPENGRAPH STUDIO BUTTON --- */}
+          <Button
+            variant="outline"
+            onClick={() => setIsOgModalOpen(true)}
+            className="gap-2 border-purple-500/30 text-purple-400 hover:bg-purple-500/10"
+          >
+            <Sparkles className="h-4 w-4" /> OG Studio
+          </Button>
           <Button onClick={() => setIsUploadOpen(true)}>
             <Upload className="mr-2 h-4 w-4" /> Upload
           </Button>
@@ -384,6 +395,9 @@ export const FilesPage = () => {
         onCancel={() => setFileToDelete(null)}
         variant="destructive"
       />
+
+      {/* --- [NEW] RENDER OPENGRAPH TESTER MODAL AT BOTTOM --- */}
+      <OpenGraphTesterModal isOpen={isOgModalOpen} onClose={() => setIsOgModalOpen(false)} />
     </div>
   );
 };

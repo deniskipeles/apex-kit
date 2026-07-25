@@ -35,6 +35,10 @@ use apexkit_core::{
 
 use async_trait::async_trait;
 
+use tera::Tera;
+use tiny_skia::{Pixmap, Transform};
+use usvg::{Options, Tree};
+
 fn get_storage_path(subpath: &str) -> String {
     if let Ok(base) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
         let clean_base = base.trim_end_matches('/');
@@ -1417,4 +1421,250 @@ fn parse_dimensions(s: &str) -> Option<(u32, u32)> {
         return Some((w, h));
     }
     None
+}
+
+// --- DTOs: OpenGraph Generation ---
+#[derive(Deserialize, ToSchema, IntoParams)]
+pub struct OpenGraphQuery {
+    pub template: String,
+    pub format: Option<String>,
+    pub quality: Option<u8>,
+    /// URL-encoded JSON string array: [{"type": "text|image|logo", "value": "...", "target": "..."}]
+    pub data: String,
+}
+
+#[derive(Deserialize)]
+struct OgItem {
+    r#type: String,
+    value: String,
+    target: String,
+}
+
+// Helper to resolve current Scope's Logo to Base64 Data URI
+async fn get_scope_logo_base64(db: &Arc<dyn Db>, storage: &Arc<dyn StorageBackend>) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let mut logo_data: Option<(Vec<u8>, String)> = None;
+
+    if let Ok(Some(settings)) = db.get_config("general").await {
+        if let Some(logo_filename) = settings
+            .get("app_logo")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            if let Ok(bytes) = storage.get(logo_filename).await {
+                let mime = mime_guess::from_path(logo_filename)
+                    .first_or_octet_stream()
+                    .to_string();
+                logo_data = Some((bytes, mime));
+            } else {
+                // Fallback to local system storage if primary storage lookup fails
+                let root_local =
+                    LocalStorage::new(&get_storage_path("storage/system/uploads"), "/").await;
+                if let Ok(bytes) = root_local.get(logo_filename).await {
+                    let mime = mime_guess::from_path(logo_filename)
+                        .first_or_octet_stream()
+                        .to_string();
+                    logo_data = Some((bytes, mime));
+                }
+            }
+        }
+    }
+
+    let (bytes, mime) = match logo_data {
+        Some(res) => res,
+        None => match get_default_logo() {
+            Ok((b, m, _)) => (b, m),
+            Err(_) => return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=".to_string(),
+        }
+    };
+
+    format!("data:{};base64,{}", mime, STANDARD.encode(&bytes))
+}
+
+// --- HANDLER: Generate OpenGraph Image (GET) ---
+#[utoipa::path(
+    get,
+    path = "/api/v1/storage/files/opengraph",
+    params(OpenGraphQuery),
+    responses((status = 200, description = "Generated Image"))
+)]
+pub async fn generate_opengraph(
+    DatabaseConnection(db): DatabaseConnection,
+    StorageConnection(storage): StorageConnection,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<OpenGraphQuery>,
+) -> Result<Response, AppError> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    // 1. Enforce Limits & Parse JSON Data
+    let items: Vec<OgItem> = serde_json::from_str(&params.data)
+        .map_err(|e| AppError::JsonError(format!("Invalid data JSON array: {}", e)))?;
+
+    if items.len() > 8 {
+        return Err(AppError::Forbidden(
+            "Maximum of 8 data objects allowed".into(),
+        ));
+    }
+
+    // 2. Construct Unique Cache Key & Check Cache
+    let format_str = params.format.as_deref().unwrap_or("png");
+    let quality = params.quality.unwrap_or(80);
+    let data_hash = md5::compute(params.data.as_bytes());
+    let cache_key = format!(
+        "og_{}_{}_{}_{:x}",
+        params.template, format_str, quality, data_hash
+    );
+
+    if let Some(cached_bytes) = state.thumb_cache.get(&cache_key).await {
+        let mime = mime_guess::from_ext(format_str)
+            .first_or_octet_stream()
+            .to_string();
+        let etag = format!("\"{:x}\"", md5::compute(cached_bytes.as_ref()));
+
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime)
+            .header(header::CACHE_CONTROL, "public, max-age=86400, immutable")
+            .header(header::ETAG, etag)
+            .body(axum::body::Body::from(cached_bytes.as_ref().clone()))
+            .unwrap());
+    }
+
+    // 3. Resolve Template (DB Slug or Raw Base64)
+    let raw_svg = if let Ok(Some(tmpl)) = db.get_template_by_slug(&params.template).await {
+        tmpl.content
+    } else if let Ok(decoded) = STANDARD.decode(&params.template) {
+        String::from_utf8_lossy(&decoded).to_string()
+    } else {
+        return Err(AppError::NotFound(
+            "Template slug not found and not a valid base64 string".into(),
+        ));
+    };
+
+    // 4. Build Tera Context & Resolve Images (Strictly 'image' or 'text')
+    let mut context = tera::Context::new();
+    let mut fallback_logo_cache: Option<String> = None;
+
+    for item in items {
+        if item.r#type == "image" {
+            let b64_src = if item.value.starts_with("data:image") || item.value.starts_with("http")
+            {
+                item.value
+            } else {
+                match storage.get(&item.value).await {
+                    Ok(bytes) => {
+                        let mime = mime_guess::from_path(&item.value)
+                            .first_or_octet_stream()
+                            .to_string();
+                        format!("data:{};base64,{}", mime, STANDARD.encode(&bytes))
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "OpenGraph: Image '{}' not found. Falling back to App Logo.",
+                            item.value
+                        );
+                        if fallback_logo_cache.is_none() {
+                            fallback_logo_cache = Some(get_scope_logo_base64(&db, &storage).await);
+                        }
+                        fallback_logo_cache.clone().unwrap()
+                    }
+                }
+            };
+            context.insert(item.target, &b64_src);
+        } else {
+            // Text type
+            context.insert(item.target, &item.value);
+        }
+    }
+
+    // 5. Render SVG via Tera (autoescape=true for XML safety)
+    let rendered_svg = Tera::one_off(&raw_svg, &context, true)
+        .map_err(|e| AppError::JsonError(format!("Template injection error: {}", e)))?;
+
+    // --- [FIX]: DYNAMIC FONT RESOLUTION VIA GSTATIC ---
+    let font_reg_key = "og_font_roboto_reg".to_string();
+    let font_reg = if let Some(cached) = state.thumb_cache.get(&font_reg_key).await {
+        cached.as_ref().clone()
+    } else {
+        let bytes = reqwest::get("https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Me5Q.ttf")
+            .await
+            .map_err(|_| AppError::UnknownError("Font DL fail".into()))?
+            .bytes()
+            .await
+            .map_err(|_| AppError::UnknownError("Font bytes fail".into()))?
+            .to_vec();
+        state
+            .thumb_cache
+            .insert(font_reg_key, std::sync::Arc::new(bytes.clone()))
+            .await;
+        bytes
+    };
+
+    let font_bold_key = "og_font_roboto_bold".to_string();
+    let font_bold = if let Some(cached) = state.thumb_cache.get(&font_bold_key).await {
+        cached.as_ref().clone()
+    } else {
+        let bytes =
+            reqwest::get("https://fonts.gstatic.com/s/roboto/v30/KFOlCnqEu92Fr1MmWUlvAw.ttf")
+                .await
+                .map_err(|_| AppError::UnknownError("Font DL fail".into()))?
+                .bytes()
+                .await
+                .map_err(|_| AppError::UnknownError("Font bytes fail".into()))?
+                .to_vec();
+        state
+            .thumb_cache
+            .insert(font_bold_key, std::sync::Arc::new(bytes.clone()))
+            .await;
+        bytes
+    };
+
+    let safe_svg = rendered_svg
+        .replace("system-ui", "sans-serif")
+        .replace("font-weight=\"800\"", "font-weight=\"700\"")
+        .replace("font-weight=\"600\"", "font-weight=\"700\"");
+    // --------------------------------------------------------
+
+    // 6. Isolated CPU Rendering Block
+    let png_bytes = {
+        let mut fontdb = usvg::fontdb::Database::new();
+        fontdb.load_system_fonts();
+        fontdb.load_font_data(font_reg);
+        fontdb.load_font_data(font_bold);
+
+        fontdb.set_sans_serif_family("Roboto");
+        fontdb.set_serif_family("Roboto");
+        fontdb.set_monospace_family("Roboto");
+
+        let mut opt = Options::default();
+        opt.font_family = "Roboto".to_string();
+        opt.fontdb = std::sync::Arc::new(fontdb);
+
+        let tree = Tree::from_str(&safe_svg, &opt)
+            .map_err(|e| AppError::JsonError(format!("Invalid SVG XML layout: {}", e)))?;
+
+        let pixmap_size = tree.size().to_int_size();
+        let mut pixmap = Pixmap::new(pixmap_size.width(), pixmap_size.height())
+            .ok_or_else(|| AppError::UnknownError("Failed to allocate canvas memory".into()))?;
+
+        resvg::render(&tree, Transform::default(), &mut pixmap.as_mut());
+        pixmap
+            .encode_png()
+            .map_err(|e| AppError::UnknownError(format!("PNG Encoding failed: {}", e)))?
+    };
+
+    // 7. Route through standard image processor
+    process_image(
+        &state,
+        &headers,
+        png_bytes,
+        "image/png",
+        cache_key,
+        None,
+        params.format,
+        params.quality,
+    )
+    .await
 }

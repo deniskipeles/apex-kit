@@ -57,6 +57,9 @@ export const TenantsListPage = () => {
     name: '',
     tier: 'free',
     ownerId: '',
+    max_storage_mb: 500,
+    max_vectors: 10000,
+    max_ai_requests: 100,
   });
 
   const { toast } = useToast();
@@ -100,6 +103,9 @@ export const TenantsListPage = () => {
         name: formData.name || undefined,
         tier: formData.tier,
         owner_id: formData.ownerId ? Number(formData.ownerId) : undefined,
+        max_vectors: formData.max_vectors,
+        max_storage_mb: formData.max_storage_mb,
+        max_ai_requests: formData.max_ai_requests,
       });
 
       toast(`Tenant '${formData.tenantId}' successfully created.`, 'success');
@@ -123,6 +129,9 @@ export const TenantsListPage = () => {
       await apiClient.root.updateTenant(editingTenant.id, {
         name: formData.name || undefined,
         tier: formData.tier,
+        max_vectors: formData.max_vectors,
+        max_storage_mb: formData.max_storage_mb,
+        max_ai_requests: formData.max_ai_requests,
       });
       toast(`Tenant metadata updated successfully.`, 'success');
       setIsEditOpen(false);
@@ -169,10 +178,13 @@ export const TenantsListPage = () => {
   const openEditModal = (tenant: Tenant) => {
     setEditingTenant(tenant);
     setFormData({
+      ownerId: '', // Owner IDs are non-updatable in this view for safety
       tenantId: tenant.id,
       name: tenant.name || '',
-      tier: tenant.tier,
-      ownerId: '', // Owner IDs are non-updatable in this view for safety
+      tier: tenant.tier || 'free',
+      max_storage_mb: tenant.stats?.max_storage_mb ?? 500,
+      max_vectors: tenant.stats?.max_vectors ?? 10000,
+      max_ai_requests: tenant.stats?.max_ai_requests ?? 100,
     });
     setIsEditOpen(true);
   };
@@ -183,6 +195,9 @@ export const TenantsListPage = () => {
       name: '',
       tier: 'free',
       ownerId: '',
+      max_storage_mb: 500,
+      max_vectors: 10000,
+      max_ai_requests: 100,
     });
   };
 
@@ -540,27 +555,83 @@ export const TenantsListPage = () => {
         isOpen={isEditOpen}
         onClose={() => setIsEditOpen(false)}
         title={`Configure Metadata: ${editingTenant?.id}`}
-        size="sm"
+        size="md"
       >
         <form onSubmit={handleEditSubmit} className="space-y-4">
-          <div className="space-y-2">
-            <Label>Display Name</Label>
-            <Input
-              placeholder="e.g. Acme Corp"
-              value={formData.name}
-              onChange={(e: any) => setFormData({ ...formData, name: e.target.value })}
-            />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label>Display Name</Label>
+              <Input
+                placeholder="e.g. Acme Corp"
+                value={formData.name || ''}
+                onChange={(e: any) => setFormData({ ...formData, name: e.target.value })}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label>Billing Tier</Label>
+              <Select
+                value={formData.tier || 'free'}
+                onChange={(e: any) => setFormData({ ...formData, tier: e.target.value })}
+              >
+                <option value="free">Free Tier (Standard Limits)</option>
+                <option value="pro">Pro Tier (Enterprise Limits)</option>
+              </Select>
+            </div>
           </div>
 
-          <div className="space-y-2">
-            <Label>Billing Tier</Label>
-            <Select
-              value={formData.tier}
-              onChange={(e: any) => setFormData({ ...formData, tier: e.target.value })}
-            >
-              <option value="free">Free Tier (Standard Limits)</option>
-              <option value="pro">Pro Tier (Enterprise Limits)</option>
-            </Select>
+          {/* Resource Limits Section */}
+          <div className="pt-3 border-t border-border/60">
+            <Label className="text-xs uppercase font-bold text-muted-foreground tracking-wider block mb-3">
+              Quota Limits
+            </Label>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">Storage (MB)</Label>
+                <Input
+                  type="number"
+                  placeholder="500"
+                  value={formData.max_storage_mb ?? ''}
+                  onChange={(e: any) =>
+                    setFormData({
+                      ...formData,
+                      max_storage_mb: e.target.value !== '' ? Number(e.target.value) : 50,
+                    })
+                  }
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label className="text-xs">Max Vectors</Label>
+                <Input
+                  type="number"
+                  placeholder="10000"
+                  value={formData.max_vectors ?? ''}
+                  onChange={(e: any) =>
+                    setFormData({
+                      ...formData,
+                      max_vectors: e.target.value !== '' ? Number(e.target.value) : 1000,
+                    })
+                  }
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label className="text-xs">AI Reqs (30m)</Label>
+                <Input
+                  type="number"
+                  placeholder="100"
+                  value={formData.max_ai_requests ?? ''}
+                  onChange={(e: any) =>
+                    setFormData({
+                      ...formData,
+                      max_ai_requests: e.target.value !== '' ? Number(e.target.value) : 20,
+                    })
+                  }
+                />
+              </div>
+            </div>
           </div>
 
           <div className="flex justify-end gap-2 pt-4 border-t border-border mt-4">

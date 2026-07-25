@@ -432,7 +432,7 @@ export class ApexKit {
        * Update the current authenticated user's profile or metadata.
        * @param payload - Object containing optional fields to update.
        */
-      updateMe: async (metadata?: Record<string, any>): Promise<User> => {
+      updateMeMetadata: async (metadata?: Record<string, any>): Promise<User> => {
         const user = await this._request<User>('/auth/me', {
           method: 'PATCH',
           body: { metadata },
@@ -986,6 +986,30 @@ export class ApexKit {
       },
 
       delete: (id: string | number) => this._request(`/storage/files/${id}`, { method: 'DELETE' }),
+
+      // --- [NEW] OPENGRAPH URL BUILDER ---
+      /**
+       * Generates a fully encoded URL for the OpenGraph image GET endpoint.
+       * Perfect for placing directly into <meta property="og:image" content="..."> tags.
+       */
+      getOpenGraphUrl: (
+        templateSlugOrBase64: string,
+        data: Array<{ type: 'text' | 'image'; value: string; target: string }>,
+        options?: { format?: 'png' | 'webp' | 'jpeg'; quality?: number }
+      ): string => {
+        if (data.length > 8) throw new Error('Maximum of 8 OpenGraph data objects allowed.');
+
+        const base = this.baseUrl.replace(/\/$/, '');
+        const url = new URL(`${base}/api/v1/storage/files/opengraph`);
+
+        url.searchParams.append('template', templateSlugOrBase64);
+        url.searchParams.append('data', JSON.stringify(data));
+
+        if (options?.format) url.searchParams.append('format', options.format);
+        if (options?.quality) url.searchParams.append('quality', String(options.quality));
+
+        return url.toString();
+      },
 
       getFileUrl: (
         filename: string,
