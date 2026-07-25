@@ -68,6 +68,7 @@ pub struct FileParams {
     pub thumb: Option<String>,
     pub format: Option<String>,
     pub quality: Option<u8>,
+    pub blur: Option<f32>, // <--- [NEW] Radius/Sigma (e.g. 5.0, 10)
 }
 
 #[derive(Serialize, ToSchema)]
@@ -996,13 +997,14 @@ pub async fn serve_file(
 
     process_image(
         &state,
-        &headers, // <--- Passed
+        &headers,
         data,
         &mime_type,
         clean_filename.to_string(),
         params.thumb,
         params.format,
         params.quality,
+        params.blur, // <--- [NEW]
     )
     .await
 }
@@ -1166,18 +1168,19 @@ pub async fn delete_file(
 // --- HELPER: Centralized Image Processing ---
 async fn process_image(
     state: &AppState,
-    headers: &HeaderMap, // <--- Added
+    headers: &HeaderMap,
     original_bytes: Vec<u8>,
     original_mime: &str,
     cache_key: String,
     dim_str: Option<String>,
     req_format: Option<String>,
     req_quality: Option<u8>,
+    req_blur: Option<f32>, // <--- [NEW] Accept blur param
 ) -> Result<Response, AppError> {
     let cache_header_val = "public, max-age=31536000, immutable";
     let etag = format!("\"{:x}\"", md5::compute(&original_bytes));
 
-    // 1. Serve 304 Not Modified if ETag matches for unmodified content
+    // Serve 304 Not Modified if ETag matches
     if let Some(if_none_match) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -1190,7 +1193,8 @@ async fn process_image(
         }
     }
 
-    if (dim_str.is_none() && req_format.is_none() && req_quality.is_none())
+    // [UPDATED FAST PATH]: Fast exit if NO transformation (no thumb, format, quality, or blur) requested
+    if (dim_str.is_none() && req_format.is_none() && req_quality.is_none() && req_blur.is_none())
         || original_mime.contains("svg")
     {
         return Ok(Response::builder()
@@ -1202,7 +1206,6 @@ async fn process_image(
             .unwrap());
     }
 
-    // Default to 80 quality for good web balance
     let quality = req_quality.unwrap_or(80).clamp(1, 100);
 
     let (target_format, target_mime) =
@@ -1221,12 +1224,19 @@ async fn process_image(
 
     let dim_part = dim_str.as_deref().unwrap_or("orig");
     let fmt_part = target_mime.split('/').next_back().unwrap_or("bin");
-    let full_cache_key = format!("{}_{}_{}_q{}", cache_key, dim_part, fmt_part, quality);
+
+    // [NEW]: Include blur in unique cache key
+    let blur_part = req_blur
+        .map(|b| format!("_blur{:.1}", b))
+        .unwrap_or_default();
+    let full_cache_key = format!(
+        "{}_{}_{}_q{}{}",
+        cache_key, dim_part, fmt_part, quality, blur_part
+    );
 
     if let Some(cached_bytes) = state.thumb_cache.get(&full_cache_key).await {
         let thumb_etag = format!("\"{:x}\"", md5::compute(cached_bytes.as_ref()));
 
-        // 2. Serve 304 Not Modified if ETag matches for cached/transformed thumbnails
         if let Some(if_none_match) = headers
             .get(header::IF_NONE_MATCH)
             .and_then(|v| v.to_str().ok())
@@ -1255,26 +1265,36 @@ async fn process_image(
     };
     let bytes_for_processing = original_bytes.clone();
 
-    let img_result =
-        tokio::task::spawn_blocking(move || image::load_from_memory(&bytes_for_processing))
-            .await
-            .map_err(|e| AppError::UnknownError(e.to_string()))?;
+    // CPU Heavy operations execute inside spawn_blocking pool
+    let img_result = tokio::task::spawn_blocking(move || {
+        let img = image::load_from_memory(&bytes_for_processing)?;
+
+        // 1. Resize if dimensions requested
+        let mut processed_img = if w > 0 || h > 0 {
+            let target_w = if w == 0 { u32::MAX } else { w };
+            let target_h = if h == 0 { u32::MAX } else { h };
+            img.resize(target_w, target_h, FilterType::Triangle)
+        } else {
+            img
+        };
+
+        // 2. [NEW]: Apply Gaussian Blur (Clamped between 0.1 and 50.0 for safety)
+        if let Some(sigma) = req_blur {
+            let safe_sigma = sigma.clamp(0.1, 50.0);
+            processed_img = processed_img.blur(safe_sigma);
+        }
+
+        Ok::<_, image::ImageError>(processed_img)
+    })
+    .await
+    .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
     match img_result {
-        Ok(img) => {
-            let processed_img = if w > 0 || h > 0 {
-                let target_w = if w == 0 { u32::MAX } else { w };
-                let target_h = if h == 0 { u32::MAX } else { h };
-                img.resize(target_w, target_h, FilterType::Triangle)
-            } else {
-                img
-            };
-
+        Ok(processed_img) => {
             let mut buffer = Cursor::new(Vec::new());
             let encoding_success = match target_format {
                 image::ImageFormat::WebP => {
                     if let Ok(encoder) = webp::Encoder::from_image(&processed_img) {
-                        // Pass the quality value (0.0 to 100.0) for lossy compression
                         let webp_memory = encoder.encode(quality as f32);
                         std::io::Write::write_all(&mut buffer, &webp_memory).is_ok()
                     } else {
@@ -1298,10 +1318,6 @@ async fn process_image(
             };
 
             if !encoding_success {
-                tracing::warn!(
-                    "Image encoding to {} failed. Serving original.",
-                    target_mime
-                );
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, original_mime)
@@ -1326,19 +1342,13 @@ async fn process_image(
                 .body(Body::from(thumb_bytes))
                 .unwrap())
         }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to load image for processing: {}. Serving original.",
-                e
-            );
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, original_mime)
-                .header(header::CACHE_CONTROL, cache_header_val)
-                .header(header::ETAG, etag)
-                .body(Body::from(original_bytes))
-                .unwrap())
-        }
+        Err(_) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, original_mime)
+            .header(header::CACHE_CONTROL, cache_header_val)
+            .header(header::ETAG, etag)
+            .body(Body::from(original_bytes))
+            .unwrap()),
     }
 }
 
@@ -1387,13 +1397,14 @@ pub async fn serve_app_logo(
 
     process_image(
         &state,
-        &headers, // <--- Passed
+        &headers,
         bytes,
         &mime,
         format!("logo_{}", cache_key_base),
         params.thumb,
         params.format,
         params.quality,
+        params.blur, // <--- [NEW]
     )
     .await
 }
@@ -1665,6 +1676,7 @@ pub async fn generate_opengraph(
         None,
         params.format,
         params.quality,
+        None, // <--- [NEW]
     )
     .await
 }

@@ -1019,6 +1019,7 @@ export class ApexKit {
               thumb?: string;
               format?: string;
               quality?: number;
+              blur?: number; // <--- [NEW] Blur parameter (e.g., 5 or 10.5)
               signed?: boolean;
               expiresIn?: number;
             }
@@ -1045,6 +1046,7 @@ export class ApexKit {
             if (options.thumb) extraParams.append('thumb', options.thumb);
             if (options.format) extraParams.append('format', options.format);
             if (options.quality) extraParams.append('quality', String(options.quality));
+            if (options.blur) extraParams.append('blur', String(options.blur)); // <--- [NEW]
 
             const queryStr = extraParams.toString();
             if (queryStr) {
@@ -1054,7 +1056,7 @@ export class ApexKit {
           });
         }
 
-        // Synchronous Public URL Resolution (No Network Request)
+        // Synchronous Public URL Resolution
         const base = this.baseUrl.replace(/\/$/, '');
         const name = filename.replace(/^\//, '');
         const url = new URL(`${base}/api/v1/storage/file/${name}`);
@@ -1066,6 +1068,7 @@ export class ApexKit {
             if (options.thumb) url.searchParams.append('thumb', options.thumb);
             if (options.format) url.searchParams.append('format', options.format);
             if (options.quality) url.searchParams.append('quality', String(options.quality));
+            if (options.blur) url.searchParams.append('blur', String(options.blur)); // <--- [NEW]
           }
         }
         return url.toString();
