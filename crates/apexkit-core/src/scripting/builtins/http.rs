@@ -70,7 +70,15 @@ fn execute_http_request(
                             );
                         }
 
-                        let body_text = res.text().await.unwrap_or_default();
+                        // Read raw, uncorrupted response bytes
+                        let bytes = res.bytes().await.unwrap_or_default();
+
+                        // Base64 encode raw binary bytes directly (100% binary-safe for images/zips)
+                        use base64::{Engine as _, engine::general_purpose::STANDARD};
+                        let body_b64 = STANDARD.encode(&bytes);
+
+                        // Lossy UTF-8 text string fallback for JSON/HTML responses
+                        let body_text = String::from_utf8_lossy(&bytes).to_string();
 
                         // Return standardized response object
                         Ok(json!({
@@ -79,7 +87,8 @@ fn execute_http_request(
                             "statusText": status_text,
                             "url": final_url,
                             "headers": res_headers,
-                            "body": body_text
+                            "body": body_text,
+                            "body_b64": body_b64 // <--- UNCORRUPTED BASE64 DATA
                         }))
                     }
                     Err(e) => Err(format!("Network Error: {}", e)),
