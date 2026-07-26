@@ -34,6 +34,14 @@ jobs:
             extension: ".exe"
 
     steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
       - name: Checkout Code
         uses: actions/checkout@v4
 
@@ -80,7 +88,7 @@ jobs:
         run: |
           # This compiles the dependencies but stops before linking, 
           # forcing cargo-xwin to automatically download and extract the SDK.
-          cargo xwin check --target x86_64-pc-windows-msvc
+          cargo xwin check --target x86_64-pc-windows-msvc --release
 
       - name: Apply Case-Sensitivity Symlinks
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -93,7 +101,7 @@ jobs:
       - name: Build (${{ matrix.target }})
         run: |
           if [ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]; then
-            OPENSSL_NO_ASM=1 RUSTFLAGS="-C target-feature=+crt-static" cargo xwin build --target ${{ matrix.target }} --release -p apexkit-cli  --no-default-features
+            OPENSSL_NO_ASM=1 RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C link-arg=/DEBUG:NONE" cargo xwin build --target ${{ matrix.target }} --release -p apexkit-cli  --no-default-features
           else
             cargo build --target ${{ matrix.target }} --release -p apexkit-cli
           fi
