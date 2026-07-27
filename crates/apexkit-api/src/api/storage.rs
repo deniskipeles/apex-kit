@@ -1560,26 +1560,81 @@ pub async fn generate_opengraph(
 
     for item in items {
         if item.r#type == "image" {
-            let b64_src = if item.value.starts_with("data:image") || item.value.starts_with("http")
-            {
+            let b64_src = if item.value.starts_with("data:image") {
                 item.value
+            } else if item.value.starts_with("http://") || item.value.starts_with("https://") {
+                match reqwest::get(&item.value).await {
+                    Ok(res) if res.status().is_success() => {
+                        let mime = res
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("image/jpeg")
+                            .to_string();
+                        if let Ok(bytes) = res.bytes().await {
+                            format!("data:{};base64,{}", mime, STANDARD.encode(&bytes))
+                        } else {
+                            fallback_logo_cache.clone().unwrap_or_default()
+                        }
+                    }
+                    _ => fallback_logo_cache.clone().unwrap_or_default(),
+                }
             } else {
-                match storage.get(&item.value).await {
+                // LOCAL FILENAME (e.g. "uuid.jpg?blur=15")
+                let (clean_filename, query_str) = if let Some((f, q)) = item.value.split_once('?') {
+                    (f, Some(q))
+                } else {
+                    (item.value.as_str(), None)
+                };
+
+                match storage.get(clean_filename).await {
                     Ok(bytes) => {
-                        let mime = mime_guess::from_path(&item.value)
+                        let mut final_bytes = bytes.clone();
+                        
+                        // Apply dynamic image transformations if query parameters exist
+                        if let Some(qs) = query_str {
+                            let mut blur: Option<f32> = None;
+                            
+                            // Parse simple query string without extra dependencies
+                            for pair in qs.split('&') {
+                                if let Some((k, v)) = pair.split_once('=') {
+                                    if k == "blur" {
+                                        blur = v.parse().ok();
+                                    }
+                                }
+                            }
+
+                            if blur.is_some() {
+                                if let Ok(processed_img) = tokio::task::spawn_blocking(move || {
+                                    let mut img = image::load_from_memory(&bytes)?;
+                                    if let Some(b) = blur {
+                                        img = img.blur(b.clamp(0.1, 50.0));
+                                    }
+                                    // Re-encode to JPEG to save SVG payload space
+                                    let mut buf = std::io::Cursor::new(Vec::new());
+                                    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+                                    encoder.encode_image(&img)?;
+                                    Ok::<_, image::ImageError>(buf.into_inner())
+                                }).await.unwrap() {
+                                    final_bytes = processed_img;
+                                }
+                            }
+                        }
+
+                        let mime = mime_guess::from_path(clean_filename)
                             .first_or_octet_stream()
                             .to_string();
-                        format!("data:{};base64,{}", mime, STANDARD.encode(&bytes))
+                        format!("data:{};base64,{}", mime, STANDARD.encode(&final_bytes))
                     }
                     Err(_) => {
                         tracing::warn!(
-                            "OpenGraph: Image '{}' not found. Falling back to App Logo.",
-                            item.value
+                            "OpenGraph: Local image '{}' not found. Falling back to App Logo.",
+                            clean_filename
                         );
                         if fallback_logo_cache.is_none() {
                             fallback_logo_cache = Some(get_scope_logo_base64(&db, &storage).await);
                         }
-                        fallback_logo_cache.clone().unwrap()
+                        fallback_logo_cache.clone().unwrap_or_default()
                     }
                 }
             };

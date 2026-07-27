@@ -17,6 +17,7 @@ import { useToast } from '../../../components/feedback/Toast';
 import { templatesService } from '../../templates/services/templatesService';
 import { Template } from '../../../types';
 import { APP_CONFIG } from '../../../config/app.config';
+import { pb } from '@/src/lib/apiClient';
 
 interface OpenGraphTesterModalProps {
   isOpen: boolean;
@@ -69,7 +70,7 @@ export const OpenGraphTesterModal = ({ isOpen, onClose }: OpenGraphTesterModalPr
     if (format !== 'png') params.append('format', format);
     if (quality !== 80) params.append('quality', String(quality));
 
-    return `${APP_CONFIG.apiBaseUrl}/api/v1/storage/files/opengraph?${params.toString()}`;
+    return `${pb.baseUrl}/api/v1/storage/files/opengraph?${params.toString()}`;
   };
 
   const handleGenerate = () => {
