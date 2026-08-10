@@ -67,7 +67,7 @@ export default async function(req) {
     });
 
     if (charge.status === 'succeeded') {
-        await $db.records.patch('orders', orderId, { status: 'paid' });
+        await $db.records.update('orders', orderId, { status: 'paid' });
     }
 }
 ```

@@ -17,7 +17,7 @@ Uses the `$db.query` engine to aggregate data directly in SQL.
 export default async function(req) {
     const { category } = await req.json();
 
-    const report = await $db.query(null, {
+    const report = await $db.query({
         "from": "sales",
         "select": [
             "region",

@@ -39,7 +39,7 @@ export default async function(req) {
         text: ticket.description
     });
 
-    await $db.records.patch('tickets', ticket.id, {
+    await $db.records.update('tickets', ticket.id, {
         category: suggestions.category,
         priority: suggestions.priority
     });

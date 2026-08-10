@@ -25,7 +25,7 @@ ApexKit is a monolithic, single-binary Backend-as-a-Service. Unlike traditional 
 *   **Multi-Tenancy:** ApexKit supports multiple isolated environments (Tenants/Sandboxes) within a single instance.
 *   **Database:** Uses **Rusqlite** (SQLite) for data storage. It uses JSON columns (`data`) for flexibility while maintaining relational integrity.
 *   **Search:** Integrated **Tantivy** engine provides full-text and vector search. It automatically syncs with SQLite transactions.
-*   **Logic:** A v8-compatible JavaScript engine (**Boa**) runs inside the Rust process.
+*   **Logic:** A sandboxed, Rust-native JavaScript engine (**Boa**) runs inside the Rust process.
 *   **Storage:** Abstracts local disk and AWS S3-compatible storage transparently.
 
 ---
@@ -94,7 +94,7 @@ Scripts run in a sandboxed environment on the server.
 
 | Object | Description |
 | :--- | :--- |
-| **`$db`** | Database Access (`find`, `insert`, `update`, `delete`, `query`). Context-aware (Tenant/Root). |
+| **`$db`** | Database Access (`list`, `get`, `create`, `update`, `delete`, `query`). Context-aware (Tenant/Root). |
 | **`$http`** | Make external HTTP requests (`get`, `post`). |
 | **`$util`** | Utilities (`uuid`, `slugify`, `hash`, `hmac`). |
 | **`$zip`** | In-memory Zip creation/extraction (`create`, `extract`, `inspect`). |

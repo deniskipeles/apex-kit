@@ -97,7 +97,7 @@ ARCHIVE_LIMIT=50
 APEX_VECTOR_MODEL="bge-small"
 
 # Environment
-PORT=8080
+PORT=5000
 APP_ENV="production"
 ```
 

@@ -70,7 +70,7 @@ const posts = await apex.collection('posts').list({
 ## Advanced SQL Queries
 For complex use cases, ApexKit allows structured queries that resemble SQL but are safe and performant.
 ```javascript
-const stats = await apex.collection('sales').searchRecordsWithSQL({
+const stats = await apex.collection('sales').searchRecordsWithSQLQueryEngine({
     select: [
         { fn: 'sum', field: 'amount', as: 'total_revenue' },
         'category'

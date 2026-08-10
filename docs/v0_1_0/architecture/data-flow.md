@@ -46,7 +46,7 @@ sequenceDiagram
 
     Client->>Axum: POST /api/v1/scripts/my-logic
     Axum->>Boa: Load & Execute Script
-    Boa->>DB: $db.records.find('users', { id: 1 })
+    Boa->>DB: $db.records.get('users', 1)
     DB-->>Boa: User Data
     Boa->>External: $http.post('https://api.thirdparty.com/notify')
     External-->>Boa: Response

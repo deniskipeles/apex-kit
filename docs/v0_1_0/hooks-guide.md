@@ -24,7 +24,7 @@ These objects are available in every script context.
 
 | Object | Description | Example |
 | :--- | :--- | :--- |
-| **`$db`** | Scoped Database Access. | `await $db.records.list(null, "users", { active: true })` |
+| **`$db`** | Scoped Database Access. | `await $db.records.list("users", { filter: { active: true } })` |
 | **`$run`** | Execute other scripts. | `await $run.script("shared-logic", { id: 1 })` |
 | **`$cache`** | Scoped Key-Value store. | `await $cache.incr("hits", 1)` |
 | **`$http`** | Make external requests. | `await $http.get("https://api.com")` |
@@ -132,7 +132,7 @@ The `e` object varies based on the trigger:
 
 ## 5. Troubleshooting & Best Practices
 
-1.  **Infinite Loops**: Be careful calling `$db.insert` for `Collection A` inside an `after_create` hook for `Collection A`. This will trigger the hook again recursively.
+1.  **Infinite Loops**: Be careful calling `$db.records.create` for `Collection A` inside an `after_create` hook for `Collection A`. This will trigger the hook again recursively.
 2.  **Error Messages**: Messages thrown in `before_` hooks are sent directly to the client as a `422 Unprocessable Entity` response.
 3.  **Return Values**: Always remember to return the data object (`e.record.data` or `e.data`) in transformation hooks. If you return `null` or nothing, the system may assume you are blocking the change.
 4.  **Logging**: Use `log()` frequently during development. Logs are viewable in the **Admin UI > Logs** section.
