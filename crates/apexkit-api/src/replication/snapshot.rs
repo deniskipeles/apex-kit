@@ -140,7 +140,7 @@ pub async fn force_replica_sync(base_path: &str) {
 }
 
 async fn do_sync_env(base_path: &str, force: bool) {
-    if let Ok(master_url) = std::env::var("APEX_MASTER_URL")
+    if let Ok(master_url) = std::env::var("APEXKIT_MASTER_URL")
         && !master_url.is_empty()
     {
         if force {

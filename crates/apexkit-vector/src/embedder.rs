@@ -1019,12 +1019,12 @@ impl CandleEmbedder {
 
 /// Mirrors the active_model_name -> EmbeddingModelConfig mapping applications typically
 /// build around this crate (bge-small / bge-base / gte-small / gemma-300m / qwen3-embedding
-/// / custom), driven by APEX_VECTOR_TEXT_MODEL + the APEX_VECTOR_CUSTOM_* env vars, so the
+/// / custom), driven by APEXKIT_VECTOR_TEXT_MODEL + the APEXKIT_VECTOR_CUSTOM_* env vars, so the
 /// identity string can be computed independently of whatever model instance is currently
 /// loaded in memory.
 pub fn get_current_text_model() -> String {
     let active_model_name =
-        std::env::var("APEX_VECTOR_TEXT_MODEL").unwrap_or_else(|_| "default".to_string());
+        std::env::var("APEXKIT_VECTOR_TEXT_MODEL").unwrap_or_else(|_| "default".to_string());
 
     let cfg = match active_model_name.as_str() {
         "bge-small" => EmbeddingModelConfig::bge_small_en_v1_5(),
@@ -1035,20 +1035,20 @@ pub fn get_current_text_model() -> String {
         "gemma-300m-onnx" => EmbeddingModelConfig::gemma_300m_onnx(),
         "qwen3-embedding-onnx" => EmbeddingModelConfig::qwen3_embedding_0_6b_onnx(),
         "custom" => EmbeddingModelConfig::custom(
-            std::env::var("APEX_VECTOR_CUSTOM_REPO")
+            std::env::var("APEXKIT_VECTOR_CUSTOM_REPO")
                 .unwrap_or_else(|_| "sentence-transformers/all-MiniLM-L6-v2".to_string()),
-            std::env::var("APEX_VECTOR_CUSTOM_REV").unwrap_or_else(|_| "main".to_string()),
-            std::env::var("APEX_VECTOR_CUSTOM_CONFIG")
+            std::env::var("APEXKIT_VECTOR_CUSTOM_REV").unwrap_or_else(|_| "main".to_string()),
+            std::env::var("APEXKIT_VECTOR_CUSTOM_CONFIG")
                 .unwrap_or_else(|_| "config.json".to_string()),
-            std::env::var("APEX_VECTOR_CUSTOM_TOKENIZER")
+            std::env::var("APEXKIT_VECTOR_CUSTOM_TOKENIZER")
                 .unwrap_or_else(|_| "tokenizer.json".to_string()),
-            std::env::var("APEX_VECTOR_CUSTOM_WEIGHTS")
+            std::env::var("APEXKIT_VECTOR_CUSTOM_WEIGHTS")
                 .unwrap_or_else(|_| "model.safetensors".to_string()),
-            std::env::var("APEX_VECTOR_CUSTOM_WINDOW")
+            std::env::var("APEXKIT_VECTOR_CUSTOM_WINDOW")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(512),
-            std::env::var("APEX_VECTOR_CUSTOM_OVERLAP")
+            std::env::var("APEXKIT_VECTOR_CUSTOM_OVERLAP")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(128),

@@ -169,6 +169,33 @@ const JS_PRELUDE: &str = r#"
             }
         }
     }
+    
+    class URL {
+        constructor(urlStr, baseStr) {
+            let full = urlStr || "";
+            if (baseStr && !full.includes('://')) {
+                full = baseStr.replace(/\/$/, '') + '/' + full.replace(/^\//, '');
+            }
+            this.href = full;
+            const parts = full.split('?');
+            this.pathname = parts[0] || '';
+            const queryStr = parts[1] || '';
+            
+            const params = new Map();
+            if (queryStr) {
+                queryStr.split('&').forEach(pair => {
+                    const [k, v] = pair.split('=');
+                    if (k) params.set(decodeURIComponent(k), decodeURIComponent(v || ''));
+                });
+            }
+            this.searchParams = {
+                get: (k) => params.get(k) || null,
+                has: (k) => params.has(k),
+                getAll: (k) => params.has(k) ? [params.get(k)] : []
+            };
+        }
+    }
+    globalThis.URL = URL;
 
     globalThis.ApexKit = ApexKit;
     // Default instance uses current scope ($db)

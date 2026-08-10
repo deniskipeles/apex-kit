@@ -18,7 +18,7 @@ pub use tracker::REPLICA_ID;
 pub static USE_HTTP_FALLBACK: AtomicBool = AtomicBool::new(false);
 
 pub fn is_http_fallback() -> bool {
-    if std::env::var("APEX_FORCE_HTTP_REPLICATION").unwrap_or_default() == "true" {
+    if std::env::var("APEXKIT_FORCE_HTTP_REPLICATION").unwrap_or_default() == "true" {
         return true;
     }
     USE_HTTP_FALLBACK.load(Ordering::SeqCst)
@@ -122,7 +122,7 @@ pub async fn build_grpc_channel(master_url: &str) -> Result<Channel, String> {
 
     if master_url.starts_with("https://") {
         let mut tls_config = ClientTlsConfig::new();
-        if let Ok(ca_path) = std::env::var("APEX_TLS_CA_PATH") {
+        if let Ok(ca_path) = std::env::var("APEXKIT_TLS_CA_PATH") {
             if !ca_path.is_empty()
                 && let Ok(ca_cert) = tokio::fs::read(&ca_path).await
             {

@@ -103,7 +103,7 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
     const loadRoles = async () => {
       try {
         const list = await configService.list();
-        const roleConfig = list.find((c) => c.key === 'APEX_AUTH_ROLES');
+        const roleConfig = list.find((c) => c.key === '_apexkit_auth_roles');
         if (roleConfig && roleConfig.value) {
           setRoles(JSON.parse(roleConfig.value));
         } else {
@@ -135,7 +135,7 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
 
   const saveRoles = async (updatedRoles: string[]) => {
     try {
-      await configService.set('APEX_AUTH_ROLES', JSON.stringify(updatedRoles), false);
+      await configService.set('_apexkit_auth_roles', JSON.stringify(updatedRoles), false);
       toast('Roles updated', 'success');
     } catch (e) {
       toast('Failed to save roles', 'error');

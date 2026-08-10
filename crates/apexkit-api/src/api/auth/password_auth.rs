@@ -181,9 +181,9 @@ pub async fn register(
         } else {
             // Public users cannot request system/hidden roles prefixed with _
             if !req_role.starts_with('_') {
-                // Check if the requested role exists in the allowed APEX_AUTH_ROLES
+                // Check if the requested role exists in the allowed _apexkit_auth_roles
                 let allowed_roles: Vec<String> =
-                    if let Ok(Some(val)) = db.get_config("APEX_AUTH_ROLES").await {
+                    if let Ok(Some(val)) = db.get_config("_apexkit_auth_roles").await {
                         if let Some(s) = val.as_str() {
                             serde_json::from_str(s)
                                 .unwrap_or_else(|_| vec!["admin".to_string(), "user".to_string()])

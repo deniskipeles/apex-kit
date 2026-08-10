@@ -203,7 +203,7 @@ pub async fn start(port: u16) {
         .install_recorder()
         .expect("failed to install Prometheus recorder");
 
-    let master_url = env::var("APEX_MASTER_URL").ok().filter(|s| !s.is_empty());
+    let master_url = env::var("APEXKIT_MASTER_URL").ok().filter(|s| !s.is_empty());
     let is_replica = master_url.is_some();
 
     let forwarder: Option<Arc<dyn apexkit_core::batching::WriteForwarder>> =
@@ -216,7 +216,7 @@ pub async fn start(port: u16) {
     // --- 3. Vector Engine Initialization ---
     tracing::info!("Initializing Apex Vector Engine...");
     let active_model_name =
-        env::var("APEX_VECTOR_TEXT_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
+        env::var("APEXKIT_VECTOR_TEXT_MODEL").unwrap_or("all-minilm-l6-v2".to_string());
 
     let model_config = match active_model_name.as_str() {
         "bge-small" => EmbeddingModelConfig::bge_small_en_v1_5(),
@@ -227,17 +227,17 @@ pub async fn start(port: u16) {
         "gemma-300m-onnx" => EmbeddingModelConfig::gemma_300m_onnx(),
         "qwen3-embedding-onnx" => EmbeddingModelConfig::qwen3_embedding_0_6b_onnx(),
         "custom" => EmbeddingModelConfig::custom(
-            env::var("APEX_VECTOR_CUSTOM_REPO")
+            env::var("APEXKIT_VECTOR_CUSTOM_REPO")
                 .unwrap_or("sentence-transformers/all-MiniLM-L6-v2".to_string()),
-            env::var("APEX_VECTOR_CUSTOM_REV").unwrap_or("main".to_string()),
-            env::var("APEX_VECTOR_CUSTOM_CONFIG").unwrap_or("config.json".to_string()),
-            env::var("APEX_VECTOR_CUSTOM_TOKENIZER").unwrap_or("tokenizer.json".to_string()),
-            env::var("APEX_VECTOR_CUSTOM_WEIGHTS").unwrap_or("model.safetensors".to_string()),
-            env::var("APEX_VECTOR_CUSTOM_WINDOW")
+            env::var("APEXKIT_VECTOR_CUSTOM_REV").unwrap_or("main".to_string()),
+            env::var("APEXKIT_VECTOR_CUSTOM_CONFIG").unwrap_or("config.json".to_string()),
+            env::var("APEXKIT_VECTOR_CUSTOM_TOKENIZER").unwrap_or("tokenizer.json".to_string()),
+            env::var("APEXKIT_VECTOR_CUSTOM_WEIGHTS").unwrap_or("model.safetensors".to_string()),
+            env::var("APEXKIT_VECTOR_CUSTOM_WINDOW")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(512),
-            env::var("APEX_VECTOR_CUSTOM_OVERLAP")
+            env::var("APEXKIT_VECTOR_CUSTOM_OVERLAP")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(128),
@@ -431,7 +431,7 @@ pub async fn start(port: u16) {
     };
 
     // --- 8. Master/Replica Sync Hookup ---
-    if let Ok(m_url) = env::var("APEX_MASTER_URL")
+    if let Ok(m_url) = env::var("APEXKIT_MASTER_URL")
         && !m_url.is_empty()
     {
         let state_clone = state.clone();

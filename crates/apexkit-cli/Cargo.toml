@@ -7,7 +7,7 @@ edition = "2024"
 apexkit-api = { path = "../apexkit-api", default-features = false }
 apexkit-core = { path = "../apexkit-core", default-features = false }
 tokio = { version = "1.37.0", features = ["full"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 async-trait = "0.1" # <--- ADD THIS LINE

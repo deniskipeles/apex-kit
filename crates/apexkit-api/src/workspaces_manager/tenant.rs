@@ -227,7 +227,7 @@ impl TenantManager {
         // 4. Verify Files Exist
         let expected_db = format!("{}/data.db", base_path);
         let files_exist = std::path::Path::new(&expected_db).exists();
-        let is_replica = std::env::var("APEX_MASTER_URL")
+        let is_replica = std::env::var("APEXKIT_MASTER_URL")
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false);
 

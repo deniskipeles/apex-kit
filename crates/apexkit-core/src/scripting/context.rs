@@ -81,6 +81,7 @@ pub trait ScriptContext: Send + Sync {
     fn admin_create_sandbox(
         &self,
         id: String,
+        config: serde_json::Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>>;
     fn admin_update_sandbox(
         &self,

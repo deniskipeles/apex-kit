@@ -65,25 +65,26 @@ pub fn register_root(ctx: &mut Context) -> Result<(), String> {
                 .get_or_undefined(0)
                 .to_string(ctx)?
                 .to_std_string_escaped();
-            // Extract config object
-            let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
+            
+            // Extract config object, ensuring we always pass an object down to Rust
+            let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten().unwrap_or(serde_json::json!({}));
+            
             let (name, owner_id, expires_at) =
-                if let Some(serde_json::Value::Object(map)) = config_val {
+                if let Some(map) = config_val.as_object() {
                     (
                         map.get("name").and_then(|v| v.as_str()).map(String::from),
                         map.get("owner_id").and_then(|v| v.as_i64()),
-                        map.get("expires_at")
-                            .and_then(|v| v.as_str())
-                            .map(String::from), // ISO String
+                        map.get("expires_at").and_then(|v| v.as_str()).map(String::from),
                     )
                 } else {
                     (None, None, None)
                 };
+                
             let res = ACTIVE_CONTEXT.with(|c| {
                 if let Some((app, handle, _, _, _)) = &*c.borrow() {
                     handle.block_on(async {
-                        // 1. Create Physical Resources
-                        app.admin_create_sandbox(id.clone())
+                        // 1. Create Physical Resources (Pass the config payload to handle cloning strategy)
+                        app.admin_create_sandbox(id.clone(), config_val)
                             .await
                             .map_err(|e| e.to_string())?;
 

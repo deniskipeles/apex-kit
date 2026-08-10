@@ -136,7 +136,7 @@ pub async fn list_roles_handler(
     DatabaseConnection(db): DatabaseConnection,
 ) -> Result<Json<RolesResponse>, AppError> {
     // 1. Try to fetch from config
-    let roles = if let Ok(Some(val)) = db.get_config("APEX_AUTH_ROLES").await {
+    let roles = if let Ok(Some(val)) = db.get_config("_apexkit_auth_roles").await {
         // [FIX] Handle potential double-encoding or string-wrapped JSON
         if let Some(s) = val.as_str() {
             // If it's a string, try to parse it as JSON array

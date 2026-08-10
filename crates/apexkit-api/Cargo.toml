@@ -123,10 +123,3 @@ default = ["onnx"]
 onnx = ["apexkit-core/onnx", "apexkit-vector/onnx"]
 cuda = ["apexkit-core/cuda", "apexkit-vector/cuda"]
 metal = ["apexkit-core/metal", "apexkit-vector/metal"]
-
-# Profile optimizations for release
-[profile.release]
-strip = true
-lto = true
-codegen-units = 1
-

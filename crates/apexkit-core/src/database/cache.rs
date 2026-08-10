@@ -31,7 +31,7 @@ pub struct CachedDb {
 
 impl CachedDb {
     pub fn new(inner: Arc<dyn Db>) -> Self {
-        let is_replica = std::env::var("APEX_MASTER_URL").is_ok();
+        let is_replica = std::env::var("APEXKIT_MASTER_URL").is_ok();
         Self {
             inner,
             collection_cache: Cache::builder()

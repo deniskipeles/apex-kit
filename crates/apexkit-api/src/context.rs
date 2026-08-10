@@ -427,10 +427,12 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
     fn admin_create_sandbox(
         &self,
         id: String,
+        config: serde_json::Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
         let sm = self.state.sandbox_manager.clone();
         let db = self.state.db.clone();
         let scope = self.scope.clone();
+        
         Box::pin(async move {
             let general_config = db.get_config("general").await.unwrap_or_default();
             let max_storage_mb = general_config
@@ -438,10 +440,39 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
                 .and_then(|v| v.get("max_sandbox_storage_mb").and_then(|n| n.as_i64()))
                 .unwrap_or(100);
 
-            // Default strategy for script creation
+            // Parse JavaScript configuration object into Rust CloneStrategy
+            let strategy = if let Some(obj) = config.as_object() {
+                let strat_str = obj.get("clone_strategy").and_then(|v| v.as_str()).unwrap_or("none");
+                match strat_str {
+                    "schema" => sandbox_manager::CloneStrategy::SchemaOnly,
+                    "partial" => sandbox_manager::CloneStrategy::Partial(
+                        obj.get("clone_record_limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize
+                    ),
+                    "full" => sandbox_manager::CloneStrategy::Full,
+                    "selected" => {
+                        let parse_arr = |key: &str| -> Vec<String> {
+                            obj.get(key)
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.iter().filter_map(|i| i.as_str().map(|s| s.to_string())).collect())
+                                .unwrap_or_default()
+                        };
+                        sandbox_manager::CloneStrategy::Selected {
+                            collections: parse_arr("collections"),
+                            scripts: parse_arr("scripts"),
+                            templates: parse_arr("templates"),
+                            record_limit: obj.get("clone_record_limit").and_then(|v| v.as_u64()).map(|n| n as usize),
+                        }
+                    },
+                    "none" => sandbox_manager::CloneStrategy::None,
+                    _ => sandbox_manager::CloneStrategy::None,
+                }
+            } else {
+                sandbox_manager::CloneStrategy::None
+            };
+
             sm.create_sandbox(
                 &id,
-                sandbox_manager::CloneStrategy::None,
+                strategy,
                 db,
                 scope,
                 max_storage_mb,

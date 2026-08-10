@@ -217,7 +217,7 @@ impl StorageBackend for DynamicStorage {
 
         // [REPLICA PUSH] Forward local file uploads to Master via gRPC
         if is_local
-            && let Ok(master_url) = std::env::var("APEX_MASTER_URL")
+            && let Ok(master_url) = std::env::var("APEXKIT_MASTER_URL")
             && !master_url.is_empty()
         {
             let data_clone = data.to_vec();
@@ -247,7 +247,7 @@ impl StorageBackend for DynamicStorage {
             Ok(data) => Ok(data),
             Err(e) => {
                 // [LAZY REPLICATION] Pull file from Master if missing on Replica
-                if let Ok(master_url) = std::env::var("APEX_MASTER_URL")
+                if let Ok(master_url) = std::env::var("APEXKIT_MASTER_URL")
                     && !master_url.is_empty()
                 {
                     tracing::info!(
@@ -464,7 +464,7 @@ impl StorageBackend for ScopedDynamicStorage {
 
         // [REPLICA PUSH] Forward local file uploads to Master via gRPC
         if is_local
-            && let Ok(master_url) = std::env::var("APEX_MASTER_URL")
+            && let Ok(master_url) = std::env::var("APEXKIT_MASTER_URL")
             && !master_url.is_empty()
         {
             let data_clone = data.to_vec();
@@ -517,7 +517,7 @@ impl StorageBackend for ScopedDynamicStorage {
 
         // [LAZY REPLICATION] If still failed, and we are a replica, fetch from Master HTTP
         if result.is_err()
-            && let Ok(master_url) = std::env::var("APEX_MASTER_URL")
+            && let Ok(master_url) = std::env::var("APEXKIT_MASTER_URL")
             && !master_url.is_empty()
         {
             tracing::info!(

@@ -343,7 +343,7 @@ async fn render_view_core(
 
     // --- DYNAMIC PATH-BASED SCOPE REWRITING ---
     let mut scope_prefix = String::new();
-    let root_domain = std::env::var("APEX_ROOT_DOMAIN").unwrap_or_default();
+    let root_domain = std::env::var("APEXKIT_ROOT_DOMAIN").unwrap_or_default();
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())

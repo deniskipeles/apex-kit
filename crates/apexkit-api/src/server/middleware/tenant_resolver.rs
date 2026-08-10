@@ -56,7 +56,7 @@ pub async fn tenant_resolver_middleware(
     }
 
     if tenant_id.is_empty() {
-        let root_domain = std::env::var("APEX_ROOT_DOMAIN").unwrap_or_default();
+        let root_domain = std::env::var("APEXKIT_ROOT_DOMAIN").unwrap_or_default();
         let host = req
             .headers()
             .get("host")
