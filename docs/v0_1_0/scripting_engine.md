@@ -91,7 +91,7 @@ Consolidated HTTP logic for external API calls.
 ## 3. Scoping & Visibility
 
 ### Context Awareness
-Scripts are automatically "anchored" to the scope they are called from. When a script calls `$db.find()`, it only sees data from the current Tenant.
+Scripts are automatically "anchored" to the scope they are called from. When a script calls `$db.records.list()`, it only sees data from the current Tenant.
 
 ### Shared Scripts
 Root Admins can create scripts with **Public Visibility**. These scripts act as "System Functions" that Tenants can invoke to perform heavy tasks (like FFmpeg processing) that require `$cmd` access, which Tenants lack for security reasons.

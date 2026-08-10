@@ -64,7 +64,7 @@ export default async function(req) {
         limit: 5,
         sort: '-created_at'
     }),
-    $db.query(null, {
+    $db.query({
         from: 'orders',
         select: [{ fn: 'sum', field: 'total', as: 'lifetimeValue' }],
         where: { customer_id: userId }

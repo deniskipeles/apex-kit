@@ -37,7 +37,7 @@ Build a documentation platform where users can ask questions in natural language
 export default async function(req) {
     const text = `${req.record.title} ${req.record.content}`;
     const vector = await $ai.embed(text);
-    await $db.records.patch('articles', req.record.id, {
+    await $db.records.update('articles', req.record.id, {
         embedding: vector
     });
 }

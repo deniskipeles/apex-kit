@@ -31,7 +31,7 @@ export default async function(req) {
     // Get AI to tag the image
     const tags = await $ai.run('tag-image', { url: fileUrl });
 
-    await $db.records.patch('assets', req.record.id, {
+    await $db.records.update('assets', req.record.id, {
         tags: tags
     });
 }

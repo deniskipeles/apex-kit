@@ -67,7 +67,7 @@ export const graphql = {
 export default async function(req) {
   const { category } = await req.json();
   
-  const stats = await $db.query(null, {
+  const stats = await $db.query({
     "from": "orders",
     "select": [
        { "fn": "sum", "field": "total", "as": "revenue" },

@@ -101,7 +101,7 @@ Use the full power of the query engine for reporting.
 
 ```javascript
 export default async function(req) {
-    const report = await $db.query(null, {
+    const report = await $db.query({
         from: 'orders',
         select: [
             { fn: 'strftime', args: ['%Y-%m', 'created_at'], as: 'month' },
