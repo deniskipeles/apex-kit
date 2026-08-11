@@ -121,8 +121,24 @@ pub fn create_db_object(
                     handle.block_on(async {
                         let db = resolve_db(ctx_id, app.clone()).await?;
                         let col_id = resolve_collection_local(db.clone(), &col).await?;
-                        let opts: QueryOptions =
-                            serde_json::from_value(opts_val).unwrap_or_default();
+                        
+                        // Robustly parse JS floats (f64) into Rust Integers (u64)
+                        let mut opts = QueryOptions::default();
+                        if let Some(obj) = opts_val.as_object() {
+                            opts.page = obj.get("page").and_then(|v| v.as_f64()).map(|n| n as u64).or(obj.get("page").and_then(|v| v.as_u64()));
+                            opts.per_page = obj.get("per_page").and_then(|v| v.as_f64()).map(|n| n as u64).or(obj.get("per_page").and_then(|v| v.as_u64()));
+                            opts.limit = obj.get("limit").and_then(|v| v.as_f64()).map(|n| n as u64).or(obj.get("limit").and_then(|v| v.as_u64()));
+                            opts.offset = obj.get("offset").and_then(|v| v.as_f64()).map(|n| n as u64).or(obj.get("offset").and_then(|v| v.as_u64()));
+                            
+                            opts.sort = obj.get("sort").and_then(|v| v.as_str()).map(String::from);
+                            opts.expand = obj.get("expand").and_then(|v| v.as_str()).map(String::from);
+                            opts.fields = obj.get("fields").and_then(|v| v.as_str()).map(String::from);
+                            
+                            opts.filter = obj.get("filter").map(|v| {
+                                if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }
+                            });
+                        }
+
                         let list = db
                             .list_records(col_id, opts)
                             .await
