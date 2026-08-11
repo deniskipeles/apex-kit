@@ -1,11 +1,10 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/http.rs start here ===========================
-use std::collections::HashMap;
-use std::sync::Arc;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rquickjs::function::Async;
 use rquickjs::{Ctx, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::super::context::ScriptContext;
 
@@ -18,9 +17,9 @@ async fn execute_http_request(
 ) -> Result<serde_json::Value, String> {
     let policy = match redirect_mode.as_deref() {
         Some("manual") => reqwest::redirect::Policy::none(),
-        Some("error") => reqwest::redirect::Policy::custom(|attempt| {
-            attempt.error("Redirects not allowed")
-        }),
+        Some("error") => {
+            reqwest::redirect::Policy::custom(|attempt| attempt.error("Redirects not allowed"))
+        }
         _ => reqwest::redirect::Policy::default(),
     };
 
@@ -29,8 +28,7 @@ async fn execute_http_request(
         .build()
         .map_err(|e| format!("Client Build Error: {}", e))?;
 
-    let req_method =
-        reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+    let req_method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
 
     let mut req_builder = client.request(req_method, &url);
 
@@ -100,7 +98,9 @@ pub fn register_fetch<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> 
                             method = m.to_string();
                         }
                         if let Some(h) = opts.get("headers") {
-                            if let Ok(h_map) = serde_json::from_value::<HashMap<String, String>>(h.clone()) {
+                            if let Ok(h_map) =
+                                serde_json::from_value::<HashMap<String, String>>(h.clone())
+                            {
                                 headers = Some(h_map);
                             }
                         }
@@ -122,7 +122,9 @@ pub fn register_fetch<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> 
     )
     .map_err(|e| e.to_string())?;
 
-    globals.set("$__native_fetch", fetch_fn).map_err(|e| e.to_string())?;
+    globals
+        .set("$__native_fetch", fetch_fn)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -132,41 +134,37 @@ pub fn register_http<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
 
     let get_fn = Function::new(
         ctx.clone(),
-        Async(move |url: String| {
-            async move {
-                let res = execute_http_request(url, "GET".to_string(), None, None, None)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+        Async(move |url: String| async move {
+            let res = execute_http_request(url, "GET".to_string(), None, None, None)
+                .await
+                .map_err(|_| rquickjs::Error::Exception)?;
 
-                let body = res
-                    .get("body")
-                    .and_then(|b| b.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                
-                Ok::<String, rquickjs::Error>(body)
-            }
+            let body = res
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            Ok::<String, rquickjs::Error>(body)
         }),
     )
     .map_err(|e| e.to_string())?;
 
     let post_fn = Function::new(
         ctx.clone(),
-        Async(move |url: String, body_val: Value<'js>| {
-            async move {
-                let body_json: serde_json::Value = from_value(body_val).unwrap_or(json!({}));
-                let res = execute_http_request(url, "POST".to_string(), None, Some(body_json), None)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+        Async(move |url: String, body_val: Value<'js>| async move {
+            let body_json: serde_json::Value = from_value(body_val).unwrap_or(json!({}));
+            let res = execute_http_request(url, "POST".to_string(), None, Some(body_json), None)
+                .await
+                .map_err(|_| rquickjs::Error::Exception)?;
 
-                let body = res
-                    .get("body")
-                    .and_then(|b| b.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                
-                Ok::<String, rquickjs::Error>(body)
-            }
+            let body = res
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            Ok::<String, rquickjs::Error>(body)
         }),
     )
     .map_err(|e| e.to_string())?;
@@ -177,4 +175,3 @@ pub fn register_http<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     globals.set("$http", http_obj).map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/http.rs ends here ===========================

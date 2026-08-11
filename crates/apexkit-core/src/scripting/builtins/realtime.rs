@@ -1,14 +1,16 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/realtime.rs start here ===========================
-use std::sync::Arc;
 use rquickjs::function::Async;
 use rquickjs::{Ctx, Function, Object, Value};
 use rquickjs_serde::from_value;
 use serde_json::json;
+use std::sync::Arc;
 
 use super::super::context::ScriptContext;
 use crate::realtime::{DbEvent, EventScope};
 
-pub fn register_realtime<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
+pub fn register_realtime<'js>(
+    ctx: &Ctx<'js>,
+    app_ctx: Arc<dyn ScriptContext>,
+) -> Result<(), String> {
     let globals = ctx.globals();
     let realtime_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
@@ -41,8 +43,11 @@ pub fn register_realtime<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -
     )
     .map_err(|e| e.to_string())?;
 
-    realtime_obj.set("send", send_fn).map_err(|e| e.to_string())?;
-    globals.set("$realtime", realtime_obj).map_err(|e| e.to_string())?;
+    realtime_obj
+        .set("send", send_fn)
+        .map_err(|e| e.to_string())?;
+    globals
+        .set("$realtime", realtime_obj)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/realtime.rs ends here ===========================

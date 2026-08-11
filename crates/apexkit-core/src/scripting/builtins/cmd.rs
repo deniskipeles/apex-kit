@@ -1,14 +1,13 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/cmd.rs start here ===========================
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use rquickjs::function::Async;
 use rquickjs::{Ctx, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
-use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -104,7 +103,10 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
     let run_fn = Function::new(
         ctx.clone(),
         Async(
-            move |js_ctx: Ctx<'js>, program: String, args_val: Value<'js>, opts_val: Option<Value<'js>>| {
+            move |js_ctx: Ctx<'js>,
+                  program: String,
+                  args_val: Value<'js>,
+                  opts_val: Option<Value<'js>>| {
                 let cmd_args: Vec<String> = from_value(args_val).unwrap_or_default();
                 let opts: CmdOptions = opts_val
                     .and_then(|v| from_value(v).ok())
@@ -117,7 +119,10 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
                     }
 
                     let sem = get_semaphore_for_program(&program);
-                    let _permit = sem.acquire().await.map_err(|_| rquickjs::Error::Exception)?;
+                    let _permit = sem
+                        .acquire()
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
 
                     let mut command = tokio::process::Command::new(&program);
                     command.args(&cmd_args);
@@ -158,7 +163,10 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
     let spawn_fn = Function::new(
         ctx.clone(),
         Async(
-            move |js_ctx: Ctx<'js>, program: String, args_val: Value<'js>, opts_val: Option<Value<'js>>| {
+            move |js_ctx: Ctx<'js>,
+                  program: String,
+                  args_val: Value<'js>,
+                  opts_val: Option<Value<'js>>| {
                 let cmd_args: Vec<String> = from_value(args_val).unwrap_or_default();
                 let opts: CmdOptions = opts_val
                     .and_then(|v| from_value(v).ok())
@@ -238,7 +246,11 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
                                 }
 
                                 if let Some(prog) = opts.on_progress
-                                    && let (Some(regex_pattern), Some(channel_name), Some(event_name)) = (prog.regex, prog.channel, prog.event)
+                                    && let (
+                                        Some(regex_pattern),
+                                        Some(channel_name),
+                                        Some(event_name),
+                                    ) = (prog.regex, prog.channel, prog.event)
                                     && let Some(stderr) = child.stderr.take()
                                     && let Some(broadcaster) = tx
                                 {
@@ -248,8 +260,12 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
                                     } else {
                                         match &client_scope {
                                             EventScope::Root => format!("root::{}", channel_name),
-                                            EventScope::Tenant(id) => format!("tenant_{}::{}", id, channel_name),
-                                            EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, channel_name),
+                                            EventScope::Tenant(id) => {
+                                                format!("tenant_{}::{}", id, channel_name)
+                                            }
+                                            EventScope::Sandbox(id) => {
+                                                format!("sandbox_{}::{}", id, channel_name)
+                                            }
                                             _ => channel_name.clone(),
                                         }
                                     };
@@ -259,14 +275,18 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
                                             let mut lines = reader.lines();
                                             while let Ok(Some(line)) = lines.next_line().await {
                                                 if let Some(caps) = re.captures(&line) {
-                                                    let val = caps
-                                                        .get(1)
-                                                        .map(|m| m.as_str())
-                                                        .unwrap_or(caps.get(0).map(|m| m.as_str()).unwrap_or(""));
+                                                    let val =
+                                                        caps.get(1).map(|m| m.as_str()).unwrap_or(
+                                                            caps.get(0)
+                                                                .map(|m| m.as_str())
+                                                                .unwrap_or(""),
+                                                        );
                                                     let event = DbEvent::Custom {
                                                         event: event_name.clone(),
                                                         data: json!({ "value": val, "raw": line }),
-                                                        scope: EventScope::Channel(scoped_channel.clone()),
+                                                        scope: EventScope::Channel(
+                                                            scoped_channel.clone(),
+                                                        ),
                                                     };
                                                     let _ = broadcaster.send(event);
                                                 }
@@ -277,7 +297,8 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
 
                                 let _permit_guard = permit;
                                 let wait_future = child.wait();
-                                let result = timeout(Duration::from_millis(max_time), wait_future).await;
+                                let result =
+                                    timeout(Duration::from_millis(max_time), wait_future).await;
 
                                 let mut tracker = get_tracker().lock().unwrap();
                                 if let Some(info) = tracker.get_mut(&internal_id) {
@@ -386,11 +407,14 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
 
     cmd_obj.set("run", run_fn).map_err(|e| e.to_string())?;
     cmd_obj.set("spawn", spawn_fn).map_err(|e| e.to_string())?;
-    cmd_obj.set("status", status_fn).map_err(|e| e.to_string())?;
-    cmd_obj.set("setLimit", set_limit_fn).map_err(|e| e.to_string())?;
+    cmd_obj
+        .set("status", status_fn)
+        .map_err(|e| e.to_string())?;
+    cmd_obj
+        .set("setLimit", set_limit_fn)
+        .map_err(|e| e.to_string())?;
     cmd_obj.set("kill", kill_fn).map_err(|e| e.to_string())?;
 
     globals.set("$cmd", cmd_obj).map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/cmd.rs ends here ===========================

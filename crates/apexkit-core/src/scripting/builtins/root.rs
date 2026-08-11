@@ -1,9 +1,8 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/root.rs start here ===========================
-use std::sync::Arc;
 use rquickjs::function::Async;
 use rquickjs::{Ctx, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde_json::json;
+use std::sync::Arc;
 
 use super::super::context::ScriptContext;
 use crate::realtime::EventScope;
@@ -145,7 +144,9 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                     (
                         map.get("name").and_then(|v| v.as_str()).map(String::from),
                         map.get("owner_id").and_then(|v| v.as_i64()),
-                        map.get("expires_at").and_then(|v| v.as_str()).map(String::from),
+                        map.get("expires_at")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                     )
                 } else {
                     (None, None, None)
@@ -155,8 +156,7 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                     .await
                     .map_err(|_| rquickjs::Error::Exception)?;
 
-                let general_config =
-                    app.get_db().get_config("general").await.unwrap_or_default();
+                let general_config = app.get_db().get_config("general").await.unwrap_or_default();
                 let max_storage_mb = general_config
                     .as_ref()
                     .and_then(|v| v.get("max_sandbox_storage_mb").and_then(|n| n.as_i64()))
@@ -247,62 +247,64 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_c_key = app_ctx.clone();
     let create_key_fn = Function::new(
         ctx.clone(),
-        Async(move |js_ctx: Ctx<'js>, name: String, config_val: Option<Value<'js>>| {
-            let config = config_val.and_then(|v| from_value::<serde_json::Value>(v).ok());
-            let app = app_c_key.clone();
+        Async(
+            move |js_ctx: Ctx<'js>, name: String, config_val: Option<Value<'js>>| {
+                let config = config_val.and_then(|v| from_value::<serde_json::Value>(v).ok());
+                let app = app_c_key.clone();
 
-            async move {
-                let (tenant_id, issuer, env_type, roles, bypass) =
-                    if let Some(serde_json::Value::Object(map)) = config {
-                        (
-                            map.get("tenant_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("root")
-                                .to_string(),
-                            map.get("issuer")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("root")
-                                .to_string(),
-                            map.get("env_type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("sys")
-                                .to_string(),
-                            map.get("roles")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                        .collect::<Vec<String>>()
-                                })
-                                .unwrap_or_else(|| vec!["admin".to_string()]),
-                            map.get("bypass_cors")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false),
-                        )
-                    } else {
-                        (
-                            "root".to_string(),
-                            "root".to_string(),
-                            "sys".to_string(),
-                            vec!["admin".to_string()],
-                            false,
-                        )
-                    };
+                async move {
+                    let (tenant_id, issuer, env_type, roles, bypass) =
+                        if let Some(serde_json::Value::Object(map)) = config {
+                            (
+                                map.get("tenant_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("root")
+                                    .to_string(),
+                                map.get("issuer")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("root")
+                                    .to_string(),
+                                map.get("env_type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("sys")
+                                    .to_string(),
+                                map.get("roles")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                            .collect::<Vec<String>>()
+                                    })
+                                    .unwrap_or_else(|| vec!["admin".to_string()]),
+                                map.get("bypass_cors")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                            )
+                        } else {
+                            (
+                                "root".to_string(),
+                                "root".to_string(),
+                                "sys".to_string(),
+                                vec!["admin".to_string()],
+                                false,
+                            )
+                        };
 
-                let (raw_key, info) = app
-                    .get_db()
-                    .create_api_key(&name, &tenant_id, &issuer, &env_type, roles, bypass)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                    let (raw_key, info) = app
+                        .get_db()
+                        .create_api_key(&name, &tenant_id, &issuer, &env_type, roles, bypass)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
 
-                let res = json!({
-                    "key": raw_key,
-                    "info": info
-                });
+                    let res = json!({
+                        "key": raw_key,
+                        "info": info
+                    });
 
-                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
-            }
-        }),
+                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                }
+            },
+        ),
     )
     .map_err(|e| e.to_string())?;
 
@@ -377,23 +379,48 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     .map_err(|e| e.to_string())?;
 
     // Bind Functions
-    root_obj.set("createTenant", create_tenant_fn).map_err(|e| e.to_string())?;
-    root_obj.set("updateTenant", update_tenant_fn).map_err(|e| e.to_string())?;
-    root_obj.set("deleteTenant", delete_tenant_fn).map_err(|e| e.to_string())?;
-    root_obj.set("getTenantDiskUsage", get_tenant_usage_fn).map_err(|e| e.to_string())?;
-    root_obj.set("listTenants", list_tenants_fn).map_err(|e| e.to_string())?;
+    root_obj
+        .set("createTenant", create_tenant_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("updateTenant", update_tenant_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("deleteTenant", delete_tenant_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("getTenantDiskUsage", get_tenant_usage_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("listTenants", list_tenants_fn)
+        .map_err(|e| e.to_string())?;
 
-    root_obj.set("createSandbox", create_sandbox_fn).map_err(|e| e.to_string())?;
-    root_obj.set("updateSandbox", update_sandbox_fn).map_err(|e| e.to_string())?;
-    root_obj.set("deleteSandbox", delete_sandbox_fn).map_err(|e| e.to_string())?;
-    root_obj.set("getSandboxDiskUsage", get_sandbox_usage_fn).map_err(|e| e.to_string())?;
+    root_obj
+        .set("createSandbox", create_sandbox_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("updateSandbox", update_sandbox_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("deleteSandbox", delete_sandbox_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("getSandboxDiskUsage", get_sandbox_usage_fn)
+        .map_err(|e| e.to_string())?;
 
-    root_obj.set("createKey", create_key_fn).map_err(|e| e.to_string())?;
-    root_obj.set("updateKey", update_key_fn).map_err(|e| e.to_string())?;
-    root_obj.set("deleteKey", delete_key_fn).map_err(|e| e.to_string())?;
-    root_obj.set("listKeys", list_keys_fn).map_err(|e| e.to_string())?;
+    root_obj
+        .set("createKey", create_key_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("updateKey", update_key_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("deleteKey", delete_key_fn)
+        .map_err(|e| e.to_string())?;
+    root_obj
+        .set("listKeys", list_keys_fn)
+        .map_err(|e| e.to_string())?;
 
     globals.set("$root", root_obj).map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/root.rs ends here ===========================

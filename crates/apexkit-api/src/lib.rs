@@ -203,7 +203,9 @@ pub async fn start(port: u16) {
         .install_recorder()
         .expect("failed to install Prometheus recorder");
 
-    let master_url = env::var("APEXKIT_MASTER_URL").ok().filter(|s| !s.is_empty());
+    let master_url = env::var("APEXKIT_MASTER_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
     let is_replica = master_url.is_some();
 
     let forwarder: Option<Arc<dyn apexkit_core::batching::WriteForwarder>> =

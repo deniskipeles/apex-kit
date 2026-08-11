@@ -1,4 +1,3 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/fs.rs start here ===========================
 use std::io::{Cursor, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -179,58 +178,66 @@ pub fn register_file_tools<'js>(
     let app_reg_meta = app_ctx.clone();
     let register_metadata_fn = Function::new(
         ctx.clone(),
-        Async(move |js_ctx: Ctx<'js>, filename: String, opts_val: Value<'js>| {
-            let opts: serde_json::Value = from_value(opts_val).unwrap_or(json!({}));
-            let app = app_reg_meta.clone();
+        Async(
+            move |js_ctx: Ctx<'js>, filename: String, opts_val: Value<'js>| {
+                let opts: serde_json::Value = from_value(opts_val).unwrap_or(json!({}));
+                let app = app_reg_meta.clone();
 
-            async move {
-                let db = resolve_db(None, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                async move {
+                    let db = resolve_db(None, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
 
-                if let Ok(Some(_)) = db.get_file_by_filename(&filename).await {
-                    return Err(rquickjs::Error::Exception);
+                    if let Ok(Some(_)) = db.get_file_by_filename(&filename).await {
+                        return Err(rquickjs::Error::Exception);
+                    }
+
+                    let original_name = opts
+                        .get("originalName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&filename)
+                        .to_string();
+                    let mime_type = opts
+                        .get("mimeType")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("application/octet-stream")
+                        .to_string();
+                    let size = opts.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+
+                    let id = db
+                        .create_file_metadata(&filename, &original_name, &mime_type, size, None)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    let storage = app.get_storage();
+                    let public_url = format!("{}{}", storage.get_public_url_base(), filename);
+
+                    let res = json!({
+                        "id": id,
+                        "filename": filename,
+                        "url": public_url,
+                        "size": size
+                    });
+
+                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
                 }
-
-                let original_name = opts
-                    .get("originalName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&filename)
-                    .to_string();
-                let mime_type = opts
-                    .get("mimeType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-                let size = opts.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
-
-                let id = db
-                    .create_file_metadata(&filename, &original_name, &mime_type, size, None)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-
-                let storage = app.get_storage();
-                let public_url = format!("{}{}", storage.get_public_url_base(), filename);
-
-                let res = json!({
-                    "id": id,
-                    "filename": filename,
-                    "url": public_url,
-                    "size": size
-                });
-
-                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
-            }
-        }),
+            },
+        ),
     )
     .map_err(|e| e.to_string())?;
 
     files_obj.set("read", read_fn).map_err(|e| e.to_string())?;
     files_obj.set("save", save_fn).map_err(|e| e.to_string())?;
-    files_obj.set("registerMetadata", register_metadata_fn).map_err(|e| e.to_string())?;
-    files_obj.set("getSignedUrl", signed_url_fn).map_err(|e| e.to_string())?;
+    files_obj
+        .set("registerMetadata", register_metadata_fn)
+        .map_err(|e| e.to_string())?;
+    files_obj
+        .set("getSignedUrl", signed_url_fn)
+        .map_err(|e| e.to_string())?;
 
-    globals.set("$files", files_obj).map_err(|e| e.to_string())?;
+    globals
+        .set("$files", files_obj)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -246,7 +253,8 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
             let app = app_read.clone();
             async move {
                 let scope = app.get_scope();
-                let target = resolve_read_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target =
+                    resolve_read_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
 
                 if !target.exists() || target.is_dir() {
                     return Err(rquickjs::Error::Exception);
@@ -255,7 +263,7 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
                 let content = tokio::fs::read_to_string(target)
                     .await
                     .map_err(|_| rquickjs::Error::Exception)?;
-                
+
                 Ok::<String, rquickjs::Error>(content)
             }
         }),
@@ -270,13 +278,16 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
             let app = app_write.clone();
             async move {
                 let scope = app.get_scope();
-                let target = resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target =
+                    resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
 
                 if let Some(parent) = target.parent() {
                     tokio::fs::create_dir_all(parent).await.ok();
                 }
 
-                tokio::fs::write(target, content).await.map_err(|_| rquickjs::Error::Exception)?;
+                tokio::fs::write(target, content)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
                 Ok::<bool, rquickjs::Error>(true)
             }
@@ -292,16 +303,21 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
             let app = app_del.clone();
             async move {
                 let scope = app.get_scope();
-                let target = resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target =
+                    resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
 
                 if !target.exists() {
                     return Err(rquickjs::Error::Exception);
                 }
 
                 if target.is_dir() {
-                    tokio::fs::remove_dir_all(target).await.map_err(|_| rquickjs::Error::Exception)?;
+                    tokio::fs::remove_dir_all(target)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
                 } else {
-                    tokio::fs::remove_file(target).await.map_err(|_| rquickjs::Error::Exception)?;
+                    tokio::fs::remove_file(target)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
                 };
 
                 Ok::<bool, rquickjs::Error>(true)
@@ -318,17 +334,23 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
             let app = app_list.clone();
             async move {
                 let scope = app.get_scope();
-                let target = resolve_read_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target =
+                    resolve_read_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
 
                 if !target.exists() {
                     return Err(rquickjs::Error::Exception);
                 }
 
                 let mut entries = Vec::new();
-                let mut dir = tokio::fs::read_dir(target).await.map_err(|_| rquickjs::Error::Exception)?;
+                let mut dir = tokio::fs::read_dir(target)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
                 while let Ok(Some(entry)) = dir.next_entry().await {
-                    let meta = entry.metadata().await.map_err(|_| rquickjs::Error::Exception)?;
+                    let meta = entry
+                        .metadata()
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
                     entries.push(json!({
                         "name": entry.file_name().to_string_lossy(),
                         "isDir": meta.is_dir(),
@@ -367,7 +389,8 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
             let app = app_mkdir.clone();
             async move {
                 let scope = app.get_scope();
-                let target = resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target =
+                    resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
 
                 tokio::fs::create_dir_all(target)
                     .await
@@ -418,10 +441,7 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     Ok(())
 }
 
-pub fn register_zip<'js>(
-    ctx: &Ctx<'js>,
-    _app_ctx: Arc<dyn ScriptContext>,
-) -> Result<(), String> {
+pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
     let globals = ctx.globals();
     let zip_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
@@ -442,9 +462,7 @@ pub fn register_zip<'js>(
             let files_json: serde_json::Value =
                 from_value(files_val).map_err(|_| rquickjs::Error::Exception)?;
 
-            let files = files_json
-                .as_object()
-                .ok_or(rquickjs::Error::Exception)?;
+            let files = files_json.as_object().ok_or(rquickjs::Error::Exception)?;
 
             let mut buffer = Cursor::new(Vec::new());
 
@@ -505,8 +523,7 @@ pub fn register_zip<'js>(
             }
 
             let cursor = Cursor::new(bytes);
-            let mut archive =
-                ZipArchive::new(cursor).map_err(|_| rquickjs::Error::Exception)?;
+            let mut archive = ZipArchive::new(cursor).map_err(|_| rquickjs::Error::Exception)?;
 
             let mut output = serde_json::Map::new();
             let mut total_extracted = 0;
@@ -541,7 +558,8 @@ pub fn register_zip<'js>(
                 output.insert(name, val);
             }
 
-            to_value(js_ctx, &serde_json::Value::Object(output)).map_err(|_| rquickjs::Error::Exception)
+            to_value(js_ctx, &serde_json::Value::Object(output))
+                .map_err(|_| rquickjs::Error::Exception)
         },
     )
     .map_err(|e| e.to_string())?;
@@ -554,8 +572,7 @@ pub fn register_zip<'js>(
                 .decode(&b64_str)
                 .map_err(|_| rquickjs::Error::Exception)?;
             let cursor = Cursor::new(bytes.clone());
-            let mut archive =
-                ZipArchive::new(cursor).map_err(|_| rquickjs::Error::Exception)?;
+            let mut archive = ZipArchive::new(cursor).map_err(|_| rquickjs::Error::Exception)?;
 
             let mut files_meta = Vec::new();
             let mut total_uncompressed: u64 = 0;
@@ -607,11 +624,16 @@ pub fn register_zip<'js>(
     )
     .map_err(|e| e.to_string())?;
 
-    zip_obj.set("create", create_fn).map_err(|e| e.to_string())?;
-    zip_obj.set("extract", extract_fn).map_err(|e| e.to_string())?;
-    zip_obj.set("inspect", inspect_fn).map_err(|e| e.to_string())?;
+    zip_obj
+        .set("create", create_fn)
+        .map_err(|e| e.to_string())?;
+    zip_obj
+        .set("extract", extract_fn)
+        .map_err(|e| e.to_string())?;
+    zip_obj
+        .set("inspect", inspect_fn)
+        .map_err(|e| e.to_string())?;
 
     globals.set("$zip", zip_obj).map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/fs.rs ends here ===========================

@@ -1,4 +1,3 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/console.rs start here ===========================
 use rquickjs::prelude::{Async, Rest};
 use rquickjs::{Ctx, Function, Object, Value};
 use rquickjs_serde::from_value;
@@ -61,4 +60,3 @@ pub fn register_console<'js>(
         .map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/console.rs ends here ===========================

@@ -1,4 +1,3 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/engine.rs start here ===========================
 use crate::realtime::EventScope;
 use regex::Regex;
 use serde_json::{Value as JsonValue, json};
@@ -259,7 +258,8 @@ impl ScriptEngine {
         let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
             .map_err(|e| e.to_string())?;
         let code_cleaned = re_config.replace_all(code, "");
-        let processed_code = code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
+        let processed_code =
+            code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
 
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
@@ -362,7 +362,8 @@ impl ScriptEngine {
         let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
             .map_err(|e| e.to_string())?;
         let code_cleaned = re_config.replace_all(code, "");
-        let processed_code = code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
+        let processed_code =
+            code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
 
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
@@ -416,7 +417,8 @@ impl ScriptEngine {
                 } else {
                     Ok::<Option<JsonValue>, String>(None)
                 }
-            }).await
+            })
+            .await
         });
 
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
@@ -464,51 +466,54 @@ fn register_run<'js>(
     let app_ctx_clone = app_ctx.clone();
     let script_fn = Function::new(
         ctx.clone(),
-        rquickjs::function::Async(move |js_ctx: rquickjs::Ctx<'js>, name: String, payload: rquickjs::Value<'js>| {
-            let app = app_ctx_clone.clone();
-            async move {
-                let payload_json: JsonValue = from_value(payload).unwrap_or(json!({}));
-                let current_scope = app.get_scope();
+        rquickjs::function::Async(
+            move |js_ctx: rquickjs::Ctx<'js>, name: String, payload: rquickjs::Value<'js>| {
+                let app = app_ctx_clone.clone();
+                async move {
+                    let payload_json: JsonValue = from_value(payload).unwrap_or(json!({}));
+                    let current_scope = app.get_scope();
 
-                let local_db = app.get_db();
-                let mut script_opt = local_db.get_script_by_name(&name).await.ok().flatten();
-                let mut exec_scope = current_scope.clone();
+                    let local_db = app.get_db();
+                    let mut script_opt = local_db.get_script_by_name(&name).await.ok().flatten();
+                    let mut exec_scope = current_scope.clone();
 
-                if script_opt.is_none() && !matches!(current_scope, EventScope::Root) {
-                    if let Some(shared) = app.get_shared_script(&name).await {
-                        if shared.visibility == "public" {
-                            script_opt = Some(shared);
-                            exec_scope = EventScope::Root;
+                    if script_opt.is_none() && !matches!(current_scope, EventScope::Root) {
+                        if let Some(shared) = app.get_shared_script(&name).await {
+                            if shared.visibility == "public" {
+                                script_opt = Some(shared);
+                                exec_scope = EventScope::Root;
+                            }
                         }
                     }
-                }
 
-                if let Some(script) = script_opt {
-                    if !script.active {
-                        return Err(rquickjs::Error::Exception);
+                    if let Some(script) = script_opt {
+                        if !script.active {
+                            return Err(rquickjs::Error::Exception);
+                        }
+
+                        let mut call_payload = payload_json.clone();
+                        if let Some(obj) = call_payload.as_object_mut() {
+                            obj.insert("__caller_scope".to_string(), json!(current_scope));
+                        }
+
+                        let res = app
+                            .execute_shared_script(script.code, call_payload, exec_scope)
+                            .await
+                            .map_err(|_| rquickjs::Error::Exception)?;
+
+                        to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                    } else {
+                        Err(rquickjs::Error::Exception)
                     }
-
-                    let mut call_payload = payload_json.clone();
-                    if let Some(obj) = call_payload.as_object_mut() {
-                        obj.insert("__caller_scope".to_string(), json!(current_scope));
-                    }
-
-                    let res = app
-                        .execute_shared_script(script.code, call_payload, exec_scope)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-
-                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
-                } else {
-                    Err(rquickjs::Error::Exception)
                 }
-            }
-        }),
+            },
+        ),
     )
     .map_err(|e| e.to_string())?;
 
-    run_obj.set("script", script_fn).map_err(|e| e.to_string())?;
+    run_obj
+        .set("script", script_fn)
+        .map_err(|e| e.to_string())?;
     globals.set("$run", run_obj).map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/engine.rs ends here ===========================

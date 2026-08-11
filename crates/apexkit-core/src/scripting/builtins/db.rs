@@ -1,9 +1,8 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/db.rs start here ===========================
-use std::sync::Arc;
 use rquickjs::function::Async;
 use rquickjs::{Ctx, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde_json::{Value as JsonValue, json};
+use std::sync::Arc;
 
 use super::super::context::ScriptContext;
 use crate::Db;
@@ -82,14 +81,19 @@ pub fn create_db_object<'js>(
     let list_records = Function::new(
         ctx.clone(),
         Async(
-            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Option<Value<'js>>, a3: Option<Value<'js>>| {
+            move |js_ctx: Ctx<'js>,
+                  a1: Value<'js>,
+                  a2: Option<Value<'js>>,
+                  a3: Option<Value<'js>>| {
                 let app = app_list.clone();
                 async move {
                     let (ctx_id, col, opts_val) = match mode {
                         DbMode::Root => {
                             let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
                             let col_name = a2
-                                .and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default()))
+                                .and_then(|v| {
+                                    v.as_string().map(|s| s.to_string().unwrap_or_default())
+                                })
                                 .unwrap_or_default();
                             (c_id, col_name, a3)
                         }
@@ -134,7 +138,8 @@ pub fn create_db_object<'js>(
                                     .map(|n| n as u64)
                                     .or(map.get("offset").and_then(|v| v.as_u64()));
 
-                                opts.sort = map.get("sort").and_then(|v| v.as_str()).map(String::from);
+                                opts.sort =
+                                    map.get("sort").and_then(|v| v.as_str()).map(String::from);
                                 opts.expand =
                                     map.get("expand").and_then(|v| v.as_str()).map(String::from);
                                 opts.fields =
@@ -182,7 +187,9 @@ pub fn create_db_object<'js>(
                                 .as_string()
                                 .map(|s| s.to_string().unwrap_or_default())
                                 .unwrap_or_default();
-                            let rec_id = from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(0);
+                            let rec_id =
+                                from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone())))
+                                    .unwrap_or(0);
                             let exp = a4.and_then(|v| from_value::<String>(v).ok());
                             (c_id, col_name, rec_id, exp)
                         }
@@ -230,7 +237,11 @@ pub fn create_db_object<'js>(
                                 .as_string()
                                 .map(|s| s.to_string().unwrap_or_default())
                                 .unwrap_or_default();
-                            (c_id, col_name, a3.unwrap_or(Value::new_null(a1.ctx().clone())))
+                            (
+                                c_id,
+                                col_name,
+                                a3.unwrap_or(Value::new_null(a1.ctx().clone())),
+                            )
                         }
                         DbMode::Scoped => {
                             let col_name = a1
@@ -330,7 +341,9 @@ pub fn create_db_object<'js>(
                                 .as_string()
                                 .map(|s| s.to_string().unwrap_or_default())
                                 .unwrap_or_default();
-                            let rec_id = from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(0);
+                            let rec_id =
+                                from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone())))
+                                    .unwrap_or(0);
                             (c_id, col_name, rec_id)
                         }
                         DbMode::Scoped => {
@@ -386,7 +399,10 @@ pub fn create_db_object<'js>(
                                 .map(|s| s.to_string().unwrap_or_default())
                                 .unwrap_or_default();
                             let v = a4;
-                            let l = from_value::<usize>(a5.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(10);
+                            let l = from_value::<usize>(
+                                a5.unwrap_or(Value::new_null(a1.ctx().clone())),
+                            )
+                            .unwrap_or(10);
                             (c_id, col_name, f, v, l)
                         }
                         DbMode::Scoped => {
@@ -439,7 +455,9 @@ pub fn create_db_object<'js>(
                                 .as_string()
                                 .map(|s| s.to_string().unwrap_or_default())
                                 .unwrap_or_default();
-                            let rec_id = from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(0);
+                            let rec_id =
+                                from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone())))
+                                    .unwrap_or(0);
                             (c_id, col_name, rec_id)
                         }
                         DbMode::Scoped => {
@@ -494,7 +512,10 @@ pub fn create_db_object<'js>(
                                 .as_string()
                                 .map(|s| s.to_string().unwrap_or_default())
                                 .unwrap_or_default();
-                            let l = from_value::<usize>(a4.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(10);
+                            let l = from_value::<usize>(
+                                a4.unwrap_or(Value::new_null(a1.ctx().clone())),
+                            )
+                            .unwrap_or(10);
                             (c_id, col_name, q, l)
                         }
                         DbMode::Scoped => {
@@ -530,14 +551,30 @@ pub fn create_db_object<'js>(
     )
     .map_err(|e| e.to_string())?;
 
-    records_obj.set("list", list_records).map_err(|e| e.to_string())?;
-    records_obj.set("get", get_record).map_err(|e| e.to_string())?;
-    records_obj.set("create", create_record).map_err(|e| e.to_string())?;
-    records_obj.set("update", update_record).map_err(|e| e.to_string())?;
-    records_obj.set("delete", delete_record).map_err(|e| e.to_string())?;
-    records_obj.set("searchVector", search_vector).map_err(|e| e.to_string())?;
-    records_obj.set("getVector", get_vector).map_err(|e| e.to_string())?;
-    records_obj.set("instantSearch", instant_search).map_err(|e| e.to_string())?;
+    records_obj
+        .set("list", list_records)
+        .map_err(|e| e.to_string())?;
+    records_obj
+        .set("get", get_record)
+        .map_err(|e| e.to_string())?;
+    records_obj
+        .set("create", create_record)
+        .map_err(|e| e.to_string())?;
+    records_obj
+        .set("update", update_record)
+        .map_err(|e| e.to_string())?;
+    records_obj
+        .set("delete", delete_record)
+        .map_err(|e| e.to_string())?;
+    records_obj
+        .set("searchVector", search_vector)
+        .map_err(|e| e.to_string())?;
+    records_obj
+        .set("getVector", get_vector)
+        .map_err(|e| e.to_string())?;
+    records_obj
+        .set("instantSearch", instant_search)
+        .map_err(|e| e.to_string())?;
 
     // --- 2. QUERY ---
     let app_query = app_ctx.clone();
@@ -555,7 +592,8 @@ pub fn create_db_object<'js>(
                         }
                         DbMode::Scoped => {
                             if a2.is_some() && a1.is_string() {
-                                let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                                let c_id =
+                                    a1.as_string().map(|s| s.to_string().unwrap_or_default());
                                 (c_id, a2.unwrap())
                             } else {
                                 (None, a1)
@@ -567,11 +605,15 @@ pub fn create_db_object<'js>(
                         .await
                         .map_err(|_| rquickjs::Error::Exception)?;
 
-                    let q_json: JsonValue = from_value(q_val).map_err(|_| rquickjs::Error::Exception)?;
-                    let query: ApexQuery = serde_json::from_value(q_json)
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let q_json: JsonValue =
+                        from_value(q_val).map_err(|_| rquickjs::Error::Exception)?;
+                    let query: ApexQuery =
+                        serde_json::from_value(q_json).map_err(|_| rquickjs::Error::Exception)?;
 
-                    let res = db.query_engine(query).await.map_err(|_| rquickjs::Error::Exception)?;
+                    let res = db
+                        .query_engine(query)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
                     to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
                 }
             },
@@ -585,19 +627,28 @@ pub fn create_db_object<'js>(
     let files_list = Function::new(
         ctx.clone(),
         Async(
-            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Option<Value<'js>>, a3: Option<Value<'js>>| {
+            move |js_ctx: Ctx<'js>,
+                  a1: Value<'js>,
+                  a2: Option<Value<'js>>,
+                  a3: Option<Value<'js>>| {
                 let app = app_files.clone();
                 async move {
                     let (ctx_id, limit, offset) = match mode {
                         DbMode::Root => {
                             let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let l = from_value::<i64>(a2.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(20);
-                            let o = from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(0);
+                            let l =
+                                from_value::<i64>(a2.unwrap_or(Value::new_null(a1.ctx().clone())))
+                                    .unwrap_or(20);
+                            let o =
+                                from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone())))
+                                    .unwrap_or(0);
                             (c_id, l, o)
                         }
                         DbMode::Scoped => {
                             let l = from_value::<i64>(a1).unwrap_or(20);
-                            let o = from_value::<i64>(a2.unwrap_or(Value::new_null(js_ctx.clone()))).unwrap_or(0);
+                            let o =
+                                from_value::<i64>(a2.unwrap_or(Value::new_null(js_ctx.clone())))
+                                    .unwrap_or(0);
                             (None, l, o)
                         }
                     };
@@ -605,8 +656,11 @@ pub fn create_db_object<'js>(
                     let db = resolve_db(ctx_id, app.clone())
                         .await
                         .map_err(|_| rquickjs::Error::Exception)?;
-                    let files = db.list_files(limit, offset).await.map_err(|_| rquickjs::Error::Exception)?;
-                    
+                    let files = db
+                        .list_files(limit, offset)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
                     to_value(js_ctx, &files).map_err(|_| rquickjs::Error::Exception)
                 }
             },
@@ -614,11 +668,13 @@ pub fn create_db_object<'js>(
     )
     .map_err(|e| e.to_string())?;
 
-    files_obj.set("list", files_list).map_err(|e| e.to_string())?;
+    files_obj
+        .set("list", files_list)
+        .map_err(|e| e.to_string())?;
 
     // --- 4. USERS ---
     let users_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
-    
+
     let app_u_get = app_ctx.clone();
     let users_get = Function::new(
         ctx.clone(),
@@ -629,11 +685,18 @@ pub fn create_db_object<'js>(
                     let (ctx_id, email) = match mode {
                         DbMode::Root => {
                             let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let e = a2.and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default())).unwrap_or_default();
+                            let e = a2
+                                .and_then(|v| {
+                                    v.as_string().map(|s| s.to_string().unwrap_or_default())
+                                })
+                                .unwrap_or_default();
                             (c_id, e)
                         }
                         DbMode::Scoped => {
-                            let e = a1.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+                            let e = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
                             (None, e)
                         }
                     };
@@ -641,8 +704,11 @@ pub fn create_db_object<'js>(
                     let db = resolve_db(ctx_id, app.clone())
                         .await
                         .map_err(|_| rquickjs::Error::Exception)?;
-                    let u = db.get_user_by_email(&email).await.map_err(|_| rquickjs::Error::Exception)?;
-                    
+                    let u = db
+                        .get_user_by_email(&email)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
                     to_value(js_ctx, &u).map_err(|_| rquickjs::Error::Exception)
                 }
             },
@@ -654,21 +720,44 @@ pub fn create_db_object<'js>(
     let users_create = Function::new(
         ctx.clone(),
         Async(
-            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Value<'js>, a3: Value<'js>, a4: Option<Value<'js>>| {
+            move |js_ctx: Ctx<'js>,
+                  a1: Value<'js>,
+                  a2: Value<'js>,
+                  a3: Value<'js>,
+                  a4: Option<Value<'js>>| {
                 let app = app_u_create.clone();
                 async move {
                     let (ctx_id, email, pass, role) = match mode {
                         DbMode::Root => {
                             let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let e = a2.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
-                            let p = a3.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
-                            let r = a4.and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default())).unwrap_or_default();
+                            let e = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let p = a3
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let r = a4
+                                .and_then(|v| {
+                                    v.as_string().map(|s| s.to_string().unwrap_or_default())
+                                })
+                                .unwrap_or_default();
                             (c_id, e, p, r)
                         }
                         DbMode::Scoped => {
-                            let e = a1.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
-                            let p = a2.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
-                            let r = a3.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+                            let e = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let p = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let r = a3
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
                             (None, e, p, r)
                         }
                     };
@@ -676,7 +765,8 @@ pub fn create_db_object<'js>(
                     let db = resolve_db(ctx_id, app.clone())
                         .await
                         .map_err(|_| rquickjs::Error::Exception)?;
-                    let hash = crate::auth::hash_password(&pass).map_err(|_| rquickjs::Error::Exception)?;
+                    let hash = crate::auth::hash_password(&pass)
+                        .map_err(|_| rquickjs::Error::Exception)?;
                     let u = db
                         .create_user(&email, &hash, &role, None)
                         .await
@@ -690,40 +780,49 @@ pub fn create_db_object<'js>(
     .map_err(|e| e.to_string())?;
 
     users_obj.set("get", users_get).map_err(|e| e.to_string())?;
-    users_obj.set("create", users_create).map_err(|e| e.to_string())?;
+    users_obj
+        .set("create", users_create)
+        .map_err(|e| e.to_string())?;
 
     // --- 5. COLLECTIONS ---
     let cols_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
     let app_cols = app_ctx.clone();
     let cols_list = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>, a1: Option<Value<'js>>| {
-                let app = app_cols.clone();
-                async move {
-                    let ctx_id = match mode {
-                        DbMode::Root => a1.and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default())),
-                        DbMode::Scoped => None,
-                    };
+        Async(move |js_ctx: Ctx<'js>, a1: Option<Value<'js>>| {
+            let app = app_cols.clone();
+            async move {
+                let ctx_id = match mode {
+                    DbMode::Root => {
+                        a1.and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default()))
+                    }
+                    DbMode::Scoped => None,
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let cols = db.list_collections().await.map_err(|_| rquickjs::Error::Exception)?;
-                    
-                    to_value(js_ctx, &cols).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let cols = db
+                    .list_collections()
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+
+                to_value(js_ctx, &cols).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
     cols_obj.set("list", cols_list).map_err(|e| e.to_string())?;
 
     // Build Final Object
-    db_obj.set("records", records_obj).map_err(|e| e.to_string())?;
+    db_obj
+        .set("records", records_obj)
+        .map_err(|e| e.to_string())?;
     db_obj.set("users", users_obj).map_err(|e| e.to_string())?;
-    db_obj.set("collections", cols_obj).map_err(|e| e.to_string())?;
+    db_obj
+        .set("collections", cols_obj)
+        .map_err(|e| e.to_string())?;
     db_obj.set("files", files_obj).map_err(|e| e.to_string())?;
     db_obj.set("query", query_fn).map_err(|e| e.to_string())?;
 
@@ -736,4 +835,3 @@ pub fn register_db<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     globals.set("$db", db_obj).map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/db.rs ends here ===========================

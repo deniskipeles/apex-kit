@@ -1590,11 +1590,11 @@ pub async fn generate_opengraph(
                 match storage.get(clean_filename).await {
                     Ok(bytes) => {
                         let mut final_bytes = bytes.clone();
-                        
+
                         // Apply dynamic image transformations if query parameters exist
                         if let Some(qs) = query_str {
                             let mut blur: Option<f32> = None;
-                            
+
                             // Parse simple query string without extra dependencies
                             for pair in qs.split('&') {
                                 if let Some((k, v)) = pair.split_once('=') {
@@ -1612,10 +1612,16 @@ pub async fn generate_opengraph(
                                     }
                                     // Re-encode to JPEG to save SVG payload space
                                     let mut buf = std::io::Cursor::new(Vec::new());
-                                    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+                                    let mut encoder =
+                                        image::codecs::jpeg::JpegEncoder::new_with_quality(
+                                            &mut buf, 85,
+                                        );
                                     encoder.encode_image(&img)?;
                                     Ok::<_, image::ImageError>(buf.into_inner())
-                                }).await.unwrap() {
+                                })
+                                .await
+                                .unwrap()
+                                {
                                     final_bytes = processed_img;
                                 }
                             }

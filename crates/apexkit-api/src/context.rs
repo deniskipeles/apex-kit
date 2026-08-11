@@ -432,7 +432,7 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
         let sm = self.state.sandbox_manager.clone();
         let db = self.state.db.clone();
         let scope = self.scope.clone();
-        
+
         Box::pin(async move {
             let general_config = db.get_config("general").await.unwrap_or_default();
             let max_storage_mb = general_config
@@ -442,27 +442,39 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
 
             // Parse JavaScript configuration object into Rust CloneStrategy
             let strategy = if let Some(obj) = config.as_object() {
-                let strat_str = obj.get("clone_strategy").and_then(|v| v.as_str()).unwrap_or("none");
+                let strat_str = obj
+                    .get("clone_strategy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("none");
                 match strat_str {
                     "schema" => sandbox_manager::CloneStrategy::SchemaOnly,
                     "partial" => sandbox_manager::CloneStrategy::Partial(
-                        obj.get("clone_record_limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize
+                        obj.get("clone_record_limit")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(100) as usize,
                     ),
                     "full" => sandbox_manager::CloneStrategy::Full,
                     "selected" => {
                         let parse_arr = |key: &str| -> Vec<String> {
                             obj.get(key)
                                 .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter().filter_map(|i| i.as_str().map(|s| s.to_string())).collect())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|i| i.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
                                 .unwrap_or_default()
                         };
                         sandbox_manager::CloneStrategy::Selected {
                             collections: parse_arr("collections"),
                             scripts: parse_arr("scripts"),
                             templates: parse_arr("templates"),
-                            record_limit: obj.get("clone_record_limit").and_then(|v| v.as_u64()).map(|n| n as usize),
+                            record_limit: obj
+                                .get("clone_record_limit")
+                                .and_then(|v| v.as_u64())
+                                .map(|n| n as usize),
                         }
-                    },
+                    }
                     "none" => sandbox_manager::CloneStrategy::None,
                     _ => sandbox_manager::CloneStrategy::None,
                 }
@@ -470,16 +482,10 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
                 sandbox_manager::CloneStrategy::None
             };
 
-            sm.create_sandbox(
-                &id,
-                strategy,
-                db,
-                scope,
-                max_storage_mb,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            sm.create_sandbox(&id, strategy, db, scope, max_storage_mb)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         })
     }
 

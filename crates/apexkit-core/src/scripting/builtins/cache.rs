@@ -1,9 +1,8 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/cache.rs start here ===========================
-use std::sync::Arc;
+use super::super::context::ScriptContext;
 use rquickjs::function::Async;
 use rquickjs::{Ctx, Function, Object, Value};
 use rquickjs_serde::from_value;
-use super::super::context::ScriptContext;
+use std::sync::Arc;
 
 pub fn register_cache<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
     let globals = ctx.globals();
@@ -97,12 +96,17 @@ pub fn register_cache<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> R
 
     cache_obj.set("get", get_fn).map_err(|e| e.to_string())?;
     cache_obj.set("set", set_fn).map_err(|e| e.to_string())?;
-    cache_obj.set("delete", del_fn.clone()).map_err(|e| e.to_string())?;
+    cache_obj
+        .set("delete", del_fn.clone())
+        .map_err(|e| e.to_string())?;
     cache_obj.set("del", del_fn).map_err(|e| e.to_string())?; // Alias
     cache_obj.set("incr", incr_fn).map_err(|e| e.to_string())?;
-    cache_obj.set("listKeys", list_keys_fn).map_err(|e| e.to_string())?;
+    cache_obj
+        .set("listKeys", list_keys_fn)
+        .map_err(|e| e.to_string())?;
 
-    globals.set("$cache", cache_obj).map_err(|e| e.to_string())?;
+    globals
+        .set("$cache", cache_obj)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/cache.rs ends here ===========================

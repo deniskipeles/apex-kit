@@ -740,8 +740,13 @@ impl CandleEmbedder {
             return Ok(());
         }
 
-        let default_model = if cfg!(feature = "onnx") { "siglip2" } else { "candle-siglip2" };
-        let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| default_model.to_string());
+        let default_model = if cfg!(feature = "onnx") {
+            "siglip2"
+        } else {
+            "candle-siglip2"
+        };
+        let selection =
+            std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| default_model.to_string());
 
         if selection == "candle-siglip2" {
             tracing::info!(
@@ -854,7 +859,9 @@ impl CandleEmbedder {
         }
         #[cfg(not(feature = "onnx"))]
         {
-            bail!("ONNX support is disabled. Set APEXKIT_VISION_MODEL=candle-siglip2 to use pure Rust vision engine.");
+            bail!(
+                "ONNX support is disabled. Set APEXKIT_VISION_MODEL=candle-siglip2 to use pure Rust vision engine."
+            );
         }
     }
 
@@ -1065,8 +1072,13 @@ pub fn get_current_text_model() -> String {
 /// so callers can compute it cheaply (e.g. to decide whether stored vectors need
 /// re-embedding) without paying the cost of actually loading the ONNX session.
 pub fn get_current_vision_model() -> String {
-    let default_model = if cfg!(feature = "onnx") { "siglip2" } else { "candle-siglip2" };
-    let selection = std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| default_model.to_string());
+    let default_model = if cfg!(feature = "onnx") {
+        "siglip2"
+    } else {
+        "candle-siglip2"
+    };
+    let selection =
+        std::env::var("APEXKIT_VISION_MODEL").unwrap_or_else(|_| default_model.to_string());
 
     if selection == "candle-siglip2" {
         return "candle-siglip2:google/siglip2-base-patch16-224:model.safetensors".to_string();

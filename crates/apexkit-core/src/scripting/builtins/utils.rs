@@ -1,10 +1,9 @@
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/utils.rs start here ===========================
-use std::sync::Arc;
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
 use rquickjs::{Ctx, Function, Object, function::Async};
+use std::sync::Arc;
 
 use super::super::context::ScriptContext;
 use crate::utils::{generate_random_hex, hmac_sha256, sha256, sha512, slugify};
@@ -20,9 +19,10 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     .map_err(|e| e.to_string())?;
 
     // 2. $util.slugify(text) -> String
-    let slug_fn = Function::new(ctx.clone(), move |text: String| -> rquickjs::Result<String> {
-        Ok(slugify(&text))
-    })
+    let slug_fn = Function::new(
+        ctx.clone(),
+        move |text: String| -> rquickjs::Result<String> { Ok(slugify(&text)) },
+    )
     .map_err(|e| e.to_string())?;
 
     // 3. $util.hash(text, alg) -> String
@@ -50,9 +50,7 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     // 5. $util.base64Encode(text) -> String
     let b64_enc_fn = Function::new(
         ctx.clone(),
-        move |text: String| -> rquickjs::Result<String> {
-            Ok(STANDARD.encode(text))
-        },
+        move |text: String| -> rquickjs::Result<String> { Ok(STANDARD.encode(text)) },
     )
     .map_err(|e| e.to_string())?;
 
@@ -99,15 +97,22 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     .map_err(|e| e.to_string())?;
 
     util_obj.set("uuid", uuid_fn).map_err(|e| e.to_string())?;
-    util_obj.set("slugify", slug_fn).map_err(|e| e.to_string())?;
+    util_obj
+        .set("slugify", slug_fn)
+        .map_err(|e| e.to_string())?;
     util_obj.set("hash", hash_fn).map_err(|e| e.to_string())?;
     util_obj.set("hmac", hmac_fn).map_err(|e| e.to_string())?;
-    util_obj.set("base64Encode", b64_enc_fn).map_err(|e| e.to_string())?;
-    util_obj.set("base64Decode", b64_dec_fn).map_err(|e| e.to_string())?;
+    util_obj
+        .set("base64Encode", b64_enc_fn)
+        .map_err(|e| e.to_string())?;
+    util_obj
+        .set("base64Decode", b64_dec_fn)
+        .map_err(|e| e.to_string())?;
     util_obj.set("sleep", sleep_fn).map_err(|e| e.to_string())?;
-    util_obj.set("randomHex", random_hex_fn).map_err(|e| e.to_string())?;
+    util_obj
+        .set("randomHex", random_hex_fn)
+        .map_err(|e| e.to_string())?;
 
     globals.set("$util", util_obj).map_err(|e| e.to_string())?;
     Ok(())
 }
-// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/utils.rs ends here ===========================
