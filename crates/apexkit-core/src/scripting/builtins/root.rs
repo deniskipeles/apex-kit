@@ -1,76 +1,147 @@
-use crate::realtime::EventScope;
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/root.rs start here ===========================
+use std::sync::Arc;
+use rquickjs::function::Async;
+use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs_serde::{from_value, to_value};
 use serde_json::json;
 
-use super::super::{context::ACTIVE_CONTEXT, return_json_promise};
-use boa_engine::{
-    Context, JsArgs, JsError, JsString, JsValue, NativeFunction, object::ObjectInitializer,
-    property::Attribute,
-};
+use super::super::context::ScriptContext;
+use crate::realtime::EventScope;
 
-pub fn register_root(ctx: &mut Context) -> Result<(), String> {
-    let is_root = ACTIVE_CONTEXT.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|t| t.4 == EventScope::Root)
-            .unwrap_or(false)
-    });
+pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
+    let globals = ctx.globals();
 
-    if is_root {
-        // Updated Signature: createTenant(id: string, config?: object)
-        let create_tenant = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args
-                .get_or_undefined(0)
-                .to_string(ctx)?
-                .to_std_string_escaped();
+    // Security Guard: $root is ONLY available when executing in the Root Scope
+    if app_ctx.get_scope() != EventScope::Root {
+        globals
+            .set("$root", Value::new_null(ctx.clone()))
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
 
-            // Extract config object if present
-            let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
+    let root_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-            let (name, tier, owner_id) = if let Some(serde_json::Value::Object(map)) = config_val {
-                (
-                    map.get("name").and_then(|v| v.as_str()).map(String::from),
-                    map.get("tier").and_then(|v| v.as_str()).map(String::from),
-                    map.get("owner_id").and_then(|v| v.as_i64()), // Expecting number
-                )
-            } else {
-                (None, None, None)
-            };
+    // Attach DB Object for $root.db
+    let db_obj = super::db::create_db_object(ctx, app_ctx.clone(), super::db::DbMode::Root)?;
+    root_obj.set("db", db_obj).map_err(|e| e.to_string())?;
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        // [CRITICAL FIX]: Register Metadata FIRST so the manager can find it
-                        app.get_db()
-                            .register_tenant(&id, owner_id, name, tier)
-                            .await
-                            .map_err(|e| e.to_string())?;
+    // --- 1. TENANT MANAGEMENT ---
 
-                        // Create Physical Resources SECOND
-                        app.admin_create_tenant(id.clone())
-                            .await
-                            .map_err(|e| e.to_string())?;
-
-                        Ok(true)
-                    })
+    // $root.createTenant(id, config?)
+    let app_c_tenant = app_ctx.clone();
+    let create_tenant_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: String, config_val: Option<Value<'js>>| {
+            let config = config_val.and_then(|v| from_value::<serde_json::Value>(v).ok());
+            let app = app_c_tenant.clone();
+            async move {
+                let (name, tier, owner_id) = if let Some(serde_json::Value::Object(map)) = config {
+                    (
+                        map.get("name").and_then(|v| v.as_str()).map(String::from),
+                        map.get("tier").and_then(|v| v.as_str()).map(String::from),
+                        map.get("owner_id").and_then(|v| v.as_i64()),
+                    )
                 } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res.map(serde_json::Value::Bool))
-        });
+                    (None, None, None)
+                };
 
-        // createSandbox(id: string, config?: object)
-        let create_sandbox = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args
-                .get_or_undefined(0)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            
-            // Extract config object, ensuring we always pass an object down to Rust
-            let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten().unwrap_or(serde_json::json!({}));
-            
-            let (name, owner_id, expires_at) =
-                if let Some(map) = config_val.as_object() {
+                app.get_db()
+                    .register_tenant(&id, owner_id, name, tier)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+
+                app.admin_create_tenant(id)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+
+                Ok::<bool, rquickjs::Error>(true)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // $root.updateTenant(id, updates)
+    let app_u_tenant = app_ctx.clone();
+    let update_tenant_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: String, updates_val: Value<'js>| {
+            let updates: serde_json::Value = from_value(updates_val).unwrap_or(json!({}));
+            let app = app_u_tenant.clone();
+            async move {
+                app.admin_update_tenant(id, updates)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                Ok::<bool, rquickjs::Error>(true)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // $root.deleteTenant(id)
+    let app_d_tenant = app_ctx.clone();
+    let delete_tenant_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: String| {
+            let app = app_d_tenant.clone();
+            async move {
+                app.admin_delete_tenant(id)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                Ok::<bool, rquickjs::Error>(true)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // $root.getTenantDiskUsage(id) -> number (bytes)
+    let app_usage_tenant = app_ctx.clone();
+    let get_tenant_usage_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: String| {
+            let app = app_usage_tenant.clone();
+            async move {
+                let bytes = app
+                    .admin_get_tenant_usage(id)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                Ok::<f64, rquickjs::Error>(bytes as f64)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // $root.listTenants() -> Array<Tenant>
+    let app_list_tenants = app_ctx.clone();
+    let list_tenants_fn = Function::new(
+        ctx.clone(),
+        Async(move |js_ctx: Ctx<'js>| {
+            let app = app_list_tenants.clone();
+            async move {
+                let tenants = app
+                    .get_db()
+                    .list_tenants()
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                to_value(js_ctx, &json!(tenants)).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // --- 2. SANDBOX MANAGEMENT ---
+
+    // $root.createSandbox(id, config?)
+    let app_c_sandbox = app_ctx.clone();
+    let create_sandbox_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: String, config_val: Option<Value<'js>>| {
+            let config = config_val
+                .and_then(|v| from_value::<serde_json::Value>(v).ok())
+                .unwrap_or_else(|| json!({}));
+            let app = app_c_sandbox.clone();
+
+            async move {
+                let (name, owner_id, expires_at) = if let Some(map) = config.as_object() {
                     (
                         map.get("name").and_then(|v| v.as_str()).map(String::from),
                         map.get("owner_id").and_then(|v| v.as_i64()),
@@ -79,128 +150,172 @@ pub fn register_root(ctx: &mut Context) -> Result<(), String> {
                 } else {
                     (None, None, None)
                 };
-                
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        // 1. Create Physical Resources (Pass the config payload to handle cloning strategy)
-                        app.admin_create_sandbox(id.clone(), config_val)
-                            .await
-                            .map_err(|e| e.to_string())?;
 
-                        // --- FETCH GLOBAL LIMITS ---
-                        let general_config =
-                            app.get_db().get_config("general").await.unwrap_or_default();
-                        let max_storage_mb = general_config
-                            .as_ref()
-                            .and_then(|v| v.get("max_sandbox_storage_mb").and_then(|n| n.as_i64()))
-                            .unwrap_or(100);
-                        let max_vectors = general_config
-                            .as_ref()
-                            .and_then(|v| v.get("max_sandbox_vectors").and_then(|n| n.as_i64()))
-                            .unwrap_or(10000);
-                        let max_ai_requests = general_config
-                            .as_ref()
-                            .and_then(|v| v.get("max_sandbox_ai_requests").and_then(|n| n.as_i64()))
-                            .unwrap_or(100);
+                app.admin_create_sandbox(id.clone(), config)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                        // 2. Register Metadata
-                        app.get_db()
-                            .register_sandbox(
-                                &id,
-                                owner_id,
-                                name,
-                                expires_at,
-                                "root",
-                                None,
-                                max_storage_mb,
-                                max_vectors,
-                                max_ai_requests,
-                            )
-                            .await
-                            .map_err(|e| e.to_string())?;
+                let general_config =
+                    app.get_db().get_config("general").await.unwrap_or_default();
+                let max_storage_mb = general_config
+                    .as_ref()
+                    .and_then(|v| v.get("max_sandbox_storage_mb").and_then(|n| n.as_i64()))
+                    .unwrap_or(100);
+                let max_vectors = general_config
+                    .as_ref()
+                    .and_then(|v| v.get("max_sandbox_vectors").and_then(|n| n.as_i64()))
+                    .unwrap_or(10000);
+                let max_ai_requests = general_config
+                    .as_ref()
+                    .and_then(|v| v.get("max_sandbox_ai_requests").and_then(|n| n.as_i64()))
+                    .unwrap_or(100);
 
-                        Ok(true)
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res.map(serde_json::Value::Bool))
-        });
-
-        // 1. createKey(name, config?)
-        let create_key = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let name = args
-                .get_or_undefined(0)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
-
-            let (tenant_id, issuer, env_type, roles, bypass) =
-                if let Some(serde_json::Value::Object(map)) = config_val {
-                    (
-                        map.get("tenant_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("root")
-                            .to_string(),
-                        map.get("issuer")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("root")
-                            .to_string(),
-                        map.get("env_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("sys")
-                            .to_string(),
-                        map.get("roles")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                    .collect::<Vec<String>>()
-                            })
-                            .unwrap_or_else(|| vec!["admin".to_string()]),
-                        map.get("bypass_cors")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
+                app.get_db()
+                    .register_sandbox(
+                        &id,
+                        owner_id,
+                        name,
+                        expires_at,
+                        "root",
+                        None,
+                        max_storage_mb,
+                        max_vectors,
+                        max_ai_requests,
                     )
-                } else {
-                    (
-                        "root".to_string(),
-                        "root".to_string(),
-                        "sys".to_string(),
-                        vec!["admin".to_string()],
-                        false,
-                    )
-                };
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let (raw_key, info) = app
-                            .get_db()
-                            .create_api_key(&name, &tenant_id, &issuer, &env_type, roles, bypass)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(json!({
-                            "key": raw_key,
-                            "info": info
-                        }))
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res)
-        });
+                Ok::<bool, rquickjs::Error>(true)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-        // 2. updateKey(id, updates)
-        let update_key = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as i64;
-            let config_val = args.get(1).and_then(|v| v.to_json(ctx).ok()).flatten();
+    // $root.updateSandbox(id, updates)
+    let app_u_sandbox = app_ctx.clone();
+    let update_sandbox_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: String, updates_val: Value<'js>| {
+            let updates: serde_json::Value = from_value(updates_val).unwrap_or(json!({}));
+            let app = app_u_sandbox.clone();
+            async move {
+                app.admin_update_sandbox(id, updates)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                Ok::<bool, rquickjs::Error>(true)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-            let (name, status, roles, bypass) =
-                if let Some(serde_json::Value::Object(map)) = config_val {
+    // $root.deleteSandbox(id)
+    let app_d_sandbox = app_ctx.clone();
+    let delete_sandbox_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: String| {
+            let app = app_d_sandbox.clone();
+            async move {
+                app.admin_delete_sandbox(id)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                Ok::<bool, rquickjs::Error>(true)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // $root.getSandboxDiskUsage(id) -> number
+    let app_usage_sandbox = app_ctx.clone();
+    let get_sandbox_usage_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: String| {
+            let app = app_usage_sandbox.clone();
+            async move {
+                let bytes = app
+                    .admin_get_sandbox_usage(id)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                Ok::<f64, rquickjs::Error>(bytes as f64)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // --- 3. API KEY MANAGEMENT ---
+
+    // $root.createKey(name, config?)
+    let app_c_key = app_ctx.clone();
+    let create_key_fn = Function::new(
+        ctx.clone(),
+        Async(move |js_ctx: Ctx<'js>, name: String, config_val: Option<Value<'js>>| {
+            let config = config_val.and_then(|v| from_value::<serde_json::Value>(v).ok());
+            let app = app_c_key.clone();
+
+            async move {
+                let (tenant_id, issuer, env_type, roles, bypass) =
+                    if let Some(serde_json::Value::Object(map)) = config {
+                        (
+                            map.get("tenant_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("root")
+                                .to_string(),
+                            map.get("issuer")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("root")
+                                .to_string(),
+                            map.get("env_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("sys")
+                                .to_string(),
+                            map.get("roles")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                        .collect::<Vec<String>>()
+                                })
+                                .unwrap_or_else(|| vec!["admin".to_string()]),
+                            map.get("bypass_cors")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                        )
+                    } else {
+                        (
+                            "root".to_string(),
+                            "root".to_string(),
+                            "sys".to_string(),
+                            vec!["admin".to_string()],
+                            false,
+                        )
+                    };
+
+                let (raw_key, info) = app
+                    .get_db()
+                    .create_api_key(&name, &tenant_id, &issuer, &env_type, roles, bypass)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+
+                let res = json!({
+                    "key": raw_key,
+                    "info": info
+                });
+
+                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // $root.updateKey(id, updates)
+    let app_u_key = app_ctx.clone();
+    let update_key_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: i64, config_val: Value<'js>| {
+            let config: serde_json::Value = from_value(config_val).unwrap_or(json!({}));
+            let app = app_u_key.clone();
+
+            async move {
+                let (name, status, roles, bypass) = if let Some(map) = config.as_object() {
                     (
                         map.get("name").and_then(|v| v.as_str()).map(String::from),
                         map.get("status").and_then(|v| v.as_str()).map(String::from),
@@ -215,239 +330,70 @@ pub fn register_root(ctx: &mut Context) -> Result<(), String> {
                     (None, None, None, None)
                 };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        app.get_db()
-                            .update_api_key(id, name, status, roles, bypass)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::Value::Bool(true))
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res)
-        });
+                app.get_db()
+                    .update_api_key(id, name, status, roles, bypass)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-        // 3. deleteKey(id)
-        let delete_key = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as i64;
-
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        app.get_db()
-                            .delete_api_key(id)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::Value::Bool(true))
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res)
-        });
-
-        // 4. listKeys()
-        let list_keys = NativeFunction::from_copy_closure(move |_, _, ctx| {
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let keys = app
-                            .get_db()
-                            .list_api_keys()
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(keys).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res)
-        });
-
-        // 5. updateTenant(id, updates)
-        let update_tenant = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args
-                .get_or_undefined(0)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let updates = args
-                .get_or_undefined(1)
-                .to_json(ctx)
-                .unwrap()
-                .unwrap_or(json!({}));
-
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        app.admin_update_tenant(id, updates)
-                            .await
-                            .map_err(|e| e.to_string())
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
-        });
-
-        // 6. deleteTenant(id)
-        let delete_tenant = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args
-                .get_or_undefined(0)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        app.admin_delete_tenant(id).await.map_err(|e| e.to_string())
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
-        });
-
-        // 7. updateSandbox(id, updates)
-        let update_sandbox = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args
-                .get_or_undefined(0)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let updates = args
-                .get_or_undefined(1)
-                .to_json(ctx)
-                .unwrap()
-                .unwrap_or(json!({}));
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        app.admin_update_sandbox(id, updates)
-                            .await
-                            .map_err(|e| e.to_string())
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
-        });
-
-        // 8. deleteSandbox(id)
-        let delete_sandbox = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args
-                .get_or_undefined(0)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        app.admin_delete_sandbox(id)
-                            .await
-                            .map_err(|e| e.to_string())
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
-        });
-
-        // 9. getTenantUsage(id) -> number (bytes)
-        let get_tenant_usage = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args
-                .get_or_undefined(0)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async { app.admin_get_tenant_usage(id).await })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-
-            // Return number (or null on error/empty)
-            match res {
-                Ok(bytes) => Ok(JsValue::from(bytes as f64)), // JS uses f64 for numbers
-                Err(e) => Err(JsError::from_opaque(JsString::from(e).into())),
+                Ok::<bool, rquickjs::Error>(true)
             }
-        });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-        // 10. getSandboxUsage(id)
-        let get_sandbox_usage = NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let id = args
-                .get_or_undefined(0)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async { app.admin_get_sandbox_usage(id).await })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-
-            match res {
-                Ok(bytes) => Ok(JsValue::from(bytes as f64)),
-                Err(e) => Err(JsError::from_opaque(JsString::from(e).into())),
+    // $root.deleteKey(id)
+    let app_d_key = app_ctx.clone();
+    let delete_key_fn = Function::new(
+        ctx.clone(),
+        Async(move |id: i64| {
+            let app = app_d_key.clone();
+            async move {
+                app.get_db()
+                    .delete_api_key(id)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                Ok::<bool, rquickjs::Error>(true)
             }
-        });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-        // 11. listTenants() -> Array
-        let list_tenants = NativeFunction::from_copy_closure(move |_, _, ctx| {
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        // list_tenants returns Vec<Tenant>
-                        let tenants = app
-                            .get_db()
-                            .list_tenants()
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(tenants).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
-                }
-            });
-            return_json_promise(ctx, res)
-        });
+    // $root.listKeys()
+    let app_l_key = app_ctx.clone();
+    let list_keys_fn = Function::new(
+        ctx.clone(),
+        Async(move |js_ctx: Ctx<'js>| {
+            let app = app_l_key.clone();
+            async move {
+                let keys = app
+                    .get_db()
+                    .list_api_keys()
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                to_value(js_ctx, &json!(keys)).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-        // Create DB Object for $root.db
-        let db_obj = super::db::create_db_object(ctx, super::db::DbMode::Root)?;
+    // Bind Functions
+    root_obj.set("createTenant", create_tenant_fn).map_err(|e| e.to_string())?;
+    root_obj.set("updateTenant", update_tenant_fn).map_err(|e| e.to_string())?;
+    root_obj.set("deleteTenant", delete_tenant_fn).map_err(|e| e.to_string())?;
+    root_obj.set("getTenantDiskUsage", get_tenant_usage_fn).map_err(|e| e.to_string())?;
+    root_obj.set("listTenants", list_tenants_fn).map_err(|e| e.to_string())?;
 
-        let obj = ObjectInitializer::new(ctx)
-            // API Keys
-            .function(create_key, JsString::from("createKey"), 2)
-            .function(update_key, JsString::from("updateKey"), 2)
-            .function(delete_key, JsString::from("deleteKey"), 1)
-            .function(list_keys, JsString::from("listKeys"), 0)
-            // Tenant Management
-            .function(create_tenant, JsString::from("createTenant"), 2)
-            .function(update_tenant, JsString::from("updateTenant"), 2)
-            .function(delete_tenant, JsString::from("deleteTenant"), 1)
-            .function(get_tenant_usage, JsString::from("getTenantDiskUsage"), 1)
-            .function(list_tenants, JsString::from("listTenants"), 0)
-            // Sandbox Management
-            .function(create_sandbox, JsString::from("createSandbox"), 2)
-            .function(update_sandbox, JsString::from("updateSandbox"), 2)
-            .function(delete_sandbox, JsString::from("deleteSandbox"), 1)
-            .function(get_sandbox_usage, JsString::from("getSandboxDiskUsage"), 1)
-            .property(JsString::from("db"), db_obj, Attribute::all())
-            .build();
-        ctx.register_global_property(JsString::from("$root"), obj, Attribute::all())
-            .map_err(|e| e.to_string())
-    } else {
-        ctx.register_global_property(JsString::from("$root"), JsValue::null(), Attribute::all())
-            .map_err(|e| e.to_string())
-    }
+    root_obj.set("createSandbox", create_sandbox_fn).map_err(|e| e.to_string())?;
+    root_obj.set("updateSandbox", update_sandbox_fn).map_err(|e| e.to_string())?;
+    root_obj.set("deleteSandbox", delete_sandbox_fn).map_err(|e| e.to_string())?;
+    root_obj.set("getSandboxDiskUsage", get_sandbox_usage_fn).map_err(|e| e.to_string())?;
+
+    root_obj.set("createKey", create_key_fn).map_err(|e| e.to_string())?;
+    root_obj.set("updateKey", update_key_fn).map_err(|e| e.to_string())?;
+    root_obj.set("deleteKey", delete_key_fn).map_err(|e| e.to_string())?;
+    root_obj.set("listKeys", list_keys_fn).map_err(|e| e.to_string())?;
+
+    globals.set("$root", root_obj).map_err(|e| e.to_string())?;
+    Ok(())
 }
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/root.rs ends here ===========================

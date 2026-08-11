@@ -1,45 +1,42 @@
-use super::super::{context::ACTIVE_CONTEXT, return_json_promise};
-use boa_engine::{
-    Context, JsArgs, JsString, NativeFunction, object::ObjectInitializer, property::Attribute,
-};
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/mail.rs start here ===========================
+use std::sync::Arc;
+use rquickjs::function::Async;
+use rquickjs::{Ctx, Function, Object};
+use super::super::context::ScriptContext;
+use super::db::resolve_db;
 
-pub fn register_mail(ctx: &mut Context) -> Result<(), String> {
-    let send = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let to = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        let subj = args
-            .get_or_undefined(1)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        let body = args
-            .get_or_undefined(2)
-            .to_string(ctx)?
-            .to_std_string_escaped();
+pub fn register_mail<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
+    let globals = ctx.globals();
+    let mail_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-        let res = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    let db = super::db::resolve_db(None, app.clone()).await?;
-                    crate::workers::tasks::emails::send_email(
-                        db,
-                        app.get_vault(),
-                        &to,
-                        &subj,
-                        &body,
-                    )
+    let app_send = app_ctx.clone();
+    let send_fn = Function::new(
+        ctx.clone(),
+        Async(move |to: String, subj: String, body: String| {
+            let app = app_send.clone();
+            async move {
+                let db = resolve_db(None, app.clone())
                     .await
-                })
-            } else {
-                Err("Context lost".into())
+                    .map_err(|_| rquickjs::Error::Exception)?;
+
+                crate::workers::tasks::emails::send_email(
+                    db,
+                    app.get_vault(),
+                    &to,
+                    &subj,
+                    &body,
+                )
+                .await
+                .map_err(|_| rquickjs::Error::Exception)?;
+
+                Ok::<bool, rquickjs::Error>(true)
             }
-        });
-        return_json_promise(ctx, res.map(|_| serde_json::Value::Bool(true)))
-    });
-    let obj = ObjectInitializer::new(ctx)
-        .function(send, JsString::from("send"), 3)
-        .build();
-    ctx.register_global_property(JsString::from("$mail"), obj, Attribute::all())
-        .map_err(|e| e.to_string())
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    mail_obj.set("send", send_fn).map_err(|e| e.to_string())?;
+    globals.set("$mail", mail_obj).map_err(|e| e.to_string())?;
+    Ok(())
 }
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/mail.rs ends here ===========================

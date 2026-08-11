@@ -1,18 +1,17 @@
-use super::super::ScriptContext;
-use crate::Db;
-use crate::query::ApexQuery;
-use crate::query::QueryOptions;
-use crate::realtime::EventScope;
-use crate::scripting::{ACTIVE_CONTEXT, return_json_promise};
-use boa_engine::{
-    Context, JsArgs, JsString, JsValue, NativeFunction, object::ObjectInitializer,
-    property::Attribute,
-};
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/db.rs start here ===========================
 use std::sync::Arc;
+use rquickjs::function::Async;
+use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs_serde::{from_value, to_value};
+use serde_json::{Value as JsonValue, json};
+
+use super::super::context::ScriptContext;
+use crate::Db;
+use crate::query::{ApexQuery, QueryOptions};
+use crate::realtime::EventScope;
 
 // --- HELPERS ---
 
-// Helper to resolve Collection ID from Name or ID String
 async fn resolve_collection_local(db: Arc<dyn Db>, identifier: &str) -> Result<i64, String> {
     if let Ok(id) = identifier.parse::<i64>() {
         return Ok(id);
@@ -24,12 +23,10 @@ async fn resolve_collection_local(db: Arc<dyn Db>, identifier: &str) -> Result<i
         .ok_or_else(|| format!("Collection '{}' not found", identifier))
 }
 
-// Helper to resolve Database based on Context ID string OR Current Scope
 pub async fn resolve_db(
     ctx_str: Option<String>,
     app_ctx: Arc<dyn ScriptContext>,
 ) -> Result<Arc<dyn Db>, String> {
-    // 1. Explicit Context Passed in JS (e.g. $root.db.records.list("tenant:123", ...))
     if let Some(s) = ctx_str {
         if s.starts_with("tenant:") {
             let tid = s.strip_prefix("tenant:").unwrap();
@@ -45,15 +42,12 @@ pub async fn resolve_db(
                 .await
                 .ok_or(format!("Sandbox {} not found", sid));
         }
-        // If "root" passed explicitly
         if s == "root" {
-            return Ok(app_ctx.get_db()); // Returns Root DB (since get_db defaults to Root in ScopedScriptContext)
+            return Ok(app_ctx.get_db());
         }
     }
 
-    // 2. Implicit Context based on Execution Scope
     let scope = app_ctx.get_scope();
-
     match scope {
         EventScope::Tenant(id) => app_ctx
             .resolve_tenant_db(&id)
@@ -63,572 +57,683 @@ pub async fn resolve_db(
             .resolve_sandbox_db(&id)
             .await
             .ok_or(format!("Current Sandbox {} context not found", id)),
-        // Root scope or Channel scope falls back to default (Root DB)
         _ => Ok(app_ctx.get_db()),
     }
 }
 
-// --- MODES ---
-
 #[derive(Clone, Copy)]
 pub enum DbMode {
-    Scoped, // $db: No context arg, uses current scope automatically
-    Root,   // $root.db: First arg IS context ID
+    Scoped,
+    Root,
 }
 
-// --- BUILDER ---
-
-pub fn create_db_object(
-    ctx: &mut Context,
+pub fn create_db_object<'js>(
+    ctx: &Ctx<'js>,
+    app_ctx: Arc<dyn ScriptContext>,
     mode: DbMode,
-) -> Result<boa_engine::object::JsObject, String> {
-    // Helper to handle arguments based on mode
-    // Returns (context_id_string, offset_index)
-    // For Scoped: context_id = None, offset = 0
-    // For Root: context_id = args[0], offset = 1
-    let get_args = |args: &[JsValue], _ctx: &mut Context, m: &DbMode| -> (Option<String>, usize) {
-        match m {
-            DbMode::Scoped => (None, 0),
-            DbMode::Root => {
-                let id = args
-                    .first()
-                    .and_then(|v| v.as_string())
-                    .map(|s| s.to_std_string_escaped());
-                (id, 1)
-            }
-        }
-    };
+) -> Result<Object<'js>, String> {
+    let db_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
     // --- 1. RECORDS ---
+    let records_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
     // list(col, opts) OR list(ctx, col, opts)
-    let list_records = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let col = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let opts_val = args
-                .get_or_undefined(offset + 1)
-                .to_json(ctx)
-                .unwrap()
-                .unwrap_or(serde_json::Value::Null);
-
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let col_id = resolve_collection_local(db.clone(), &col).await?;
-                        
-                        // Robustly parse JS floats (f64) into Rust Integers (u64)
-                        let mut opts = QueryOptions::default();
-                        if let Some(obj) = opts_val.as_object() {
-                            opts.page = obj.get("page").and_then(|v| v.as_f64()).map(|n| n as u64).or(obj.get("page").and_then(|v| v.as_u64()));
-                            opts.per_page = obj.get("per_page").and_then(|v| v.as_f64()).map(|n| n as u64).or(obj.get("per_page").and_then(|v| v.as_u64()));
-                            opts.limit = obj.get("limit").and_then(|v| v.as_f64()).map(|n| n as u64).or(obj.get("limit").and_then(|v| v.as_u64()));
-                            opts.offset = obj.get("offset").and_then(|v| v.as_f64()).map(|n| n as u64).or(obj.get("offset").and_then(|v| v.as_u64()));
-                            
-                            opts.sort = obj.get("sort").and_then(|v| v.as_str()).map(String::from);
-                            opts.expand = obj.get("expand").and_then(|v| v.as_str()).map(String::from);
-                            opts.fields = obj.get("fields").and_then(|v| v.as_str()).map(String::from);
-                            
-                            opts.filter = obj.get("filter").map(|v| {
-                                if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }
-                            });
+    let app_list = app_ctx.clone();
+    let list_records = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Option<Value<'js>>, a3: Option<Value<'js>>| {
+                let app = app_list.clone();
+                async move {
+                    let (ctx_id, col, opts_val) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let col_name = a2
+                                .and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default()))
+                                .unwrap_or_default();
+                            (c_id, col_name, a3)
                         }
+                        DbMode::Scoped => {
+                            let col_name = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            (None, col_name, a2)
+                        }
+                    };
 
-                        let list = db
-                            .list_records(col_id, opts)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(list).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let col_id = resolve_collection_local(db.clone(), &col)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    let mut opts = QueryOptions::default();
+                    if let Some(v) = opts_val {
+                        if let Ok(obj) = from_value::<JsonValue>(v) {
+                            if let Some(map) = obj.as_object() {
+                                opts.page = map
+                                    .get("page")
+                                    .and_then(|v| v.as_f64())
+                                    .map(|n| n as u64)
+                                    .or(map.get("page").and_then(|v| v.as_u64()));
+                                opts.per_page = map
+                                    .get("per_page")
+                                    .and_then(|v| v.as_f64())
+                                    .map(|n| n as u64)
+                                    .or(map.get("per_page").and_then(|v| v.as_u64()));
+                                opts.limit = map
+                                    .get("limit")
+                                    .and_then(|v| v.as_f64())
+                                    .map(|n| n as u64)
+                                    .or(map.get("limit").and_then(|v| v.as_u64()));
+                                opts.offset = map
+                                    .get("offset")
+                                    .and_then(|v| v.as_f64())
+                                    .map(|n| n as u64)
+                                    .or(map.get("offset").and_then(|v| v.as_u64()));
+
+                                opts.sort = map.get("sort").and_then(|v| v.as_str()).map(String::from);
+                                opts.expand =
+                                    map.get("expand").and_then(|v| v.as_str()).map(String::from);
+                                opts.fields =
+                                    map.get("fields").and_then(|v| v.as_str()).map(String::from);
+
+                                opts.filter = map.get("filter").map(|v| {
+                                    if v.is_string() {
+                                        v.as_str().unwrap().to_string()
+                                    } else {
+                                        v.to_string()
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    let list = db
+                        .list_records(col_id, opts)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    to_value(js_ctx, &list).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
     // get(col, id, expand) OR get(ctx, col, id, expand)
-    let get_record = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let col = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let id = args
-                .get_or_undefined(offset + 1)
-                .to_number(ctx)
-                .unwrap_or(0.0) as i64;
-            let expand = args
-                .get(offset + 2)
-                .and_then(|v| v.as_string())
-                .map(|s| s.to_std_string_escaped());
+    let app_get = app_ctx.clone();
+    let get_record = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>,
+                  a1: Value<'js>,
+                  a2: Value<'js>,
+                  a3: Option<Value<'js>>,
+                  a4: Option<Value<'js>>| {
+                let app = app_get.clone();
+                async move {
+                    let (ctx_id, col, id, expand) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let col_name = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let rec_id = from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(0);
+                            let exp = a4.and_then(|v| from_value::<String>(v).ok());
+                            (c_id, col_name, rec_id, exp)
+                        }
+                        DbMode::Scoped => {
+                            let col_name = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let rec_id = from_value::<i64>(a2).unwrap_or(0);
+                            let exp = a3.and_then(|v| from_value::<String>(v).ok());
+                            (None, col_name, rec_id, exp)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let col_id = resolve_collection_local(db.clone(), &col).await?;
-                        let rec = db
-                            .get_record(col_id, id, expand)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(rec).unwrap_or(serde_json::Value::Null))
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let col_id = resolve_collection_local(db.clone(), &col)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let rec = db
+                        .get_record(col_id, id, expand)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    to_value(js_ctx, &rec).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
     // create(col, data) OR create(ctx, col, data)
-    let create_record = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let col = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let data = args
-                .get_or_undefined(offset + 1)
-                .to_json(ctx)
-                .unwrap()
-                .unwrap_or(serde_json::Value::Null);
+    let app_create = app_ctx.clone();
+    let create_record = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Value<'js>, a3: Option<Value<'js>>| {
+                let app = app_create.clone();
+                async move {
+                    let (ctx_id, col, data_val) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let col_name = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            (c_id, col_name, a3.unwrap_or(Value::new_null(a1.ctx().clone())))
+                        }
+                        DbMode::Scoped => {
+                            let col_name = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            (None, col_name, a2)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let col_id = resolve_collection_local(db.clone(), &col).await?;
-                        let id = db
-                            .create_record(col_id, &data)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::json!({ "id": id }))
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let col_id = resolve_collection_local(db.clone(), &col)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    let data: JsonValue = from_value(data_val).unwrap_or(json!({}));
+                    let id = db
+                        .create_record(col_id, &data)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    let res = json!({ "id": id });
+                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
     // update(col, id, data) OR update(ctx, col, id, data)
-    let update_record = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let col = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let id = args
-                .get_or_undefined(offset + 1)
-                .to_number(ctx)
-                .unwrap_or(0.0) as i64;
-            let data = args
-                .get_or_undefined(offset + 2)
-                .to_json(ctx)
-                .unwrap()
-                .unwrap_or(serde_json::Value::Null);
+    let app_update = app_ctx.clone();
+    let update_record = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>,
+                  a1: Value<'js>,
+                  a2: Value<'js>,
+                  a3: Value<'js>,
+                  a4: Option<Value<'js>>| {
+                let app = app_update.clone();
+                async move {
+                    let (ctx_id, col, id, data_val) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let col_name = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let rec_id = from_value::<i64>(a3).unwrap_or(0);
+                            let data_v = a4.unwrap_or(Value::new_null(a1.ctx().clone()));
+                            (c_id, col_name, rec_id, data_v)
+                        }
+                        DbMode::Scoped => {
+                            let col_name = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let rec_id = from_value::<i64>(a2).unwrap_or(0);
+                            (None, col_name, rec_id, a3)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let col_id = resolve_collection_local(db.clone(), &col).await?;
-                        let rec = db
-                            .update_record(col_id, id, &data)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(rec).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let col_id = resolve_collection_local(db.clone(), &col)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    let data: JsonValue = from_value(data_val).unwrap_or(json!({}));
+                    let rec = db
+                        .update_record(col_id, id, &data)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    to_value(js_ctx, &rec).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
     // delete(col, id) OR delete(ctx, col, id)
-    let delete_record = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let col = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let id = args
-                .get_or_undefined(offset + 1)
-                .to_number(ctx)
-                .unwrap_or(0.0) as i64;
+    let app_delete = app_ctx.clone();
+    let delete_record = Function::new(
+        ctx.clone(),
+        Async(
+            move |a1: Value<'js>, a2: Value<'js>, a3: Option<Value<'js>>| {
+                let app = app_delete.clone();
+                async move {
+                    let (ctx_id, col, id) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let col_name = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let rec_id = from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(0);
+                            (c_id, col_name, rec_id)
+                        }
+                        DbMode::Scoped => {
+                            let col_name = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let rec_id = from_value::<i64>(a2).unwrap_or(0);
+                            (None, col_name, rec_id)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let col_id = resolve_collection_local(db.clone(), &col).await?;
-                        db.delete_record(col_id, id)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::Value::Bool(true))
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let col_id = resolve_collection_local(db.clone(), &col)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    db.delete_record(col_id, id)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    Ok::<bool, rquickjs::Error>(true)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
     // searchVector(col, field, vec, limit)
-    let search_vector = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let col = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let field = args
-                .get_or_undefined(offset + 1)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let vec_val = args
-                .get_or_undefined(offset + 2)
-                .to_json(ctx)
-                .unwrap()
-                .unwrap_or(serde_json::Value::Null);
-            let limit = args
-                .get_or_undefined(offset + 3)
-                .to_number(ctx)
-                .unwrap_or(10.0) as usize;
+    let app_search_vec = app_ctx.clone();
+    let search_vector = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>,
+                  a1: Value<'js>,
+                  a2: Value<'js>,
+                  a3: Value<'js>,
+                  a4: Value<'js>,
+                  a5: Option<Value<'js>>| {
+                let app = app_search_vec.clone();
+                async move {
+                    let (ctx_id, col, field, vec_val, limit) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let col_name = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let f = a3
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let v = a4;
+                            let l = from_value::<usize>(a5.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(10);
+                            (c_id, col_name, f, v, l)
+                        }
+                        DbMode::Scoped => {
+                            let col_name = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let f = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let v = a3;
+                            let l = from_value::<usize>(a4).unwrap_or(10);
+                            (None, col_name, f, v, l)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let col_id = resolve_collection_local(db.clone(), &col).await?;
-                        let vector: Vec<f32> = serde_json::from_value(vec_val).unwrap_or_default();
-                        let recs = db
-                            .search_vector(col_id, &field, vector, limit)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(recs).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let col_id = resolve_collection_local(db.clone(), &col)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    let vector: Vec<f32> = from_value(vec_val).unwrap_or_default();
+                    let recs = db
+                        .search_vector(col_id, &field, vector, limit)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    to_value(js_ctx, &recs).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
     // getVector(col, id)
-    let get_vector = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let col = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let id = args
-                .get_or_undefined(offset + 1)
-                .to_number(ctx)
-                .unwrap_or(0.0) as i64;
+    let app_get_vec = app_ctx.clone();
+    let get_vector = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Value<'js>, a3: Option<Value<'js>>| {
+                let app = app_get_vec.clone();
+                async move {
+                    let (ctx_id, col, id) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let col_name = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let rec_id = from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(0);
+                            (c_id, col_name, rec_id)
+                        }
+                        DbMode::Scoped => {
+                            let col_name = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let rec_id = from_value::<i64>(a2).unwrap_or(0);
+                            (None, col_name, rec_id)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let col_id = resolve_collection_local(db.clone(), &col).await?;
-                        let vecs = db
-                            .get_record_vectors(col_id, id)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(vecs).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let col_id = resolve_collection_local(db.clone(), &col)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    let vecs = db
+                        .get_record_vectors(col_id, id)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    to_value(js_ctx, &vecs).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
-    // instantSearch(col, query, limit) OR instantSearch(ctx, col, query, limit)
-    let instant_search = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let col = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let query = args
-                .get_or_undefined(offset + 1)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let limit = args
-                .get_or_undefined(offset + 2)
-                .to_number(ctx)
-                .unwrap_or(10.0) as usize;
+    // instantSearch(col, query, limit)
+    let app_instant_search = app_ctx.clone();
+    let instant_search = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>,
+                  a1: Value<'js>,
+                  a2: Value<'js>,
+                  a3: Value<'js>,
+                  a4: Option<Value<'js>>| {
+                let app = app_instant_search.clone();
+                async move {
+                    let (ctx_id, col, query, limit) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let col_name = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let q = a3
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let l = from_value::<usize>(a4.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(10);
+                            (c_id, col_name, q, l)
+                        }
+                        DbMode::Scoped => {
+                            let col_name = a1
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let q = a2
+                                .as_string()
+                                .map(|s| s.to_string().unwrap_or_default())
+                                .unwrap_or_default();
+                            let l = from_value::<usize>(a3).unwrap_or(10);
+                            (None, col_name, q, l)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let col_id = resolve_collection_local(db.clone(), &col).await?;
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let col_id = resolve_collection_local(db.clone(), &col)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
 
-                        // Call the Tantivy instant search engine
-                        let results = db
-                            .instant_search(col_id, &query, limit)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                    let results = db
+                        .instant_search(col_id, &query, limit)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
 
-                        Ok(serde_json::to_value(results).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
+                    to_value(js_ctx, &results).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
-    let records_obj = ObjectInitializer::new(ctx)
-        .function(list_records, JsString::from("list"), 2)
-        .function(get_record, JsString::from("get"), 3)
-        .function(create_record, JsString::from("create"), 2)
-        .function(update_record, JsString::from("update"), 3)
-        .function(delete_record, JsString::from("delete"), 2)
-        .function(search_vector, JsString::from("searchVector"), 4)
-        .function(get_vector, JsString::from("getVector"), 2)
-        .function(instant_search, JsString::from("instantSearch"), 3)
-        .build();
+    records_obj.set("list", list_records).map_err(|e| e.to_string())?;
+    records_obj.set("get", get_record).map_err(|e| e.to_string())?;
+    records_obj.set("create", create_record).map_err(|e| e.to_string())?;
+    records_obj.set("update", update_record).map_err(|e| e.to_string())?;
+    records_obj.set("delete", delete_record).map_err(|e| e.to_string())?;
+    records_obj.set("searchVector", search_vector).map_err(|e| e.to_string())?;
+    records_obj.set("getVector", get_vector).map_err(|e| e.to_string())?;
+    records_obj.set("instantSearch", instant_search).map_err(|e| e.to_string())?;
 
     // --- 2. QUERY ---
-    let query_fn = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            // Robust Argument Parsing Logic
-            let (ctx_id, q_val) = match m {
-                DbMode::Root => {
-                    // Root mode: explicit context required as first arg
-                    let id = args
-                        .first()
-                        .and_then(|v| v.as_string())
-                        .map(|s| s.to_std_string_escaped());
-                    let query = args
-                        .get_or_undefined(1)
-                        .to_json(ctx)
-                        .unwrap()
-                        .unwrap_or(serde_json::Value::Null);
-                    (id, query)
-                }
-                DbMode::Scoped => {
-                    // Scoped mode: check if user is trying to switch context dynamically
-                    // If arg[0] is string and arg[1] is object -> It's a context switch
-                    // If arg[0] is object -> It's a standard query
-                    if args.len() >= 2 && args.first().map(|v| v.is_string()).unwrap_or(false) {
-                        let id = args
-                            .first()
-                            .and_then(|v| v.as_string())
-                            .map(|s| s.to_std_string_escaped());
-                        let query = args
-                            .get_or_undefined(1)
-                            .to_json(ctx)
-                            .unwrap()
-                            .unwrap_or(serde_json::Value::Null);
-                        (id, query)
-                    } else {
-                        let query = args
-                            .get_or_undefined(0)
-                            .to_json(ctx)
-                            .unwrap()
-                            .unwrap_or(serde_json::Value::Null);
-                        (None, query)
-                    }
-                }
-            };
+    let app_query = app_ctx.clone();
+    let query_fn = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Option<Value<'js>>| {
+                let app = app_query.clone();
+                async move {
+                    let (ctx_id, q_val) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let q = a2.unwrap_or(Value::new_null(a1.ctx().clone()));
+                            (c_id, q)
+                        }
+                        DbMode::Scoped => {
+                            if a2.is_some() && a1.is_string() {
+                                let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                                (c_id, a2.unwrap())
+                            } else {
+                                (None, a1)
+                            }
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        // Resolve the DB based on the optional context ID
-                        let db = resolve_db(ctx_id, app.clone()).await?;
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
 
-                        let query: ApexQuery = serde_json::from_value(q_val)
-                            .map_err(|e| format!("Query Parse Error: {}", e))?;
+                    let q_json: JsonValue = from_value(q_val).map_err(|_| rquickjs::Error::Exception)?;
+                    let query: ApexQuery = serde_json::from_value(q_json)
+                        .map_err(|_| rquickjs::Error::Exception)?;
 
-                        // Execute on the resolved DB
-                        db.query_engine(query).await.map_err(|e| e.to_string())
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let res = db.query_engine(query).await.map_err(|_| rquickjs::Error::Exception)?;
+                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
     // --- 3. FILES ---
-    let files_list = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let limit = args.get_or_undefined(offset).to_number(ctx).unwrap_or(20.0) as i64;
-            let offset_val = args
-                .get_or_undefined(offset + 1)
-                .to_number(ctx)
-                .unwrap_or(0.0) as i64;
+    let files_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+    let app_files = app_ctx.clone();
+    let files_list = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Option<Value<'js>>, a3: Option<Value<'js>>| {
+                let app = app_files.clone();
+                async move {
+                    let (ctx_id, limit, offset) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let l = from_value::<i64>(a2.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(20);
+                            let o = from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone()))).unwrap_or(0);
+                            (c_id, l, o)
+                        }
+                        DbMode::Scoped => {
+                            let l = from_value::<i64>(a1).unwrap_or(20);
+                            let o = from_value::<i64>(a2.unwrap_or(Value::new_null(js_ctx.clone()))).unwrap_or(0);
+                            (None, l, o)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let files = db
-                            .list_files(limit, offset_val)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(files).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let files = db.list_files(limit, offset).await.map_err(|_| rquickjs::Error::Exception)?;
+                    
+                    to_value(js_ctx, &files).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
-    let files_obj = ObjectInitializer::new(ctx)
-        .function(files_list, JsString::from("list"), 2)
-        .build();
+    files_obj.set("list", files_list).map_err(|e| e.to_string())?;
 
     // --- 4. USERS ---
-    let users_get = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let email = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
+    let users_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+    
+    let app_u_get = app_ctx.clone();
+    let users_get = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Option<Value<'js>>| {
+                let app = app_u_get.clone();
+                async move {
+                    let (ctx_id, email) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let e = a2.and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default())).unwrap_or_default();
+                            (c_id, e)
+                        }
+                        DbMode::Scoped => {
+                            let e = a1.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+                            (None, e)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let u = db
-                            .get_user_by_email(&email)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(u).unwrap_or(serde_json::Value::Null))
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let u = db.get_user_by_email(&email).await.map_err(|_| rquickjs::Error::Exception)?;
+                    
+                    to_value(js_ctx, &u).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
-    let users_create = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, offset) = get_args(args, ctx, &m);
-            let email = args
-                .get_or_undefined(offset)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let pass = args
-                .get_or_undefined(offset + 1)
-                .to_string(ctx)?
-                .to_std_string_escaped();
-            let role = args
-                .get_or_undefined(offset + 2)
-                .to_string(ctx)?
-                .to_std_string_escaped();
+    let app_u_create = app_ctx.clone();
+    let users_create = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Value<'js>, a3: Value<'js>, a4: Option<Value<'js>>| {
+                let app = app_u_create.clone();
+                async move {
+                    let (ctx_id, email, pass, role) = match mode {
+                        DbMode::Root => {
+                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
+                            let e = a2.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+                            let p = a3.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+                            let r = a4.and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default())).unwrap_or_default();
+                            (c_id, e, p, r)
+                        }
+                        DbMode::Scoped => {
+                            let e = a1.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+                            let p = a2.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+                            let r = a3.as_string().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+                            (None, e, p, r)
+                        }
+                    };
 
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        // Note: We need to access hash_password which is in auth module of core.
-                        // But we are in core, so we can use crate::auth::hash_password
-                        let hash = crate::auth::hash_password(&pass).map_err(|e| e.to_string())?;
-                        let u = db
-                            .create_user(&email, &hash, &role, None)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(u).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let hash = crate::auth::hash_password(&pass).map_err(|_| rquickjs::Error::Exception)?;
+                    let u = db
+                        .create_user(&email, &hash, &role, None)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    to_value(js_ctx, &u).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
-    let users_obj = ObjectInitializer::new(ctx)
-        .function(users_get, JsString::from("get"), 1)
-        .function(users_create, JsString::from("create"), 3)
-        .build();
+    users_obj.set("get", users_get).map_err(|e| e.to_string())?;
+    users_obj.set("create", users_create).map_err(|e| e.to_string())?;
 
     // --- 5. COLLECTIONS ---
-    let cols_list = {
-        let m = mode;
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let (ctx_id, _offset) = get_args(args, ctx, &m);
-            let res = ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                    handle.block_on(async {
-                        let db = resolve_db(ctx_id, app.clone()).await?;
-                        let cols = db.list_collections().await.map_err(|e| e.to_string())?;
-                        Ok(serde_json::to_value(cols).unwrap())
-                    })
-                } else {
-                    Err("Context lost".into())
+    let cols_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+    let app_cols = app_ctx.clone();
+    let cols_list = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, a1: Option<Value<'js>>| {
+                let app = app_cols.clone();
+                async move {
+                    let ctx_id = match mode {
+                        DbMode::Root => a1.and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default())),
+                        DbMode::Scoped => None,
+                    };
+
+                    let db = resolve_db(ctx_id, app.clone())
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let cols = db.list_collections().await.map_err(|_| rquickjs::Error::Exception)?;
+                    
+                    to_value(js_ctx, &cols).map_err(|_| rquickjs::Error::Exception)
                 }
-            });
-            return_json_promise(ctx, res)
-        })
-    };
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
-    let cols_obj = ObjectInitializer::new(ctx)
-        .function(cols_list, JsString::from("list"), 0)
-        .build();
+    cols_obj.set("list", cols_list).map_err(|e| e.to_string())?;
 
-    // --- BUILD FINAL OBJECT ---
-    let db_obj = ObjectInitializer::new(ctx)
-        .property(JsString::from("records"), records_obj, Attribute::all())
-        .property(JsString::from("users"), users_obj, Attribute::all())
-        .property(JsString::from("collections"), cols_obj, Attribute::all())
-        .property(JsString::from("files"), files_obj, Attribute::all())
-        .function(query_fn, JsString::from("query"), 1)
-        .build();
+    // Build Final Object
+    db_obj.set("records", records_obj).map_err(|e| e.to_string())?;
+    db_obj.set("users", users_obj).map_err(|e| e.to_string())?;
+    db_obj.set("collections", cols_obj).map_err(|e| e.to_string())?;
+    db_obj.set("files", files_obj).map_err(|e| e.to_string())?;
+    db_obj.set("query", query_fn).map_err(|e| e.to_string())?;
 
     Ok(db_obj)
 }
 
-// Default registration for $db (Scoped Mode)
-pub fn register_db(ctx: &mut Context) -> Result<(), String> {
-    let db_obj = create_db_object(ctx, DbMode::Scoped)?;
-    ctx.register_global_property(JsString::from("$db"), db_obj, Attribute::all())
-        .map_err(|e| e.to_string())
+pub fn register_db<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
+    let globals = ctx.globals();
+    let db_obj = create_db_object(ctx, app_ctx, DbMode::Scoped)?;
+    globals.set("$db", db_obj).map_err(|e| e.to_string())?;
+    Ok(())
 }
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/db.rs ends here ===========================

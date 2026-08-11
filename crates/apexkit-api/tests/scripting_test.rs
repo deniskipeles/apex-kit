@@ -45,6 +45,7 @@ impl VectorProvider for MockVectorProvider {
     }
 }
 
+#[allow(dead_code)]
 struct TestJobContext {
     db: Arc<dyn Db>,
     vp: Arc<dyn VectorProvider>,

@@ -1,119 +1,108 @@
-use super::super::{context::ACTIVE_CONTEXT, return_json_promise};
-use boa_engine::{
-    Context, JsArgs, JsString, JsValue, NativeFunction, object::ObjectInitializer,
-    property::Attribute,
-};
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/cache.rs start here ===========================
+use std::sync::Arc;
+use rquickjs::function::Async;
+use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs_serde::from_value;
+use super::super::context::ScriptContext;
 
-// Function to register $cache
-pub fn register_cache(ctx: &mut Context) -> Result<(), String> {
-    // 1. GET
-    let get = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        let res = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async { app.cache_get(&key).await })
-            } else {
-                None
+pub fn register_cache<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
+    let globals = ctx.globals();
+    let cache_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+
+    // 1. $cache.get(key) -> Promise<string | null>
+    let app_get = app_ctx.clone();
+    let get_fn = Function::new(
+        ctx.clone(),
+        Async(move |key: String| {
+            let app = app_get.clone();
+            async move {
+                let val = app.cache_get(&key).await;
+                Ok::<Option<String>, rquickjs::Error>(val)
             }
-        });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-        match res {
-            Some(val) => Ok(JsValue::from(JsString::from(val))),
-            None => Ok(JsValue::null()),
-        }
-    });
+    // 2. $cache.set(key, val, ttl?) -> Promise<void>
+    let app_set = app_ctx.clone();
+    let set_fn = Function::new(
+        ctx.clone(),
+        Async(move |key: String, val: Value<'js>, ttl: Option<u64>| {
+            let app = app_set.clone();
+            async move {
+                let val_str = if val.is_object() || val.is_array() {
+                    if let Ok(json_val) = from_value::<serde_json::Value>(val) {
+                        serde_json::to_string(&json_val).unwrap_or_default()
+                    } else {
+                        "".to_string()
+                    }
+                } else if let Some(s) = val.as_string() {
+                    s.to_string().unwrap_or_default()
+                } else if let Some(b) = val.as_bool() {
+                    b.to_string()
+                } else if let Some(n) = val.as_int().map(|i| i as f64).or_else(|| val.as_float()) {
+                    n.to_string()
+                } else {
+                    "".to_string()
+                };
 
-    // 2. SET
-    let set = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        // Accept string or JSON object (stringify it)
-        let val = args.get_or_undefined(1);
-        let val_str = if val.is_object() {
-            serde_json::to_string(&val.to_json(ctx).unwrap()).unwrap_or_default()
-        } else {
-            val.to_string(ctx)?.to_std_string_escaped()
-        };
-
-        let ttl = args
-            .get(2)
-            .and_then(|v| v.to_number(ctx).ok())
-            .map(|n| n as u64);
-
-        ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    app.cache_set(&key, &val_str, ttl).await;
-                })
+                app.cache_set(&key, &val_str, ttl).await;
+                Ok::<(), rquickjs::Error>(())
             }
-        });
-        Ok(JsValue::undefined())
-    });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-    // 3. DELETE
-    let del = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    app.cache_del(&key).await;
-                })
+    // 3. $cache.delete(key) -> Promise<void>
+    let app_del = app_ctx.clone();
+    let del_fn = Function::new(
+        ctx.clone(),
+        Async(move |key: String| {
+            let app = app_del.clone();
+            async move {
+                app.cache_del(&key).await;
+                Ok::<(), rquickjs::Error>(())
             }
-        });
-        Ok(JsValue::undefined())
-    });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-    // 4. INCREMENT (For Quotas)
-    let incr = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        let delta = args
-            .get(1)
-            .and_then(|v| v.to_number(ctx).ok())
-            .unwrap_or(1.0) as i64;
-
-        let res = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async { app.cache_incr(&key, delta).await })
-            } else {
-                0
+    // 4. $cache.incr(key, delta?) -> Promise<i64>
+    let app_incr = app_ctx.clone();
+    let incr_fn = Function::new(
+        ctx.clone(),
+        Async(move |key: String, delta: Option<i64>| {
+            let app = app_incr.clone();
+            async move {
+                let res = app.cache_incr(&key, delta.unwrap_or(1)).await;
+                Ok::<i64, rquickjs::Error>(res)
             }
-        });
-        Ok(JsValue::from(res))
-    });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-    // 5. LIST KEYS [NEW]
-    let list_keys = NativeFunction::from_copy_closure(move |_, _, ctx| {
-        let res = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async { app.cache_list_keys().await })
-            } else {
-                vec![]
+    // 5. $cache.listKeys() -> Promise<Vec<String>>
+    let app_list = app_ctx.clone();
+    let list_keys_fn = Function::new(
+        ctx.clone(),
+        Async(move || {
+            let app = app_list.clone();
+            async move {
+                let keys = app.cache_list_keys().await;
+                Ok::<Vec<String>, rquickjs::Error>(keys)
             }
-        });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-        let json_arr = serde_json::to_value(res).unwrap_or(serde_json::Value::Array(vec![]));
-        return_json_promise(ctx, Ok(json_arr))
-    });
+    cache_obj.set("get", get_fn).map_err(|e| e.to_string())?;
+    cache_obj.set("set", set_fn).map_err(|e| e.to_string())?;
+    cache_obj.set("delete", del_fn.clone()).map_err(|e| e.to_string())?;
+    cache_obj.set("del", del_fn).map_err(|e| e.to_string())?; // Alias
+    cache_obj.set("incr", incr_fn).map_err(|e| e.to_string())?;
+    cache_obj.set("listKeys", list_keys_fn).map_err(|e| e.to_string())?;
 
-    let obj = ObjectInitializer::new(ctx)
-        .function(get, JsString::from("get"), 1)
-        .function(set, JsString::from("set"), 3)
-        .function(del, JsString::from("delete"), 1)
-        .function(incr, JsString::from("incr"), 2)
-        .function(list_keys, JsString::from("listKeys"), 0) // Register new function
-        .build();
-
-    ctx.register_global_property(JsString::from("$cache"), obj, Attribute::all())
-        .map_err(|e| e.to_string())
+    globals.set("$cache", cache_obj).map_err(|e| e.to_string())?;
+    Ok(())
 }
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/cache.rs ends here ===========================

@@ -1,132 +1,90 @@
-use super::super::{context::ACTIVE_CONTEXT, return_json_promise};
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/env.rs start here ===========================
+use std::sync::Arc;
+use rquickjs::function::Async;
+use rquickjs::{Ctx, Function, Object};
+use super::super::context::ScriptContext;
+use super::db::resolve_db;
 use crate::realtime::EventScope;
-use boa_engine::{
-    Context, JsArgs, JsString, JsValue, NativeFunction, object::ObjectInitializer,
-    property::Attribute,
-};
 
-pub fn register_env(ctx: &mut Context) -> Result<(), String> {
-    let get = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let key = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
+pub fn register_env<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
+    let globals = ctx.globals();
+    let env_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, base_url_opt, _, scope)) = &*c.borrow() {
-                handle.block_on(async {
-                    // THE FIX 1: Resolve the contextual database (Tenant/Sandbox) instead of hardcoding to Root
-                    let db = super::db::resolve_db(None, app.clone())
-                        .await
-                        .unwrap_or_else(|_| app.get_db());
+    // $env.get(key) -> Promise<string>
+    let app_get = app_ctx.clone();
+    let get_fn = Function::new(
+        ctx.clone(),
+        Async(move |key: String| {
+            let app = app_get.clone();
+            async move {
+                let db = resolve_db(None, app.clone())
+                    .await
+                    .unwrap_or_else(|_| app.get_db());
 
-                    // 1. Intercept APP_URL and LOCAL_APP_URL to apply scoping rules
-                    if key == "APP_URL" || key == "LOCAL_APP_URL" {
-                        // Determine the scoped path suffix
-                        let scope_path = match scope {
-                            EventScope::Root => "".to_string(),
-                            EventScope::Tenant(id) => format!("/tenant/{}", id),
-                            EventScope::Sandbox(id) => format!("/sandbox/{}", id),
-                            _ => "".to_string(),
-                        };
+                // 1. Intercept APP_URL and LOCAL_APP_URL to apply scoping rules
+                if key == "APP_URL" || key == "LOCAL_APP_URL" {
+                    let scope = app.get_scope();
+                    let scope_path = match scope {
+                        EventScope::Root => "".to_string(),
+                        EventScope::Tenant(id) => format!("/tenant/{}", id),
+                        EventScope::Sandbox(id) => format!("/sandbox/{}", id),
+                        _ => "".to_string(),
+                    };
 
-                        let origin = if key == "LOCAL_APP_URL" {
-                            // Natively construct the local URL using the context's port
-                            format!("http://127.0.0.1:{}", app.get_port())
-                        } else {
-                            // Try DB config general.app_url
-                            let mut configured = None;
-                            if let Ok(Some(val)) = db.get_config("general").await {
-                                if let Some(url) = val
-                                    .get("app_url")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty())
-                                {
-                                    configured = Some(url.to_string());
-                                }
+                    let origin = if key == "LOCAL_APP_URL" {
+                        format!("http://127.0.0.1:{}", app.get_port())
+                    } else {
+                        let mut configured = None;
+                        if let Ok(Some(val)) = db.get_config("general").await {
+                            if let Some(url) = val
+                                .get("app_url")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                            {
+                                configured = Some(url.to_string());
                             }
-                            // Fallback to process env APP_URL, then base_url
-                            configured
-                                .or_else(|| std::env::var("APP_URL").ok().filter(|s| !s.is_empty()))
-                                .unwrap_or_else(|| {
-                                    base_url_opt
-                                        .clone()
-                                        .unwrap_or_else(|| "http://localhost:5000".to_string())
-                                })
-                        };
-
-                        return Ok(format!("{}{}", origin.trim_end_matches('/'), scope_path));
-                    }
-
-                    // 2. Attempt to fetch from Database Secrets
-                    if let Ok(Some(val)) = db.get_config(&key).await {
-                        // Check if it's an encrypted wrapper
-                        if let Ok(enc) = serde_json::from_value::<
-                            crate::security::vault::EncryptedValue,
-                        >(val.clone())
-                        {
-                            return app.get_vault().decrypt(&enc).map_err(|e| e.to_string());
                         }
+                        configured
+                            .or_else(|| std::env::var("APP_URL").ok().filter(|s| !s.is_empty()))
+                            .unwrap_or_else(|| format!("http://localhost:{}", app.get_port()))
+                    };
 
-                        // THE FIX 2: Safely convert boolean and number JSON values to String.
-                        // If `val` is a boolean `true`, `val.as_str()` used to return `None`.
-                        let val_str = match val {
-                            serde_json::Value::String(s) => s,
-                            serde_json::Value::Bool(b) => b.to_string(),
-                            serde_json::Value::Number(n) => n.to_string(),
-                            _ => val.to_string(),
-                        };
-                        return Ok(val_str);
-                    }
-
-                    // 3. Fallback to reading from the .env file / system process environment
-                    if let Ok(env_val) = std::env::var(&key) {
-                        return Ok(env_val);
-                    }
-
-                    Ok("".to_string())
-                })
-            } else {
-                Err("Context lost".into())
-            }
-        });
-        return_json_promise(ctx, result.map(serde_json::Value::String))
-    });
-
-    let (app_url, smtp_blocked) = ACTIVE_CONTEXT.with(|c| {
-        if let Some((app, handle, base_url_opt, _, _)) = &*c.borrow() {
-            let url = base_url_opt.clone().unwrap_or_default();
-            let blocked = handle.block_on(async {
-                if let Ok(db) = super::db::resolve_db(None, app.clone()).await
-                    && let Ok(Some(smtp_val)) = db.get_config("smtp").await
-                {
-                    return smtp_val
-                        .get("block_smtp")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                    return Ok::<String, rquickjs::Error>(format!("{}{}", origin.trim_end_matches('/'), scope_path));
                 }
-                false
-            });
-            (url, blocked)
-        } else {
-            ("".to_string(), false)
-        }
-    });
 
-    let obj = ObjectInitializer::new(ctx)
-        .function(get, JsString::from("get"), 1)
-        .property(
-            JsString::from("APP_URL"), // Preserved global variable without scope path mapping
-            JsString::from(app_url),
-            Attribute::all(),
-        )
-        .property(
-            JsString::from("SMTP_BLOCKED"),
-            JsValue::from(smtp_blocked),
-            Attribute::all(),
-        )
-        .build();
+                // 2. Attempt to fetch from Database Secrets
+                if let Ok(Some(val)) = db.get_config(&key).await {
+                    if let Ok(enc) = serde_json::from_value::<crate::security::vault::EncryptedValue>(val.clone()) {
+                        return Ok::<String, rquickjs::Error>(app.get_vault().decrypt(&enc).map_err(|_| rquickjs::Error::Exception)?);
+                    }
 
-    ctx.register_global_property(JsString::from("$env"), obj, Attribute::all())
-        .map_err(|e| e.to_string())
+                    let val_str = match val {
+                        serde_json::Value::String(s) => s,
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => val.to_string(),
+                    };
+                    return Ok::<String, rquickjs::Error>(val_str);
+                }
+
+                // 3. Fallback to reading from system environment
+                if let Ok(env_val) = std::env::var(&key) {
+                    return Ok::<String, rquickjs::Error>(env_val);
+                }
+
+                Ok::<String, rquickjs::Error>("".to_string())
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let app_url = format!("http://localhost:{}", app_ctx.get_port());
+
+    env_obj.set("get", get_fn).map_err(|e| e.to_string())?;
+    env_obj.set("APP_URL", app_url).map_err(|e| e.to_string())?;
+    env_obj.set("SMTP_BLOCKED", false).map_err(|e| e.to_string())?;
+
+    globals.set("$env", env_obj).map_err(|e| e.to_string())?;
+    Ok(())
 }
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/env.rs ends here ===========================

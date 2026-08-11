@@ -1,146 +1,114 @@
-use super::super::{context::ACTIVE_CONTEXT, return_json_promise};
-use boa_engine::{
-    Context, JsArgs, JsNativeError, JsString, JsValue, NativeFunction, object::ObjectInitializer,
-    property::Attribute,
-};
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/ai.rs start here ===========================
+use std::sync::Arc;
+use rquickjs::prelude::Async;
+use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs_serde::from_value;
+use super::super::context::ScriptContext;
 
-pub fn register_ai(ctx: &mut Context) -> Result<(), String> {
-    // 1. $ai.embed(text)
-    let embed = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let text = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
+pub fn register_ai<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
+    let globals = ctx.globals();
+    let ai_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-        let res = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _, _, _)) = &*c.borrow() {
-                handle.block_on(async {
-                    // Verify Quota first
-                    app.check_quota("ai").await.map_err(|e| e.to_string())?;
+    // 1. $ai.embed(text) -> Promise<Vec<f32>>
+    let app_embed = app_ctx.clone();
+    let embed_fn = Function::new(ctx.clone(), Async(move |text: String| {
+    let app = app_embed.clone();
+    async move {
+        app.check_quota("ai").await.map_err(|_| rquickjs::Error::Exception)?;
+        let provider = app.get_scoped_vector_provider().await;
+        let vec = provider.embed(&text).await.map_err(|_| rquickjs::Error::Exception)?;
+        
+        Ok::<Vec<f32>, rquickjs::Error>(vec) // <-- Type explicitly at the end!
+    }
+}))
+    .map_err(|e| e.to_string())?;
 
-                    let provider = app.get_scoped_vector_provider().await;
-                    provider.embed(&text).await
-                })
+    // 2. $ai.meanVector([v1, v2, ...]) -> Vec<f32>
+    let mean_vector_fn = Function::new(
+        ctx.clone(),
+        move |val: Value<'js>| -> rquickjs::Result<Vec<f32>> {
+            let vectors: Vec<Vec<f32>> =
+                from_value(val).map_err(|_| rquickjs::Error::Exception)?;
+
+            if vectors.is_empty() {
+                return Err(rquickjs::Error::Exception);
+            }
+
+            let dim = vectors[0].len();
+            if dim == 0 {
+                return Err(rquickjs::Error::Exception);
+            }
+
+            for v in &vectors {
+                if v.len() != dim {
+                    return Err(rquickjs::Error::Exception);
+                }
+            }
+
+            // Sum
+            let mut summed = vec![0.0_f32; dim];
+            for v in &vectors {
+                for (i, &val) in v.iter().enumerate() {
+                    summed[i] += val;
+                }
+            }
+
+            // Mean
+            let count = vectors.len() as f32;
+            for val in &mut summed {
+                *val /= count;
+            }
+
+            // L2 Normalize
+            let sum_sq: f32 = summed.iter().map(|x| x * x).sum();
+            let mag = sum_sq.sqrt() + 1e-12;
+            for val in &mut summed {
+                *val /= mag;
+            }
+
+            Ok(summed)
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 3. $ai.cosineSimilarity(v1, v2) -> f64
+    let cosine_sim_fn = Function::new(
+        ctx.clone(),
+        move |v1_val: Value<'js>, v2_val: Value<'js>| -> rquickjs::Result<f64> {
+            let v1: Vec<f32> = from_value(v1_val).map_err(|_| rquickjs::Error::Exception)?;
+            let v2: Vec<f32> = from_value(v2_val).map_err(|_| rquickjs::Error::Exception)?;
+
+            if v1.len() != v2.len() || v1.is_empty() {
+                return Err(rquickjs::Error::Exception);
+            }
+
+            let mut dot_product = 0.0;
+            let mut norm_a = 0.0;
+            let mut norm_b = 0.0;
+
+            for i in 0..v1.len() {
+                dot_product += v1[i] * v2[i];
+                norm_a += v1[i] * v1[i];
+                norm_b += v2[i] * v2[i];
+            }
+
+            let denominator = norm_a.sqrt() * norm_b.sqrt();
+            let similarity = if denominator == 0.0 {
+                0.0
             } else {
-                Err("Context lost".into())
-            }
-        });
+                dot_product / denominator
+            };
 
-        return_json_promise(ctx, res.map(|v| serde_json::to_value(v).unwrap()))
-    });
+            Ok(similarity as f64)
+        },
+    )
+    .map_err(|e| e.to_string())?;
 
-    // 2. $ai.meanVector([v1, v2, ...]) -> averages and L2 normalizes a list of vectors
-    let mean_vector = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let val = args.get_or_undefined(0);
-        let json_val = val.to_json(ctx)?.unwrap_or(serde_json::Value::Null);
+    ai_obj.set("embed", embed_fn).map_err(|e| e.to_string())?;
+    ai_obj.set("meanVector", mean_vector_fn).map_err(|e| e.to_string())?;
+    ai_obj.set("cosineSimilarity", cosine_sim_fn).map_err(|e| e.to_string())?;
 
-        let vectors: Vec<Vec<f32>> = serde_json::from_value(json_val).map_err(|e| {
-            JsNativeError::typ().with_message(format!("Expected an array of float arrays: {e}"))
-        })?;
-
-        if vectors.is_empty() {
-            return Err(JsNativeError::range()
-                .with_message("Cannot average an empty array of vectors")
-                .into());
-        }
-
-        let dim = vectors[0].len();
-        if dim == 0 {
-            return Err(JsNativeError::range()
-                .with_message("Vector dimension cannot be 0")
-                .into());
-        }
-
-        for (i, v) in vectors.iter().enumerate() {
-            if v.len() != dim {
-                return Err(JsNativeError::range()
-                    .with_message(format!(
-                        "Vector dimension mismatch at index {}. Expected {}, got {}",
-                        i,
-                        dim,
-                        v.len()
-                    ))
-                    .into());
-            }
-        }
-
-        // Sum
-        let mut summed = vec![0.0_f32; dim];
-        for v in &vectors {
-            for (i, &val) in v.iter().enumerate() {
-                summed[i] += val;
-            }
-        }
-
-        // Mean
-        let count = vectors.len() as f32;
-        for val in &mut summed {
-            *val /= count;
-        }
-
-        // L2 Normalize (so it can be safely used in vector search)
-        let sum_sq: f32 = summed.iter().map(|x| x * x).sum();
-        let mag = sum_sq.sqrt() + 1e-12; // epsilon to prevent div by zero
-        for val in &mut summed {
-            *val /= mag;
-        }
-
-        let js_arr = serde_json::to_value(summed).unwrap();
-        Ok(JsValue::from_json(&js_arr, ctx).unwrap())
-    });
-
-    // 3. $ai.cosineSimilarity(v1, v2) -> computes similarity score between -1 and 1
-    let cosine_sim = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let v1_val = args
-            .get_or_undefined(0)
-            .to_json(ctx)?
-            .unwrap_or(serde_json::Value::Null);
-        let v2_val = args
-            .get_or_undefined(1)
-            .to_json(ctx)?
-            .unwrap_or(serde_json::Value::Null);
-
-        let v1: Vec<f32> = serde_json::from_value(v1_val).map_err(|e| {
-            JsNativeError::typ()
-                .with_message(format!("Argument 1 must be an array of numbers: {e}"))
-        })?;
-        let v2: Vec<f32> = serde_json::from_value(v2_val).map_err(|e| {
-            JsNativeError::typ()
-                .with_message(format!("Argument 2 must be an array of numbers: {e}"))
-        })?;
-
-        if v1.len() != v2.len() || v1.is_empty() {
-            return Err(JsNativeError::range()
-                .with_message("Vectors must have the same non-zero dimensions")
-                .into());
-        }
-
-        let mut dot_product = 0.0;
-        let mut norm_a = 0.0;
-        let mut norm_b = 0.0;
-
-        for i in 0..v1.len() {
-            dot_product += v1[i] * v2[i];
-            norm_a += v1[i] * v1[i];
-            norm_b += v2[i] * v2[i];
-        }
-
-        let denominator = norm_a.sqrt() * norm_b.sqrt();
-        let similarity = if denominator == 0.0 {
-            0.0
-        } else {
-            dot_product / denominator
-        };
-
-        Ok(JsValue::from(similarity as f64))
-    });
-
-    let obj = ObjectInitializer::new(ctx)
-        .function(embed, JsString::from("embed"), 1)
-        .function(mean_vector, JsString::from("meanVector"), 1)
-        .function(cosine_sim, JsString::from("cosineSimilarity"), 2)
-        .build();
-
-    ctx.register_global_property(JsString::from("$ai"), obj, Attribute::all())
-        .map_err(|e| e.to_string())
+    globals.set("$ai", ai_obj).map_err(|e| e.to_string())?;
+    Ok(())
 }
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/ai.rs ends here ===========================

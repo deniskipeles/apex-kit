@@ -1,23 +1,35 @@
+// =========================== apex-kit/crates/apexkit-core/src/scripting/engine.rs start here ===========================
 use crate::realtime::EventScope;
 use regex::Regex;
 use serde_json::{Value as JsonValue, json};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::builtins::db::resolve_db;
-use boa_engine::{
-    Context, JsArgs, JsError, JsResult, JsString, JsValue, NativeFunction,
-    builtins::promise::PromiseState, object::ObjectInitializer, property::Attribute,
-};
-use std::collections::HashMap;
+use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function, Object, Promise};
+use rquickjs_serde::{from_value, to_value};
 
 use super::builtins::{
     register_ai, register_cache, register_cmd, register_console, register_db, register_env,
     register_fetch, register_file_tools, register_fs, register_http, register_mail,
     register_realtime, register_root, register_util, register_zip,
 };
-use super::context::{ACTIVE_CONTEXT, ScriptContext};
+use super::context::ScriptContext;
 
-// --- PRELUDE ---
+// Helper struct to wrap non-Send QuickJS futures for Tokio's multithreaded runtime
+struct SendWrapper<F>(F);
+unsafe impl<F> Send for SendWrapper<F> {}
+
+impl<F: std::future::Future> std::future::Future for SendWrapper<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
+        inner.poll(cx)
+    }
+}
+
 const JS_PRELUDE: &str = r#"
     class Headers {
         constructor(init = {}) {
@@ -73,14 +85,12 @@ const JS_PRELUDE: &str = r#"
             }
             this.args = this.bodyData || {};
 
-            // Auto-resolve JWT Auth claims
             this.auth = null;
             const authHeader = this.headers.get("authorization");
             if (authHeader && authHeader.startsWith("Bearer ")) {
                 try {
                     const token = authHeader.split(" ")[1];
                     const payload = token.split(".")[1];
-                    // Safely pad and format Base64Url to standard Base64
                     let b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
                     while (b64.length % 4) b64 += '=';
                     
@@ -103,13 +113,9 @@ const JS_PRELUDE: &str = r#"
     class ApexKit {
         constructor(contextId = null) { 
             this.contextId = contextId;
-            // Determine which DB object to use
-            // If contextId is present, we MUST use $root.db (privileged).
-            // If contextId is null, we use $db (scoped).
             this.dbRef = this.contextId ? globalThis.$root?.db : globalThis.$db;
             
             if (this.contextId && !this.dbRef) {
-                // If user tried to switch context but $root is missing (i.e. running in tenant script)
                 throw new Error("Access Denied: Root scope required for context switching.");
             }
         }
@@ -117,7 +123,6 @@ const JS_PRELUDE: &str = r#"
         tenant(id) { return new ApexKit("tenant:" + id); }
         sandbox(id) { return new ApexKit("sandbox:" + id); }
 
-        // Helper to pass context ONLY if using root db
         _call(method, ...args) {
              if (this.contextId) {
                  return method(this.contextId, ...args);
@@ -196,17 +201,13 @@ const JS_PRELUDE: &str = r#"
         }
     }
     globalThis.URL = URL;
-
     globalThis.ApexKit = ApexKit;
-    // Default instance uses current scope ($db)
     globalThis.$apex = new ApexKit();
-
     globalThis.Headers = Headers;
     globalThis.Request = Request;
     globalThis.Response = Response;
-    // --- STANDARD FETCH IMPLEMENTATION ---
+
     globalThis.fetch = async function(url, options = {}) {
-        // Normalize headers to a simple object for the Rust layer
         let headersObj = {};
         if (options.headers) {
             if (options.headers instanceof Headers) {
@@ -216,14 +217,12 @@ const JS_PRELUDE: &str = r#"
             }
         }
 
-        // Call Native Rust Implementation
         const nativeRes = await $__native_fetch(url, {
             method: options.method || 'GET',
             headers: headersObj,
             body: options.body
         });
 
-        // Rehydrate into JS Response Object
         return new Response(nativeRes.body, {
             status: nativeRes.status,
             statusText: nativeRes.statusText,
@@ -234,11 +233,17 @@ const JS_PRELUDE: &str = r#"
 "#;
 
 #[derive(Clone)]
-pub struct ScriptEngine;
+pub struct ScriptEngine {
+    runtime: AsyncRuntime,
+}
+
+unsafe impl Send for ScriptEngine {}
+unsafe impl Sync for ScriptEngine {}
 
 impl ScriptEngine {
     pub async fn new() -> Self {
-        Self
+        let runtime = AsyncRuntime::new().unwrap();
+        Self { runtime }
     }
 
     pub async fn run_script(
@@ -246,106 +251,104 @@ impl ScriptEngine {
         code: &str,
         input_data: JsonValue,
         context: Arc<dyn ScriptContext>,
-        base_url: Option<String>,
+        _base_url: Option<String>,
         headers: Option<HashMap<String, String>>,
         method: Option<String>,
         url: Option<String>,
     ) -> Result<JsonValue, String> {
-        self.execute_js_task(code, context, base_url, move |ctx| {
-            let js_body = JsValue::from_json(&input_data, ctx).map_err(|e| e.to_string())?;
+        let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
+            .map_err(|e| e.to_string())?;
+        let code_cleaned = re_config.replace_all(code, "");
+        let processed_code = code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
 
-            // 1. Build Headers Object
-            let mut header_init = ObjectInitializer::new(ctx);
-            if let Some(h) = headers {
-                for (k, v) in h {
-                    header_init.property(JsString::from(k), JsString::from(v), Attribute::all());
+        let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+
+        let runtime = self.runtime.clone();
+
+        // Wrap the ENTIRE async block in SendWrapper so AsyncContext pointers never leak Send bounds
+        let task = SendWrapper(async move {
+            let ctx = AsyncContext::full(&runtime)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            #[allow(deprecated)]
+            rquickjs::async_with!(ctx => |js_ctx| {
+                setup_quickjs(&js_ctx, context.clone())?;
+
+                js_ctx
+                    .eval::<(), _>(processed_code.as_str())
+                    .catch(&js_ctx)
+                    .map_err(|e| format!("Script Syntax Error: {}", e))?;
+
+                let req_data = json!({
+                    "url": url.unwrap_or_else(|| "http://localhost".to_string()),
+                    "method": method.unwrap_or_else(|| "POST".to_string()),
+                    "headers": headers.unwrap_or_default(),
+                    "bodyData": input_data
+                });
+
+                let js_req_data = to_value(js_ctx.clone(), &req_data).map_err(|e| e.to_string())?;
+                let globals = js_ctx.globals();
+
+                let req_class: Function = js_ctx.eval("(data) => new Request(data)").unwrap();
+                let request_obj: Object = req_class.call((js_req_data,)).map_err(|e| e.to_string())?;
+
+                let handler: Function = globals
+                    .get("__mainHandler")
+                    .map_err(|_| "No 'export default' found".to_string())?;
+
+                let promise: Promise = handler
+                    .call((request_obj,))
+                    .catch(&js_ctx)
+                    .map_err(|e| e.to_string())?;
+
+                let result_val: rquickjs::Value = promise
+                    .into_future::<rquickjs::Value>()
+                    .await
+                    .catch(&js_ctx)
+                    .map_err(|e| format!("Script Execution Error: {}", e))?;
+
+                if let Some(obj) = result_val.as_object() {
+                    if obj.contains_key("body").unwrap_or(false)
+                        && obj.contains_key("status").unwrap_or(false)
+                    {
+                        let status_val: rquickjs::Value = obj
+                            .get("status")
+                            .unwrap_or(rquickjs::Value::new_null(js_ctx.clone()));
+                        let status_code: u16 = from_value(status_val).unwrap_or(200);
+
+                        let body_val: rquickjs::Value = obj
+                            .get("body")
+                            .unwrap_or(rquickjs::Value::new_null(js_ctx.clone()));
+
+                        let body_json = if let Some(js_str) = body_val.as_string() {
+                            let rust_str = js_str.to_string().unwrap_or_default();
+                            serde_json::from_str(&rust_str)
+                                .unwrap_or(serde_json::Value::String(rust_str))
+                        } else {
+                            from_value(body_val).unwrap_or(serde_json::Value::Null)
+                        };
+
+                        return Ok::<JsonValue, String>(json!({
+                            "__is_apex_response": true,
+                            "status": status_code,
+                            "body": body_json
+                        }));
+                    }
                 }
-            }
-            let js_headers = header_init.build();
 
-            // 2. Build Request Init
-            let request_cls = ctx
-                .global_object()
-                .get(JsString::from("Request"), ctx)
-                .unwrap();
-            let req_init = ObjectInitializer::new(ctx)
-                .property(
-                    JsString::from("method"),
-                    JsString::from(method.unwrap_or_else(|| "POST".to_string())),
-                    Attribute::all(),
-                )
-                .property(JsString::from("body"), js_body, Attribute::all())
-                .property(JsString::from("headers"), js_headers, Attribute::all())
-                .build();
+                let json_res: JsonValue = from_value(result_val).unwrap_or(JsonValue::Null);
+                Ok::<JsonValue, String>(json_res)
+            }).await
+        });
 
-            let url_val = url.unwrap_or_else(|| "http://localhost".to_string());
-
-            let request_obj = request_cls
-                .as_constructor()
-                .unwrap()
-                .construct(
-                    &[
-                        JsValue::from(JsString::from(url_val)),
-                        JsValue::from(req_init),
-                    ],
-                    Some(&request_cls.as_object().unwrap()),
-                    ctx,
-                )
-                .map_err(|e| format!("Failed to create Request: {}", e))?;
-
-            let handler = ctx
-                .global_object()
-                .get(JsString::from("__mainHandler"), ctx);
-            let promise = match handler {
-                Ok(h) if h.is_callable() => {
-                    h.as_callable()
-                        .unwrap()
-                        .call(&JsValue::undefined(), &[request_obj.into()], ctx)
-                }
-                _ => return Err("No 'export default' found".to_string()),
-            };
-
-            let _ = ctx.run_jobs();
-            let final_val = Self::resolve_promise(promise, ctx)?;
-
-            // THE FIX: Intercept JS Response objects, extract status, and parse stringified bodies safely
-            if let Some(obj) = final_val.as_object()
-                && obj
-                    .has_property(JsString::from("body"), ctx)
-                    .unwrap_or(false)
-                && obj
-                    .has_property(JsString::from("status"), ctx)
-                    .unwrap_or(false)
-            {
-                let body = obj.get(JsString::from("body"), ctx).unwrap_or_default();
-                let status = obj.get(JsString::from("status"), ctx).unwrap_or_default();
-
-                let status_code = status.to_number(ctx).unwrap_or(200.0) as u16;
-
-                // Safely parse body if it is a stringified JSON (fixes double stringification)
-                let body_json = if let Some(js_str) = body.as_string() {
-                    let rust_str = js_str.to_std_string_escaped();
-                    serde_json::from_str(&rust_str).unwrap_or(serde_json::Value::String(rust_str))
-                } else {
-                    body.to_json(ctx)
-                        .unwrap_or(None)
-                        .unwrap_or(serde_json::Value::Null)
-                };
-
-                return Ok(serde_json::json!({
-                    "__is_apex_response": true,
-                    "status": status_code,
-                    "body": body_json
-                }));
-            }
-
-            let json = final_val
-                .to_json(ctx)
-                .unwrap_or(None)
-                .unwrap_or(serde_json::Value::Null);
-            Ok(serde_json::to_value(json).unwrap_or(JsonValue::Null))
-        })
-        .await
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
+            Ok(res) => res,
+            Err(_) => Err(format!("Script timed out after {} seconds.", timeout_secs)),
+        }
     }
 
     pub async fn run_hook(
@@ -353,264 +356,159 @@ impl ScriptEngine {
         code: &str,
         event_data: JsonValue,
         context: Arc<dyn ScriptContext>,
-        base_url: Option<String>,
-        scope: Option<EventScope>,
+        _base_url: Option<String>,
+        _scope: Option<EventScope>,
     ) -> Result<Option<JsonValue>, String> {
-        let _actual_scope = scope.unwrap_or(EventScope::Root);
-        let wrapped_code = format!(
-            r#"
-            (async () => {{
-                {}
-                const e = globalThis.__hook_context__;
-                if (globalThis.__mainHandler) {{ return await globalThis.__mainHandler(e); }}
-                return null;
-            }})()
-        "#,
-            code
-        );
-
-        self.execute_js_task(&wrapped_code, context, base_url, move |ctx| {
-            let js_event = JsValue::from_json(&event_data, ctx).map_err(|e| e.to_string())?;
-            ctx.register_global_property(
-                JsString::from("__hook_context__"),
-                js_event.clone(),
-                Attribute::all(),
-            )
-            .unwrap();
-
-            let handler = ctx
-                .global_object()
-                .get(JsString::from("__mainHandler"), ctx);
-            let promise = match handler {
-                Ok(h) if h.is_callable() => {
-                    h.as_callable()
-                        .unwrap()
-                        .call(&JsValue::undefined(), &[js_event], ctx)
-                }
-                _ => return Ok(None),
-            };
-
-            let _ = ctx.run_jobs();
-            let final_val = Self::resolve_promise(promise, ctx)?;
-
-            if final_val.is_null() || final_val.is_undefined() {
-                return Ok(None);
-            }
-
-            // [FIX] Only check boolean if the value is actually a boolean type.
-            // Objects/Strings/Numbers should NOT trigger this check.
-            if let Some(b) = final_val.as_boolean()
-                && !b
-            {
-                return Err("Hook blocked operation".to_string());
-            }
-
-            if final_val.is_object() {
-                let json = final_val.to_json(ctx).unwrap().unwrap();
-                return Ok(Some(json));
-            }
-            Ok(None)
-        })
-        .await
-    }
-
-    async fn execute_js_task<F, R>(
-        &self,
-        code: &str,
-        context: Arc<dyn ScriptContext>,
-        base_url: Option<String>,
-        task_logic: F,
-    ) -> Result<R, String>
-    where
-        F: FnOnce(&mut Context) -> Result<R, String> + Send + 'static,
-        R: Send + 'static,
-    {
         let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
             .map_err(|e| e.to_string())?;
         let code_cleaned = re_config.replace_all(code, "");
-        let processed_code =
-            code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
+        let processed_code = code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
 
-        let handle = tokio::runtime::Handle::current();
-
-        // Get TX from context
-        let tx = Some(context.get_realtime_tx());
-        let execution_scope = context.get_scope();
-
-        // 1. Get Timeout
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30); // Default 30s
+            .unwrap_or(30);
 
-        let execution_future = tokio::task::spawn_blocking(move || -> Result<R, String> {
-            let mut context_boa = Context::default();
-            ACTIVE_CONTEXT.with(|c| {
-                *c.borrow_mut() = Some((context, handle.clone(), base_url, tx, execution_scope));
-            });
-            Self::setup_boa(&mut context_boa)?;
+        let runtime = self.runtime.clone();
 
-            // Check for interrupts or inject limiter? Boa has some support but simple OS thread timeout is hard.
-            // However, spawn_blocking runs on a thread. We can't easily kill it if it loops infinitely in pure JS (no async yields).
-            // But we can timeout the *waiting* for it. The thread might leak if it's an infinite loop,
-            // but the API will respond with timeout.
-            // Ideally, we inject an instruction limit or use `context_boa.set_interrupt_handler`.
+        // Wrap the ENTIRE async block in SendWrapper
+        let task = SendWrapper(async move {
+            let ctx = AsyncContext::full(&runtime)
+                .await
+                .map_err(|e| e.to_string())?;
 
-            if let Err(e) =
-                context_boa.eval(boa_engine::Source::from_bytes(processed_code.as_bytes()))
-            {
-                return Err(format!("Script Syntax Error: {}", e));
-            }
-            task_logic(&mut context_boa)
+            #[allow(deprecated)]
+            rquickjs::async_with!(ctx => |js_ctx| {
+                setup_quickjs(&js_ctx, context.clone())?;
+
+                js_ctx
+                    .eval::<(), _>(processed_code.as_str())
+                    .catch(&js_ctx)
+                    .map_err(|e| format!("Script Syntax Error: {}", e))?;
+
+                let js_event = to_value(js_ctx.clone(), &event_data).map_err(|e| e.to_string())?;
+                let globals = js_ctx.globals();
+
+                if let Ok(handler) = globals.get::<_, Function>("__mainHandler") {
+                    let promise: Promise = handler
+                        .call((js_event,))
+                        .catch(&js_ctx)
+                        .map_err(|e| e.to_string())?;
+
+                    let result_val: rquickjs::Value = promise
+                        .into_future::<rquickjs::Value>()
+                        .await
+                        .catch(&js_ctx)
+                        .map_err(|e| e.to_string())?;
+
+                    if result_val.is_null() || result_val.is_undefined() {
+                        return Ok::<Option<JsonValue>, String>(None);
+                    }
+
+                    if let Some(b) = result_val.as_bool() {
+                        if !b {
+                            return Err("Hook blocked operation".to_string());
+                        }
+                    }
+
+                    let json_val: JsonValue = from_value(result_val).map_err(|e| e.to_string())?;
+                    Ok::<Option<JsonValue>, String>(Some(json_val))
+                } else {
+                    Ok::<Option<JsonValue>, String>(None)
+                }
+            }).await
         });
 
-        // 2. Wrap in Timeout
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            execution_future,
-        )
-        .await
-        {
-            Ok(join_res) => match join_res {
-                Ok(inner_res) => inner_res,
-                Err(e) => Err(format!("System Panic: {}", e)),
-            },
-            Err(_) => Err(format!("Script timed out after {} seconds.", timeout_secs)),
-        }
-    }
-
-    fn setup_boa(ctx: &mut Context) -> Result<(), String> {
-        ctx.eval(boa_engine::Source::from_bytes(JS_PRELUDE.as_bytes()))
-            .map_err(|e| format!("Prelude Error: {}", e))?;
-
-        register_console(ctx)?;
-        register_util(ctx)?;
-        register_http(ctx)?;
-        register_fetch(ctx)?;
-        register_file_tools(ctx)?;
-        register_fs(ctx)?;
-        register_zip(ctx)?;
-        register_db(ctx)?;
-        register_cmd(ctx)?;
-        register_run(ctx)?;
-        register_root(ctx)?;
-        register_env(ctx)?;
-        register_ai(ctx)?;
-        register_mail(ctx)?;
-        register_realtime(ctx)?;
-        register_cache(ctx)?;
-
-        Ok(())
-    }
-
-    fn resolve_promise(
-        val: Result<JsValue, JsError>,
-        _ctx: &mut Context,
-    ) -> Result<JsValue, String> {
-        let js_val = val.map_err(|e| e.to_string())?;
-        if let Some(p) = js_val.as_promise() {
-            match p.state() {
-                PromiseState::Fulfilled(v) => Ok(v),
-                PromiseState::Rejected(err) => Err(format!("Script Rejected: {}", err.display())),
-                PromiseState::Pending => {
-                    Err("Script did not complete (Pending Promise)".to_string())
-                }
-            }
-        } else {
-            Ok(js_val)
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
+            Ok(res) => res,
+            Err(_) => Err(format!("Hook timed out after {} seconds.", timeout_secs)),
         }
     }
 }
 
-// --- JS Return Helper ---
-pub fn return_json_promise(
-    ctx: &mut Context,
-    result: Result<serde_json::Value, String>,
-) -> JsResult<JsValue> {
-    let (promise, resolvers) = boa_engine::object::builtins::JsPromise::new_pending(ctx);
-    match result {
-        Ok(json_val) => {
-            let js_val = JsValue::from_json(&json_val, ctx).unwrap_or(JsValue::null());
-            resolvers
-                .resolve
-                .call(&JsValue::undefined(), &[js_val], ctx)?;
-        }
-        Err(e) => {
-            let err_msg = JsString::from(e);
-            resolvers
-                .reject
-                .call(&JsValue::undefined(), &[err_msg.into()], ctx)?;
-        }
-    }
-    Ok(promise.into())
+fn setup_quickjs<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    app_ctx: Arc<dyn ScriptContext>,
+) -> Result<(), String> {
+    ctx.eval::<(), _>(JS_PRELUDE)
+        .catch(ctx)
+        .map_err(|e| format!("Prelude Error: {}", e))?;
+
+    register_console(ctx, app_ctx.clone())?;
+    register_util(ctx, app_ctx.clone())?;
+    register_http(ctx, app_ctx.clone())?;
+    register_fetch(ctx, app_ctx.clone())?;
+    register_file_tools(ctx, app_ctx.clone())?;
+    register_fs(ctx, app_ctx.clone())?;
+    register_zip(ctx, app_ctx.clone())?;
+    register_db(ctx, app_ctx.clone())?;
+    register_cmd(ctx, app_ctx.clone())?;
+    register_run(ctx, app_ctx.clone())?;
+    register_root(ctx, app_ctx.clone())?;
+    register_env(ctx, app_ctx.clone())?;
+    register_ai(ctx, app_ctx.clone())?;
+    register_mail(ctx, app_ctx.clone())?;
+    register_realtime(ctx, app_ctx.clone())?;
+    register_cache(ctx, app_ctx.clone())?;
+
+    Ok(())
 }
 
-// --- MODULE REGISTRATIONS ---
+fn register_run<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    app_ctx: Arc<dyn ScriptContext>,
+) -> Result<(), String> {
+    let globals = ctx.globals();
+    let run_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-fn register_run(ctx: &mut Context) -> Result<(), String> {
-    let script_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let name = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        let payload = args
-            .get_or_undefined(1)
-            .to_json(ctx)
-            .unwrap()
-            .unwrap_or(json!({}));
+    let app_ctx_clone = app_ctx.clone();
+    let script_fn = Function::new(
+        ctx.clone(),
+        rquickjs::function::Async(move |js_ctx: rquickjs::Ctx<'js>, name: String, payload: rquickjs::Value<'js>| {
+            let app = app_ctx_clone.clone();
+            async move {
+                let payload_json: JsonValue = from_value(payload).unwrap_or(json!({}));
+                let current_scope = app.get_scope();
 
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((app, handle, _base_url, _, current_scope)) = &*c.borrow() {
-                handle.block_on(async {
-                    // 1. Get the DB for the CURRENT scope (e.g. Tenant DB)
-                    let local_db = resolve_db(None, app.clone()).await?;
+                let local_db = app.get_db();
+                let mut script_opt = local_db.get_script_by_name(&name).await.ok().flatten();
+                let mut exec_scope = current_scope.clone();
 
-                    // 2. Try to find the script in the LOCAL scope first.
-                    let mut script_opt = local_db.get_script_by_name(&name).await.ok().flatten();
-                    let mut exec_scope = current_scope.clone();
-
-                    // 3. If NOT FOUND LOCALLY and we are NOT in Root, check Root for a public script.
-                    if script_opt.is_none() && !matches!(current_scope, EventScope::Root) {
-                        // Visibility Check: Only 'public' scripts can be shared.
-                        if let Some(shared) = app.get_shared_script(&name).await
-                            && shared.visibility == "public"
-                        {
+                if script_opt.is_none() && !matches!(current_scope, EventScope::Root) {
+                    if let Some(shared) = app.get_shared_script(&name).await {
+                        if shared.visibility == "public" {
                             script_opt = Some(shared);
-                            // CRITICAL: Switch execution scope to Root for this call.
                             exec_scope = EventScope::Root;
                         }
                     }
+                }
 
-                    if let Some(script) = script_opt {
-                        if !script.active {
-                            return Err("Script is inactive".into());
-                        }
-
-                        let mut call_payload = payload.clone();
-                        if let Some(obj) = call_payload.as_object_mut() {
-                            obj.insert("__caller_scope".to_string(), json!(current_scope));
-                        }
-
-                        let res = app
-                            .execute_shared_script(script.code, call_payload, exec_scope)
-                            .await?;
-                        Ok(res)
-                    } else {
-                        Err(format!("Script '{}' not found or not accessible.", name))
+                if let Some(script) = script_opt {
+                    if !script.active {
+                        return Err(rquickjs::Error::Exception);
                     }
-                })
-            } else {
-                Err("Context lost".into())
+
+                    let mut call_payload = payload_json.clone();
+                    if let Some(obj) = call_payload.as_object_mut() {
+                        obj.insert("__caller_scope".to_string(), json!(current_scope));
+                    }
+
+                    let res = app
+                        .execute_shared_script(script.code, call_payload, exec_scope)
+                        .await
+                        .map_err(|_| rquickjs::Error::Exception)?;
+
+                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                } else {
+                    Err(rquickjs::Error::Exception)
+                }
             }
-        });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-        return_json_promise(ctx, result)
-    });
-
-    let obj = ObjectInitializer::new(ctx)
-        .function(script_fn, JsString::from("script"), 2)
-        .build();
-
-    ctx.register_global_property(JsString::from("$run"), obj, Attribute::all())
-        .map_err(|e| e.to_string())
+    run_obj.set("script", script_fn).map_err(|e| e.to_string())?;
+    globals.set("$run", run_obj).map_err(|e| e.to_string())?;
+    Ok(())
 }
+// =========================== apex-kit/crates/apexkit-core/src/scripting/engine.rs ends here ===========================

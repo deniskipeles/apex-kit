@@ -1,19 +1,22 @@
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/cmd.rs start here ===========================
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+use rquickjs::function::Async;
+use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs_serde::{from_value, to_value};
+use regex::Regex;
+use serde::Deserialize;
+use serde_json::json;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
+use super::super::context::ScriptContext;
 use crate::realtime::{DbEvent, EventScope};
-use crate::scripting::{ACTIVE_CONTEXT, return_json_promise};
-use boa_engine::{
-    Context, JsArgs, JsString, NativeFunction, object::ObjectInitializer, property::Attribute,
-};
-use regex::Regex;
-use serde_json::json;
-use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 // --- GLOBAL PROCESS TRACKER ---
 struct ProcessInfo {
@@ -26,7 +29,6 @@ struct ProcessInfo {
 
 static PROCESS_TRACKER: OnceLock<Mutex<HashMap<u32, ProcessInfo>>> = OnceLock::new();
 static SEMAPHORE_MAP: OnceLock<RwLock<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
-// [NEW] Use a high starting number for internal job tracking
 static JOB_COUNTER: AtomicU32 = AtomicU32::new(100000);
 
 fn get_tracker() -> &'static Mutex<HashMap<u32, ProcessInfo>> {
@@ -56,419 +58,339 @@ fn get_semaphore_for_program(program: &str) -> Arc<Semaphore> {
     write_map.get("*").unwrap().clone()
 }
 
-pub fn register_cmd(ctx: &mut Context) -> Result<(), String> {
-    let parse_options = |ctx: &mut Context,
-                         val: &boa_engine::JsValue|
-     -> (Option<String>, Option<HashMap<String, String>>, Option<u64>) {
-        let mut cwd = None;
-        let mut envs = None;
-        let mut timeout_ms = None;
+#[derive(Deserialize, Default)]
+struct CmdOptions {
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+    timeout: Option<u64>,
+    #[serde(rename = "onProgress")]
+    on_progress: Option<ProgressConfig>,
+}
 
-        if let Ok(Some(json)) = val.to_json(ctx)
-            && let Some(obj) = json.as_object()
-        {
-            cwd = obj
-                .get("cwd")
-                .and_then(|v: &serde_json::Value| v.as_str().map(|s| s.to_string()));
-            timeout_ms = obj
-                .get("timeout")
-                .and_then(|v: &serde_json::Value| v.as_u64());
+#[derive(Deserialize)]
+struct ProgressConfig {
+    regex: Option<String>,
+    channel: Option<String>,
+    event: Option<String>,
+}
 
-            if let Some(e) = obj
-                .get("env")
-                .and_then(|v: &serde_json::Value| v.as_object())
-            {
-                let mut map = HashMap::new();
-                for (k, v) in e {
-                    let val_str = if let Some(s) = v.as_str() {
-                        s.to_string()
-                    } else {
-                        v.to_string()
-                    };
-                    map.insert(k.clone(), val_str);
-                }
-                envs = Some(map);
-            }
-        }
-        (cwd, envs, timeout_ms)
-    };
+pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
+    let globals = ctx.globals();
+    let cmd_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-    // $cmd.setLimit(program, limit)
-    let set_limit_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let program = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        let limit = args.get_or_undefined(1).to_number(ctx).unwrap_or(2.0) as usize;
-
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((_, _, _, _, scope)) = &*c.borrow() {
-                if !matches!(scope, EventScope::Root) {
-                    return Err("Access Denied.".into());
+    // 1. $cmd.setLimit(program, limit)
+    let app_limit = app_ctx.clone();
+    let set_limit_fn = Function::new(
+        ctx.clone(),
+        Async(move |js_ctx: Ctx<'js>, program: String, limit: u32| {
+            let app = app_limit.clone();
+            async move {
+                if !matches!(app.get_scope(), EventScope::Root) {
+                    return Err(rquickjs::Error::Exception);
                 }
 
                 let mut map = get_semaphores().write().unwrap();
-                map.insert(program.clone(), Arc::new(Semaphore::new(limit)));
+                map.insert(program.clone(), Arc::new(Semaphore::new(limit as usize)));
 
-                Ok(json!({ "program": program, "limit": limit, "set": true }))
-            } else {
-                Err("Context lost".into())
+                let res = json!({ "program": program, "limit": limit, "set": true });
+                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
             }
-        });
-        return_json_promise(ctx, result)
-    });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-    // $cmd.run(program, args, options) -> Promise (Waiting)
-    let run_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let program = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        let args_val = args.get_or_undefined(1);
-        let options_val = args.get_or_undefined(2);
+    // 2. $cmd.run(program, args, options) -> Promise (Waiting)
+    let app_run = app_ctx.clone();
+    let run_fn = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, program: String, args_val: Value<'js>, opts_val: Option<Value<'js>>| {
+                let cmd_args: Vec<String> = from_value(args_val).unwrap_or_default();
+                let opts: CmdOptions = opts_val
+                    .and_then(|v| from_value(v).ok())
+                    .unwrap_or_default();
+                let app = app_run.clone();
 
-        let (cwd, envs, timeout_ms) = parse_options(ctx, options_val);
-        let mut cmd_args: Vec<String> = Vec::new();
+                async move {
+                    if !matches!(app.get_scope(), EventScope::Root) {
+                        return Err(rquickjs::Error::Exception);
+                    }
 
-        if let Ok(Some(json_val)) = args_val.to_json(ctx)
-            && let Some(arr) = json_val.as_array()
-        {
-            for v in arr {
-                if let Some(s) = v.as_str() {
-                    cmd_args.push(s.to_string());
-                } else {
-                    cmd_args.push(v.to_string());
-                }
-            }
-        }
-
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((_, handle, _, _, scope)) = &*c.borrow() {
-                if !matches!(scope, EventScope::Root) {
-                    return Err("Access Denied: $cmd is reserved for Root scripts.".into());
-                }
-
-                handle.block_on(async {
                     let sem = get_semaphore_for_program(&program);
-                    let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+                    let _permit = sem.acquire().await.map_err(|_| rquickjs::Error::Exception)?;
 
                     let mut command = tokio::process::Command::new(&program);
                     command.args(&cmd_args);
                     command.stdout(Stdio::piped());
                     command.stderr(Stdio::piped());
 
-                    if let Some(dir) = cwd {
+                    if let Some(dir) = opts.cwd {
                         command.current_dir(dir);
                     }
-                    if let Some(vars) = envs {
+                    if let Some(vars) = opts.env {
                         command.envs(vars);
                     }
 
-                    let ms = timeout_ms.unwrap_or(30_000);
+                    let ms = opts.timeout.unwrap_or(30_000);
                     let future = command.output();
 
-                    match timeout(std::time::Duration::from_millis(ms), future).await {
+                    let val = match timeout(Duration::from_millis(ms), future).await {
                         Ok(res) => match res {
-                            Ok(output) => Ok(json!({
+                            Ok(output) => json!({
                                 "stdout": String::from_utf8_lossy(&output.stdout),
                                 "stderr": String::from_utf8_lossy(&output.stderr),
                                 "status": output.status.code().unwrap_or(-1)
-                            })),
-                            Err(e) => Err(format!("Execution failed: {}", e)),
+                            }),
+                            Err(_) => return Err(rquickjs::Error::Exception),
                         },
-                        Err(_) => Err(format!("Command timed out after {}ms", ms)),
-                    }
-                })
-            } else {
-                Err("Context lost".into())
-            }
-        });
-
-        return_json_promise(ctx, result)
-    });
-
-    // $cmd.spawn(program, args, options) -> Promise<{ pid }> (Background)
-    let spawn_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let program = args
-            .get_or_undefined(0)
-            .to_string(ctx)?
-            .to_std_string_escaped();
-        let args_val = args.get_or_undefined(1);
-        let options_val = args.get_or_undefined(2);
-
-        let (cwd, envs, timeout_val) = parse_options(ctx, options_val);
-        let max_time = timeout_val.unwrap_or(3_600_000); // Default 1 hour
-
-        let mut cmd_args: Vec<String> = Vec::new();
-        if let Ok(Some(json_val)) = args_val.to_json(ctx)
-            && let Some(arr) = json_val.as_array()
-        {
-            for v in arr {
-                if let Some(s) = v.as_str() {
-                    cmd_args.push(s.to_string());
-                } else {
-                    cmd_args.push(v.to_string());
-                }
-            }
-        }
-
-        let mut progress_config = None;
-        if let Ok(Some(json)) = options_val.to_json(ctx)
-            && let Some(obj) = json.as_object()
-            && let Some(prog_obj) = obj.get("onProgress").and_then(|v| v.as_object())
-        {
-            let regex_str = prog_obj
-                .get("regex")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let channel = prog_obj
-                .get("channel")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let event_name = prog_obj
-                .get("event")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            if let (Some(r), Some(c), Some(e)) = (regex_str, channel, event_name) {
-                progress_config = Some((r, c, e));
-            }
-        }
-
-        let internal_id = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
-
-        {
-            let mut tracker = get_tracker().lock().unwrap();
-            tracker.insert(
-                internal_id,
-                ProcessInfo {
-                    pid: 0,
-                    program: program.clone(),
-                    start_time: Instant::now(),
-                    status: "queued".to_string(),
-                    exit_code: None,
-                },
-            );
-        }
-
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((_, handle, _, tx_opt, scope)) = &*c.borrow() {
-                if !matches!(scope, EventScope::Root) {
-                    return Err("Access Denied.".into());
-                }
-
-                let tx = tx_opt.clone();
-                let client_scope = scope.clone();
-                let program_clone = program.clone();
-
-                // [CRITICAL FIX]: Acquire semaphore INSIDE the spawned task!
-                handle.spawn(async move {
-                    let sem = get_semaphore_for_program(&program_clone);
-
-                    // The task pauses here if limit is reached, but the API request already returned!
-                    let permit = match sem.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            let mut tracker = get_tracker().lock().unwrap();
-                            if let Some(info) = tracker.get_mut(&internal_id) {
-                                info.status = format!("failed_sem: {}", e);
-                            }
-                            return;
-                        }
+                        Err(_) => return Err(rquickjs::Error::Exception),
                     };
+
+                    to_value(js_ctx, &val).map_err(|_| rquickjs::Error::Exception)
+                }
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 3. $cmd.spawn(program, args, options) -> Promise<{ pid }> (Background)
+    let app_spawn = app_ctx.clone();
+    let spawn_fn = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, program: String, args_val: Value<'js>, opts_val: Option<Value<'js>>| {
+                let cmd_args: Vec<String> = from_value(args_val).unwrap_or_default();
+                let opts: CmdOptions = opts_val
+                    .and_then(|v| from_value(v).ok())
+                    .unwrap_or_default();
+                let app = app_spawn.clone();
+
+                async move {
+                    if !matches!(app.get_scope(), EventScope::Root) {
+                        return Err(rquickjs::Error::Exception);
+                    }
+
+                    let max_time = opts.timeout.unwrap_or(3_600_000); // Default 1 hour
+                    let internal_id = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
 
                     {
                         let mut tracker = get_tracker().lock().unwrap();
-                        if let Some(info) = tracker.get_mut(&internal_id) {
-                            info.status = "running".to_string();
-                            info.start_time = Instant::now();
-                        }
+                        tracker.insert(
+                            internal_id,
+                            ProcessInfo {
+                                pid: 0,
+                                program: program.clone(),
+                                start_time: Instant::now(),
+                                status: "queued".to_string(),
+                                exit_code: None,
+                            },
+                        );
                     }
 
-                    let mut command = tokio::process::Command::new(&program_clone);
-                    command.args(&cmd_args);
-                    command.stdout(Stdio::piped());
-                    command.stderr(Stdio::piped());
-                    command.stdin(Stdio::null());
-                    command.kill_on_drop(true);
+                    let client_scope = app.get_scope();
+                    let tx = Some(app.get_realtime_tx());
+                    let program_clone = program.clone();
 
-                    if let Some(dir) = cwd {
-                        command.current_dir(dir);
-                    }
-                    if let Some(vars) = envs {
-                        command.envs(vars);
-                    }
+                    tokio::spawn(async move {
+                        let sem = get_semaphore_for_program(&program_clone);
 
-                    match command.spawn() {
-                        Ok(mut child) => {
-                            let os_pid = child.id().unwrap_or(0);
-                            {
+                        let permit = match sem.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(e) => {
                                 let mut tracker = get_tracker().lock().unwrap();
                                 if let Some(info) = tracker.get_mut(&internal_id) {
-                                    info.pid = os_pid;
+                                    info.status = format!("failed_sem: {}", e);
                                 }
+                                return;
                             }
+                        };
 
-                            if let Some((regex_pattern, channel_name, event_name)) = progress_config
-                                && let Some(stderr) = child.stderr.take()
-                                && let Some(broadcaster) = tx
-                            {
-                                let reader = BufReader::new(stderr);
-                                let scoped_channel = if channel_name.contains("::") {
-                                    channel_name.clone()
-                                } else {
-                                    match &client_scope {
-                                        EventScope::Root => format!("root::{}", channel_name),
-                                        EventScope::Tenant(id) => {
-                                            format!("tenant_{}::{}", id, channel_name)
-                                        }
-                                        EventScope::Sandbox(id) => {
-                                            format!("sandbox_{}::{}", id, channel_name)
-                                        }
-                                        _ => channel_name.clone(),
+                        {
+                            let mut tracker = get_tracker().lock().unwrap();
+                            if let Some(info) = tracker.get_mut(&internal_id) {
+                                info.status = "running".to_string();
+                                info.start_time = Instant::now();
+                            }
+                        }
+
+                        let mut command = tokio::process::Command::new(&program_clone);
+                        command.args(&cmd_args);
+                        command.stdout(Stdio::piped());
+                        command.stderr(Stdio::piped());
+                        command.stdin(Stdio::null());
+                        command.kill_on_drop(true);
+
+                        if let Some(dir) = opts.cwd {
+                            command.current_dir(dir);
+                        }
+                        if let Some(vars) = opts.env {
+                            command.envs(vars);
+                        }
+
+                        match command.spawn() {
+                            Ok(mut child) => {
+                                let os_pid = child.id().unwrap_or(0);
+                                {
+                                    let mut tracker = get_tracker().lock().unwrap();
+                                    if let Some(info) = tracker.get_mut(&internal_id) {
+                                        info.pid = os_pid;
                                     }
-                                };
+                                }
 
-                                tokio::spawn(async move {
-                                    if let Ok(re) = Regex::new(&regex_pattern) {
-                                        let mut lines = reader.lines();
-                                        while let Ok(Some(line)) = lines.next_line().await {
-                                            if let Some(caps) = re.captures(&line) {
-                                                let val =
-                                                    caps.get(1).map(|m| m.as_str()).unwrap_or(
-                                                        caps.get(0)
-                                                            .map(|m| m.as_str())
-                                                            .unwrap_or(""),
-                                                    );
-                                                let event = DbEvent::Custom {
-                                                    event: event_name.clone(),
-                                                    data: json!({ "value": val, "raw": line }),
-                                                    scope: EventScope::Channel(
-                                                        scoped_channel.clone(),
-                                                    ),
-                                                };
-                                                let _ = broadcaster.send(event);
+                                if let Some(prog) = opts.on_progress
+                                    && let (Some(regex_pattern), Some(channel_name), Some(event_name)) = (prog.regex, prog.channel, prog.event)
+                                    && let Some(stderr) = child.stderr.take()
+                                    && let Some(broadcaster) = tx
+                                {
+                                    let reader = BufReader::new(stderr);
+                                    let scoped_channel = if channel_name.contains("::") {
+                                        channel_name.clone()
+                                    } else {
+                                        match &client_scope {
+                                            EventScope::Root => format!("root::{}", channel_name),
+                                            EventScope::Tenant(id) => format!("tenant_{}::{}", id, channel_name),
+                                            EventScope::Sandbox(id) => format!("sandbox_{}::{}", id, channel_name),
+                                            _ => channel_name.clone(),
+                                        }
+                                    };
+
+                                    tokio::spawn(async move {
+                                        if let Ok(re) = Regex::new(&regex_pattern) {
+                                            let mut lines = reader.lines();
+                                            while let Ok(Some(line)) = lines.next_line().await {
+                                                if let Some(caps) = re.captures(&line) {
+                                                    let val = caps
+                                                        .get(1)
+                                                        .map(|m| m.as_str())
+                                                        .unwrap_or(caps.get(0).map(|m| m.as_str()).unwrap_or(""));
+                                                    let event = DbEvent::Custom {
+                                                        event: event_name.clone(),
+                                                        data: json!({ "value": val, "raw": line }),
+                                                        scope: EventScope::Channel(scoped_channel.clone()),
+                                                    };
+                                                    let _ = broadcaster.send(event);
+                                                }
                                             }
                                         }
-                                    }
-                                });
-                            }
+                                    });
+                                }
 
-                            let _permit_guard = permit;
-                            let wait_future = child.wait();
-                            let result =
-                                timeout(Duration::from_millis(max_time), wait_future).await;
+                                let _permit_guard = permit;
+                                let wait_future = child.wait();
+                                let result = timeout(Duration::from_millis(max_time), wait_future).await;
 
-                            let mut tracker = get_tracker().lock().unwrap();
-                            if let Some(info) = tracker.get_mut(&internal_id) {
-                                match result {
-                                    Ok(Ok(status)) => {
-                                        info.status = "completed".to_string();
-                                        info.exit_code = status.code();
-                                    }
-                                    Ok(Err(_)) => {
-                                        info.status = "failed".to_string();
-                                    }
-                                    Err(_) => {
-                                        info.status = "timed_out".to_string();
+                                let mut tracker = get_tracker().lock().unwrap();
+                                if let Some(info) = tracker.get_mut(&internal_id) {
+                                    match result {
+                                        Ok(Ok(status)) => {
+                                            info.status = "completed".to_string();
+                                            info.exit_code = status.code();
+                                        }
+                                        Ok(Err(_)) => {
+                                            info.status = "failed".to_string();
+                                        }
+                                        Err(_) => {
+                                            info.status = "timed_out".to_string();
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            let mut tracker = get_tracker().lock().unwrap();
-                            if let Some(info) = tracker.get_mut(&internal_id) {
-                                info.status = format!("spawn_failed: {}", e);
+                            Err(e) => {
+                                let mut tracker = get_tracker().lock().unwrap();
+                                if let Some(info) = tracker.get_mut(&internal_id) {
+                                    info.status = format!("spawn_failed: {}", e);
+                                }
                             }
                         }
-                    }
-                });
+                    });
 
-                // Return immediately
-                Ok(json!({ "pid": internal_id, "status": "queued" }))
-            } else {
-                Err("Context lost".into())
-            }
-        });
+                    let val = json!({ "pid": internal_id, "status": "queued" });
+                    to_value(js_ctx, &val).map_err(|_| rquickjs::Error::Exception)
+                }
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
 
-        return_json_promise(ctx, result)
-    });
-
-    // $cmd.status(pid)
-    let status_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let pid = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as u32;
-
-        let result = ACTIVE_CONTEXT.with(|c| {
-            if let Some((_, _, _, _, scope)) = &*c.borrow() {
-                if !matches!(scope, EventScope::Root) {
-                    return Err("Access Denied.".into());
+    // 4. $cmd.status(pid)
+    let app_status = app_ctx.clone();
+    let status_fn = Function::new(
+        ctx.clone(),
+        Async(move |js_ctx: Ctx<'js>, pid: u32| {
+            let app = app_status.clone();
+            async move {
+                if !matches!(app.get_scope(), EventScope::Root) {
+                    return Err(rquickjs::Error::Exception);
                 }
 
                 let tracker = get_tracker().lock().unwrap();
-                if let Some(info) = tracker.get(&pid) {
-                    Ok(json!({
-                        "pid": info.pid, // Real OS pid if running, 0 if queued
-                        "job_id": pid,   // The internal tracking ID
+                let val = if let Some(info) = tracker.get(&pid) {
+                    json!({
+                        "pid": info.pid,
+                        "job_id": pid,
                         "program": info.program,
                         "status": info.status,
                         "exit_code": info.exit_code,
                         "runtime_ms": info.start_time.elapsed().as_millis() as u64
-                    }))
+                    })
                 } else {
-                    Ok(json!({ "status": "unknown", "job_id": pid }))
-                }
-            } else {
-                Err("Context lost".into())
+                    json!({ "status": "unknown", "job_id": pid })
+                };
+
+                to_value(js_ctx, &val).map_err(|_| rquickjs::Error::Exception)
             }
-        });
-        return_json_promise(ctx, result)
-    });
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-    // $cmd.kill(pid)
-    let kill_fn = NativeFunction::from_copy_closure(move |_, args, ctx| {
-        let internal_pid = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0) as u32;
+    // 5. $cmd.kill(pid)
+    let app_kill = app_ctx.clone();
+    let kill_fn = Function::new(
+        ctx.clone(),
+        Async(move |js_ctx: Ctx<'js>, internal_pid: u32| {
+            let app = app_kill.clone();
+            async move {
+                if !matches!(app.get_scope(), EventScope::Root) {
+                    return Err(rquickjs::Error::Exception);
+                }
 
-        let result = ACTIVE_CONTEXT.with(|c| {
-             if let Some((_, handle, _, _, scope)) = &*c.borrow() {
-                 if !matches!(scope, EventScope::Root) { return Err("Access Denied.".into()); }
+                let os_pid = {
+                    let tracker = get_tracker().lock().unwrap();
+                    tracker.get(&internal_pid).map(|i| i.pid).unwrap_or(0)
+                };
 
-                 let os_pid = {
-                     let tracker = get_tracker().lock().unwrap();
-                     tracker.get(&internal_pid).map(|i| i.pid).unwrap_or(0)
-                 };
+                if os_pid == 0 {
+                    let val = json!({ "killed": false, "error": "Process not running or unkillable" });
+                    return to_value(js_ctx, &val).map_err(|_| rquickjs::Error::Exception);
+                }
 
-                 if os_pid == 0 {
-                     return Ok(json!({ "killed": false, "error": "Process not running or unkillable" }));
-                 }
+                #[cfg(unix)]
+                {
+                    use std::process::Command;
+                    let output = Command::new("kill").arg("-9").arg(os_pid.to_string()).output();
+                    let val = match output {
+                        Ok(o) if o.status.success() => json!({ "killed": true, "job_id": internal_pid }),
+                        _ => json!({ "killed": false, "job_id": internal_pid, "error": "Process not found or access denied" })
+                    };
+                    to_value(js_ctx, &val).map_err(|_| rquickjs::Error::Exception)
+                }
+                #[cfg(not(unix))]
+                {
+                    let val = json!({ "killed": false, "error": "Kill not implemented for this platform" });
+                    to_value(js_ctx, &val).map_err(|_| rquickjs::Error::Exception)
+                }
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
-                 handle.block_on(async {
-                     #[cfg(unix)]
-                     {
-                         use std::process::Command;
-                         let output = Command::new("kill").arg("-9").arg(os_pid.to_string()).output();
-                         match output {
-                             Ok(o) if o.status.success() => Ok(json!({ "killed": true, "job_id": internal_pid })),
-                             _ => Ok(json!({ "killed": false, "job_id": internal_pid, "error": "Process not found or access denied" }))
-                         }
-                     }
-                     #[cfg(not(unix))]
-                     {
-                         Ok(json!({ "killed": false, "error": "Kill not implemented for this platform" }))
-                     }
-                 })
-             } else { Err("Context lost".into()) }
-        });
-        return_json_promise(ctx, result)
-    });
+    cmd_obj.set("run", run_fn).map_err(|e| e.to_string())?;
+    cmd_obj.set("spawn", spawn_fn).map_err(|e| e.to_string())?;
+    cmd_obj.set("status", status_fn).map_err(|e| e.to_string())?;
+    cmd_obj.set("setLimit", set_limit_fn).map_err(|e| e.to_string())?;
+    cmd_obj.set("kill", kill_fn).map_err(|e| e.to_string())?;
 
-    let obj = ObjectInitializer::new(ctx)
-        .function(run_fn, JsString::from("run"), 3)
-        .function(spawn_fn, JsString::from("spawn"), 3)
-        .function(status_fn, JsString::from("status"), 1)
-        .function(set_limit_fn, JsString::from("setLimit"), 2)
-        .function(kill_fn, JsString::from("kill"), 1)
-        .build();
-
-    ctx.register_global_property(JsString::from("$cmd"), obj, Attribute::all())
-        .map_err(|e| e.to_string())
+    globals.set("$cmd", cmd_obj).map_err(|e| e.to_string())?;
+    Ok(())
 }
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/cmd.rs ends here ===========================

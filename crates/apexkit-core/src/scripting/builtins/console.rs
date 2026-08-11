@@ -1,64 +1,64 @@
-use crate::realtime::EventScope;
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/console.rs start here ===========================
+use rquickjs::prelude::{Async, Rest};
+use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs_serde::from_value;
+use std::sync::Arc;
 
-use super::super::context::ACTIVE_CONTEXT;
-use boa_engine::{
-    Context, JsString, JsValue, NativeFunction, object::ObjectInitializer, property::Attribute,
-};
+use super::super::context::ScriptContext;
 
-// --- MODULE REGISTRATIONS ---
+pub fn register_console<'js>(
+    ctx: &Ctx<'js>,
+    app_ctx: Arc<dyn ScriptContext>,
+) -> Result<(), String> {
+    let globals = ctx.globals();
+    let console_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-pub fn register_console(ctx: &mut Context) -> Result<(), String> {
-    let make_logger = |level: &'static str| {
-        NativeFunction::from_copy_closure(move |_, args, ctx| {
-            let msg = args
-                .iter()
-                .map(|a| a.to_string(ctx).unwrap_or_default().to_std_string_escaped())
-                .collect::<Vec<_>>()
-                .join(" ");
+    let make_logger = |level: &'static str, app_ctx_inner: Arc<dyn ScriptContext>| {
+        let app = app_ctx_inner.clone();
 
-            ACTIVE_CONTEXT.with(|c| {
-                if let Some((app, handle, _, _, scope)) = &*c.borrow() {
-                    let is_root = matches!(scope, EventScope::Root);
-                    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "true";
-
-                    if is_root && debug_mode {
-                        if level == "error" {
-                            eprintln!("[SCRIPT ERROR] {}", msg);
-                        } else {
-                            println!("[SCRIPT {}] {}", level.to_uppercase(), msg);
+        Function::new(
+            ctx.clone(),
+            Async(move |args: Rest<Value<'js>>| {
+                let app_clone = app.clone();
+                async move {
+                    let mut formatted = Vec::new();
+                    for arg in args.0 {
+                        if let Ok(json_val) = from_value::<serde_json::Value>(arg) {
+                            if let Some(s) = json_val.as_str() {
+                                formatted.push(s.to_string());
+                            } else {
+                                formatted.push(json_val.to_string());
+                            }
                         }
                     }
+                    let msg = formatted.join(" ");
 
-                    handle.block_on(async {
-                        let db = match scope {
-                            EventScope::Tenant(id) => app.resolve_tenant_db(id).await,
-                            EventScope::Sandbox(id) => app.resolve_sandbox_db(id).await,
-                            _ => Some(app.get_db()),
-                        };
+                    let db = app_clone.get_db();
+                    let _ = db.log_system_event(level, "script", &msg).await;
 
-                        if let Some(db) = db {
-                            let _ = db.log_system_event(level, "script", &msg).await;
-                        }
-                    });
+                    Ok::<(), rquickjs::Error>(()) // <-- Type explicitly at the end!
                 }
-            });
-
-            Ok(JsValue::undefined())
-        })
+            }),
+        )
+        .unwrap()
     };
 
-    let log_fn = make_logger("info");
-    let info_fn = make_logger("info");
-    let warn_fn = make_logger("warning");
-    let error_fn = make_logger("error");
+    console_obj
+        .set("log", make_logger("info", app_ctx.clone()))
+        .unwrap();
+    console_obj
+        .set("info", make_logger("info", app_ctx.clone()))
+        .unwrap();
+    console_obj
+        .set("warn", make_logger("warning", app_ctx.clone()))
+        .unwrap();
+    console_obj
+        .set("error", make_logger("error", app_ctx.clone()))
+        .unwrap();
 
-    let obj = ObjectInitializer::new(ctx)
-        .function(log_fn, JsString::from("log"), 1)
-        .function(info_fn, JsString::from("info"), 1)
-        .function(warn_fn, JsString::from("warn"), 1)
-        .function(error_fn, JsString::from("error"), 1)
-        .build();
-
-    ctx.register_global_property(JsString::from("console"), obj, Attribute::all())
-        .map_err(|e| e.to_string())
+    globals
+        .set("console", console_obj)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
+// =========================== apex-kit/crates/apexkit-core/src/scripting/builtins/console.rs ends here ===========================
