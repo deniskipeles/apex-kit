@@ -112,11 +112,10 @@ const JS_PRELUDE: &str = r#"
     class ApexKit {
         constructor(contextId = null) { 
             this.contextId = contextId;
-            this.dbRef = this.contextId ? globalThis.$root?.db : globalThis.$db;
-            
-            if (this.contextId && !this.dbRef) {
-                throw new Error("Access Denied: Root scope required for context switching.");
-            }
+        }
+
+        get dbRef() {
+            return this.contextId ? globalThis.$root?.db : globalThis.$db;
         }
         
         tenant(id) { return new ApexKit("tenant:" + id); }
@@ -132,15 +131,14 @@ const JS_PRELUDE: &str = r#"
 
         collection(name) {
             const self = this;
-            const rec = this.dbRef.records;
             return {
-                list: async (opts) => self._call(rec.list, name, opts),
-                get: async (id, opts) => self._call(rec.get, name, id, opts?.expand),
-                create: async (data) => self._call(rec.create, name, data),
-                update: async (id, data) => self._call(rec.update, name, id, data),
-                delete: async (id) => self._call(rec.delete, name, id),
-                searchVector: async (f, v, l) => self._call(rec.searchVector, name, f, v, l),
-                getVector: async (id) => self._call(rec.getVector, name, id)
+                list: async (opts) => self._call(self.dbRef.records.list, name, opts),
+                get: async (id, opts) => self._call(self.dbRef.records.get, name, id, opts?.expand),
+                create: async (data) => self._call(self.dbRef.records.create, name, data),
+                update: async (id, data) => self._call(self.dbRef.records.update, name, id, data),
+                delete: async (id) => self._call(self.dbRef.records.delete, name, id),
+                searchVector: async (f, v, l) => self._call(self.dbRef.records.searchVector, name, f, v, l),
+                getVector: async (id) => self._call(self.dbRef.records.getVector, name, id)
             };
         }
         
@@ -150,27 +148,24 @@ const JS_PRELUDE: &str = r#"
         
         get users() {
             const self = this;
-            const u = this.dbRef.users;
             return {
-                create: async (e, p, r) => self._call(u.create, e, p, r),
-                get: async (e) => self._call(u.get, e)
-            }
+                create: async (e, p, r) => self._call(self.dbRef.users.create, e, p, r),
+                get: async (e) => self._call(self.dbRef.users.get, e)
+            };
         }
         
         get collections() {
             const self = this;
-            const c = this.dbRef.collections;
             return {
-                list: async () => self._call(c.list)
-            }
+                list: async () => self._call(self.dbRef.collections.list)
+            };
         }
 
         get files() {
             const self = this;
-            const f = this.dbRef.files;
             return {
-                list: async (l, o) => self._call(f.list, l, o)
-            }
+                list: async (l, o) => self._call(self.dbRef.files.list, l, o)
+            };
         }
     }
     
@@ -242,6 +237,8 @@ unsafe impl Sync for ScriptEngine {}
 impl ScriptEngine {
     pub async fn new() -> Self {
         let runtime = AsyncRuntime::new().unwrap();
+        // Disable QuickJS C-stack size check to allow thread-swapping under Tokio
+        runtime.set_max_stack_size(0).await;
         Self { runtime }
     }
 
@@ -268,7 +265,6 @@ impl ScriptEngine {
 
         let runtime = self.runtime.clone();
 
-        // Wrap the ENTIRE async block in SendWrapper so AsyncContext pointers never leak Send bounds
         let task = SendWrapper(async move {
             let ctx = AsyncContext::full(&runtime)
                 .await
@@ -372,7 +368,6 @@ impl ScriptEngine {
 
         let runtime = self.runtime.clone();
 
-        // Wrap the ENTIRE async block in SendWrapper
         let task = SendWrapper(async move {
             let ctx = AsyncContext::full(&runtime)
                 .await

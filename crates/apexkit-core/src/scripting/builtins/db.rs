@@ -1,4 +1,4 @@
-use rquickjs::function::Async;
+use rquickjs::function::{Async, Rest};
 use rquickjs::{Ctx, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde_json::{Value as JsonValue, json};
@@ -80,91 +80,94 @@ pub fn create_db_object<'js>(
     let app_list = app_ctx.clone();
     let list_records = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>,
-                  a1: Value<'js>,
-                  a2: Option<Value<'js>>,
-                  a3: Option<Value<'js>>| {
-                let app = app_list.clone();
-                async move {
-                    let (ctx_id, col, opts_val) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let col_name = a2
-                                .and_then(|v| {
-                                    v.as_string().map(|s| s.to_string().unwrap_or_default())
-                                })
-                                .unwrap_or_default();
-                            (c_id, col_name, a3)
-                        }
-                        DbMode::Scoped => {
-                            let col_name = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            (None, col_name, a2)
-                        }
-                    };
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_list.clone();
+            async move {
+                let (ctx_id, col, opts_val) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let col_name = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let opts = args.0.get(2).cloned();
+                        (c_id, col_name, opts)
+                    }
+                    DbMode::Scoped => {
+                        let col_name = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let opts = args.0.get(1).cloned();
+                        (None, col_name, opts)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let col_id = resolve_collection_local(db.clone(), &col)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let col_id = resolve_collection_local(db.clone(), &col)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    let mut opts = QueryOptions::default();
-                    if let Some(v) = opts_val {
-                        if let Ok(obj) = from_value::<JsonValue>(v) {
-                            if let Some(map) = obj.as_object() {
-                                opts.page = map
-                                    .get("page")
-                                    .and_then(|v| v.as_f64())
-                                    .map(|n| n as u64)
-                                    .or(map.get("page").and_then(|v| v.as_u64()));
-                                opts.per_page = map
-                                    .get("per_page")
-                                    .and_then(|v| v.as_f64())
-                                    .map(|n| n as u64)
-                                    .or(map.get("per_page").and_then(|v| v.as_u64()));
-                                opts.limit = map
-                                    .get("limit")
-                                    .and_then(|v| v.as_f64())
-                                    .map(|n| n as u64)
-                                    .or(map.get("limit").and_then(|v| v.as_u64()));
-                                opts.offset = map
-                                    .get("offset")
-                                    .and_then(|v| v.as_f64())
-                                    .map(|n| n as u64)
-                                    .or(map.get("offset").and_then(|v| v.as_u64()));
+                let mut opts = QueryOptions::default();
+                if let Some(v) = opts_val {
+                    if let Ok(obj) = from_value::<JsonValue>(v) {
+                        if let Some(map) = obj.as_object() {
+                            opts.page = map
+                                .get("page")
+                                .and_then(|v| v.as_f64())
+                                .map(|n| n as u64)
+                                .or(map.get("page").and_then(|v| v.as_u64()));
+                            opts.per_page = map
+                                .get("per_page")
+                                .and_then(|v| v.as_f64())
+                                .map(|n| n as u64)
+                                .or(map.get("per_page").and_then(|v| v.as_u64()));
+                            opts.limit = map
+                                .get("limit")
+                                .and_then(|v| v.as_f64())
+                                .map(|n| n as u64)
+                                .or(map.get("limit").and_then(|v| v.as_u64()));
+                            opts.offset = map
+                                .get("offset")
+                                .and_then(|v| v.as_f64())
+                                .map(|n| n as u64)
+                                .or(map.get("offset").and_then(|v| v.as_u64()));
 
-                                opts.sort =
-                                    map.get("sort").and_then(|v| v.as_str()).map(String::from);
-                                opts.expand =
-                                    map.get("expand").and_then(|v| v.as_str()).map(String::from);
-                                opts.fields =
-                                    map.get("fields").and_then(|v| v.as_str()).map(String::from);
+                            opts.sort = map.get("sort").and_then(|v| v.as_str()).map(String::from);
+                            opts.expand =
+                                map.get("expand").and_then(|v| v.as_str()).map(String::from);
+                            opts.fields =
+                                map.get("fields").and_then(|v| v.as_str()).map(String::from);
 
-                                opts.filter = map.get("filter").map(|v| {
-                                    if v.is_string() {
-                                        v.as_str().unwrap().to_string()
-                                    } else {
-                                        v.to_string()
-                                    }
-                                });
-                            }
+                            opts.filter = map.get("filter").map(|v| {
+                                if v.is_string() {
+                                    v.as_str().unwrap().to_string()
+                                } else {
+                                    v.to_string()
+                                }
+                            });
                         }
                     }
-
-                    let list = db
-                        .list_records(col_id, opts)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-
-                    to_value(js_ctx, &list).map_err(|_| rquickjs::Error::Exception)
                 }
-            },
-        ),
+
+                let list = db
+                    .list_records(col_id, opts)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+
+                to_value(js_ctx, &list).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -172,53 +175,67 @@ pub fn create_db_object<'js>(
     let app_get = app_ctx.clone();
     let get_record = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>,
-                  a1: Value<'js>,
-                  a2: Value<'js>,
-                  a3: Option<Value<'js>>,
-                  a4: Option<Value<'js>>| {
-                let app = app_get.clone();
-                async move {
-                    let (ctx_id, col, id, expand) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let col_name = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let rec_id =
-                                from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone())))
-                                    .unwrap_or(0);
-                            let exp = a4.and_then(|v| from_value::<String>(v).ok());
-                            (c_id, col_name, rec_id, exp)
-                        }
-                        DbMode::Scoped => {
-                            let col_name = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let rec_id = from_value::<i64>(a2).unwrap_or(0);
-                            let exp = a3.and_then(|v| from_value::<String>(v).ok());
-                            (None, col_name, rec_id, exp)
-                        }
-                    };
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_get.clone();
+            async move {
+                let (ctx_id, col, id, expand) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let col_name = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let rec_id = args
+                            .0
+                            .get(2)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        let exp = args
+                            .0
+                            .get(3)
+                            .and_then(|v| from_value::<String>(v.clone()).ok());
+                        (c_id, col_name, rec_id, exp)
+                    }
+                    DbMode::Scoped => {
+                        let col_name = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let rec_id = args
+                            .0
+                            .get(1)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        let exp = args
+                            .0
+                            .get(2)
+                            .and_then(|v| from_value::<String>(v.clone()).ok());
+                        (None, col_name, rec_id, exp)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let col_id = resolve_collection_local(db.clone(), &col)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let rec = db
-                        .get_record(col_id, id, expand)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let col_id = resolve_collection_local(db.clone(), &col)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let rec = db
+                    .get_record(col_id, id, expand)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    to_value(js_ctx, &rec).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                to_value(js_ctx, &rec).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -226,50 +243,56 @@ pub fn create_db_object<'js>(
     let app_create = app_ctx.clone();
     let create_record = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Value<'js>, a3: Option<Value<'js>>| {
-                let app = app_create.clone();
-                async move {
-                    let (ctx_id, col, data_val) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let col_name = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            (
-                                c_id,
-                                col_name,
-                                a3.unwrap_or(Value::new_null(a1.ctx().clone())),
-                            )
-                        }
-                        DbMode::Scoped => {
-                            let col_name = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            (None, col_name, a2)
-                        }
-                    };
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_create.clone();
+            async move {
+                let (ctx_id, col, data_val) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let col_name = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let d = args.0.get(2).cloned();
+                        (c_id, col_name, d)
+                    }
+                    DbMode::Scoped => {
+                        let col_name = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let d = args.0.get(1).cloned();
+                        (None, col_name, d)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let col_id = resolve_collection_local(db.clone(), &col)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let col_id = resolve_collection_local(db.clone(), &col)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    let data: JsonValue = from_value(data_val).unwrap_or(json!({}));
-                    let id = db
-                        .create_record(col_id, &data)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let data: JsonValue = data_val
+                    .and_then(|v| from_value(v).ok())
+                    .unwrap_or(json!({}));
+                let id = db
+                    .create_record(col_id, &data)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    let res = json!({ "id": id });
-                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                let res = json!({ "id": id });
+                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -277,52 +300,65 @@ pub fn create_db_object<'js>(
     let app_update = app_ctx.clone();
     let update_record = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>,
-                  a1: Value<'js>,
-                  a2: Value<'js>,
-                  a3: Value<'js>,
-                  a4: Option<Value<'js>>| {
-                let app = app_update.clone();
-                async move {
-                    let (ctx_id, col, id, data_val) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let col_name = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let rec_id = from_value::<i64>(a3).unwrap_or(0);
-                            let data_v = a4.unwrap_or(Value::new_null(a1.ctx().clone()));
-                            (c_id, col_name, rec_id, data_v)
-                        }
-                        DbMode::Scoped => {
-                            let col_name = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let rec_id = from_value::<i64>(a2).unwrap_or(0);
-                            (None, col_name, rec_id, a3)
-                        }
-                    };
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_update.clone();
+            async move {
+                let (ctx_id, col, id, data_val) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let col_name = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let rec_id = args
+                            .0
+                            .get(2)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        let d = args.0.get(3).cloned();
+                        (c_id, col_name, rec_id, d)
+                    }
+                    DbMode::Scoped => {
+                        let col_name = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let rec_id = args
+                            .0
+                            .get(1)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        let d = args.0.get(2).cloned();
+                        (None, col_name, rec_id, d)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let col_id = resolve_collection_local(db.clone(), &col)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let col_id = resolve_collection_local(db.clone(), &col)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    let data: JsonValue = from_value(data_val).unwrap_or(json!({}));
-                    let rec = db
-                        .update_record(col_id, id, &data)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let data: JsonValue = data_val
+                    .and_then(|v| from_value(v).ok())
+                    .unwrap_or(json!({}));
+                let rec = db
+                    .update_record(col_id, id, &data)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    to_value(js_ctx, &rec).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                to_value(js_ctx, &rec).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -330,47 +366,59 @@ pub fn create_db_object<'js>(
     let app_delete = app_ctx.clone();
     let delete_record = Function::new(
         ctx.clone(),
-        Async(
-            move |a1: Value<'js>, a2: Value<'js>, a3: Option<Value<'js>>| {
-                let app = app_delete.clone();
-                async move {
-                    let (ctx_id, col, id) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let col_name = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let rec_id =
-                                from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone())))
-                                    .unwrap_or(0);
-                            (c_id, col_name, rec_id)
-                        }
-                        DbMode::Scoped => {
-                            let col_name = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let rec_id = from_value::<i64>(a2).unwrap_or(0);
-                            (None, col_name, rec_id)
-                        }
-                    };
+        Async(move |args: Rest<Value<'js>>| {
+            let app = app_delete.clone();
+            async move {
+                let (ctx_id, col, id) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let col_name = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let rec_id = args
+                            .0
+                            .get(2)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        (c_id, col_name, rec_id)
+                    }
+                    DbMode::Scoped => {
+                        let col_name = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let rec_id = args
+                            .0
+                            .get(1)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        (None, col_name, rec_id)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let col_id = resolve_collection_local(db.clone(), &col)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let col_id = resolve_collection_local(db.clone(), &col)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    db.delete_record(col_id, id)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                db.delete_record(col_id, id)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    Ok::<bool, rquickjs::Error>(true)
-                }
-            },
-        ),
+                Ok::<bool, rquickjs::Error>(true)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -378,65 +426,75 @@ pub fn create_db_object<'js>(
     let app_search_vec = app_ctx.clone();
     let search_vector = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>,
-                  a1: Value<'js>,
-                  a2: Value<'js>,
-                  a3: Value<'js>,
-                  a4: Value<'js>,
-                  a5: Option<Value<'js>>| {
-                let app = app_search_vec.clone();
-                async move {
-                    let (ctx_id, col, field, vec_val, limit) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let col_name = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let f = a3
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let v = a4;
-                            let l = from_value::<usize>(
-                                a5.unwrap_or(Value::new_null(a1.ctx().clone())),
-                            )
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_search_vec.clone();
+            async move {
+                let (ctx_id, col, field, vec_val, limit) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let col_name = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let f = args
+                            .0
+                            .get(2)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let v = args.0.get(3).cloned();
+                        let l = args
+                            .0
+                            .get(4)
+                            .and_then(|v| from_value::<usize>(v.clone()).ok())
                             .unwrap_or(10);
-                            (c_id, col_name, f, v, l)
-                        }
-                        DbMode::Scoped => {
-                            let col_name = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let f = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let v = a3;
-                            let l = from_value::<usize>(a4).unwrap_or(10);
-                            (None, col_name, f, v, l)
-                        }
-                    };
+                        (c_id, col_name, f, v, l)
+                    }
+                    DbMode::Scoped => {
+                        let col_name = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let f = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let v = args.0.get(2).cloned();
+                        let l = args
+                            .0
+                            .get(3)
+                            .and_then(|v| from_value::<usize>(v.clone()).ok())
+                            .unwrap_or(10);
+                        (None, col_name, f, v, l)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let col_id = resolve_collection_local(db.clone(), &col)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let col_id = resolve_collection_local(db.clone(), &col)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    let vector: Vec<f32> = from_value(vec_val).unwrap_or_default();
-                    let recs = db
-                        .search_vector(col_id, &field, vector, limit)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let vector: Vec<f32> = vec_val.and_then(|v| from_value(v).ok()).unwrap_or_default();
+                let recs = db
+                    .search_vector(col_id, &field, vector, limit)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    to_value(js_ctx, &recs).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                to_value(js_ctx, &recs).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -444,48 +502,60 @@ pub fn create_db_object<'js>(
     let app_get_vec = app_ctx.clone();
     let get_vector = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Value<'js>, a3: Option<Value<'js>>| {
-                let app = app_get_vec.clone();
-                async move {
-                    let (ctx_id, col, id) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let col_name = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let rec_id =
-                                from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone())))
-                                    .unwrap_or(0);
-                            (c_id, col_name, rec_id)
-                        }
-                        DbMode::Scoped => {
-                            let col_name = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let rec_id = from_value::<i64>(a2).unwrap_or(0);
-                            (None, col_name, rec_id)
-                        }
-                    };
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_get_vec.clone();
+            async move {
+                let (ctx_id, col, id) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let col_name = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let rec_id = args
+                            .0
+                            .get(2)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        (c_id, col_name, rec_id)
+                    }
+                    DbMode::Scoped => {
+                        let col_name = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let rec_id = args
+                            .0
+                            .get(1)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        (None, col_name, rec_id)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let col_id = resolve_collection_local(db.clone(), &col)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let col_id = resolve_collection_local(db.clone(), &col)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    let vecs = db
-                        .get_record_vectors(col_id, id)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let vecs = db
+                    .get_record_vectors(col_id, id)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    to_value(js_ctx, &vecs).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                to_value(js_ctx, &vecs).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -493,61 +563,72 @@ pub fn create_db_object<'js>(
     let app_instant_search = app_ctx.clone();
     let instant_search = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>,
-                  a1: Value<'js>,
-                  a2: Value<'js>,
-                  a3: Value<'js>,
-                  a4: Option<Value<'js>>| {
-                let app = app_instant_search.clone();
-                async move {
-                    let (ctx_id, col, query, limit) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let col_name = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let q = a3
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let l = from_value::<usize>(
-                                a4.unwrap_or(Value::new_null(a1.ctx().clone())),
-                            )
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_instant_search.clone();
+            async move {
+                let (ctx_id, col, query, limit) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let col_name = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let q = args
+                            .0
+                            .get(2)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let l = args
+                            .0
+                            .get(3)
+                            .and_then(|v| from_value::<usize>(v.clone()).ok())
                             .unwrap_or(10);
-                            (c_id, col_name, q, l)
-                        }
-                        DbMode::Scoped => {
-                            let col_name = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let q = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let l = from_value::<usize>(a3).unwrap_or(10);
-                            (None, col_name, q, l)
-                        }
-                    };
+                        (c_id, col_name, q, l)
+                    }
+                    DbMode::Scoped => {
+                        let col_name = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let q = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let l = args
+                            .0
+                            .get(2)
+                            .and_then(|v| from_value::<usize>(v.clone()).ok())
+                            .unwrap_or(10);
+                        (None, col_name, q, l)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let col_id = resolve_collection_local(db.clone(), &col)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let col_id = resolve_collection_local(db.clone(), &col)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    let results = db
-                        .instant_search(col_id, &query, limit)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let results = db
+                    .instant_search(col_id, &query, limit)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    to_value(js_ctx, &results).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                to_value(js_ctx, &results).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -580,44 +661,52 @@ pub fn create_db_object<'js>(
     let app_query = app_ctx.clone();
     let query_fn = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Option<Value<'js>>| {
-                let app = app_query.clone();
-                async move {
-                    let (ctx_id, q_val) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let q = a2.unwrap_or(Value::new_null(a1.ctx().clone()));
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_query.clone();
+            async move {
+                let (ctx_id, q_val) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let q = args.0.get(1).cloned();
+                        (c_id, q)
+                    }
+                    DbMode::Scoped => {
+                        if args.0.len() >= 2
+                            && args.0.first().map(|v| v.is_string()).unwrap_or(false)
+                        {
+                            let c_id = args
+                                .0
+                                .get(0)
+                                .and_then(|v| v.as_string())
+                                .map(|s| s.to_string().unwrap_or_default());
+                            let q = args.0.get(1).cloned();
                             (c_id, q)
+                        } else {
+                            let q = args.0.get(0).cloned();
+                            (None, q)
                         }
-                        DbMode::Scoped => {
-                            if a2.is_some() && a1.is_string() {
-                                let c_id =
-                                    a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                                (c_id, a2.unwrap())
-                            } else {
-                                (None, a1)
-                            }
-                        }
-                    };
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    let q_json: JsonValue =
-                        from_value(q_val).map_err(|_| rquickjs::Error::Exception)?;
-                    let query: ApexQuery =
-                        serde_json::from_value(q_json).map_err(|_| rquickjs::Error::Exception)?;
+                let q_json: JsonValue = q_val.and_then(|v| from_value(v).ok()).unwrap_or(json!({}));
+                let query: ApexQuery =
+                    serde_json::from_value(q_json).map_err(|_| rquickjs::Error::Exception)?;
 
-                    let res = db
-                        .query_engine(query)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                let res = db
+                    .query_engine(query)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -626,45 +715,54 @@ pub fn create_db_object<'js>(
     let app_files = app_ctx.clone();
     let files_list = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>,
-                  a1: Value<'js>,
-                  a2: Option<Value<'js>>,
-                  a3: Option<Value<'js>>| {
-                let app = app_files.clone();
-                async move {
-                    let (ctx_id, limit, offset) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let l =
-                                from_value::<i64>(a2.unwrap_or(Value::new_null(a1.ctx().clone())))
-                                    .unwrap_or(20);
-                            let o =
-                                from_value::<i64>(a3.unwrap_or(Value::new_null(a1.ctx().clone())))
-                                    .unwrap_or(0);
-                            (c_id, l, o)
-                        }
-                        DbMode::Scoped => {
-                            let l = from_value::<i64>(a1).unwrap_or(20);
-                            let o =
-                                from_value::<i64>(a2.unwrap_or(Value::new_null(js_ctx.clone())))
-                                    .unwrap_or(0);
-                            (None, l, o)
-                        }
-                    };
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_files.clone();
+            async move {
+                let (ctx_id, limit, offset) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let l = args
+                            .0
+                            .get(1)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(20);
+                        let o = args
+                            .0
+                            .get(2)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        (c_id, l, o)
+                    }
+                    DbMode::Scoped => {
+                        let l = args
+                            .0
+                            .get(0)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(20);
+                        let o = args
+                            .0
+                            .get(1)
+                            .and_then(|v| from_value::<i64>(v.clone()).ok())
+                            .unwrap_or(0);
+                        (None, l, o)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let files = db
-                        .list_files(limit, offset)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let files = db
+                    .list_files(limit, offset)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    to_value(js_ctx, &files).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                to_value(js_ctx, &files).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -678,104 +776,118 @@ pub fn create_db_object<'js>(
     let app_u_get = app_ctx.clone();
     let users_get = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>, a1: Value<'js>, a2: Option<Value<'js>>| {
-                let app = app_u_get.clone();
-                async move {
-                    let (ctx_id, email) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let e = a2
-                                .and_then(|v| {
-                                    v.as_string().map(|s| s.to_string().unwrap_or_default())
-                                })
-                                .unwrap_or_default();
-                            (c_id, e)
-                        }
-                        DbMode::Scoped => {
-                            let e = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            (None, e)
-                        }
-                    };
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_u_get.clone();
+            async move {
+                let (ctx_id, email) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let e = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        (c_id, e)
+                    }
+                    DbMode::Scoped => {
+                        let e = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        (None, e)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let u = db
-                        .get_user_by_email(&email)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let u = db
+                    .get_user_by_email(&email)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    to_value(js_ctx, &u).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                to_value(js_ctx, &u).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
     let app_u_create = app_ctx.clone();
     let users_create = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>,
-                  a1: Value<'js>,
-                  a2: Value<'js>,
-                  a3: Value<'js>,
-                  a4: Option<Value<'js>>| {
-                let app = app_u_create.clone();
-                async move {
-                    let (ctx_id, email, pass, role) = match mode {
-                        DbMode::Root => {
-                            let c_id = a1.as_string().map(|s| s.to_string().unwrap_or_default());
-                            let e = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let p = a3
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let r = a4
-                                .and_then(|v| {
-                                    v.as_string().map(|s| s.to_string().unwrap_or_default())
-                                })
-                                .unwrap_or_default();
-                            (c_id, e, p, r)
-                        }
-                        DbMode::Scoped => {
-                            let e = a1
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let p = a2
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            let r = a3
-                                .as_string()
-                                .map(|s| s.to_string().unwrap_or_default())
-                                .unwrap_or_default();
-                            (None, e, p, r)
-                        }
-                    };
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let app = app_u_create.clone();
+            async move {
+                let (ctx_id, email, pass, role) = match mode {
+                    DbMode::Root => {
+                        let c_id = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default());
+                        let e = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let p = args
+                            .0
+                            .get(2)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let r = args
+                            .0
+                            .get(3)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        (c_id, e, p, r)
+                    }
+                    DbMode::Scoped => {
+                        let e = args
+                            .0
+                            .get(0)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let p = args
+                            .0
+                            .get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let r = args
+                            .0
+                            .get(2)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        (None, e, p, r)
+                    }
+                };
 
-                    let db = resolve_db(ctx_id, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let hash = crate::auth::hash_password(&pass)
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let u = db
-                        .create_user(&email, &hash, &role, None)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let db = resolve_db(ctx_id, app.clone())
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                let hash =
+                    crate::auth::hash_password(&pass).map_err(|_| rquickjs::Error::Exception)?;
+                let u = db
+                    .create_user(&email, &hash, &role, None)
+                    .await
+                    .map_err(|_| rquickjs::Error::Exception)?;
 
-                    to_value(js_ctx, &u).map_err(|_| rquickjs::Error::Exception)
-                }
-            },
-        ),
+                to_value(js_ctx, &u).map_err(|_| rquickjs::Error::Exception)
+            }
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -789,13 +901,15 @@ pub fn create_db_object<'js>(
     let app_cols = app_ctx.clone();
     let cols_list = Function::new(
         ctx.clone(),
-        Async(move |js_ctx: Ctx<'js>, a1: Option<Value<'js>>| {
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
             let app = app_cols.clone();
             async move {
                 let ctx_id = match mode {
-                    DbMode::Root => {
-                        a1.and_then(|v| v.as_string().map(|s| s.to_string().unwrap_or_default()))
-                    }
+                    DbMode::Root => args
+                        .0
+                        .get(0)
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.to_string().unwrap_or_default()),
                     DbMode::Scoped => None,
                 };
 
