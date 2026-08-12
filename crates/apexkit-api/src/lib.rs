@@ -410,7 +410,9 @@ pub async fn start(port: u16) {
     // Initialize Virtual Dev File System
     let vfs = apexkit_core::scripting::module_loader::VfsState::new();
 
-    let script_engine = Arc::new(apexkit_core::scripting::ScriptEngine::new().await);
+    let script_engine = Arc::new(
+        apexkit_core::scripting::ScriptEngine::with_vfs(vfs.clone(), cached_db.clone()).await,
+    );
     let embedder = Arc::new(apexkit_core::embeddings::EmbedderService::new());
 
     let state = AppState {
@@ -660,6 +662,7 @@ export default async function(req) {
             target_collection: None,
             active: true,
             visibility: "private".to_string(),
+            metadata: None,
             code,
         })
         .await?;

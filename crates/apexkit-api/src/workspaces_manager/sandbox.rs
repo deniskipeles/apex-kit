@@ -381,6 +381,7 @@ impl SandboxManager {
                     code: script.code,
                     active: script.active,
                     visibility: script.visibility,
+                    metadata: script.metadata,
                 })
                 .await?;
         }

@@ -115,6 +115,7 @@ pub async fn import_scripts_handler(
             code: item.code,
             active: item.active,
             visibility: item.visibility,
+            metadata: item.metadata,
         };
 
         if let Err(e) = db.create_script(req).await {

@@ -235,11 +235,11 @@ unsafe impl Send for ScriptEngine {}
 unsafe impl Sync for ScriptEngine {}
 
 impl ScriptEngine {
-    pub async fn new() -> Self {
-        Self::with_vfs(crate::scripting::module_loader::VfsState::default()).await
-    }
-
-    pub async fn with_vfs(vfs: crate::scripting::module_loader::VfsState) -> Self {
+    // Add DB to with_vfs signature
+    pub async fn with_vfs(
+        vfs: crate::scripting::module_loader::VfsState,
+        db: Arc<dyn crate::Db>,
+    ) -> Self {
         let runtime = AsyncRuntime::new().unwrap();
 
         let rt = runtime.clone();
@@ -247,7 +247,7 @@ impl ScriptEngine {
             rt.set_max_stack_size(0).await;
             rt.set_loader(
                 crate::scripting::module_loader::ApexModuleResolver,
-                crate::scripting::module_loader::ApexModuleLoader { vfs },
+                crate::scripting::module_loader::ApexModuleLoader { vfs, db }, // <-- Pass db here
             )
             .await;
         })

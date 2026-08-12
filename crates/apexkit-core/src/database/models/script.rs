@@ -14,6 +14,8 @@ pub struct Script {
     //  'private' (default) or 'public' (shared with tenants)
     #[serde(default)]
     pub visibility: String,
+    // [NEW] Stores __fileMetadata__ for VS Code Workspace Sync
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -25,6 +27,8 @@ pub struct CreateScriptReq {
     pub active: bool,
     #[serde(default = "default_visibility")]
     pub visibility: String,
+    // [NEW] Accepts metadata during commit
+    pub metadata: Option<serde_json::Value>,
 }
 
 fn default_visibility() -> String {

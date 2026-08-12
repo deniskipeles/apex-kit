@@ -203,6 +203,7 @@ async fn deploy_metadata_item(db: &Arc<dyn Db>, label: &str, content: &[u8]) -> 
                     code: s.code,
                     active: s.active,
                     visibility: s.visibility,
+                    metadata: s.metadata,
                 })
                 .await
                 .map_err(|e| e.to_string())?;

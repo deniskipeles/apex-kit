@@ -516,6 +516,7 @@ pub async fn deploy_manifest(db: Arc<dyn Db>, manifest: &AppManifest) -> Result<
             code: script.code.clone(),
             active: true,
             visibility: "private".to_string(),
+            metadata: None,
         })
         .await
         .map_err(|e| AppError::UnknownError(format!("Script Deployment Error: {}", e)))?;

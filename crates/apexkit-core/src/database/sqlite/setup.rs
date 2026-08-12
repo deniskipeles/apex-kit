@@ -259,7 +259,7 @@ pub fn setup_sys(conn: &Connection) -> Result<()> {
     conn.execute("CREATE TABLE IF NOT EXISTS _ai_sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, messages JSON, current_manifest JSON, pending_manifest JSON, diff_summary TEXT, last_error TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS _plugins (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, manifest JSON NOT NULL, description TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS _templates (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE NOT NULL, content TEXT NOT NULL, script_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
-    conn.execute("CREATE TABLE IF NOT EXISTS _scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, trigger_type TEXT NOT NULL, code TEXT NOT NULL, active BOOLEAN DEFAULT 1, target_collection TEXT, visibility TEXT DEFAULT 'private', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
+    conn.execute("CREATE TABLE IF NOT EXISTS _scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, trigger_type TEXT NOT NULL, code TEXT NOT NULL, active BOOLEAN DEFAULT 1, target_collection TEXT, visibility TEXT DEFAULT 'private', metadata JSON DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS _replicas (
         id TEXT PRIMARY KEY,
@@ -273,6 +273,7 @@ pub fn setup_sys(conn: &Connection) -> Result<()> {
         "ALTER TABLE _scripts ADD COLUMN visibility TEXT DEFAULT 'private'",
         [],
     );
+    let _ = conn.execute("ALTER TABLE _scripts ADD COLUMN metadata JSON", []);
     Ok(())
 }
 
