@@ -181,13 +181,15 @@ impl WorkspaceManager {
             // 1. Export package.json
             let pkg_json = json!({
                 "name": "apexkit-workspace",
-                "type": "module", // <--- ADD THIS LINE
+                "type": "module",
                 "scope": scope_id,
                 "__track__": false,
                 "dependencies": {}
             });
-            zip.start_file("package.json", options).map_err(|e| e.to_string())?;
-            zip.write_all(serde_json::to_string_pretty(&pkg_json).unwrap().as_bytes()).map_err(|e| e.to_string())?;
+            zip.start_file("package.json", options)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(serde_json::to_string_pretty(&pkg_json).unwrap().as_bytes())
+                .map_err(|e| e.to_string())?;
 
             if let Ok(scripts) = db.list_scripts().await {
                 for script in scripts {

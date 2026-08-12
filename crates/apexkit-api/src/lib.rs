@@ -411,7 +411,7 @@ pub async fn start(port: u16) {
     let vfs = apexkit_core::scripting::module_loader::VfsState::new();
 
     let script_engine = Arc::new(
-        apexkit_core::scripting::ScriptEngine::with_vfs(vfs.clone(), cached_db.clone()).await,
+        apexkit_core::scripting::ScriptEngine::with_vfs(vfs.clone(), Some(cached_db.clone())).await,
     );
     let embedder = Arc::new(apexkit_core::embeddings::EmbedderService::new());
 

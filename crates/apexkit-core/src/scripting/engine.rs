@@ -112,10 +112,11 @@ const JS_PRELUDE: &str = r#"
     class ApexKit {
         constructor(contextId = null) { 
             this.contextId = contextId;
-        }
-
-        get dbRef() {
-            return this.contextId ? globalThis.$root?.db : globalThis.$db;
+            this.dbRef = this.contextId ? globalThis.$root?.db : globalThis.$db;
+            
+            if (this.contextId && !this.dbRef) {
+                throw new Error("Access Denied: Root scope required for context switching.");
+            }
         }
         
         tenant(id) { return new ApexKit("tenant:" + id); }
@@ -131,14 +132,15 @@ const JS_PRELUDE: &str = r#"
 
         collection(name) {
             const self = this;
+            const rec = this.dbRef.records;
             return {
-                list: async (opts) => self._call(self.dbRef.records.list, name, opts),
-                get: async (id, opts) => self._call(self.dbRef.records.get, name, id, opts?.expand),
-                create: async (data) => self._call(self.dbRef.records.create, name, data),
-                update: async (id, data) => self._call(self.dbRef.records.update, name, id, data),
-                delete: async (id) => self._call(self.dbRef.records.delete, name, id),
-                searchVector: async (f, v, l) => self._call(self.dbRef.records.searchVector, name, f, v, l),
-                getVector: async (id) => self._call(self.dbRef.records.getVector, name, id)
+                list: async (opts) => self._call(rec.list, name, opts),
+                get: async (id, opts) => self._call(rec.get, name, id, opts?.expand),
+                create: async (data) => self._call(rec.create, name, data),
+                update: async (id, data) => self._call(rec.update, name, id, data),
+                delete: async (id) => self._call(rec.delete, name, id),
+                searchVector: async (f, v, l) => self._call(rec.searchVector, name, f, v, l),
+                getVector: async (id) => self._call(rec.getVector, name, id)
             };
         }
         
@@ -148,24 +150,27 @@ const JS_PRELUDE: &str = r#"
         
         get users() {
             const self = this;
+            const u = this.dbRef.users;
             return {
-                create: async (e, p, r) => self._call(self.dbRef.users.create, e, p, r),
-                get: async (e) => self._call(self.dbRef.users.get, e)
-            };
+                create: async (e, p, r) => self._call(u.create, e, p, r),
+                get: async (e) => self._call(u.get, e)
+            }
         }
         
         get collections() {
             const self = this;
+            const c = this.dbRef.collections;
             return {
-                list: async () => self._call(self.dbRef.collections.list)
-            };
+                list: async () => self._call(c.list)
+            }
         }
 
         get files() {
             const self = this;
+            const f = this.dbRef.files;
             return {
-                list: async (l, o) => self._call(self.dbRef.files.list, l, o)
-            };
+                list: async (l, o) => self._call(f.list, l, o)
+            }
         }
     }
     
@@ -235,21 +240,48 @@ unsafe impl Send for ScriptEngine {}
 unsafe impl Sync for ScriptEngine {}
 
 impl ScriptEngine {
-    // Add DB to with_vfs signature
+    pub async fn new() -> Self {
+        Self::with_vfs(crate::scripting::module_loader::VfsState::default(), None).await
+    }
+
     pub async fn with_vfs(
         vfs: crate::scripting::module_loader::VfsState,
-        db: Arc<dyn crate::Db>,
+        db: Option<Arc<dyn crate::Db>>,
     ) -> Self {
         let runtime = AsyncRuntime::new().unwrap();
 
         let rt = runtime.clone();
         SendWrapper(async move {
             rt.set_max_stack_size(0).await;
-            rt.set_loader(
-                crate::scripting::module_loader::ApexModuleResolver,
-                crate::scripting::module_loader::ApexModuleLoader { vfs, db }, // <-- Pass db here
-            )
-            .await;
+
+            // Only register the DB in the module loader if one was provided
+            if let Some(db_arc) = db {
+                rt.set_loader(
+                    crate::scripting::module_loader::ApexModuleResolver,
+                    crate::scripting::module_loader::ApexModuleLoader { vfs, db: db_arc },
+                )
+                .await;
+            } else {
+                // Temporary dummy fallback loader if no DB is available
+                // This prevents crashes in pure testing environments
+                struct DummyLoader;
+                impl rquickjs::loader::Loader for DummyLoader {
+                    fn load<'js>(
+                        &mut self,
+                        _ctx: &rquickjs::Ctx<'js>,
+                        _name: &str,
+                        _attrs: Option<rquickjs::loader::ImportAttributes<'js>>,
+                    ) -> rquickjs::Result<rquickjs::Module<'js, rquickjs::module::Declared>>
+                    {
+                        Err(rquickjs::Error::Unknown)
+                    }
+                }
+                rt.set_loader(
+                    crate::scripting::module_loader::ApexModuleResolver,
+                    DummyLoader,
+                )
+                .await;
+            }
         })
         .await;
 
@@ -292,7 +324,6 @@ impl ScriptEngine {
 
         let runtime = self.runtime.clone();
 
-        // ALL rquickjs async calls (set_interrupt_handler, AsyncContext::full, async_with!) MUST BE INSIDE SendWrapper
         let task = SendWrapper(async move {
             runtime
                 .set_interrupt_handler(Some(Box::new(move || {
@@ -308,10 +339,11 @@ impl ScriptEngine {
             rquickjs::async_with!(ctx => |js_ctx| {
                 setup_quickjs(&js_ctx, context.clone())?;
 
-                js_ctx
-                    .eval::<(), _>(processed_code.as_str())
+                // EVALUATE AS AN ES MODULE SO IMPORTS WORK
+                let module_name = format!("exec_{}", uuid::Uuid::new_v4());
+                let _ = rquickjs::Module::evaluate(js_ctx.clone(), module_name, processed_code.as_bytes())
                     .catch(&js_ctx)
-                    .map_err(|e| format!("Script Syntax Error: {}", e))?;
+                    .map_err(|e| format!("Script Module Error: {}", e))?;
 
                 let req_data = json!({
                     "url": url.unwrap_or_else(|| "http://localhost".to_string()),
@@ -328,7 +360,7 @@ impl ScriptEngine {
 
                 let handler: Function = globals
                     .get("__mainHandler")
-                    .map_err(|_| "No 'export default' found".to_string())?;
+                    .map_err(|_| "No 'export default' found in script".to_string())?;
 
                 let promise: Promise = handler
                     .call((request_obj,))
@@ -411,10 +443,11 @@ impl ScriptEngine {
             rquickjs::async_with!(ctx => |js_ctx| {
                 setup_quickjs(&js_ctx, context.clone())?;
 
-                js_ctx
-                    .eval::<(), _>(processed_code.as_str())
+                // EVALUATE AS AN ES MODULE SO IMPORTS WORK
+                let module_name = format!("exec_{}", uuid::Uuid::new_v4());
+                let _ = rquickjs::Module::evaluate(js_ctx.clone(), module_name, processed_code.as_bytes())
                     .catch(&js_ctx)
-                    .map_err(|e| format!("Script Syntax Error: {}", e))?;
+                    .map_err(|e| format!("Script Module Error: {}", e))?;
 
                 let js_event = to_value(js_ctx.clone(), &event_data).map_err(|e| e.to_string())?;
                 let globals = js_ctx.globals();
@@ -446,8 +479,7 @@ impl ScriptEngine {
                 } else {
                     Ok::<Option<JsonValue>, String>(None)
                 }
-            })
-            .await
+            }).await
         });
 
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
