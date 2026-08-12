@@ -236,9 +236,23 @@ unsafe impl Sync for ScriptEngine {}
 
 impl ScriptEngine {
     pub async fn new() -> Self {
+        Self::with_vfs(crate::scripting::module_loader::VfsState::default()).await
+    }
+
+    pub async fn with_vfs(vfs: crate::scripting::module_loader::VfsState) -> Self {
         let runtime = AsyncRuntime::new().unwrap();
-        // Disable QuickJS C-stack size check to allow thread-swapping under Tokio
-        runtime.set_max_stack_size(0).await;
+
+        let rt = runtime.clone();
+        SendWrapper(async move {
+            rt.set_max_stack_size(0).await;
+            rt.set_loader(
+                crate::scripting::module_loader::ApexModuleResolver,
+                crate::scripting::module_loader::ApexModuleLoader { vfs },
+            )
+            .await;
+        })
+        .await;
+
         Self { runtime }
     }
 
@@ -263,9 +277,29 @@ impl ScriptEngine {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30);
 
+        let total_cpu_budget_ms = std::env::var("SCRIPT_MAX_CPU_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(300);
+        let quantum_slice_ms = 10;
+
+        let scheduler = super::scheduler::get_quantum_scheduler();
+        let task_id = scheduler.register_task(
+            std::time::Duration::from_millis(total_cpu_budget_ms),
+            std::time::Duration::from_millis(quantum_slice_ms),
+        );
+        let _guard = super::scheduler::QuantumGuard::new(task_id);
+
         let runtime = self.runtime.clone();
 
+        // ALL rquickjs async calls (set_interrupt_handler, AsyncContext::full, async_with!) MUST BE INSIDE SendWrapper
         let task = SendWrapper(async move {
+            runtime
+                .set_interrupt_handler(Some(Box::new(move || {
+                    super::scheduler::get_quantum_scheduler().check_and_yield(task_id)
+                })))
+                .await;
+
             let ctx = AsyncContext::full(&runtime)
                 .await
                 .map_err(|e| e.to_string())?;

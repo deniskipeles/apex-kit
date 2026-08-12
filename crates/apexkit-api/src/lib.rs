@@ -407,6 +407,9 @@ pub async fn start(port: u16) {
         .finish()
         .unwrap();
 
+    // Initialize Virtual Dev File System
+    let vfs = apexkit_core::scripting::module_loader::VfsState::new();
+
     let script_engine = Arc::new(apexkit_core::scripting::ScriptEngine::new().await);
     let embedder = Arc::new(apexkit_core::embeddings::EmbedderService::new());
 
@@ -430,6 +433,7 @@ pub async fn start(port: u16) {
         root_script_cache: Cache::builder().max_capacity(1000).build(),
         record_count_cache: Cache::builder().max_capacity(10_000).build(),
         rate_limiters: Cache::builder().max_capacity(100).build(),
+        vfs,
     };
 
     // --- 8. Master/Replica Sync Hookup ---

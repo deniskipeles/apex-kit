@@ -410,6 +410,11 @@ pub fn app_router(state: AppState) -> Router {
         .merge(scalar_router)
         .route("/graphql", post(graphql_handler).get(graphql_playground))
         .route("/ws", get(websocket::websocket_handler))
+        // Mount VS Code Live Sync Route
+        .route(
+            "/dev/sync",
+            get(crate::api::system::vscode_sync::vscode_sync_handler),
+        )
         .route("/logo", get(storage::serve_app_logo))
         .route("/app-name", get(settings::get_public_app_name))
         .layer(middleware::from_fn_with_state(

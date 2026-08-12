@@ -189,6 +189,7 @@ async fn setup_test_state(base_path: &std::path::Path) -> AppState {
         root_script_cache: Cache::builder().max_capacity(1000).build(),
         record_count_cache: Cache::builder().max_capacity(1000).build(),
         rate_limiters: Cache::builder().max_capacity(100).build(),
+        vfs: apexkit_core::scripting::module_loader::VfsState::new(),
     }
 }
 

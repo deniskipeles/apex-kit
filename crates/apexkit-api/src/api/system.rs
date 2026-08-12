@@ -18,6 +18,7 @@ pub mod api_keys;
 pub mod backup;
 pub mod config;
 pub mod settings;
+pub mod vscode_sync;
 
 #[utoipa::path(
     get,

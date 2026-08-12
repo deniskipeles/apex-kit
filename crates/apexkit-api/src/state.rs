@@ -1,6 +1,7 @@
 use crate::workspaces_manager::sandbox::SandboxManager;
 use crate::workspaces_manager::tenant::TenantManager;
 use apexkit_core::scripting::ScriptEngine;
+use apexkit_core::scripting::module_loader::VfsState;
 use apexkit_core::{
     Db, VectorProvider, realtime::DbEvent, security::vault::Vault, storage::StorageBackend,
     workers::JobQueue,
@@ -42,4 +43,5 @@ pub struct AppState {
     pub record_count_cache: Cache<String, i64>,
     // [NEW] Stores the active GCRA RateLimiters based on the quota limit
     pub rate_limiters: Cache<u64, Arc<DynRateLimiter>>,
+    pub vfs: VfsState,
 }

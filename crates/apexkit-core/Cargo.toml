@@ -65,11 +65,8 @@ zeroize = "1.7"
 # Search Engine
 tantivy = "0.22"
 
-# --- SCRIPTING ENGINE (Boa 0.21) ---
-# FIX: Removed features = ["intl"] to prevent "missing Intl provider" panic
-#boa_engine = { version = "0.21.0" }
-#boa_gc = "0.21.0"
-rquickjs = { version = "0.12.2", features = ["macro", "classes", "futures"] }
+# --- SCRIPTING ENGINE
+rquickjs = { version = "0.12.2", features = ["macro", "classes", "futures", "loader"] }
 rquickjs-serde = "0.6.1"
 # --- ARCHIVE MANAGER ---
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
