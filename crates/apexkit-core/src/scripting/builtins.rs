@@ -10,6 +10,7 @@ pub mod mail;
 pub mod realtime;
 pub mod root;
 pub mod utils;
+pub mod wasm;
 
 pub use ai::*;
 pub use cache::*;
@@ -23,3 +24,4 @@ pub use mail::*;
 pub use realtime::*;
 pub use root::*;
 pub use utils::*;
+pub use wasm::*;

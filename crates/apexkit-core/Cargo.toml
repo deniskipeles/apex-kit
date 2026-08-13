@@ -65,6 +65,10 @@ zeroize = "1.7"
 # Search Engine
 tantivy = "0.22"
 
+# WASM execution
+wasmtime = "24.0.0"
+wasmtime-wasi = "24.0.0"
+
 # --- SCRIPTING ENGINE
 rquickjs = { version = "0.12.2", features = ["macro", "classes", "futures", "loader"] }
 rquickjs-serde = "0.6.1"
