@@ -34,7 +34,7 @@ impl<F: std::future::Future> std::future::Future for SendWrapper<F> {
     }
 }
 
-const JS_PRELUDE: &str = r##"
+const JS_PRELUDE: &str = r#"
     class Headers {
         constructor(init = {}) {
             this.map = new Map();
@@ -61,6 +61,7 @@ const JS_PRELUDE: &str = r##"
             this.headers = new Headers(init.headers || {});
             this.ok = this.status >= 200 && this.status < 300;
             this.url = init.url || "";
+            this._body_b64 = init._body_b64 || null;
 
             this.json = async () => {
                 if (typeof this.body === 'object' && this.body !== null) return this.body;
@@ -70,6 +71,18 @@ const JS_PRELUDE: &str = r##"
             this.text = async () => {
                 if (typeof this.body === 'string') return this.body;
                 return JSON.stringify(this.body);
+            };
+
+            this.arrayBuffer = async () => {
+                if (this._body_b64 && globalThis.$util) {
+                    let bin = globalThis.$util.base64Decode(this._body_b64);
+                    let buf = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+                    return buf.buffer;
+                }
+                let txt = await this.text();
+                let encoder = new TextEncoder();
+                return encoder.encode(txt).buffer;
             };
         }
     }
@@ -94,7 +107,7 @@ const JS_PRELUDE: &str = r##"
                 this.origin = this.protocol + "//" + this.host;
                 this.pathname = match[3] || "/";
                 this.search = match[4] ? "?" + match[4] : "";
-                this.hash = match[5] ? "#" + match[5] : "";
+                this.hash = match[5] ? '#' + match[5] : "";
             } else {
                 this.protocol = "http:";
                 this.host = "localhost";
@@ -102,7 +115,7 @@ const JS_PRELUDE: &str = r##"
                 this.port = "";
                 this.origin = "http://localhost";
                 let parts = full.split('#');
-                this.hash = parts[1] ? "#" + parts[1] : "";
+                this.hash = parts[1] ? '#' + parts[1] : "";
                 let pathAndSearch = parts[0].split('?');
                 this.pathname = pathAndSearch[0] || "/";
                 this.search = pathAndSearch[1] ? "?" + pathAndSearch[1] : "";
@@ -273,6 +286,8 @@ const JS_PRELUDE: &str = r##"
     globalThis.Response = Response;
 
     globalThis.fetch = async function(url, options = {}) {
+        let urlString = typeof url === 'object' && url !== null ? (url.href || url.url || String(url)) : String(url);
+
         let headersObj = {};
         if (options.headers) {
             if (options.headers instanceof Headers) {
@@ -282,20 +297,22 @@ const JS_PRELUDE: &str = r##"
             }
         }
 
-        const nativeRes = await $__native_fetch(url, {
+        const nativeRes = await $__native_fetch(urlString, {
             method: options.method || 'GET',
             headers: headersObj,
             body: options.body
         });
 
-        return new Response(nativeRes.body, {
+        let res = new Response(nativeRes.body, {
             status: nativeRes.status,
             statusText: nativeRes.statusText,
             headers: nativeRes.headers,
             url: nativeRes.url
         });
+        res._body_b64 = nativeRes.body_b64;
+        return res;
     };
-"##;
+"#;
 
 #[derive(Clone)]
 pub struct ScriptEngine {

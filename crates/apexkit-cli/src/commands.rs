@@ -1,13 +1,14 @@
 pub mod backup;
 pub mod data;
 pub mod user;
+pub mod wasm;
 
 use clap::Subcommand;
 use std::sync::Arc;
 
 use apexkit_core::database::sqlite::connections::a_new_database_connection;
 use apexkit_core::database::traits::{Db, VectorProvider};
-use async_trait::async_trait; // <--- ADD THIS IMPORT
+use async_trait::async_trait;
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
@@ -19,33 +20,42 @@ pub enum Commands {
     #[command(subcommand)]
     Data(data::DataCmd),
 
+    /// Manage, validate, and cache WASM/WASI binaries
+    Wasm {
+        /// Download, sanitize, precompile, and cache a WASM binary from a public URL
+        #[arg(long, value_name = "URL")]
+        get: Option<String>,
+
+        /// Optional custom readable name for symlinking (e.g. ffmpeg.wasm)
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// List all cached WASM binaries in .cache/wasm
+        #[arg(short, long)]
+        list: bool,
+    },
+
     /// Create a full or partial backup of the system
     Backup {
-        /// Backup root data. Optional items: vectors.db, logs.db, indexes, or *
         #[arg(long, default_missing_value = "default", num_args = 0..=1)]
         root: Option<String>,
 
-        /// Backup specific tenants. Format: app-0,app-1(*),app-2(vectors.db)
         #[arg(long)]
         tenants: Option<String>,
 
-        /// Custom output file path (e.g., my_backup.tar.gz)
         #[arg(short, long)]
         out: Option<String>,
     },
 
     /// Restore a backup from an archive
     Restore {
-        /// Path to the archive (.tar.gz)
         file: String,
 
-        /// Bypass the interactive confirmation prompt
         #[arg(short, long, action)]
         yes: bool,
     },
 }
 
-/// Helper to get a raw database connection purely for CLI tasks without booting the whole server
 pub async fn get_cli_db() -> Result<Arc<dyn Db>, String> {
     struct CliVectorProvider;
 
@@ -94,6 +104,7 @@ pub async fn execute(command: Commands) -> Result<(), String> {
     match command {
         Commands::User(cmd) => user::execute(cmd).await,
         Commands::Data(cmd) => data::execute(cmd).await,
+        Commands::Wasm { get, name, list } => wasm::execute(get, name, list).await,
         Commands::Backup { root, tenants, out } => backup::handle_backup(root, tenants, out).await,
         Commands::Restore { file, yes } => backup::handle_restore(file, yes).await,
     }

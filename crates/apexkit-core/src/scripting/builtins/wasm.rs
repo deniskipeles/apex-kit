@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ring::digest::{SHA256, digest};
 use rquickjs::function::{Async, Opt};
-use rquickjs::{Ctx, Function, Object, Value, Exception};
+use rquickjs::{Ctx, Exception, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde::Deserialize;
 use std::fs;
@@ -65,7 +65,9 @@ fn get_wasm_cache_dir() -> PathBuf {
 }
 
 fn create_readable_symlink(cache_dir: &PathBuf, readable_name: &str, target_filename: &str) {
-    let clean_name = readable_name.trim_start_matches('/').trim_start_matches("./");
+    let clean_name = readable_name
+        .trim_start_matches('/')
+        .trim_start_matches("./");
     if clean_name.is_empty() {
         return;
     }
@@ -77,7 +79,6 @@ fn create_readable_symlink(cache_dir: &PathBuf, readable_name: &str, target_file
 
     let target_path = cache_dir.join(target_filename);
 
-    // Remove existing link/file if present
     let _ = fs::remove_file(&link_path);
 
     #[cfg(unix)]
@@ -97,10 +98,14 @@ fn resolve_wasm_bytes(
     is_root: bool,
 ) -> Result<(Vec<u8>, Option<String>), String> {
     let cache_dir = get_wasm_cache_dir();
-    let clean_input = input.trim_start_matches('/').trim_start_matches("./");
+    let clean_input = input
+        .trim()
+        .trim_start_matches("data:application/wasm;base64,")
+        .trim_start_matches("data:application/wasi;base64,")
+        .trim_start_matches('/')
+        .trim_start_matches("./");
 
-    // 1. Check if `input` references an existing host WASM file in .cache/wasm/
-    // Only check if it's reasonably sized to avoid OS File Name Too Long errors
+    // 1. Check if `input` references an existing file in .cache/wasm/
     if clean_input.len() < 256 {
         let cached_file = cache_dir.join(clean_input);
         if cached_file.exists() && cached_file.is_file() {
@@ -110,19 +115,25 @@ fn resolve_wasm_bytes(
     }
 
     // 2. Decode as Base64 payload
-    let bytes = match BASE64.decode(input.trim()) {
+    let bytes = match BASE64.decode(clean_input) {
         Ok(b) if !b.is_empty() => b,
         _ => {
-            // Not valid Base64: Fallback to reading file from host/tenant storage
             let storage = app_ctx.get_storage();
             let handle = tokio::runtime::Handle::current();
             let input_owned = input.to_string();
-            match std::thread::spawn(move || handle.block_on(async { storage.get(&input_owned).await }))
-                .join()
-                .unwrap_or(Err("Read failed".into()))
+            match std::thread::spawn(move || {
+                handle.block_on(async { storage.get(&input_owned).await })
+            })
+            .join()
+            .unwrap_or(Err("Read failed".into()))
             {
                 Ok(b) => b,
-                Err(_) => return Err(format!("Invalid WASM input: File '{}' not found in cache or storage.", input)),
+                Err(_) => {
+                    return Err(format!(
+                        "Invalid WASM input: File '{}' not found in cache or storage.",
+                        input
+                    ));
+                }
             }
         }
     };
@@ -144,18 +155,30 @@ fn get_or_compile_module(
     bytes: &[u8],
     readable_name: Option<&str>,
 ) -> Result<Module, String> {
+    if let Ok(module) = unsafe { Module::deserialize(engine, bytes) } {
+        return Ok(module);
+    }
+
     let hash = crate::utils::to_hex(digest(&SHA256, bytes).as_ref());
     let cache_dir = get_wasm_cache_dir();
     let wasm_file = cache_dir.join(format!("{}.wasm", hash));
     let cwasm_file = cache_dir.join(format!("{}.cwasm", hash));
 
     if let Some(rname) = readable_name {
-        create_readable_symlink(&cache_dir, rname, &format!("{}.cwasm", hash));
+        create_readable_symlink(&cache_dir, rname, &format!("{}.wasm", hash));
+        let cwasm_rname = if rname.ends_with(".wasm") {
+            format!("{}.cwasm", rname.trim_end_matches(".wasm"))
+        } else {
+            format!("{}.cwasm", rname)
+        };
+        create_readable_symlink(&cache_dir, &cwasm_rname, &format!("{}.cwasm", hash));
     }
 
     if cwasm_file.exists() {
         if let Ok(module) = unsafe { Module::deserialize_file(engine, &cwasm_file) } {
             return Ok(module);
+        } else {
+            let _ = fs::remove_file(&cwasm_file);
         }
     }
 
@@ -163,7 +186,8 @@ fn get_or_compile_module(
         let _ = fs::write(&wasm_file, bytes);
     }
 
-    let module = Module::from_binary(engine, bytes).map_err(|e| e.to_string())?;
+    let module = Module::from_binary(engine, bytes)
+        .map_err(|e| format!("failed to parse WebAssembly module: {}", e))?;
 
     if let Ok(serialized) = module.serialize() {
         let _ = fs::write(&cwasm_file, serialized);
@@ -196,27 +220,26 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                     let is_root = matches!(app.get_scope(), EventScope::Root);
 
                     let memory_limit_mb = opts.memory_mb.unwrap_or(if is_root { 512 } else { 64 });
-                    let timeout_ms = opts.timeout_ms.unwrap_or(if is_root { 30_000 } else { 300 });
+                    let timeout_ms = opts
+                        .timeout_ms
+                        .unwrap_or(if is_root { 30_000 } else { 300 });
 
-                    let (bytes, readable_name) = match resolve_wasm_bytes(
-                        &app,
-                        &input,
-                        opts.name.as_deref(),
-                        is_root,
-                    ) {
-                        Ok(res) => res,
-                        Err(e) => {
-                            let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
-                            return Err(js_ctx.throw(js_err.into()));
-                        }
-                    };
+                    let (bytes, readable_name) =
+                        match resolve_wasm_bytes(&app, &input, opts.name.as_deref(), is_root) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                                return Err(js_ctx.throw(js_err.into()));
+                            }
+                        };
 
                     let task = tokio::task::spawn_blocking(move || {
                         let mut config = Config::new();
                         config.consume_fuel(true);
 
                         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
-                        let module = get_or_compile_module(&engine, &bytes, readable_name.as_deref())?;
+                        let module =
+                            get_or_compile_module(&engine, &bytes, readable_name.as_deref())?;
 
                         let state = WasmStoreState {
                             wasi: None,
@@ -232,13 +255,28 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         let instance =
                             Instance::new(&mut store, &module, &[]).map_err(|e| e.to_string())?;
 
-                        let export = instance
-                            .get_func(&mut store, &func)
-                            .ok_or_else(|| format!("Function '{}' not found in WASM exports", func))?;
+                        let export = instance.get_func(&mut store, &func).ok_or_else(|| {
+                            format!("Function '{}' not found in WASM exports", func)
+                        })?;
 
-                        let wasm_args: Vec<Val> =
-                            args.iter().map(|&a| Val::F64(a.to_bits())).collect();
-                        let mut results = vec![Val::I32(0)];
+                        // Dynamically inspect parameter types expected by WASM function
+                        let func_type = export.ty(&store);
+                        let param_types: Vec<ValType> = func_type.params().collect();
+
+                        let mut wasm_args = Vec::with_capacity(args.len());
+                        for (i, &a) in args.iter().enumerate() {
+                            let param_ty = param_types.get(i).cloned().unwrap_or(ValType::F64);
+                            match param_ty {
+                                ValType::I32 => wasm_args.push(Val::I32(a as i32)),
+                                ValType::I64 => wasm_args.push(Val::I64(a as i64)),
+                                ValType::F32 => wasm_args.push(Val::F32((a as f32).to_bits())),
+                                ValType::F64 => wasm_args.push(Val::F64(a.to_bits())),
+                                _ => wasm_args.push(Val::F64(a.to_bits())),
+                            }
+                        }
+
+                        let result_types: Vec<ValType> = func_type.results().collect();
+                        let mut results = vec![Val::I32(0); result_types.len().max(1)];
 
                         export
                             .call(&mut store, &wasm_args, &mut results)
@@ -262,17 +300,25 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                             return Err(js_ctx.throw(js_err.into()));
                         }
                         Ok(Err(e)) => {
-                            let js_err = Exception::from_message(js_ctx.clone(), &format!("Task panicked: {}", e)).unwrap();
+                            let js_err = Exception::from_message(
+                                js_ctx.clone(),
+                                &format!("Task panicked: {}", e),
+                            )
+                            .unwrap();
                             return Err(js_ctx.throw(js_err.into()));
                         }
                         Err(_) => {
-                            let js_err = Exception::from_message(js_ctx.clone(), "WASM execution timed out").unwrap();
+                            let js_err =
+                                Exception::from_message(js_ctx.clone(), "WASM execution timed out")
+                                    .unwrap();
                             return Err(js_ctx.throw(js_err.into()));
                         }
                     };
 
                     to_value(js_ctx.clone(), &res).map_err(|_| {
-                        let js_err = Exception::from_message(js_ctx.clone(), "Failed to serialize result").unwrap();
+                        let js_err =
+                            Exception::from_message(js_ctx.clone(), "Failed to serialize result")
+                                .unwrap();
                         js_ctx.throw(js_err.into())
                     })
                 }
@@ -292,7 +338,8 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                   Opt(opts_val): Opt<Value<'js>>| {
                 let app = app_wasi.clone();
                 async move {
-                    let cli_args: Option<Vec<String>> = cli_args_val.and_then(|v| from_value(v).ok());
+                    let cli_args: Option<Vec<String>> =
+                        cli_args_val.and_then(|v| from_value(v).ok());
                     let opts: WasmOptions = opts_val
                         .and_then(|v| from_value(v).ok())
                         .unwrap_or_default();
@@ -300,27 +347,26 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                     let is_root = matches!(app.get_scope(), EventScope::Root);
 
                     let memory_limit_mb = opts.memory_mb.unwrap_or(if is_root { 512 } else { 64 });
-                    let timeout_ms = opts.timeout_ms.unwrap_or(if is_root { 30_000 } else { 300 });
+                    let timeout_ms = opts
+                        .timeout_ms
+                        .unwrap_or(if is_root { 30_000 } else { 300 });
 
-                    let (bytes, readable_name) = match resolve_wasm_bytes(
-                        &app,
-                        &input,
-                        opts.name.as_deref(),
-                        is_root,
-                    ) {
-                        Ok(res) => res,
-                        Err(e) => {
-                            let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
-                            return Err(js_ctx.throw(js_err.into()));
-                        }
-                    };
+                    let (bytes, readable_name) =
+                        match resolve_wasm_bytes(&app, &input, opts.name.as_deref(), is_root) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                                return Err(js_ctx.throw(js_err.into()));
+                            }
+                        };
 
                     let task = tokio::task::spawn_blocking(move || {
                         let mut config = Config::new();
                         config.consume_fuel(true);
 
                         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
-                        let module = get_or_compile_module(&engine, &bytes, readable_name.as_deref())?;
+                        let module =
+                            get_or_compile_module(&engine, &bytes, readable_name.as_deref())?;
 
                         let mut linker: Linker<WasmStoreState> = Linker::new(&engine);
                         preview1::add_to_linker_sync(&mut linker, |s| s.wasi.as_mut().unwrap())
@@ -364,17 +410,25 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                             return Err(js_ctx.throw(js_err.into()));
                         }
                         Ok(Err(e)) => {
-                            let js_err = Exception::from_message(js_ctx.clone(), &format!("Task panicked: {}", e)).unwrap();
+                            let js_err = Exception::from_message(
+                                js_ctx.clone(),
+                                &format!("Task panicked: {}", e),
+                            )
+                            .unwrap();
                             return Err(js_ctx.throw(js_err.into()));
                         }
                         Err(_) => {
-                            let js_err = Exception::from_message(js_ctx.clone(), "WASM execution timed out").unwrap();
+                            let js_err =
+                                Exception::from_message(js_ctx.clone(), "WASM execution timed out")
+                                    .unwrap();
                             return Err(js_ctx.throw(js_err.into()));
                         }
                     };
 
                     to_value(js_ctx.clone(), &res).map_err(|_| {
-                        let js_err = Exception::from_message(js_ctx.clone(), "Failed to serialize result").unwrap();
+                        let js_err =
+                            Exception::from_message(js_ctx.clone(), "Failed to serialize result")
+                                .unwrap();
                         js_ctx.throw(js_err.into())
                     })
                 }

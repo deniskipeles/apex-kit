@@ -10,13 +10,16 @@ tokio = { version = "1.37.0", features = ["full"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-async-trait = "0.1" # <--- ADD THIS LINE
-regex = "1.10"      # <--- ADD THIS LINE (used in backup.rs)
-chrono = "0.4"      # <--- ADD THIS LINE (used in backup.rs)
-uuid = { version = "1.8", features = ["v4"] } # <--- ADD THIS LINE (used in backup.rs)
-serde_json = "1.0"  # <--- ADD THIS LINE
-rusqlite = "0.39.0" # <--- ADD THIS LINE (used in data.rs)
+async-trait = "0.1"
+regex = "1.10"
+chrono = "0.4"
+uuid = { version = "1.8", features = ["v4"] }
+serde_json = "1.0"
+rusqlite = "0.39.0"
 dotenvy = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls-vendored"] }
+wasmtime = "24.0.0"
+ring = "0.17.14"
 
 [features]
 default = ["onnx"]
