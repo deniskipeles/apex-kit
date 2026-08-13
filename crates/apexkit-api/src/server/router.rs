@@ -308,9 +308,17 @@ fn make_api_router() -> Router<AppState> {
             "/run/{script_name}",
             axum::routing::any(script_routes::run_script),
         )
+        .route(
+            "/run/{script_name}/{*subpath}",
+            axum::routing::any(script_routes::run_script),
+        )
         // NEW script endpoint
         .route(
             "/webhook/{script_name}",
+            axum::routing::any(script_routes::run_script),
+        )
+        .route(
+            "/webhook/{script_name}/{*subpath}",
             axum::routing::any(script_routes::run_script),
         )
         .route(

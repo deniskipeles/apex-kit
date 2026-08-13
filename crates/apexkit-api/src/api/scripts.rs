@@ -27,6 +27,7 @@ pub struct IdPath {
 #[derive(Deserialize)]
 pub struct ScriptNamePath {
     pub script_name: String,
+    pub subpath: Option<String>,
 }
 
 // --- CRUD HANDLERS ---

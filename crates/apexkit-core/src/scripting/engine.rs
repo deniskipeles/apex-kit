@@ -2,7 +2,8 @@ use crate::realtime::EventScope;
 use regex::Regex;
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
 
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function, Object, Promise};
 use rquickjs_serde::{from_value, to_value};
@@ -14,7 +15,11 @@ use super::builtins::{
 };
 use super::context::ScriptContext;
 
-// Helper struct to wrap non-Send QuickJS futures for Tokio's multithreaded runtime
+static EXECUTION_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+fn get_execution_semaphore() -> &'static Semaphore {
+    EXECUTION_SEMAPHORE.get_or_init(|| Semaphore::new(50)) // Caps concurrent scripts at 50
+}
+
 struct SendWrapper<F>(F);
 unsafe impl<F> Send for SendWrapper<F> {}
 
@@ -29,7 +34,7 @@ impl<F: std::future::Future> std::future::Future for SendWrapper<F> {
     }
 }
 
-const JS_PRELUDE: &str = r#"
+const JS_PRELUDE: &str = r##"
     class Headers {
         constructor(init = {}) {
             this.map = new Map();
@@ -69,20 +74,82 @@ const JS_PRELUDE: &str = r#"
         }
     }
 
+    class URL {
+        constructor(urlStr, baseStr) {
+            let full = String(urlStr || "");
+            if (baseStr && !full.includes('://')) {
+                let baseClean = String(baseStr).replace(/\/$/, '');
+                full = baseClean + '/' + full.replace(/^\//, '');
+            }
+            
+            this.href = full;
+            
+            let match = full.match(/^(https?:)\/\/([^\/?#]+)([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/i);
+            if (match) {
+                this.protocol = match[1].toLowerCase();
+                this.host = match[2];
+                let hostParts = this.host.split(':');
+                this.hostname = hostParts[0];
+                this.port = hostParts[1] || "";
+                this.origin = this.protocol + "//" + this.host;
+                this.pathname = match[3] || "/";
+                this.search = match[4] ? "?" + match[4] : "";
+                this.hash = match[5] ? "#" + match[5] : "";
+            } else {
+                this.protocol = "http:";
+                this.host = "localhost";
+                this.hostname = "localhost";
+                this.port = "";
+                this.origin = "http://localhost";
+                let parts = full.split('#');
+                this.hash = parts[1] ? "#" + parts[1] : "";
+                let pathAndSearch = parts[0].split('?');
+                this.pathname = pathAndSearch[0] || "/";
+                this.search = pathAndSearch[1] ? "?" + pathAndSearch[1] : "";
+            }
+
+            const params = new Map();
+            let rawQuery = this.search.startsWith('?') ? this.search.slice(1) : this.search;
+            if (rawQuery) {
+                rawQuery.split('&').forEach(pair => {
+                    if (!pair) return;
+                    const [k, v] = pair.split('=');
+                    if (k) params.set(decodeURIComponent(k), decodeURIComponent(v || ''));
+                });
+            }
+            this.searchParams = {
+                get: (k) => params.get(k) || null,
+                has: (k) => params.has(k),
+                getAll: (k) => params.has(k) ? [params.get(k)] : []
+            };
+        }
+
+        toString() {
+            return this.origin + this.pathname + this.search + this.hash;
+        }
+    }
+
     class Request {
         constructor(input, init = {}) {
-            if (typeof input === 'object' && input.url) {
-                this.url = input.url;
-                this.method = init.method || input.method;
-                this.bodyData = init.body || input.bodyData;
-                this.headers = new Headers(init.headers || input.headers);
+            if (typeof input === 'object' && input !== null && input.url) {
+                this.url = String(input.url);
+                this.method = String(init.method || input.method || "GET").toUpperCase();
+                this.bodyData = init.body !== undefined ? init.body : (input.bodyData !== undefined ? input.bodyData : null);
+                this.headers = new Headers(init.headers || input.headers || {});
             } else {
-                this.url = input;
-                this.method = init.method || "GET";
-                this.bodyData = init.body || null;
+                this.url = String(input || "");
+                this.method = String(init.method || "GET").toUpperCase();
+                this.bodyData = init.body !== undefined ? init.body : null;
                 this.headers = new Headers(init.headers || {});
             }
             this.args = this.bodyData || {};
+
+            try {
+                let u = new URL(this.url);
+                let pathRegex = /^(\/(?:tenant|sandbox)\/[^\/]+)?(?:\/api\/v1)?\/(?:run|webhook)\/[^\/]+/;
+                let cleanPath = u.pathname.replace(pathRegex, "") || "/";
+                this.url = u.origin + cleanPath + u.search + u.hash;
+            } catch (e) {}
 
             this.auth = null;
             const authHeader = this.headers.get("authorization");
@@ -100,13 +167,37 @@ const JS_PRELUDE: &str = r#"
                         role: decoded.role,
                         scope: decoded.scope
                     };
-                } catch (e) {
-                    console.error("[ApexKit] Failed to decode auth token in Request:", e);
-                }
+                } catch (e) {}
             }
         }
-        async json() { return typeof this.bodyData === 'string' ? JSON.parse(this.bodyData) : this.bodyData; }
-        async text() { return typeof this.bodyData === 'string' ? this.bodyData : JSON.stringify(this.bodyData); }
+
+        async json() {
+            if (this.bodyData === null || this.bodyData === undefined) return {};
+            if (typeof this.bodyData === 'string') {
+                try { return JSON.parse(this.bodyData); } catch (e) { return {}; }
+            }
+            return this.bodyData;
+        }
+
+        async text() {
+            if (this.bodyData === null || this.bodyData === undefined) return "";
+            if (typeof this.bodyData === 'string') return this.bodyData;
+            return JSON.stringify(this.bodyData);
+        }
+
+        async arrayBuffer() {
+            const txt = await this.text();
+            const encoder = new TextEncoder();
+            return encoder.encode(txt).buffer;
+        }
+
+        clone() {
+            return new Request(this.url, {
+                method: this.method,
+                headers: this.headers,
+                body: this.bodyData
+            });
+        }
     }
 
     class ApexKit {
@@ -174,31 +265,6 @@ const JS_PRELUDE: &str = r#"
         }
     }
     
-    class URL {
-        constructor(urlStr, baseStr) {
-            let full = urlStr || "";
-            if (baseStr && !full.includes('://')) {
-                full = baseStr.replace(/\/$/, '') + '/' + full.replace(/^\//, '');
-            }
-            this.href = full;
-            const parts = full.split('?');
-            this.pathname = parts[0] || '';
-            const queryStr = parts[1] || '';
-            
-            const params = new Map();
-            if (queryStr) {
-                queryStr.split('&').forEach(pair => {
-                    const [k, v] = pair.split('=');
-                    if (k) params.set(decodeURIComponent(k), decodeURIComponent(v || ''));
-                });
-            }
-            this.searchParams = {
-                get: (k) => params.get(k) || null,
-                has: (k) => params.has(k),
-                getAll: (k) => params.has(k) ? [params.get(k)] : []
-            };
-        }
-    }
     globalThis.URL = URL;
     globalThis.ApexKit = ApexKit;
     globalThis.$apex = new ApexKit();
@@ -229,11 +295,12 @@ const JS_PRELUDE: &str = r#"
             url: nativeRes.url
         });
     };
-"#;
+"##;
 
 #[derive(Clone)]
 pub struct ScriptEngine {
-    runtime: AsyncRuntime,
+    pub vfs: crate::scripting::module_loader::VfsState,
+    pub db: Option<Arc<dyn crate::Db>>,
 }
 
 unsafe impl Send for ScriptEngine {}
@@ -248,44 +315,7 @@ impl ScriptEngine {
         vfs: crate::scripting::module_loader::VfsState,
         db: Option<Arc<dyn crate::Db>>,
     ) -> Self {
-        let runtime = AsyncRuntime::new().unwrap();
-
-        let rt = runtime.clone();
-        SendWrapper(async move {
-            rt.set_max_stack_size(0).await;
-
-            // Only register the DB in the module loader if one was provided
-            if let Some(db_arc) = db {
-                rt.set_loader(
-                    crate::scripting::module_loader::ApexModuleResolver,
-                    crate::scripting::module_loader::ApexModuleLoader { vfs, db: db_arc },
-                )
-                .await;
-            } else {
-                // Temporary dummy fallback loader if no DB is available
-                // This prevents crashes in pure testing environments
-                struct DummyLoader;
-                impl rquickjs::loader::Loader for DummyLoader {
-                    fn load<'js>(
-                        &mut self,
-                        _ctx: &rquickjs::Ctx<'js>,
-                        _name: &str,
-                        _attrs: Option<rquickjs::loader::ImportAttributes<'js>>,
-                    ) -> rquickjs::Result<rquickjs::Module<'js, rquickjs::module::Declared>>
-                    {
-                        Err(rquickjs::Error::Unknown)
-                    }
-                }
-                rt.set_loader(
-                    crate::scripting::module_loader::ApexModuleResolver,
-                    DummyLoader,
-                )
-                .await;
-            }
-        })
-        .await;
-
-        Self { runtime }
+        Self { vfs, db }
     }
 
     pub async fn run_script(
@@ -298,6 +328,11 @@ impl ScriptEngine {
         method: Option<String>,
         url: Option<String>,
     ) -> Result<JsonValue, String> {
+        let _permit = get_execution_semaphore()
+            .acquire()
+            .await
+            .map_err(|_| "Server is too busy. Please try again later.".to_string())?;
+
         let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
             .map_err(|e| e.to_string())?;
         let code_cleaned = re_config.replace_all(code, "");
@@ -312,23 +347,50 @@ impl ScriptEngine {
         let total_cpu_budget_ms = std::env::var("SCRIPT_MAX_CPU_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300);
-        let quantum_slice_ms = 10;
+            .unwrap_or(30000);
 
-        let scheduler = super::scheduler::get_quantum_scheduler();
-        let task_id = scheduler.register_task(
-            std::time::Duration::from_millis(total_cpu_budget_ms),
-            std::time::Duration::from_millis(quantum_slice_ms),
-        );
-        let _guard = super::scheduler::QuantumGuard::new(task_id);
+        let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
+        let vfs = self.vfs.clone();
+        let db = self.db.clone();
 
-        let runtime = self.runtime.clone();
+        let start_time = std::time::Instant::now();
+        let max_duration = std::time::Duration::from_millis(total_cpu_budget_ms);
+        let tokio_handle = tokio::runtime::Handle::current();
 
         let task = SendWrapper(async move {
+            runtime.set_max_stack_size(0).await;
+
+            if let Some(db_arc) = db {
+                runtime
+                    .set_loader(
+                        super::module_loader::ApexModuleResolver,
+                        super::module_loader::ApexModuleLoader {
+                            vfs,
+                            db: db_arc,
+                            tokio_handle,
+                        },
+                    )
+                    .await;
+            } else {
+                struct DummyLoader;
+                impl rquickjs::loader::Loader for DummyLoader {
+                    fn load<'js>(
+                        &mut self,
+                        _ctx: &rquickjs::Ctx<'js>,
+                        _name: &str,
+                        _attrs: Option<rquickjs::loader::ImportAttributes<'js>>,
+                    ) -> rquickjs::Result<rquickjs::Module<'js, rquickjs::module::Declared>>
+                    {
+                        Err(rquickjs::Error::Unknown)
+                    }
+                }
+                runtime
+                    .set_loader(super::module_loader::ApexModuleResolver, DummyLoader)
+                    .await;
+            }
+
             runtime
-                .set_interrupt_handler(Some(Box::new(move || {
-                    super::scheduler::get_quantum_scheduler().check_and_yield(task_id)
-                })))
+                .set_interrupt_handler(Some(Box::new(move || start_time.elapsed() > max_duration)))
                 .await;
 
             let ctx = AsyncContext::full(&runtime)
@@ -336,10 +398,9 @@ impl ScriptEngine {
                 .map_err(|e| e.to_string())?;
 
             #[allow(deprecated)]
-            rquickjs::async_with!(ctx => |js_ctx| {
+            let res = rquickjs::async_with!(ctx => |js_ctx| {
                 setup_quickjs(&js_ctx, context.clone())?;
 
-                // EVALUATE AS AN ES MODULE SO IMPORTS WORK
                 let module_name = format!("exec_{}", uuid::Uuid::new_v4());
                 let _ = rquickjs::Module::evaluate(js_ctx.clone(), module_name, processed_code.as_bytes())
                     .catch(&js_ctx)
@@ -373,7 +434,7 @@ impl ScriptEngine {
                     .catch(&js_ctx)
                     .map_err(|e| format!("Script Execution Error: {}", e))?;
 
-                if let Some(obj) = result_val.as_object() {
+                let res_val = if let Some(obj) = result_val.as_object() {
                     if obj.contains_key("body").unwrap_or(false)
                         && obj.contains_key("status").unwrap_or(false)
                     {
@@ -394,17 +455,24 @@ impl ScriptEngine {
                             from_value(body_val).unwrap_or(serde_json::Value::Null)
                         };
 
-                        return Ok::<JsonValue, String>(json!({
+                        json!({
                             "__is_apex_response": true,
                             "status": status_code,
                             "body": body_json
-                        }));
+                        })
+                    } else {
+                        from_value(result_val).unwrap_or(JsonValue::Null)
                     }
-                }
+                } else {
+                    from_value(result_val).unwrap_or(JsonValue::Null)
+                };
 
-                let json_res: JsonValue = from_value(result_val).unwrap_or(JsonValue::Null);
-                Ok::<JsonValue, String>(json_res)
-            }).await
+                js_ctx.run_gc();
+                Ok::<JsonValue, String>(res_val)
+            }).await;
+
+            runtime.idle().await;
+            res
         });
 
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
@@ -421,6 +489,11 @@ impl ScriptEngine {
         _base_url: Option<String>,
         _scope: Option<EventScope>,
     ) -> Result<Option<JsonValue>, String> {
+        let _permit = get_execution_semaphore()
+            .acquire()
+            .await
+            .map_err(|_| "Server is too busy. Please try again later.".to_string())?;
+
         let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
             .map_err(|e| e.to_string())?;
         let code_cleaned = re_config.replace_all(code, "");
@@ -432,18 +505,35 @@ impl ScriptEngine {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30);
 
-        let runtime = self.runtime.clone();
+        let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
+        let vfs = self.vfs.clone();
+        let db = self.db.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
 
         let task = SendWrapper(async move {
+            runtime.set_max_stack_size(0).await;
+
+            if let Some(db_arc) = db {
+                runtime
+                    .set_loader(
+                        super::module_loader::ApexModuleResolver,
+                        super::module_loader::ApexModuleLoader {
+                            vfs,
+                            db: db_arc,
+                            tokio_handle,
+                        },
+                    )
+                    .await;
+            }
+
             let ctx = AsyncContext::full(&runtime)
                 .await
                 .map_err(|e| e.to_string())?;
 
             #[allow(deprecated)]
-            rquickjs::async_with!(ctx => |js_ctx| {
+            let res = rquickjs::async_with!(ctx => |js_ctx| {
                 setup_quickjs(&js_ctx, context.clone())?;
 
-                // EVALUATE AS AN ES MODULE SO IMPORTS WORK
                 let module_name = format!("exec_{}", uuid::Uuid::new_v4());
                 let _ = rquickjs::Module::evaluate(js_ctx.clone(), module_name, processed_code.as_bytes())
                     .catch(&js_ctx)
@@ -452,7 +542,7 @@ impl ScriptEngine {
                 let js_event = to_value(js_ctx.clone(), &event_data).map_err(|e| e.to_string())?;
                 let globals = js_ctx.globals();
 
-                if let Ok(handler) = globals.get::<_, Function>("__mainHandler") {
+                let res_val = if let Ok(handler) = globals.get::<_, Function>("__mainHandler") {
                     let promise: Promise = handler
                         .call((js_event,))
                         .catch(&js_ctx)
@@ -465,21 +555,26 @@ impl ScriptEngine {
                         .map_err(|e| e.to_string())?;
 
                     if result_val.is_null() || result_val.is_undefined() {
-                        return Ok::<Option<JsonValue>, String>(None);
-                    }
-
-                    if let Some(b) = result_val.as_bool() {
+                        None
+                    } else if let Some(b) = result_val.as_bool() {
                         if !b {
                             return Err("Hook blocked operation".to_string());
                         }
+                        None
+                    } else {
+                        let json_val: JsonValue = from_value(result_val).map_err(|e| e.to_string())?;
+                        Some(json_val)
                     }
-
-                    let json_val: JsonValue = from_value(result_val).map_err(|e| e.to_string())?;
-                    Ok::<Option<JsonValue>, String>(Some(json_val))
                 } else {
-                    Ok::<Option<JsonValue>, String>(None)
-                }
-            }).await
+                    None
+                };
+
+                js_ctx.run_gc();
+                Ok::<Option<JsonValue>, String>(res_val)
+            }).await;
+
+            runtime.idle().await;
+            res
         });
 
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {

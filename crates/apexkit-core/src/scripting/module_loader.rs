@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use regex::Regex;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
@@ -24,9 +24,9 @@ pub struct FileMetadata {
     #[serde(default)]
     pub target_collection: Option<String>,
     #[serde(default = "default_type")]
-    pub r#type: String, // "webhook" | "custom:module" | "esm:module" | "template" | "ai_action"
+    pub r#type: String,
     #[serde(default = "default_path")]
-    pub path: String, // "./webhooks/" | "./modules/custom/" | "./templates/"
+    pub path: String,
     #[serde(default = "default_trigger")]
     pub trigger_type: String,
     #[serde(default = "default_true")]
@@ -98,6 +98,13 @@ impl Resolver for ApexModuleResolver {
         if name.starts_with("http://") || name.starts_with("https://") {
             return Ok(name.to_string());
         }
+        if base.starts_with("http://") || base.starts_with("https://") {
+            if let Ok(base_url) = url::Url::parse(base) {
+                if let Ok(joined) = base_url.join(name) {
+                    return Ok(joined.to_string());
+                }
+            }
+        }
         if name.starts_with("@/custom/") {
             let clean = name.strip_prefix("@/custom/").unwrap();
             return Ok(format!(
@@ -119,10 +126,26 @@ impl Resolver for ApexModuleResolver {
     }
 }
 
-// [NEW] ApexModuleLoader now takes the DB to fetch missing scripts
+// Global HTTP Client and Cache for remote modules
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+fn get_client() -> reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()
+            .unwrap()
+    }).clone()
+}
+
+static MODULE_CACHE: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+fn get_module_cache() -> &'static RwLock<HashMap<String, String>> {
+    MODULE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 pub struct ApexModuleLoader {
     pub vfs: VfsState,
     pub db: Arc<dyn Db>,
+    pub tokio_handle: tokio::runtime::Handle,
 }
 
 impl Loader for ApexModuleLoader {
@@ -132,24 +155,53 @@ impl Loader for ApexModuleLoader {
         name: &str,
         _attr: Option<ImportAttributes<'js>>,
     ) -> QjsResult<Module<'js, Declared>> {
+        let name_str = name.to_string();
+
         let code = if name.starts_with("http://") || name.starts_with("https://") {
-            let res = reqwest::blocking::get(name).map_err(|_| QjsError::Unknown)?;
-            res.text().map_err(|_| QjsError::Unknown)?
+            if let Some(cached) = get_module_cache().read().unwrap().get(name) {
+                cached.clone()
+            } else {
+                let handle = self.tokio_handle.clone();
+                let url = name_str.clone();
+                let downloaded = std::thread::spawn(move || {
+                    handle.block_on(async {
+                        let res = get_client()
+                            .get(&url)
+                            .send()
+                            .await
+                            .map_err(|_| QjsError::Unknown)?;
+                        if !res.status().is_success() {
+                            return Err(QjsError::Unknown);
+                        }
+                        res.text().await.map_err(|_| QjsError::Unknown)
+                    })
+                })
+                .join()
+                .unwrap_or(Err(QjsError::Unknown))?;
+
+                get_module_cache()
+                    .write()
+                    .unwrap()
+                    .insert(name_str, downloaded.clone());
+                downloaded
+            }
         } else if let Some(content) = self.vfs.get_file("root", name) {
-            // Note: Since module loader executes under root context for now, we default to root.
-            // Advanced scoping can be passed via context if needed.
             content
         } else if name.starts_with("./modules/") {
-            // [CRITICAL] Fallback to SQLite DB for custom modules after restart
-            let script_name = name.split('/').last().unwrap().trim_end_matches(".js");
+            let script_name = name
+                .split('/')
+                .last()
+                .unwrap()
+                .trim_end_matches(".js")
+                .to_string();
             let db = self.db.clone();
-            let s_name = script_name.to_string();
 
-            // Bridge sync QuickJS to async Tokio DB
-            let code_res = tokio::task::block_in_place(move || {
-                tokio::runtime::Handle::current()
-                    .block_on(async move { db.get_script_by_name(&s_name).await })
-            });
+            let handle = self.tokio_handle.clone();
+            let code_res = std::thread::spawn(move || {
+                handle.block_on(async { db.get_script_by_name(&script_name).await })
+            })
+            .join()
+            .unwrap_or(Ok(None));
 
             if let Ok(Some(script)) = code_res {
                 script.code
@@ -178,7 +230,6 @@ impl WorkspaceManager {
                 .compression_method(zip::CompressionMethod::Deflated)
                 .unix_permissions(0o755);
 
-            // 1. Export package.json
             let pkg_json = json!({
                 "name": "apexkit-workspace",
                 "type": "module",
@@ -193,7 +244,6 @@ impl WorkspaceManager {
 
             if let Ok(scripts) = db.list_scripts().await {
                 for script in scripts {
-                    // [UPDATED] Use Database Metadata if present!
                     let mut meta = FileMetadata {
                         id: Some(script.id),
                         name: script.name.clone(),
@@ -215,7 +265,6 @@ impl WorkspaceManager {
                         }
                     }
 
-                    // Only skip ESM modules if requested, but for now we export everything so it's a full backup
                     let meta_js = format!(
                         "export const __fileMetadata__ = {};\n\n{}",
                         serde_json::to_string_pretty(&meta).unwrap(),
@@ -235,13 +284,11 @@ impl WorkspaceManager {
                 }
             }
 
-            // ... templates and AI actions export logic remains the same
             zip.finish().map_err(|e| e.to_string())?;
         }
         Ok(buffer.into_inner())
     }
 
-    /// Parses an individual file, extracts `__fileMetadata__`, and commits changes to SQLite DB.
     pub async fn commit_file_to_db(
         db: &Arc<dyn Db>,
         _path: &str,
@@ -254,8 +301,6 @@ impl WorkspaceManager {
             let meta: FileMetadata = serde_json::from_str(meta_json)
                 .map_err(|e| format!("Invalid __fileMetadata__: {}", e))?;
             let clean_code = meta_re.replace(content, "").trim().to_string();
-
-            // FIX: Serialize metadata to Value BEFORE moving meta's fields!
             let meta_val = serde_json::to_value(&meta).ok();
 
             match meta.r#type.as_str() {
@@ -267,7 +312,7 @@ impl WorkspaceManager {
                         code: clean_code,
                         active: meta.active,
                         visibility: meta.visibility,
-                        metadata: meta_val, // <-- Pass prepared Value here
+                        metadata: meta_val,
                     })
                     .await
                     .map_err(|e| e.to_string())?;

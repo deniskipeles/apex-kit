@@ -81,12 +81,10 @@ async fn execute_http_request(
 pub fn register_fetch<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
     let globals = ctx.globals();
 
-    let fetch_ctx = ctx.clone();
     let fetch_fn = Function::new(
         ctx.clone(),
-        Async(move |url: String, opts_val: Option<Value<'js>>| {
-            let thread_ctx = fetch_ctx.clone();
-            async move {
+        Async(
+            move |js_ctx: Ctx<'js>, url: String, opts_val: Option<Value<'js>>| async move {
                 let mut method = "GET".to_string();
                 let mut headers = None;
                 let mut body = None;
@@ -115,10 +113,9 @@ pub fn register_fetch<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> 
                     .await
                     .map_err(|_| rquickjs::Error::Exception)?;
 
-                // Map JSON response to QuickJS value
-                to_value(thread_ctx.clone(), &res).map_err(|_| rquickjs::Error::Exception)
-            }
-        }),
+                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+            },
+        ),
     )
     .map_err(|e| e.to_string())?;
 
