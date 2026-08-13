@@ -11,7 +11,7 @@ use rquickjs_serde::{from_value, to_value};
 use super::builtins::{
     register_ai, register_cache, register_cmd, register_console, register_db, register_env,
     register_fetch, register_file_tools, register_fs, register_http, register_mail,
-    register_realtime, register_root, register_util, register_zip,
+    register_realtime, register_root, register_util, register_wasm, register_zip,
 };
 use super::context::ScriptContext;
 
@@ -608,6 +608,7 @@ fn setup_quickjs<'js>(
     register_mail(ctx, app_ctx.clone())?;
     register_realtime(ctx, app_ctx.clone())?;
     register_cache(ctx, app_ctx.clone())?;
+    register_wasm(ctx, app_ctx.clone())?;
 
     Ok(())
 }

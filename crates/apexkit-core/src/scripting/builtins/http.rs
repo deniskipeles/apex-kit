@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rquickjs::function::Async;
-use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs::function::{Async, Opt};
+use rquickjs::{Ctx, Function, Object, Value, Exception};
 use rquickjs_serde::{from_value, to_value};
 use serde_json::json;
 use std::collections::HashMap;
@@ -83,39 +83,44 @@ pub fn register_fetch<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> 
 
     let fetch_fn = Function::new(
         ctx.clone(),
-        Async(
-            move |js_ctx: Ctx<'js>, url: String, opts_val: Option<Value<'js>>| async move {
-                let mut method = "GET".to_string();
-                let mut headers = None;
-                let mut body = None;
-                let mut redirect = None;
+        Async(move |js_ctx: Ctx<'js>, url: String, Opt(opts_val): Opt<Value<'js>>| async move {
+            let mut method = "GET".to_string();
+            let mut headers = None;
+            let mut body = None;
+            let mut redirect = None;
 
-                if let Some(v) = opts_val {
-                    if let Ok(opts) = from_value::<serde_json::Value>(v) {
-                        if let Some(m) = opts.get("method").and_then(|v| v.as_str()) {
-                            method = m.to_string();
-                        }
-                        if let Some(h) = opts.get("headers") {
-                            if let Ok(h_map) =
-                                serde_json::from_value::<HashMap<String, String>>(h.clone())
-                            {
-                                headers = Some(h_map);
-                            }
-                        }
-                        body = opts.get("body").cloned();
-                        if let Some(r) = opts.get("redirect").and_then(|v| v.as_str()) {
-                            redirect = Some(r.to_string());
+            if let Some(v) = opts_val {
+                if let Ok(opts) = from_value::<serde_json::Value>(v) {
+                    if let Some(m) = opts.get("method").and_then(|v| v.as_str()) {
+                        method = m.to_string();
+                    }
+                    if let Some(h) = opts.get("headers") {
+                        if let Ok(h_map) =
+                            serde_json::from_value::<HashMap<String, String>>(h.clone())
+                        {
+                            headers = Some(h_map);
                         }
                     }
+                    body = opts.get("body").cloned();
+                    if let Some(r) = opts.get("redirect").and_then(|v| v.as_str()) {
+                        redirect = Some(r.to_string());
+                    }
                 }
+            }
 
-                let res = execute_http_request(url, method, headers, body, redirect)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+            let res = match execute_http_request(url, method, headers, body, redirect).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                    return Err(js_ctx.throw(js_err.into()));
+                }
+            };
 
-                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
-            },
-        ),
+            to_value(js_ctx.clone(), &res).map_err(|_| {
+                let js_err = Exception::from_message(js_ctx.clone(), "Failed to serialize fetch result").unwrap();
+                js_ctx.throw(js_err.into())
+            })
+        }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -131,10 +136,14 @@ pub fn register_http<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
 
     let get_fn = Function::new(
         ctx.clone(),
-        Async(move |url: String| async move {
-            let res = execute_http_request(url, "GET".to_string(), None, None, None)
-                .await
-                .map_err(|_| rquickjs::Error::Exception)?;
+        Async(move |js_ctx: Ctx<'js>, url: String| async move {
+            let res = match execute_http_request(url, "GET".to_string(), None, None, None).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                    return Err(js_ctx.throw(js_err.into()));
+                }
+            };
 
             let body = res
                 .get("body")
@@ -149,11 +158,15 @@ pub fn register_http<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
 
     let post_fn = Function::new(
         ctx.clone(),
-        Async(move |url: String, body_val: Value<'js>| async move {
+        Async(move |js_ctx: Ctx<'js>, url: String, body_val: Value<'js>| async move {
             let body_json: serde_json::Value = from_value(body_val).unwrap_or(json!({}));
-            let res = execute_http_request(url, "POST".to_string(), None, Some(body_json), None)
-                .await
-                .map_err(|_| rquickjs::Error::Exception)?;
+            let res = match execute_http_request(url, "POST".to_string(), None, Some(body_json), None).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                    return Err(js_ctx.throw(js_err.into()));
+                }
+            };
 
             let body = res
                 .get("body")
