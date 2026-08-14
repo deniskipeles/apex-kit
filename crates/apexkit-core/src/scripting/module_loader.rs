@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 use regex::Regex;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
@@ -83,6 +84,12 @@ impl VfsState {
         }
         None
     }
+    pub fn remove_file(&self, scope: &str, path: &str) {
+        self.files
+            .write()
+            .unwrap()
+            .remove(&(scope.to_string(), path.to_string()));
+    }
 }
 
 pub struct ApexModuleResolver;
@@ -126,14 +133,15 @@ impl Resolver for ApexModuleResolver {
     }
 }
 
-static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-fn get_client() -> reqwest::Client {
-    HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+static UREQ_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn get_ureq_agent() -> &'static ureq::Agent {
+    UREQ_AGENT.get_or_init(|| {
+        ureq::builder()
+            .timeout(Duration::from_secs(15))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .build()
-            .unwrap()
-    }).clone()
+    })
 }
 
 static MODULE_CACHE: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
@@ -144,7 +152,6 @@ fn get_module_cache() -> &'static RwLock<HashMap<String, String>> {
 pub struct ApexModuleLoader {
     pub vfs: VfsState,
     pub db: Arc<dyn Db>,
-    pub tokio_handle: tokio::runtime::Handle,
 }
 
 impl Loader for ApexModuleLoader {
@@ -156,27 +163,22 @@ impl Loader for ApexModuleLoader {
     ) -> QjsResult<Module<'js, Declared>> {
         let name_str = name.to_string();
 
+        // Prevent syntax errors when ESM imports a .wasm binary asset directly
+        if name_str.ends_with(".wasm") {
+            let js_code = format!("export default \"{}\";", name_str);
+            return Module::declare(ctx.clone(), name, js_code);
+        }
+
         let code = if name.starts_with("http://") || name.starts_with("https://") {
             if let Some(cached) = get_module_cache().read().unwrap().get(name) {
                 cached.clone()
             } else {
-                let handle = self.tokio_handle.clone();
-                let url = name_str.clone();
-                let downloaded = std::thread::spawn(move || {
-                    handle.block_on(async {
-                        let res = get_client()
-                            .get(&url)
-                            .send()
-                            .await
-                            .map_err(|_| QjsError::Unknown)?;
-                        if !res.status().is_success() {
-                            return Err(QjsError::Unknown);
-                        }
-                        res.text().await.map_err(|_| QjsError::Unknown)
-                    })
-                })
-                .join()
-                .unwrap_or(Err(QjsError::Unknown))?;
+                let res = get_ureq_agent()
+                    .get(name)
+                    .call()
+                    .map_err(|_| QjsError::Unknown)?;
+
+                let downloaded = res.into_string().map_err(|_| QjsError::Unknown)?;
 
                 get_module_cache()
                     .write()
@@ -195,9 +197,8 @@ impl Loader for ApexModuleLoader {
                 .to_string();
             let db = self.db.clone();
 
-            let handle = self.tokio_handle.clone();
             let code_res = std::thread::spawn(move || {
-                handle.block_on(async { db.get_script_by_name(&script_name).await })
+                futures::executor::block_on(async { db.get_script_by_name(&script_name).await })
             })
             .join()
             .unwrap_or(Ok(None));

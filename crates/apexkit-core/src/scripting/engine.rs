@@ -78,7 +78,6 @@ const JS_PRELUDE: &str = r#"
                     try {
                         return globalThis.$util.base64DecodeBuffer(this._body_b64);
                     } catch (e) {
-                        // Safe fallback for edge-case buffer parsing
                         let bin = globalThis.$util.base64Decode(this._body_b64);
                         let buf = new Uint8Array(bin.length);
                         for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
@@ -86,7 +85,6 @@ const JS_PRELUDE: &str = r#"
                     }
                 }
                 
-                // If body is already a TypedArray or ArrayBuffer, extract it safely
                 if (this.body instanceof ArrayBuffer) return this.body;
                 if (ArrayBuffer.isView(this.body)) {
                     return this.body.buffer.slice(this.body.byteOffset, this.body.byteOffset + this.body.byteLength);
@@ -373,9 +371,10 @@ const JS_PRELUDE: &str = r#"
     globalThis.Request = Request;
     globalThis.Response = Response;
     globalThis.__wasm_instances = {};
-    globalThis.__apex_sync_mem = function(dst, src) {
+
+    globalThis.__apex_sync_mem = function(dst, src, len) {
         try {
-            new Uint8Array(dst).set(new Uint8Array(src));
+            new Uint8Array(dst).set(new Uint8Array(src, 0, len));
         } catch (e) {}
     };
 
@@ -454,9 +453,11 @@ impl ScriptEngine {
 
         let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
             .map_err(|e| e.to_string())?;
-        let code_cleaned = re_config.replace_all(code, "");
-        let processed_code =
-            code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
+        let code_cleaned = re_config.replace_all(code, "").to_string();
+
+        let module_name = format!("/exec_{}.js", uuid::Uuid::new_v4());
+        self.vfs.set_file("root", &module_name, &code_cleaned);
+        let module_name_vfs = module_name.clone();
 
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
@@ -474,7 +475,6 @@ impl ScriptEngine {
 
         let start_time = std::time::Instant::now();
         let max_duration = std::time::Duration::from_millis(total_cpu_budget_ms);
-        let tokio_handle = tokio::runtime::Handle::current();
 
         let task = SendWrapper(async move {
             runtime.set_max_stack_size(0).await;
@@ -483,11 +483,7 @@ impl ScriptEngine {
                 runtime
                     .set_loader(
                         super::module_loader::ApexModuleResolver,
-                        super::module_loader::ApexModuleLoader {
-                            vfs,
-                            db: db_arc,
-                            tokio_handle,
-                        },
+                        super::module_loader::ApexModuleLoader { vfs, db: db_arc },
                     )
                     .await;
             } else {
@@ -520,10 +516,16 @@ impl ScriptEngine {
             let res = rquickjs::async_with!(ctx => |js_ctx| {
                 setup_quickjs(&js_ctx, context.clone())?;
 
-                let module_name = format!("exec_{}", uuid::Uuid::new_v4());
-                let _ = rquickjs::Module::evaluate(js_ctx.clone(), module_name, processed_code.as_bytes())
+                let import_code = format!("import('{}')", module_name);
+                let promise: Promise = js_ctx.eval(import_code)
                     .catch(&js_ctx)
-                    .map_err(|e| format!("Script Module Error: {}", e))?;
+                    .map_err(|e| format!("Script Import Error: {}", e))?;
+
+                let module_obj: Object = promise
+                    .into_future::<Object>()
+                    .await
+                    .catch(&js_ctx)
+                    .map_err(|e| format!("Script Evaluation Error: {}", e))?;
 
                 let req_data = json!({
                     "url": url.unwrap_or_else(|| "http://localhost".to_string()),
@@ -533,13 +535,12 @@ impl ScriptEngine {
                 });
 
                 let js_req_data = to_value(js_ctx.clone(), &req_data).map_err(|e| e.to_string())?;
-                let globals = js_ctx.globals();
 
                 let req_class: Function = js_ctx.eval("(data) => new Request(data)").unwrap();
                 let request_obj: Object = req_class.call((js_req_data,)).map_err(|e| e.to_string())?;
 
-                let handler: Function = globals
-                    .get("__mainHandler")
+                let handler: Function = module_obj
+                    .get("default")
                     .map_err(|_| "No 'export default' found in script".to_string())?;
 
                 let promise: Promise = handler
@@ -594,10 +595,15 @@ impl ScriptEngine {
             res
         });
 
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
-            Ok(res) => res,
-            Err(_) => Err(format!("Script timed out after {} seconds.", timeout_secs)),
-        }
+        let result =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
+                Ok(res) => res,
+                Err(_) => Err(format!("Script timed out after {} seconds.", timeout_secs)),
+            };
+
+        self.vfs.remove_file("root", &module_name_vfs);
+
+        result
     }
 
     pub async fn run_hook(
@@ -615,9 +621,11 @@ impl ScriptEngine {
 
         let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
             .map_err(|e| e.to_string())?;
-        let code_cleaned = re_config.replace_all(code, "");
-        let processed_code =
-            code_cleaned.replacen("export default", "globalThis.__mainHandler =", 1);
+        let code_cleaned = re_config.replace_all(code, "").to_string();
+
+        let module_name = format!("/exec_hook_{}.js", uuid::Uuid::new_v4());
+        self.vfs.set_file("root", &module_name, &code_cleaned);
+        let module_name_vfs = module_name.clone();
 
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
@@ -627,7 +635,6 @@ impl ScriptEngine {
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         let vfs = self.vfs.clone();
         let db = self.db.clone();
-        let tokio_handle = tokio::runtime::Handle::current();
 
         let task = SendWrapper(async move {
             runtime.set_max_stack_size(0).await;
@@ -636,11 +643,7 @@ impl ScriptEngine {
                 runtime
                     .set_loader(
                         super::module_loader::ApexModuleResolver,
-                        super::module_loader::ApexModuleLoader {
-                            vfs,
-                            db: db_arc,
-                            tokio_handle,
-                        },
+                        super::module_loader::ApexModuleLoader { vfs, db: db_arc },
                     )
                     .await;
             }
@@ -653,15 +656,20 @@ impl ScriptEngine {
             let res = rquickjs::async_with!(ctx => |js_ctx| {
                 setup_quickjs(&js_ctx, context.clone())?;
 
-                let module_name = format!("exec_{}", uuid::Uuid::new_v4());
-                let _ = rquickjs::Module::evaluate(js_ctx.clone(), module_name, processed_code.as_bytes())
+                let import_code = format!("import('{}')", module_name);
+                let promise: Promise = js_ctx.eval(import_code)
                     .catch(&js_ctx)
-                    .map_err(|e| format!("Script Module Error: {}", e))?;
+                    .map_err(|e| format!("Hook Import Error: {}", e))?;
+
+                let module_obj: Object = promise
+                    .into_future::<Object>()
+                    .await
+                    .catch(&js_ctx)
+                    .map_err(|e| format!("Hook Evaluation Error: {}", e))?;
 
                 let js_event = to_value(js_ctx.clone(), &event_data).map_err(|e| e.to_string())?;
-                let globals = js_ctx.globals();
 
-                let res_val = if let Ok(handler) = globals.get::<_, Function>("__mainHandler") {
+                let res_val = if let Ok(handler) = module_obj.get::<_, Function>("default") {
                     let promise: Promise = handler
                         .call((js_event,))
                         .catch(&js_ctx)
@@ -696,10 +704,15 @@ impl ScriptEngine {
             res
         });
 
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
-            Ok(res) => res,
-            Err(_) => Err(format!("Hook timed out after {} seconds.", timeout_secs)),
-        }
+        let result =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
+                Ok(res) => res,
+                Err(_) => Err(format!("Hook timed out after {} seconds.", timeout_secs)),
+            };
+
+        self.vfs.remove_file("root", &module_name_vfs);
+
+        result
     }
 }
 

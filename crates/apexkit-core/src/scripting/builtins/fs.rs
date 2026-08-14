@@ -5,7 +5,7 @@ use std::time::UNIX_EPOCH;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rquickjs::function::Async;
-use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs::{Ctx, Exception, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde_json::json;
 use zip::write::FileOptions;
@@ -100,13 +100,20 @@ pub fn register_file_tools<'js>(
     let app_read = app_ctx.clone();
     let read_fn = Function::new(
         ctx.clone(),
-        Async(move |filename: String| {
+        Async(move |js_ctx: Ctx<'js>, filename: String| {
             let app = app_read.clone();
             async move {
                 let storage = app.get_storage();
                 match storage.get(&filename).await {
                     Ok(bytes) => Ok::<String, rquickjs::Error>(BASE64.encode(bytes)),
-                    Err(_) => Err(rquickjs::Error::Exception),
+                    Err(e) => {
+                        let js_err = Exception::from_message(
+                            js_ctx.clone(),
+                            &format!("File '{}' not found: {}", filename, e),
+                        )
+                        .unwrap();
+                        Err(js_ctx.throw(js_err.into()))
+                    }
                 }
             }
         }),
@@ -124,9 +131,13 @@ pub fn register_file_tools<'js>(
                   mime: Option<String>| {
                 let app = app_save.clone();
                 async move {
-                    let db = resolve_db(None, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let db = match resolve_db(None, app.clone()).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                            return Err(js_ctx.throw(js_err.into()));
+                        }
+                    };
                     let storage = app.get_storage();
 
                     let mime_type = mime.unwrap_or_else(|| "application/octet-stream".to_string());
@@ -140,7 +151,17 @@ pub fn register_file_tools<'js>(
                             .trim_start_matches("data:image/png;base64,")
                             .trim_start_matches("data:image/webp;base64,")
                             .trim_start_matches("data:application/octet-stream;base64,");
-                        BASE64.decode(b64).map_err(|_| rquickjs::Error::Exception)?
+                        match BASE64.decode(b64) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                let js_err = Exception::from_message(
+                                    js_ctx.clone(),
+                                    &format!("Invalid Base64 payload: {}", e),
+                                )
+                                .unwrap();
+                                return Err(js_ctx.throw(js_err.into()));
+                            }
+                        }
                     } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(data_val.clone()) {
                         ab.as_bytes().map(|b| b.to_vec()).unwrap_or_default()
                     } else if let Some(obj) = data_val.as_object() {
@@ -166,7 +187,12 @@ pub fn register_file_tools<'js>(
                     };
 
                     if bytes.is_empty() {
-                        return Err(rquickjs::Error::Exception);
+                        let js_err = Exception::from_message(
+                            js_ctx.clone(),
+                            "Cannot save empty or invalid file data",
+                        )
+                        .unwrap();
+                        return Err(js_ctx.throw(js_err.into()));
                     }
 
                     let size = bytes.len() as i64;
@@ -174,20 +200,41 @@ pub fn register_file_tools<'js>(
                     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
                     let storage_filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
 
-                    storage
-                        .save(&storage_filename, &bytes, &mime_type)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                    if let Err(e) = storage.save(&storage_filename, &bytes, &mime_type).await {
+                        let js_err = Exception::from_message(
+                            js_ctx.clone(),
+                            &format!("Storage save failed: {}", e),
+                        )
+                        .unwrap();
+                        return Err(js_ctx.throw(js_err.into()));
+                    }
 
-                    let id = db
+                    let id = match db
                         .create_file_metadata(&storage_filename, &filename, &mime_type, size, None)
                         .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                    {
+                        Ok(i) => i,
+                        Err(e) => {
+                            let js_err = Exception::from_message(
+                                js_ctx.clone(),
+                                &format!("Metadata creation failed: {}", e),
+                            )
+                            .unwrap();
+                            return Err(js_ctx.throw(js_err.into()));
+                        }
+                    };
 
                     let url = format!("{}{}", storage.get_public_url_base(), storage_filename);
 
                     let res = json!({ "id": id, "url": url, "filename": storage_filename });
-                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                    to_value(js_ctx.clone(), &res).map_err(|e| {
+                        let js_err = Exception::from_message(
+                            js_ctx.clone(),
+                            &format!("Response serialization error: {}", e),
+                        )
+                        .unwrap();
+                        js_ctx.throw(js_err.into())
+                    })
                 }
             },
         ),
@@ -198,66 +245,23 @@ pub fn register_file_tools<'js>(
     let app_signed = app_ctx.clone();
     let signed_url_fn = Function::new(
         ctx.clone(),
-        Async(move |filename: String, ttl_opt: Option<f64>| {
-            let app = app_signed.clone();
-            async move {
-                let ttl = ttl_opt.unwrap_or(900.0) as u64;
-                let storage = app.get_storage();
-                match storage.get_signed_url(&filename, ttl).await {
-                    Ok(url) => Ok::<String, rquickjs::Error>(url),
-                    Err(_) => Err(rquickjs::Error::Exception),
-                }
-            }
-        }),
-    )
-    .map_err(|e| e.to_string())?;
-
-    // 4. $files.registerMetadata(filename, options) -> Promise<Metadata>
-    let app_reg_meta = app_ctx.clone();
-    let register_metadata_fn = Function::new(
-        ctx.clone(),
         Async(
-            move |js_ctx: Ctx<'js>, filename: String, opts_val: Value<'js>| {
-                let opts: serde_json::Value = from_value(opts_val).unwrap_or(json!({}));
-                let app = app_reg_meta.clone();
-
+            move |js_ctx: Ctx<'js>, filename: String, ttl_opt: Option<f64>| {
+                let app = app_signed.clone();
                 async move {
-                    let db = resolve_db(None, app.clone())
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-
-                    if let Ok(Some(_)) = db.get_file_by_filename(&filename).await {
-                        return Err(rquickjs::Error::Exception);
-                    }
-
-                    let original_name = opts
-                        .get("originalName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&filename)
-                        .to_string();
-                    let mime_type = opts
-                        .get("mimeType")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("application/octet-stream")
-                        .to_string();
-                    let size = opts.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
-
-                    let id = db
-                        .create_file_metadata(&filename, &original_name, &mime_type, size, None)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-
+                    let ttl = ttl_opt.unwrap_or(900.0) as u64;
                     let storage = app.get_storage();
-                    let public_url = format!("{}{}", storage.get_public_url_base(), filename);
-
-                    let res = json!({
-                        "id": id,
-                        "filename": filename,
-                        "url": public_url,
-                        "size": size
-                    });
-
-                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                    match storage.get_signed_url(&filename, ttl).await {
+                        Ok(url) => Ok::<String, rquickjs::Error>(url),
+                        Err(e) => {
+                            let js_err = Exception::from_message(
+                                js_ctx.clone(),
+                                &format!("Get signed URL failed: {}", e),
+                            )
+                            .unwrap();
+                            Err(js_ctx.throw(js_err.into()))
+                        }
+                    }
                 }
             },
         ),
@@ -266,9 +270,6 @@ pub fn register_file_tools<'js>(
 
     files_obj.set("read", read_fn).map_err(|e| e.to_string())?;
     files_obj.set("save", save_fn).map_err(|e| e.to_string())?;
-    files_obj
-        .set("registerMetadata", register_metadata_fn)
-        .map_err(|e| e.to_string())?;
     files_obj
         .set("getSignedUrl", signed_url_fn)
         .map_err(|e| e.to_string())?;

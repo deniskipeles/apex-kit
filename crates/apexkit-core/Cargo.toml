@@ -14,6 +14,7 @@ serde_sqlite_jsonb = "0.2.1" # Zero-copy JSONB wrapper
 # Async & Runtime
 tokio = { version = "1.37.0", features = ["full"] }
 async-trait = "0.1.80"
+futures = "0.3"
 
 # Serialization
 serde = { version = "1.0.200", features = ["derive"] }
@@ -34,21 +35,17 @@ tracing = "0.1"
 utoipa = "5.4.0"
 
 # Storage & AWS
-# This uses the system's native crypto (Schannel on Windows), avoiding aws-lc compilation.
 aws-config = { version = "1.8.12", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
 aws-sdk-s3 = { version = "1.1", default-features = false, features = ["rt-tokio"] }
 aws-credential-types = "1.1"
-# Added to implement the HTTP adapter
 aws-smithy-runtime-api = { version = "1.1", features = ["client"] }
-# Added for SdkBody
 aws-smithy-types = "1.1"
-# Explicit http dependency for building responses
 http = "0.2.9" 
 
-# Use native-tls-vendored for Reqwest to avoid aws-lc/ring conflict
-reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "native-tls-vendored"] }
+# HTTP Clients
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls-vendored"] }
+ureq = { version = "2.9", default-features = false, features = ["tls"] }
 
-# [Note] We can keep rustls for other things if needed, but AWS/Reqwest will now use native-tls
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
 # Email
@@ -74,7 +71,6 @@ rquickjs = { version = "0.12.2", features = ["macro", "classes", "futures", "loa
 rquickjs-serde = "0.6.1"
 # --- ARCHIVE MANAGER ---
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
-# Filesystem Traversal
 walkdir = "2.4"
 
 # Validation Extensions

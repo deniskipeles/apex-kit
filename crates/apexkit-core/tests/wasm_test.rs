@@ -78,10 +78,19 @@ async fn setup_test_context(base_path: &std::path::Path) -> Arc<dyn apexkit_core
     let master_key = MasterKey::from_string(master_key_str).unwrap();
     let vault = Arc::new(Vault::new(&master_key));
 
+    let uploads_dir = base_path.join("uploads");
+    std::fs::create_dir_all(&uploads_dir).unwrap();
+    let storage: Arc<dyn apexkit_core::storage::StorageBackend> =
+        Arc::new(apexkit_core::storage::local::LocalStorage {
+            base_path: uploads_dir,
+            base_url: "/api/v1/storage/file/".into(),
+        });
+
     struct TestScriptContext {
         db: Arc<dyn Db>,
         vault: Arc<Vault>,
         vp: Arc<dyn VectorProvider>,
+        storage: Arc<dyn apexkit_core::storage::StorageBackend>,
     }
 
     #[async_trait::async_trait]
@@ -104,10 +113,7 @@ async fn setup_test_context(base_path: &std::path::Path) -> Arc<dyn apexkit_core
             tokio::sync::broadcast::channel(1).0
         }
         fn get_storage(&self) -> Arc<dyn apexkit_core::storage::StorageBackend> {
-            Arc::new(apexkit_core::storage::local::LocalStorage {
-                base_path: std::path::PathBuf::from("/tmp"),
-                base_url: "".into(),
-            })
+            self.storage.clone()
         }
         fn get_scope(&self) -> EventScope {
             EventScope::Root
@@ -257,6 +263,7 @@ async fn setup_test_context(base_path: &std::path::Path) -> Arc<dyn apexkit_core
         db: cached_db,
         vault,
         vp: Arc::new(MockVectorProvider),
+        storage,
     })
 }
 
@@ -311,6 +318,74 @@ async fn test_wasm_execution_f64_add() {
     let actual = result["body"]["wasm_result"].as_f64().unwrap();
 
     assert_eq!(actual, expected, "WASM execution failed to add 10.5 + 20.5");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_wasm_photon_image_processor() {
+    let dir = generate_temp_dir();
+    let ctx = setup_test_context(&dir).await;
+
+    // Minimal valid PNG image binary (1x1 red pixel)
+    let image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let image_bytes = STANDARD.decode(image_b64).unwrap();
+
+    let test_filename = "a9edec4d-0854-40a7-ac6d-e9459ae04e7a.jpg";
+    ctx.get_storage()
+        .save(test_filename, &image_bytes, "image/jpeg")
+        .await
+        .unwrap();
+
+    let vfs = VfsState::new();
+    let engine = ScriptEngine::with_vfs(vfs, Some(ctx.get_db())).await;
+
+    let js_code = r#"
+import init, { resize, PhotonImage } from "https://esm.sh/@silvia-odwyer/photon@0.3.3";
+
+export default async function (req) {
+    await init("https://esm.sh/@silvia-odwyer/photon@0.3.3/es2022/photon_rs_bg.wasm");
+
+    // 1. Read Base64 image
+    const base64Data = await $files.read("a9edec4d-0854-40a7-ac6d-e9459ae04e7a.jpg");
+    
+    // 2. Decode into Uint8Array
+    const arrayBuffer = $util.base64DecodeBuffer(base64Data);
+    const inputBytes = new Uint8Array(arrayBuffer);
+
+    // 3. Load into Photon
+    const img = PhotonImage.new_from_byteslice(inputBytes);
+    
+    // 4. Resize (returns the new resized PhotonImage)
+    const resizedImg = resize(img, 800, 600, 1); 
+    
+    // 5. Get JPEG output bytes (quality 85)
+    const outputBytes = resizedImg.get_bytes_jpeg(85);
+    
+    // 6. Encode Uint8Array to Base64 using $util.base64Encode
+    const outBase64 = $util.base64Encode(outputBytes);
+    
+    // 7. Save file
+    const newFile = await $files.save("resized_output.jpg", outBase64, "image/jpeg");
+    
+    return new Response({
+        success: true,
+        message: "Image resized successfully!",
+        file: newFile
+    });
+}
+"#;
+
+    let result = engine
+        .run_script(js_code, json!({}), ctx.clone(), None, None, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(result["__is_apex_response"], true);
+    assert_eq!(result["status"], 200);
+    assert_eq!(result["body"]["success"], true);
+    assert_eq!(result["body"]["message"], "Image resized successfully!");
+    assert!(result["body"]["file"]["url"].is_string());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
