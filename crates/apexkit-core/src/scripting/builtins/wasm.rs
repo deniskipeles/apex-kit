@@ -105,7 +105,11 @@ fn extract_bytes_from_js_value<'js>(val: Value<'js>) -> Result<Vec<u8>, String> 
         let s_str = s.to_string().unwrap_or_default();
         let clean = s_str
             .trim()
-            .trim_start_matches("data:application/wasm;base64,");
+            .trim_start_matches("data:image/jpeg;base64,")
+            .trim_start_matches("data:image/png;base64,")
+            .trim_start_matches("data:image/webp;base64,")
+            .trim_start_matches("data:application/wasm;base64,")
+            .trim_start_matches("data:application/octet-stream;base64,");
         if let Ok(b) = BASE64.decode(clean) {
             return Ok(b);
         }
@@ -224,9 +228,7 @@ fn instantiate_wasm_module<'js>(
     _imports_val: Option<Value<'js>>,
     is_root: bool,
 ) -> Result<Object<'js>, String> {
-    let mut config = Config::new();
-    config.consume_fuel(true);
-
+    let config = Config::new();
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = get_or_compile_module(&engine, bytes, None)?;
 
@@ -240,10 +242,11 @@ fn instantiate_wasm_module<'js>(
 
     let mut store = Store::new(&engine, state);
     store.limiter(|s| &mut s.limiter);
-    let _ = store.set_fuel(100_000_000);
 
     let mut linker = Linker::new(&engine);
-    linker.define_unknown_imports_as_traps(&module).ok();
+    linker
+        .define_unknown_imports_as_default_values(&module)
+        .ok();
 
     let instance = linker
         .instantiate(&mut store, &module)
@@ -261,6 +264,11 @@ fn instantiate_wasm_module<'js>(
         exports_obj.set("memory", mem_obj).ok();
     }
 
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    if let Ok(registry) = ctx.globals().get::<_, Object>("__wasm_instances") {
+        let _ = registry.set(&instance_id, exports_obj.clone());
+    }
+
     let store_arc = Arc::new(std::sync::Mutex::new(store));
     let instance_arc = Arc::new(instance);
 
@@ -273,6 +281,7 @@ fn instantiate_wasm_module<'js>(
         if let ExternType::Func(func_ty) = export_item.ty() {
             let store_ref = store_arc.clone();
             let inst_ref = instance_arc.clone();
+            let instance_id_clone = instance_id.clone();
             let func_name = name.clone();
             let param_types: Vec<ValType> = func_ty.params().collect();
             let result_types: Vec<ValType> = func_ty.results().collect();
@@ -293,6 +302,23 @@ fn instantiate_wasm_module<'js>(
                             return Err(ctx_call.throw(js_err.into()));
                         }
                     };
+
+                    // 1. Sync JS Memory -> Wasmtime before call
+                    if let Some(memory) = inst_ref.get_memory(&mut *store_guard, "memory") {
+                        if let Ok(registry) = ctx_call.globals().get::<_, Object>("__wasm_instances") {
+                            if let Ok(exports_obj) = registry.get::<_, Object>(&instance_id_clone) {
+                                if let Ok(mem_obj) = exports_obj.get::<_, Object>("memory") {
+                                    if let Ok(js_ab) = mem_obj.get::<_, rquickjs::ArrayBuffer>("buffer") {
+                                        if let Some(js_bytes) = js_ab.as_bytes() {
+                                            let wasm_mem = memory.data_mut(&mut *store_guard);
+                                            let copy_len = std::cmp::min(wasm_mem.len(), js_bytes.len());
+                                            wasm_mem[..copy_len].copy_from_slice(&js_bytes[..copy_len]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     let wasm_func = match inst_ref.get_func(&mut *store_guard, &func_name) {
                         Some(f) => f,
@@ -330,17 +356,33 @@ fn instantiate_wasm_module<'js>(
                         return Err(ctx_call.throw(js_err.into()));
                     }
 
+                    // 2. Sync Wasmtime -> JS in-place (without dynamic eval)
                     if let Some(memory) = inst_ref.get_memory(&mut *store_guard, "memory") {
                         let data_slice = memory.data(&*store_guard);
-                        if let Ok(mem_obj) = ctx_call
-                            .globals()
-                            .get::<_, Object>("exports")
-                            .and_then(|e| e.get::<_, Object>("memory"))
-                        {
-                            if let Ok(js_ab) =
-                                rquickjs::ArrayBuffer::new(ctx_call.clone(), data_slice.to_vec())
-                            {
-                                mem_obj.set("buffer", js_ab).ok();
+                        if let Ok(registry) = ctx_call.globals().get::<_, Object>("__wasm_instances") {
+                            if let Ok(exports_obj) = registry.get::<_, Object>(&instance_id_clone) {
+                                if let Ok(mem_obj) = exports_obj.get::<_, Object>("memory") {
+                                    let mut updated_in_place = false;
+
+                                    if let Ok(old_ab) = mem_obj.get::<_, rquickjs::ArrayBuffer>("buffer") {
+                                        if let Some(old_bytes) = old_ab.as_bytes() {
+                                            if old_bytes.len() == data_slice.len() {
+                                                if let Ok(new_ab) = rquickjs::ArrayBuffer::new(ctx_call.clone(), data_slice.to_vec()) {
+                                                    if let Ok(sync_fn) = ctx_call.globals().get::<_, rquickjs::Function>("__apex_sync_mem") {
+                                                        let _ = sync_fn.call::<_, ()>((old_ab, new_ab));
+                                                        updated_in_place = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if !updated_in_place {
+                                        if let Ok(js_ab) = rquickjs::ArrayBuffer::new(ctx_call.clone(), data_slice.to_vec()) {
+                                            let _ = mem_obj.set("buffer", js_ab);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -424,7 +466,6 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
         .set("__instantiate", instantiate_fn)
         .map_err(|e| e.to_string())?;
 
-    // 1. $wasm.call(b64OrName, func, args, options?)
     let app_call = app_ctx.clone();
     let call_fn = Function::new(
         ctx.clone(),
@@ -442,7 +483,6 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         .unwrap_or_default();
 
                     let is_root = matches!(app.get_scope(), EventScope::Root);
-
                     let memory_limit_mb = opts.memory_mb.unwrap_or(if is_root { 512 } else { 64 });
                     let timeout_ms = opts
                         .timeout_ms
@@ -458,9 +498,7 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         };
 
                     let task = tokio::task::spawn_blocking(move || {
-                        let mut config = Config::new();
-                        config.consume_fuel(true);
-
+                        let config = Config::new();
                         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
                         let module =
                             get_or_compile_module(&engine, &bytes, readable_name.as_deref())?;
@@ -474,10 +512,16 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
 
                         let mut store = Store::new(&engine, state);
                         store.limiter(|s| &mut s.limiter);
-                        let _ = store.set_fuel(100_000_000);
 
-                        let instance =
-                            Instance::new(&mut store, &module, &[]).map_err(|e| e.to_string())?;
+                        let mut linker = Linker::new(&engine);
+                        linker
+                            .define_unknown_imports_as_default_values(&module)
+                            .ok();
+
+                        let instance = linker
+                            .instantiate(&mut store, &module)
+                            .or_else(|_| Instance::new(&mut store, &module, &[]))
+                            .map_err(|e| e.to_string())?;
 
                         let export = instance.get_func(&mut store, &func).ok_or_else(|| {
                             format!("Function '{}' not found in WASM exports", func)
@@ -550,7 +594,6 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     )
     .map_err(|e| e.to_string())?;
 
-    // 2. $wasm.runWasi(b64OrName, cliArgs?, options?)
     let app_wasi = app_ctx.clone();
     let run_wasi_fn = Function::new(
         ctx.clone(),
@@ -568,7 +611,6 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         .unwrap_or_default();
 
                     let is_root = matches!(app.get_scope(), EventScope::Root);
-
                     let memory_limit_mb = opts.memory_mb.unwrap_or(if is_root { 512 } else { 64 });
                     let timeout_ms = opts
                         .timeout_ms
@@ -584,17 +626,12 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         };
 
                     let task = tokio::task::spawn_blocking(move || {
-                        let mut config = Config::new();
-                        config.consume_fuel(true);
-
+                        let config = Config::new();
                         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
                         let module =
                             get_or_compile_module(&engine, &bytes, readable_name.as_deref())?;
 
-                        let mut linker: Linker<WasmStoreState> = Linker::new(&engine);
-                        preview1::add_to_linker_sync(&mut linker, |s| s.wasi.as_mut().unwrap())
-                            .map_err(|e| e.to_string())?;
-
+                        // 1. Build WASI context FIRST
                         let mut builder = WasiCtxBuilder::new();
                         builder.inherit_stdio();
                         if let Some(args) = cli_args {
@@ -602,8 +639,9 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                                 builder.arg(&arg);
                             }
                         }
-
                         let wasi_ctx = builder.build_p1();
+
+                        // 2. Put wasi_ctx into Store State
                         let state = WasmStoreState {
                             wasi: Some(wasi_ctx),
                             limiter: CustomResourceLimiter {
@@ -611,10 +649,20 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                             },
                         };
 
+                        // 3. Create Store
                         let mut store = Store::new(&engine, state);
                         store.limiter(|s| &mut s.limiter);
-                        let _ = store.set_fuel(100_000_000);
 
+                        // 4. Create Linker and bind WASI
+                        let mut linker: Linker<WasmStoreState> = Linker::new(&engine);
+                        preview1::add_to_linker_sync(&mut linker, |s| s.wasi.as_mut().unwrap())
+                            .map_err(|e| e.to_string())?;
+
+                        linker
+                            .define_unknown_imports_as_default_values(&module)
+                            .ok();
+
+                        // 5. Instantiate and execute _start
                         let instance = linker
                             .instantiate(&mut store, &module)
                             .map_err(|e| e.to_string())?;

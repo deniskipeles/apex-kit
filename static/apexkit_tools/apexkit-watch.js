@@ -449,12 +449,34 @@ async function runManualCommit() {
   });
 }
 
-// --- 8. WATCHER & SYNC CLIENT (Leak-Free & Debounced) ---
+// --- 8. WATCHER & SYNC CLIENT (Self-Healing & Debounced) ---
 let ws;
+let isReconnecting = false;
+let reconnectTimer = null;
+let hasLoggedWaiting = false;
 const debounceMap = new Map();
 
-async function connectWebSocket() {
-  console.log(`⚡ Connecting to ApexKit (URL: ${BASE_URL}, Scope: ${SCOPE_KEY})...`);
+function scheduleReconnect() {
+  if (isReconnecting) return;
+  isReconnecting = true;
+
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+
+  if (!hasLoggedWaiting) {
+    console.log("🔌 Connection lost or unavailable. Waiting for connection...\n");
+    hasLoggedWaiting = true;
+  }
+
+  reconnectTimer = setTimeout(() => {
+    isReconnecting = false;
+    connectWebSocket(true);
+  }, 3000);
+}
+
+async function connectWebSocket(isRetry = false) {
+  if (!isRetry) {
+    console.log(`⚡ Connecting to ApexKit (URL: ${BASE_URL}, Scope: ${SCOPE_KEY})...`);
+  }
   
   let WSClient = globalThis.WebSocket;
   if (!WSClient) {
@@ -467,9 +489,20 @@ async function connectWebSocket() {
     }
   }
 
-  ws = new WSClient(WS_URL);
+  try {
+    if (ws) {
+      try { ws.close(); } catch (e) {}
+    }
+    ws = new WSClient(WS_URL);
+  } catch (err) {
+    scheduleReconnect();
+    return;
+  }
 
   ws.addEventListener("open", async () => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    isReconnecting = false;
+    hasLoggedWaiting = false;
     console.log("✅ Connected to ApexKit Live Engine!");
 
     if (IS_PULL) {
@@ -482,31 +515,31 @@ async function connectWebSocket() {
   });
 
   ws.addEventListener("message", (event) => {
-    const dataStr = typeof event.data === "string" ? event.data : event.data.toString();
-    const msg = JSON.parse(dataStr);
+    try {
+      const dataStr = typeof event.data === "string" ? event.data : event.data.toString();
+      const msg = JSON.parse(dataStr);
 
-    if (msg.type === "WorkspaceData" && msg.payload && msg.payload.zip_b64) {
-      console.log("📦 Received workspace ZIP from server. Unpacking...");
-      const zipBuffer = Buffer.from(msg.payload.zip_b64, "base64");
-      const count = extractZipBuffer(zipBuffer, ".");
-      console.log(`✨ Successfully pulled ${count} files!\n`);
-    } else if (msg.type === "SyncAck") {
-      console.log(`🚀 [DB Sync]: ${msg.payload.message}`);
-    } else if (msg.type === "Error") {
-      console.error(`❌ [Error]: ${msg.payload.message}`);
-    } else if (msg.type === "Ping") {
-      ws.send(JSON.stringify({ type: "Pong" }));
-    }
+      if (msg.type === "WorkspaceData" && msg.payload && msg.payload.zip_b64) {
+        console.log("📦 Received workspace ZIP from server. Unpacking...");
+        const zipBuffer = Buffer.from(msg.payload.zip_b64, "base64");
+        const count = extractZipBuffer(zipBuffer, ".");
+        console.log(`✨ Successfully pulled ${count} files!\n`);
+      } else if (msg.type === "SyncAck") {
+        console.log(`🚀 [DB Sync]: ${msg.payload.message}`);
+      } else if (msg.type === "Error") {
+        console.error(`❌ [Error]: ${msg.payload.message}`);
+      } else if (msg.type === "Ping") {
+        ws.send(JSON.stringify({ type: "Pong" }));
+      }
+    } catch (e) {}
   });
 
-  ws.addEventListener("error", (err) => {
-    // Suppress verbose error objects, rely on close event for retry
+  ws.addEventListener("error", () => {
+    scheduleReconnect();
   });
 
   ws.addEventListener("close", () => {
-    console.log("🔌 Connection closed. Retrying in 3 seconds...\n");
-    // Only reconnect the socket, DO NOT attach duplicate file watchers!
-    setTimeout(connectWebSocket, 3000);
+    scheduleReconnect();
   });
 }
 
@@ -524,7 +557,6 @@ function startWatcher() {
         if (filename.endsWith(".js") || filename.endsWith(".html") || filename.endsWith(".json")) {
           const relativePath = path.join(dir, filename).replace(/\\/g, "/").replace(/^\.\//, "");
           
-          // Debounce: Wait 100ms before reading to ensure OS file locks are released
           clearTimeout(debounceMap.get(relativePath));
           debounceMap.set(relativePath, setTimeout(() => {
             try {
@@ -532,7 +564,6 @@ function startWatcher() {
                 const content = fs.readFileSync(relativePath, "utf-8");
                 console.log(`📝 Synced: ${relativePath} ${NO_AUTO_COMMIT ? "(VFS Only)" : "(Committed to DB)"}`);
                 
-                // Ensure WebSocket is strictly in the OPEN state (1)
                 if (ws && ws.readyState === 1) {
                   ws.send(JSON.stringify({
                     type: "PushFile",
@@ -547,7 +578,7 @@ function startWatcher() {
             } catch (err) {
               console.error(`⚠️ Could not read ${relativePath} (File might be locked):`, err.message);
             }
-          }, 100)); // 100ms debounce
+          }, 100));
         }
       });
     }

@@ -126,7 +126,6 @@ impl Resolver for ApexModuleResolver {
     }
 }
 
-// Global HTTP Client and Cache for remote modules
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 fn get_client() -> reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {

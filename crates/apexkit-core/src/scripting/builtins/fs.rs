@@ -113,12 +113,15 @@ pub fn register_file_tools<'js>(
     )
     .map_err(|e| e.to_string())?;
 
-    // 2. $files.save(filename, b64_data, mime) -> Promise<Metadata>
+    // 2. $files.save(filename, data, mime) -> Promise<Metadata>
     let app_save = app_ctx.clone();
     let save_fn = Function::new(
         ctx.clone(),
         Async(
-            move |js_ctx: Ctx<'js>, filename: String, b64_data: String, mime: Option<String>| {
+            move |js_ctx: Ctx<'js>,
+                  filename: String,
+                  data_val: Value<'js>,
+                  mime: Option<String>| {
                 let app = app_save.clone();
                 async move {
                     let db = resolve_db(None, app.clone())
@@ -127,11 +130,46 @@ pub fn register_file_tools<'js>(
                     let storage = app.get_storage();
 
                     let mime_type = mime.unwrap_or_else(|| "application/octet-stream".to_string());
-                    let bytes = BASE64
-                        .decode(&b64_data)
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    let size = bytes.len() as i64;
 
+                    // Support Base64 String, ArrayBuffer, or Uint8Array directly
+                    let bytes = if let Some(s) = data_val.as_string() {
+                        let clean = s.to_string().unwrap_or_default();
+                        let b64 = clean
+                            .trim()
+                            .trim_start_matches("data:image/jpeg;base64,")
+                            .trim_start_matches("data:image/png;base64,")
+                            .trim_start_matches("data:image/webp;base64,")
+                            .trim_start_matches("data:application/octet-stream;base64,");
+                        BASE64.decode(b64).map_err(|_| rquickjs::Error::Exception)?
+                    } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(data_val.clone()) {
+                        ab.as_bytes().map(|b| b.to_vec()).unwrap_or_default()
+                    } else if let Some(obj) = data_val.as_object() {
+                        if let Ok(ab) = obj.get::<_, rquickjs::ArrayBuffer>("buffer") {
+                            let offset = obj.get::<_, usize>("byteOffset").unwrap_or(0);
+                            let length = obj
+                                .get::<_, usize>("byteLength")
+                                .unwrap_or_else(|_| ab.as_bytes().map(|b| b.len()).unwrap_or(0));
+                            if let Some(b) = ab.as_bytes() {
+                                if offset + length <= b.len() {
+                                    b[offset..offset + length].to_vec()
+                                } else {
+                                    vec![]
+                                }
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    };
+
+                    if bytes.is_empty() {
+                        return Err(rquickjs::Error::Exception);
+                    }
+
+                    let size = bytes.len() as i64;
                     let path = std::path::Path::new(&filename);
                     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
                     let storage_filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
@@ -245,7 +283,6 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     let globals = ctx.globals();
     let fs_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-    // 1. $fs.read(path) -> Promise<string>
     let app_read = app_ctx.clone();
     let read_fn = Function::new(
         ctx.clone(),
@@ -270,7 +307,6 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     )
     .map_err(|e| e.to_string())?;
 
-    // 2. $fs.write(path, content) -> Promise<bool>
     let app_write = app_ctx.clone();
     let write_fn = Function::new(
         ctx.clone(),
@@ -295,7 +331,6 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     )
     .map_err(|e| e.to_string())?;
 
-    // 3. $fs.delete(path) -> Promise<bool>
     let app_del = app_ctx.clone();
     let delete_fn = Function::new(
         ctx.clone(),
@@ -326,7 +361,6 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     )
     .map_err(|e| e.to_string())?;
 
-    // 4. $fs.list(path) -> Promise<Array>
     let app_list = app_ctx.clone();
     let list_fn = Function::new(
         ctx.clone(),
@@ -364,7 +398,6 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     )
     .map_err(|e| e.to_string())?;
 
-    // 5. $fs.exists(path) -> Promise<bool>
     let app_exists = app_ctx.clone();
     let exists_fn = Function::new(
         ctx.clone(),
@@ -381,7 +414,6 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     )
     .map_err(|e| e.to_string())?;
 
-    // 6. $fs.mkdir(path) -> Promise<bool>
     let app_mkdir = app_ctx.clone();
     let mkdir_fn = Function::new(
         ctx.clone(),
@@ -402,7 +434,6 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     )
     .map_err(|e| e.to_string())?;
 
-    // 7. $fs.stat(path) -> Promise<Object>
     let app_stat = app_ctx.clone();
     let stat_fn = Function::new(
         ctx.clone(),
@@ -454,7 +485,6 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
             * 1024
     };
 
-    // 1. $zip.create(filesObj) -> Base64 (Synchronous)
     let create_fn = Function::new(
         ctx.clone(),
         move |files_val: Value<'js>| -> rquickjs::Result<String> {
@@ -463,7 +493,6 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
                 from_value(files_val).map_err(|_| rquickjs::Error::Exception)?;
 
             let files = files_json.as_object().ok_or(rquickjs::Error::Exception)?;
-
             let mut buffer = Cursor::new(Vec::new());
 
             {
@@ -509,7 +538,6 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
     )
     .map_err(|e| e.to_string())?;
 
-    // 2. $zip.extract(b64_str) -> Object (Synchronous)
     let extract_fn = Function::new(
         ctx.clone(),
         move |js_ctx: Ctx<'js>, b64_str: String| -> rquickjs::Result<rquickjs::Value<'js>> {
@@ -564,7 +592,6 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
     )
     .map_err(|e| e.to_string())?;
 
-    // 3. $zip.inspect(b64_str) -> Metadata Object (Synchronous)
     let inspect_fn = Function::new(
         ctx.clone(),
         move |js_ctx: Ctx<'js>, b64_str: String| -> rquickjs::Result<rquickjs::Value<'js>> {

@@ -2,7 +2,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
-use rquickjs::{Ctx, Function, Object, function::Async};
+use rquickjs::{Ctx, Function, Object, Value, function::Async};
 use std::sync::Arc;
 
 use super::super::context::ScriptContext;
@@ -47,14 +47,69 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     )
     .map_err(|e| e.to_string())?;
 
-    // 5. $util.base64Encode(text) -> String
+    // 5. $util.base64Encode(data) -> String (Supports String, ArrayBuffer, and Uint8Array)
     let b64_enc_fn = Function::new(
         ctx.clone(),
-        move |text: String| -> rquickjs::Result<String> { Ok(STANDARD.encode(text)) },
+        move |val: Value<'js>| -> rquickjs::Result<String> {
+            if let Some(s) = val.as_string() {
+                let s_str = s.to_string().unwrap_or_default();
+                return Ok(STANDARD.encode(s_str.as_bytes()));
+            }
+            if let Some(ab) = rquickjs::ArrayBuffer::from_value(val.clone()) {
+                if let Some(bytes) = ab.as_bytes() {
+                    return Ok(STANDARD.encode(bytes));
+                }
+            }
+            if let Some(obj) = val.as_object() {
+                if let Ok(ab) = obj.get::<_, rquickjs::ArrayBuffer>("buffer") {
+                    let offset = obj.get::<_, usize>("byteOffset").unwrap_or(0);
+                    let length = obj
+                        .get::<_, usize>("byteLength")
+                        .unwrap_or_else(|_| ab.as_bytes().map(|b| b.len()).unwrap_or(0));
+                    if let Some(bytes) = ab.as_bytes() {
+                        if offset + length <= bytes.len() {
+                            return Ok(STANDARD.encode(&bytes[offset..offset + length]));
+                        }
+                    }
+                }
+            }
+            Ok(String::new())
+        },
     )
     .map_err(|e| e.to_string())?;
 
-    // 6. $util.base64Decode(text) -> String (Handles standard, url-safe, padded, and unpadded)
+    // 6. $util.base64EncodeBuffer(buffer) -> String
+    let b64_enc_buf_fn = Function::new(
+        ctx.clone(),
+        move |val: Value<'js>| -> rquickjs::Result<String> {
+            if let Some(ab) = rquickjs::ArrayBuffer::from_value(val.clone()) {
+                if let Some(bytes) = ab.as_bytes() {
+                    return Ok(STANDARD.encode(bytes));
+                }
+            }
+            if let Some(obj) = val.as_object() {
+                if let Ok(ab) = obj.get::<_, rquickjs::ArrayBuffer>("buffer") {
+                    let offset = obj.get::<_, usize>("byteOffset").unwrap_or(0);
+                    let length = obj
+                        .get::<_, usize>("byteLength")
+                        .unwrap_or_else(|_| ab.as_bytes().map(|b| b.len()).unwrap_or(0));
+                    if let Some(bytes) = ab.as_bytes() {
+                        if offset + length <= bytes.len() {
+                            return Ok(STANDARD.encode(&bytes[offset..offset + length]));
+                        }
+                    }
+                }
+            }
+            if let Some(s) = val.as_string() {
+                let s_str = s.to_string().unwrap_or_default();
+                return Ok(STANDARD.encode(s_str.as_bytes()));
+            }
+            Ok(String::new())
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 7. $util.base64Decode(text) -> String
     let b64_dec_fn = Function::new(
         ctx.clone(),
         move |text: String| -> rquickjs::Result<String> {
@@ -75,15 +130,22 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     )
     .map_err(|e| e.to_string())?;
 
-    // 7. $util.base64DecodeBuffer(text) -> ArrayBuffer (Returns RAW binary data, avoids UTF-8 corruption)
+    // 8. $util.base64DecodeBuffer(text) -> ArrayBuffer
     let b64_dec_buf_fn = Function::new(
         ctx.clone(),
         move |js_ctx: Ctx<'js>, text: String| -> rquickjs::Result<rquickjs::ArrayBuffer<'js>> {
+            let clean = text
+                .trim()
+                .trim_start_matches("data:image/jpeg;base64,")
+                .trim_start_matches("data:image/png;base64,")
+                .trim_start_matches("data:image/webp;base64,")
+                .trim_start_matches("data:application/octet-stream;base64,");
+
             let decoded = STANDARD
-                .decode(&text)
-                .or_else(|_| URL_SAFE_NO_PAD.decode(&text))
-                .or_else(|_| URL_SAFE.decode(&text))
-                .or_else(|_| STANDARD_NO_PAD.decode(&text))
+                .decode(clean)
+                .or_else(|_| URL_SAFE_NO_PAD.decode(clean))
+                .or_else(|_| URL_SAFE.decode(clean))
+                .or_else(|_| STANDARD_NO_PAD.decode(clean))
                 .map_err(|_| rquickjs::Error::Exception)?;
 
             rquickjs::ArrayBuffer::new(js_ctx, decoded).map_err(|_| rquickjs::Error::Exception)
@@ -91,7 +153,7 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     )
     .map_err(|e| e.to_string())?;
 
-    // 8. $util.sleep(ms) -> Promise<void> (Non-blocking async sleep)
+    // 9. $util.sleep(ms) -> Promise<void>
     let sleep_fn = Function::new(
         ctx.clone(),
         Async(move |ms_opt: Option<u64>| async move {
@@ -102,7 +164,7 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     )
     .map_err(|e| e.to_string())?;
 
-    // 9. $util.randomHex(len) -> String
+    // 10. $util.randomHex(len) -> String
     let random_hex_fn = Function::new(
         ctx.clone(),
         move |len_opt: Option<usize>| -> rquickjs::Result<String> {
@@ -120,6 +182,9 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     util_obj.set("hmac", hmac_fn).map_err(|e| e.to_string())?;
     util_obj
         .set("base64Encode", b64_enc_fn)
+        .map_err(|e| e.to_string())?;
+    util_obj
+        .set("base64EncodeBuffer", b64_enc_buf_fn)
         .map_err(|e| e.to_string())?;
     util_obj
         .set("base64Decode", b64_dec_fn)

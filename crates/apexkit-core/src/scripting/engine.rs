@@ -372,6 +372,12 @@ const JS_PRELUDE: &str = r#"
     globalThis.Headers = Headers;
     globalThis.Request = Request;
     globalThis.Response = Response;
+    globalThis.__wasm_instances = {};
+    globalThis.__apex_sync_mem = function(dst, src) {
+        try {
+            new Uint8Array(dst).set(new Uint8Array(src));
+        } catch (e) {}
+    };
 
     globalThis.fetch = async function(url, options = {}) {
         let urlString = typeof url === 'object' && url !== null ? (url.href || url.url || String(url)) : String(url);
