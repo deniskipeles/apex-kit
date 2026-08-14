@@ -75,7 +75,23 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     )
     .map_err(|e| e.to_string())?;
 
-    // 7. $util.sleep(ms) -> Promise<void> (Non-blocking async sleep)
+    // 7. $util.base64DecodeBuffer(text) -> ArrayBuffer (Returns RAW binary data, avoids UTF-8 corruption)
+    let b64_dec_buf_fn = Function::new(
+        ctx.clone(),
+        move |js_ctx: Ctx<'js>, text: String| -> rquickjs::Result<rquickjs::ArrayBuffer<'js>> {
+            let decoded = STANDARD
+                .decode(&text)
+                .or_else(|_| URL_SAFE_NO_PAD.decode(&text))
+                .or_else(|_| URL_SAFE.decode(&text))
+                .or_else(|_| STANDARD_NO_PAD.decode(&text))
+                .map_err(|_| rquickjs::Error::Exception)?;
+
+            rquickjs::ArrayBuffer::new(js_ctx, decoded).map_err(|_| rquickjs::Error::Exception)
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 8. $util.sleep(ms) -> Promise<void> (Non-blocking async sleep)
     let sleep_fn = Function::new(
         ctx.clone(),
         Async(move |ms_opt: Option<u64>| async move {
@@ -86,7 +102,7 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     )
     .map_err(|e| e.to_string())?;
 
-    // 8. $util.randomHex(len) -> String
+    // 9. $util.randomHex(len) -> String
     let random_hex_fn = Function::new(
         ctx.clone(),
         move |len_opt: Option<usize>| -> rquickjs::Result<String> {
@@ -107,6 +123,9 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
         .map_err(|e| e.to_string())?;
     util_obj
         .set("base64Decode", b64_dec_fn)
+        .map_err(|e| e.to_string())?;
+    util_obj
+        .set("base64DecodeBuffer", b64_dec_buf_fn)
         .map_err(|e| e.to_string())?;
     util_obj.set("sleep", sleep_fn).map_err(|e| e.to_string())?;
     util_obj

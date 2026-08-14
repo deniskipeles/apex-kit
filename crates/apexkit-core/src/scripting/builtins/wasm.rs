@@ -4,6 +4,7 @@ use rquickjs::function::{Async, Opt};
 use rquickjs::{Ctx, Exception, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde::Deserialize;
+use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,6 +92,30 @@ fn create_readable_symlink(cache_dir: &PathBuf, readable_name: &str, target_file
     }
 }
 
+fn extract_bytes_from_js_value<'js>(val: Value<'js>) -> Result<Vec<u8>, String> {
+    if let Some(ab) = rquickjs::ArrayBuffer::from_value(val.clone()) {
+        if let Some(bytes) = ab.as_bytes() {
+            return Ok(bytes.to_vec());
+        }
+    }
+    if let Ok(ta) = rquickjs::TypedArray::<u8>::from_value(val.clone()) {
+        return Ok(ta.as_bytes().unwrap_or_default().to_vec());
+    }
+    if let Some(s) = val.as_string() {
+        let s_str = s.to_string().unwrap_or_default();
+        let clean = s_str
+            .trim()
+            .trim_start_matches("data:application/wasm;base64,");
+        if let Ok(b) = BASE64.decode(clean) {
+            return Ok(b);
+        }
+    }
+    if let Ok(vec) = from_value::<Vec<u8>>(val) {
+        return Ok(vec);
+    }
+    Err("Could not extract WASM byte array from input".to_string())
+}
+
 fn resolve_wasm_bytes(
     app_ctx: &Arc<dyn ScriptContext>,
     input: &str,
@@ -105,7 +130,6 @@ fn resolve_wasm_bytes(
         .trim_start_matches('/')
         .trim_start_matches("./");
 
-    // 1. Check if `input` references an existing file in .cache/wasm/
     if clean_input.len() < 256 {
         let cached_file = cache_dir.join(clean_input);
         if cached_file.exists() && cached_file.is_file() {
@@ -114,7 +138,6 @@ fn resolve_wasm_bytes(
         }
     }
 
-    // 2. Decode as Base64 payload
     let bytes = match BASE64.decode(clean_input) {
         Ok(b) if !b.is_empty() => b,
         _ => {
@@ -138,10 +161,9 @@ fn resolve_wasm_bytes(
         }
     };
 
-    // 3. Enforce 200 KB size limit for custom non-root tenant WASM uploads
     if !is_root && bytes.len() > 200 * 1024 {
         return Err(format!(
-            "Tenant WASM upload size ({} KB) exceeds allowed limit (200 KB max). Use host-provided WASM tools or upgrade subscription.",
+            "Tenant WASM upload size ({} KB) exceeds allowed limit (200 KB max).",
             bytes.len() / 1024
         ));
     }
@@ -196,9 +218,211 @@ fn get_or_compile_module(
     Ok(module)
 }
 
+fn instantiate_wasm_module<'js>(
+    ctx: &Ctx<'js>,
+    bytes: &[u8],
+    _imports_val: Option<Value<'js>>,
+    is_root: bool,
+) -> Result<Object<'js>, String> {
+    let mut config = Config::new();
+    config.consume_fuel(true);
+
+    let engine = Engine::new(&config).map_err(|e| e.to_string())?;
+    let module = get_or_compile_module(&engine, bytes, None)?;
+
+    let memory_limit_mb = if is_root { 512 } else { 64 };
+    let state = WasmStoreState {
+        wasi: None,
+        limiter: CustomResourceLimiter {
+            max_memory_bytes: memory_limit_mb * 1024 * 1024,
+        },
+    };
+
+    let mut store = Store::new(&engine, state);
+    store.limiter(|s| &mut s.limiter);
+    let _ = store.set_fuel(100_000_000);
+
+    let mut linker = Linker::new(&engine);
+    linker.define_unknown_imports_as_traps(&module).ok();
+
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .or_else(|_| Instance::new(&mut store, &module, &[]))
+        .map_err(|e| e.to_string())?;
+
+    let exports_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+
+    if let Some(memory) = instance.get_memory(&mut store, "memory") {
+        let data_slice = memory.data(&store);
+        let js_ab = rquickjs::ArrayBuffer::new(ctx.clone(), data_slice.to_vec())
+            .map_err(|e| e.to_string())?;
+        let mem_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+        mem_obj.set("buffer", js_ab).ok();
+        exports_obj.set("memory", mem_obj).ok();
+    }
+
+    let store_arc = Arc::new(std::sync::Mutex::new(store));
+    let instance_arc = Arc::new(instance);
+
+    for export_item in module.exports() {
+        let name = export_item.name().to_string();
+        if name == "memory" {
+            continue;
+        }
+
+        if let ExternType::Func(func_ty) = export_item.ty() {
+            let store_ref = store_arc.clone();
+            let inst_ref = instance_arc.clone();
+            let func_name = name.clone();
+            let param_types: Vec<ValType> = func_ty.params().collect();
+            let result_types: Vec<ValType> = func_ty.results().collect();
+
+            let js_func = Function::new(
+                ctx.clone(),
+                move |ctx_call: Ctx<'js>,
+                      rquickjs::function::Rest(args): rquickjs::function::Rest<Value<'js>>|
+                      -> rquickjs::Result<Value<'js>> {
+                    let mut store_guard = match store_ref.lock() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            let js_err = Exception::from_message(
+                                ctx_call.clone(),
+                                "WASM store mutex lock failed",
+                            )
+                            .unwrap();
+                            return Err(ctx_call.throw(js_err.into()));
+                        }
+                    };
+
+                    let wasm_func = match inst_ref.get_func(&mut *store_guard, &func_name) {
+                        Some(f) => f,
+                        None => {
+                            let js_err = Exception::from_message(
+                                ctx_call.clone(),
+                                &format!("Function '{}' not found", func_name),
+                            )
+                            .unwrap();
+                            return Err(ctx_call.throw(js_err.into()));
+                        }
+                    };
+
+                    let mut wasm_args = Vec::new();
+                    for (i, arg_val) in args.iter().enumerate() {
+                        let param_ty = param_types.get(i).cloned().unwrap_or(ValType::F64);
+                        let num: f64 = from_value(arg_val.clone()).unwrap_or(0.0);
+                        match param_ty {
+                            ValType::I32 => wasm_args.push(Val::I32(num as i32)),
+                            ValType::I64 => wasm_args.push(Val::I64(num as i64)),
+                            ValType::F32 => wasm_args.push(Val::F32((num as f32).to_bits())),
+                            ValType::F64 => wasm_args.push(Val::F64(num.to_bits())),
+                            _ => wasm_args.push(Val::F64(num.to_bits())),
+                        }
+                    }
+
+                    let mut results = vec![Val::I32(0); result_types.len()];
+
+                    if let Err(e) = wasm_func.call(&mut *store_guard, &wasm_args, &mut results) {
+                        let js_err = Exception::from_message(
+                            ctx_call.clone(),
+                            &format!("WASM function execution failed: {}", e),
+                        )
+                        .unwrap();
+                        return Err(ctx_call.throw(js_err.into()));
+                    }
+
+                    if let Some(memory) = inst_ref.get_memory(&mut *store_guard, "memory") {
+                        let data_slice = memory.data(&*store_guard);
+                        if let Ok(mem_obj) = ctx_call
+                            .globals()
+                            .get::<_, Object>("exports")
+                            .and_then(|e| e.get::<_, Object>("memory"))
+                        {
+                            if let Ok(js_ab) =
+                                rquickjs::ArrayBuffer::new(ctx_call.clone(), data_slice.to_vec())
+                            {
+                                mem_obj.set("buffer", js_ab).ok();
+                            }
+                        }
+                    }
+
+                    let ret_val = match results.first() {
+                        Some(Val::I32(i)) => json!(*i),
+                        Some(Val::I64(i)) => json!(*i),
+                        Some(Val::F32(f)) => json!(f32::from_bits(*f)),
+                        Some(Val::F64(f)) => json!(f64::from_bits(*f)),
+                        _ => json!(null),
+                    };
+
+                    to_value(ctx_call.clone(), &ret_val).map_err(|e| {
+                        let js_err = Exception::from_message(
+                            ctx_call.clone(),
+                            &format!("Failed to parse WASM output: {}", e),
+                        )
+                        .unwrap();
+                        ctx_call.throw(js_err.into())
+                    })
+                },
+            )
+            .map_err(|e| e.to_string())?;
+
+            exports_obj.set(&name, js_func).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(exports_obj)
+}
+
 pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
     let globals = ctx.globals();
     let wasm_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+
+    let app_inst = app_ctx.clone();
+    let instantiate_fn = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, bytes_val: Value<'js>, Opt(imports_val): Opt<Value<'js>>| {
+                let app = app_inst.clone();
+                async move {
+                    let bytes = match extract_bytes_from_js_value(bytes_val) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                            return Err(js_ctx.throw(js_err.into()));
+                        }
+                    };
+
+                    let is_root = matches!(app.get_scope(), EventScope::Root);
+
+                    let res_exports =
+                        match instantiate_wasm_module(&js_ctx, &bytes, imports_val, is_root) {
+                            Ok(exp) => exp,
+                            Err(e) => {
+                                let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                                return Err(js_ctx.throw(js_err.into()));
+                            }
+                        };
+
+                    let res_obj = Object::new(js_ctx.clone()).map_err(|_| {
+                        let js_err = Exception::from_message(
+                            js_ctx.clone(),
+                            "Failed to create exports object",
+                        )
+                        .unwrap();
+                        js_ctx.throw(js_err.into())
+                    })?;
+
+                    res_obj.set("exports", res_exports).ok();
+
+                    Ok::<Object<'js>, rquickjs::Error>(res_obj)
+                }
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    wasm_obj
+        .set("__instantiate", instantiate_fn)
+        .map_err(|e| e.to_string())?;
 
     // 1. $wasm.call(b64OrName, func, args, options?)
     let app_call = app_ctx.clone();
@@ -259,7 +483,6 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                             format!("Function '{}' not found in WASM exports", func)
                         })?;
 
-                        // Dynamically inspect parameter types expected by WASM function
                         let func_type = export.ty(&store);
                         let param_types: Vec<ValType> = func_type.params().collect();
 
@@ -276,7 +499,7 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         }
 
                         let result_types: Vec<ValType> = func_type.results().collect();
-                        let mut results = vec![Val::I32(0); result_types.len().max(1)];
+                        let mut results = vec![Val::I32(0); result_types.len()];
 
                         export
                             .call(&mut store, &wasm_args, &mut results)

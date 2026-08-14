@@ -74,12 +74,24 @@ const JS_PRELUDE: &str = r#"
             };
 
             this.arrayBuffer = async () => {
-                if (this._body_b64 && globalThis.$util) {
-                    let bin = globalThis.$util.base64Decode(this._body_b64);
-                    let buf = new Uint8Array(bin.length);
-                    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-                    return buf.buffer;
+                if (this._body_b64 && globalThis.$util && globalThis.$util.base64DecodeBuffer) {
+                    try {
+                        return globalThis.$util.base64DecodeBuffer(this._body_b64);
+                    } catch (e) {
+                        // Safe fallback for edge-case buffer parsing
+                        let bin = globalThis.$util.base64Decode(this._body_b64);
+                        let buf = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+                        return buf.buffer;
+                    }
                 }
+                
+                // If body is already a TypedArray or ArrayBuffer, extract it safely
+                if (this.body instanceof ArrayBuffer) return this.body;
+                if (ArrayBuffer.isView(this.body)) {
+                    return this.body.buffer.slice(this.body.byteOffset, this.body.byteOffset + this.body.byteLength);
+                }
+
                 let txt = await this.text();
                 let encoder = new TextEncoder();
                 return encoder.encode(txt).buffer;
@@ -213,6 +225,82 @@ const JS_PRELUDE: &str = r#"
         }
     }
 
+    class WebAssemblyMemory {
+        constructor(buffer) {
+            this.buffer = buffer;
+        }
+    }
+
+    class WebAssemblyInstance {
+        constructor(exports) {
+            this.exports = exports;
+        }
+    }
+
+    class WebAssemblyModule {
+        constructor(b64) {
+            this.b64 = b64;
+        }
+    }
+
+    globalThis.WebAssembly = {
+        Memory: WebAssemblyMemory,
+        Instance: WebAssemblyInstance,
+        Module: WebAssemblyModule,
+
+        _toBase64: async function(bufferSource) {
+            if (typeof bufferSource === 'string') return bufferSource;
+            if (bufferSource instanceof WebAssemblyModule) return bufferSource.b64;
+
+            let ab;
+            if (bufferSource instanceof ArrayBuffer) {
+                ab = bufferSource;
+            } else if (ArrayBuffer.isView(bufferSource)) {
+                ab = bufferSource.buffer.slice(bufferSource.byteOffset, bufferSource.byteOffset + bufferSource.byteLength);
+            } else if (bufferSource && typeof bufferSource.arrayBuffer === 'function') {
+                ab = await bufferSource.arrayBuffer();
+            } else {
+                return String(bufferSource);
+            }
+
+            if (globalThis.$util && globalThis.$util.base64EncodeBuffer) {
+                return globalThis.$util.base64EncodeBuffer(ab);
+            }
+
+            const uint8 = new Uint8Array(ab);
+            let binary = '';
+            const chunkSize = 8192;
+            for (let i = 0; i < uint8.length; i += chunkSize) {
+                binary += String.fromCharCode.apply(null, uint8.subarray(i, i + chunkSize));
+            }
+            return btoa(binary);
+        },
+
+        async instantiate(bufferSource, importObject = {}) {
+            let b64 = await this._toBase64(bufferSource);
+            const res = await $wasm.__instantiate(b64, importObject);
+            
+            const module = new WebAssemblyModule(b64);
+            const instance = new WebAssemblyInstance(res.exports);
+            
+            if (bufferSource instanceof WebAssemblyModule) {
+                return instance;
+            }
+            return { module, instance };
+        },
+
+        async instantiateStreaming(source, importObject = {}) {
+            const response = await source;
+            const ab = await response.arrayBuffer();
+            return await this.instantiate(ab, importObject);
+        },
+
+        async compile(bufferSource) {
+            let b64 = await this._toBase64(bufferSource);
+            return new WebAssemblyModule(b64);
+        }
+    };
+
     class ApexKit {
         constructor(contextId = null) { 
             this.contextId = contextId;
@@ -287,6 +375,14 @@ const JS_PRELUDE: &str = r#"
 
     globalThis.fetch = async function(url, options = {}) {
         let urlString = typeof url === 'object' && url !== null ? (url.href || url.url || String(url)) : String(url);
+
+        if (!urlString.startsWith("http://") && !urlString.startsWith("https://")) {
+            let baseUrl = "http://localhost:5000";
+            if (globalThis.$env && globalThis.$env.APP_URL) {
+                baseUrl = globalThis.$env.APP_URL;
+            }
+            urlString = baseUrl.replace(/\/$/, "") + "/" + urlString.replace(/^\//, "");
+        }
 
         let headersObj = {};
         if (options.headers) {
@@ -449,7 +545,7 @@ impl ScriptEngine {
                     .into_future::<rquickjs::Value>()
                     .await
                     .catch(&js_ctx)
-                    .map_err(|e| format!("Script Execution Error: {}", e))?;
+                    .map_err(|e| e.to_string())?;
 
                 let res_val = if let Some(obj) = result_val.as_object() {
                     if obj.contains_key("body").unwrap_or(false)
