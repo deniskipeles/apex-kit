@@ -16,9 +16,6 @@ use std::sync::Arc;
 use tracing::info;
 
 // --- PATH DTOS ---
-// These allow Axum to pick specific params by name and ignore
-// parent params (like tenant_id or session_id) automatically.
-
 #[derive(Deserialize)]
 pub struct IdPath {
     pub id: i64,
@@ -31,7 +28,6 @@ pub struct ScriptNamePath {
 }
 
 // --- CRUD HANDLERS ---
-
 #[utoipa::path(get, path = "/api/v1/admin/scripts", responses((status = 200, body = Value)))]
 pub async fn list_scripts(
     Extension(claims): Extension<Claims>,
@@ -43,7 +39,6 @@ pub async fn list_scripts(
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // 1. Fetch Local Scripts (For this Tenant/Sandbox or Root)
     let local_scripts = db
         .list_scripts()
         .await
@@ -55,7 +50,6 @@ pub async fn list_scripts(
 
     let current_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
 
-    // 2. If we are inside a Tenant/Sandbox, inject Root Scripts
     if !matches!(current_scope, EventScope::Root) {
         let root_scripts = state.db.list_scripts().await.unwrap_or_default();
         root_total = root_scripts.len();
@@ -70,9 +64,8 @@ pub async fn list_scripts(
 
         for s in root_scripts {
             if s.visibility == "public" {
-                shared.push(s.clone()); // Public scripts share code freely
+                shared.push(s.clone());
             } else if transparency_enabled {
-                // Transparency Mode: Expose existence, redact the code
                 let mut redacted = s.clone();
                 redacted.code = "// [TRANSPARENCY MODE]\n// Code redacted by Host Provider to protect secrets.\n// Script is active and running in the Root context.".to_string();
                 shared.push(redacted);
@@ -110,7 +103,7 @@ pub async fn delete_script(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection,
     State(_state): State<AppState>,
-    Path(path): Path<IdPath>, // FIX: Use struct
+    Path(path): Path<IdPath>,
 ) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" {
         return Err(AppError::Forbidden("Admins only".into()));
@@ -122,7 +115,6 @@ pub async fn delete_script(
 }
 
 // --- EXECUTION CORE ---
-
 async fn run_script_core(
     db: Arc<dyn Db>,
     state: AppState,
@@ -157,7 +149,7 @@ async fn run_script_core(
         .run_script(
             &script.code,
             payload,
-            context, // Pass AppState
+            context,
             base_url,
             headers,
             method,
@@ -166,7 +158,7 @@ async fn run_script_core(
         .await
         .map_err(|e| AppError::UnknownError(format!("Script Execution Error: {}", e)))?;
 
-    // THE FIX: Unpack the intercepted Response object and apply the correct HTTP Status
+    // Unpack intercepted Response object, supporting binary streams and custom headers
     if let Some(obj) = result.as_object() {
         if obj
             .get("__is_apex_response")
@@ -174,19 +166,51 @@ async fn run_script_core(
             .unwrap_or(false)
         {
             let status_code = obj.get("status").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
+
+            let mut builder = Response::builder().status(status);
+
+            let is_binary = obj
+                .get("is_binary")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let b64_opt = obj.get("b64").and_then(|v| v.as_str());
+
+            if let Some(headers_obj) = obj.get("headers").and_then(|v| v.as_object()) {
+                for (k, v) in headers_obj {
+                    if let Some(val_str) = v.as_str() {
+                        builder = builder.header(k, val_str);
+                    }
+                }
+            }
+
+            if is_binary && let Some(b64) = b64_opt {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                let bytes = STANDARD.decode(b64).unwrap_or_default();
+                return Ok(builder.body(axum::body::Body::from(bytes)).unwrap());
+            }
+
             let body = obj.get("body").cloned().unwrap_or(serde_json::Value::Null);
 
-            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
-            return Ok((status, Json(body)).into_response());
+            if let Some(text) = body.as_str() {
+                return Ok(builder
+                    .body(axum::body::Body::from(text.to_string()))
+                    .unwrap());
+            }
+
+            return Ok(builder
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&body).unwrap_or_default(),
+                ))
+                .unwrap());
         }
     }
 
-    // Default return
     Ok(Json(result).into_response())
 }
 
 // --- PUBLIC HANDLERS ---
-// --- HELPER ---
 fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for (k, v) in headers.iter() {

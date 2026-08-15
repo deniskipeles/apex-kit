@@ -1,4 +1,5 @@
 use crate::realtime::EventScope;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use regex::Regex;
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
@@ -17,7 +18,7 @@ use super::context::ScriptContext;
 
 static EXECUTION_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 fn get_execution_semaphore() -> &'static Semaphore {
-    EXECUTION_SEMAPHORE.get_or_init(|| Semaphore::new(50)) // Caps concurrent scripts at 50
+    EXECUTION_SEMAPHORE.get_or_init(|| Semaphore::new(50))
 }
 
 struct SendWrapper<F>(F);
@@ -38,18 +39,35 @@ const JS_PRELUDE: &str = r#"
     class Headers {
         constructor(init = {}) {
             this.map = new Map();
+            this.raw = {};
             if (init instanceof Headers) {
-                init.map.forEach((v, k) => this.map.set(k, v));
+                init.map.forEach((v, k) => { this.map.set(k, v); this.raw[k] = v; });
             } else if (Array.isArray(init)) {
-                init.forEach(([k, v]) => this.map.set(k.toLowerCase(), v));
-            } else {
-                Object.entries(init).forEach(([k, v]) => this.map.set(k.toLowerCase(), String(v)));
+                init.forEach(([k, v]) => { 
+                    const lk = String(k).toLowerCase(); 
+                    this.map.set(lk, String(v)); 
+                    this.raw[lk] = String(v); 
+                });
+            } else if (init && typeof init === 'object') {
+                Object.entries(init).forEach(([k, v]) => { 
+                    const lk = String(k).toLowerCase(); 
+                    this.map.set(lk, String(v)); 
+                    this.raw[lk] = String(v); 
+                });
             }
         }
-        get(name) { return this.map.get(name.toLowerCase()) || null; }
-        set(name, value) { this.map.set(name.toLowerCase(), String(value)); }
-        has(name) { return this.map.has(name.toLowerCase()); }
-        delete(name) { this.map.delete(name.toLowerCase()); }
+        get(name) { return this.map.get(String(name).toLowerCase()) || null; }
+        set(name, value) { 
+            const lk = String(name).toLowerCase(); 
+            this.map.set(lk, String(value)); 
+            this.raw[lk] = String(value); 
+        }
+        has(name) { return this.map.has(String(name).toLowerCase()); }
+        delete(name) { 
+            const lk = String(name).toLowerCase(); 
+            this.map.delete(lk); 
+            delete this.raw[lk]; 
+        }
         forEach(callback) { this.map.forEach((v, k) => callback(v, k, this)); }
     }
 
@@ -59,9 +77,20 @@ const JS_PRELUDE: &str = r#"
             this.status = init.status || 200;
             this.statusText = init.statusText || "OK";
             this.headers = new Headers(init.headers || {});
+            this._headers_raw = this.headers.raw;
             this.ok = this.status >= 200 && this.status < 300;
             this.url = init.url || "";
             this._body_b64 = init._body_b64 || null;
+
+            if (this.body instanceof ArrayBuffer) {
+                if (globalThis.$util && globalThis.$util.base64EncodeBuffer) {
+                    this._body_b64 = globalThis.$util.base64EncodeBuffer(this.body);
+                }
+            } else if (ArrayBuffer.isView(this.body)) {
+                if (globalThis.$util && globalThis.$util.base64Encode) {
+                    this._body_b64 = globalThis.$util.base64Encode(this.body);
+                }
+            }
 
             this.json = async () => {
                 if (typeof this.body === 'object' && this.body !== null) return this.body;
@@ -563,21 +592,52 @@ impl ScriptEngine {
                             .unwrap_or(rquickjs::Value::new_null(js_ctx.clone()));
                         let status_code: u16 = from_value(status_val).unwrap_or(200);
 
+                        // Directly read the mirror object containing all JS response headers
+                        let headers_map: serde_json::Map<String, serde_json::Value> = obj
+                            .get::<_, rquickjs::Object>("_headers_raw")
+                            .ok()
+                            .and_then(|h| from_value(h.into_value()).ok())
+                            .and_then(|v: serde_json::Value| v.as_object().cloned())
+                            .unwrap_or_default();
+
                         let body_val: rquickjs::Value = obj
                             .get("body")
                             .unwrap_or(rquickjs::Value::new_null(js_ctx.clone()));
 
-                        let body_json = if let Some(js_str) = body_val.as_string() {
+                        let b64_val: Option<String> = obj.get("_body_b64").ok();
+
+                        let (body_json, is_binary, b64_data) = if let Some(b64) = b64_val {
+                            (serde_json::Value::Null, true, Some(b64))
+                        } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(body_val.clone()) {
+                            let bytes = ab.as_bytes().unwrap_or_default();
+                            (serde_json::Value::Null, true, Some(STANDARD.encode(bytes)))
+                        } else if let Some(ta) = body_val.as_object() {
+                            if let Ok(ab) = ta.get::<_, rquickjs::ArrayBuffer>("buffer") {
+                                let offset = ta.get::<_, usize>("byteOffset").unwrap_or(0);
+                                let length = ta.get::<_, usize>("byteLength").unwrap_or_else(|_| ab.as_bytes().map(|b| b.len()).unwrap_or(0));
+                                if let Some(bytes) = ab.as_bytes() {
+                                    let slice = if offset + length <= bytes.len() { &bytes[offset..offset+length] } else { bytes };
+                                    (serde_json::Value::Null, true, Some(STANDARD.encode(slice)))
+                                } else {
+                                    (serde_json::Value::Null, false, None)
+                                }
+                            } else {
+                                let val_json: serde_json::Value = from_value(body_val).unwrap_or(serde_json::Value::Null);
+                                (val_json, false, None)
+                            }
+                        } else if let Some(js_str) = body_val.as_string() {
                             let rust_str = js_str.to_string().unwrap_or_default();
-                            serde_json::from_str(&rust_str)
-                                .unwrap_or(serde_json::Value::String(rust_str))
+                            (serde_json::Value::String(rust_str), false, None)
                         } else {
-                            from_value(body_val).unwrap_or(serde_json::Value::Null)
+                            (from_value(body_val).unwrap_or(serde_json::Value::Null), false, None)
                         };
 
                         json!({
                             "__is_apex_response": true,
                             "status": status_code,
+                            "headers": headers_map,
+                            "is_binary": is_binary,
+                            "b64": b64_data,
                             "body": body_json
                         })
                     } else {
