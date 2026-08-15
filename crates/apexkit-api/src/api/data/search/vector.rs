@@ -669,3 +669,37 @@ pub async fn revectorize_collection_handler(
         "message": "Revectorization job successfully queued in background.",
     })))
 }
+
+#[derive(Deserialize, ToSchema)]
+pub struct FlushVectorsReq {
+    pub model: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/vectors/flush",
+    request_body = FlushVectorsReq,
+    responses((status = 200, description = "Flushed successfully"))
+)]
+pub async fn flush_model_vectors_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    Json(payload): Json<FlushVectorsReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let claims = auth
+        .ok_or(AppError::Unauthorized("Login required".into()))?
+        .0;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+
+    let deleted = db
+        .flush_vectors_by_model(&payload.model)
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "deleted": deleted
+    })))
+}

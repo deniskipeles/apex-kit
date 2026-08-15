@@ -267,6 +267,10 @@ fn make_api_router() -> Router<AppState> {
             post(vector_routes::revectorize_collection_handler),
         )
         .route(
+            "/admin/vectors/flush",
+            post(vector_routes::flush_model_vectors_handler),
+        )
+        .route(
             "/admin/ai/actions",
             get(ai_routes::list_actions).post(ai_routes::create_action),
         )
@@ -517,6 +521,7 @@ pub fn app_router(state: AppState) -> Router {
         vector_routes::get_record_vector,
         vector_routes::query_image_vector_search,
         vector_routes::query_text_image_vector_search,
+        vector_routes::flush_model_vectors_handler,
         serve_css::serve_styles,
         tenant_routes::create_tenant_handler,
         sse::sse_handler,
@@ -571,6 +576,7 @@ pub fn app_router(state: AppState) -> Router {
         vector_routes::TextImageVectorSearchReq,
         vector_routes::RecordVectorPath,
         vector_routes::TextVectorSearchReq,
+        vector_routes::FlushVectorsReq,
         tenant_routes::TenantResponse,tenant_routes::CreateTenantReq,
     )),
     tags((name = "ApexKit",description = "ApexKit API"))

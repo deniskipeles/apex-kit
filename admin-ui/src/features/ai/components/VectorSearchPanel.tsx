@@ -9,6 +9,7 @@ import {
   Type,
   X,
   UploadCloud,
+  Trash2,
 } from 'lucide-react';
 import {
   Button,
@@ -22,6 +23,7 @@ import {
   Label,
   Switch,
 } from '../../../components/ui/Elements';
+import { Dialog } from '../../../components/ui/Dialog';
 import { collectionsService } from '../../collections/services/collectionsService';
 import { Collection, AppRecord } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
@@ -42,6 +44,12 @@ export const VectorSearchPanel = () => {
   const [isSearching, setIsSearching] = useState(false);
   const [isReindexing, setIsReindexing] = useState(false);
   const [forceRevectorize, setForceRevectorize] = useState(false);
+
+  // --- NEW STATES FOR FLUSHING ---
+  const [isFlushModalOpen, setIsFlushModalOpen] = useState(false);
+  const [vectorModels, setVectorModels] = useState<{ model: string; count: number }[]>([]);
+  const [modelToFlush, setModelToFlush] = useState<string>('');
+  const [isFlushing, setIsFlushing] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
@@ -106,6 +114,34 @@ export const VectorSearchPanel = () => {
       toast('Re-vectorization failed', 'error');
     } finally {
       setIsReindexing(false);
+    }
+  };
+
+  // --- NEW HANDLERS ---
+  const openFlushModal = async () => {
+    setIsFlushModalOpen(true);
+    try {
+      const stats = await apiClient.getAdminDashboardStats();
+      setVectorModels(stats.vector_models || []);
+      if (stats.vector_models && stats.vector_models.length > 0) {
+        setModelToFlush(stats.vector_models[0].model);
+      }
+    } catch (err) {
+      toast('Failed to load vector models', 'error');
+    }
+  };
+
+  const handleFlushVectors = async () => {
+    if (!modelToFlush) return;
+    setIsFlushing(true);
+    try {
+      const res = await apiClient.flushVectors(modelToFlush);
+      toast(`Flushed ${res.deleted || 0} vectors for model ${modelToFlush}`, 'success');
+      setIsFlushModalOpen(false);
+    } catch (e: any) {
+      toast(e.message || 'Failed to flush vectors', 'error');
+    } finally {
+      setIsFlushing(false);
     }
   };
 
@@ -260,6 +296,16 @@ export const VectorSearchPanel = () => {
                 >
                   <RefreshCw className="mr-2 h-3 w-3" /> Re-generate Embeddings
                 </Button>
+
+                {/* --- NEW BUTTON --- */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full text-xs text-destructive hover:bg-destructive/10 hover:text-destructive border-destructive/20"
+                  onClick={openFlushModal}
+                >
+                  <Trash2 className="mr-2 h-3 w-3" /> Flush Old Vectors
+                </Button>
               </div>
             </CardContent>
           </Card>
@@ -355,6 +401,57 @@ export const VectorSearchPanel = () => {
           </div>
         </div>
       </div>
+      {/* --- NEW FLUSH MODAL --- */}
+      <Dialog
+        isOpen={isFlushModalOpen}
+        onClose={() => !isFlushing && setIsFlushModalOpen(false)}
+        title="Flush Model Vectors"
+        size="sm"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Select an AI model to permanently delete all of its associated vector embeddings from
+            the database. This is useful if you switched models and want to reclaim disk space.
+          </p>
+          <div className="space-y-2">
+            <Label>AI Model</Label>
+            {vectorModels.length === 0 ? (
+              <div className="p-3 border border-border border-dashed rounded text-xs text-muted-foreground">
+                No vector models found in the database.
+              </div>
+            ) : (
+              <Select
+                value={modelToFlush}
+                onChange={(e: any) => setModelToFlush(e.target.value)}
+                disabled={isFlushing}
+              >
+                {vectorModels.map((vm) => (
+                  <option key={vm.model} value={vm.model}>
+                    {vm.model} ({vm.count} vectors)
+                  </option>
+                ))}
+              </Select>
+            )}
+          </div>
+          <div className="flex justify-end gap-2 pt-2 mt-4 border-t border-border">
+            <Button
+              variant="ghost"
+              onClick={() => setIsFlushModalOpen(false)}
+              disabled={isFlushing}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleFlushVectors}
+              isLoading={isFlushing}
+              disabled={isFlushing || vectorModels.length === 0}
+            >
+              <Trash2 className="mr-2 h-4 w-4" /> Delete Vectors
+            </Button>
+          </div>
+        </div>
+      </Dialog>
     </div>
   );
 };

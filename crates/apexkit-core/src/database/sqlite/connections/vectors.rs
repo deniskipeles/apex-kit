@@ -154,4 +154,24 @@ impl VectorStore for ApexKit {
 
         Ok(final_results)
     }
+
+    async fn flush_vectors_by_model(
+        &self,
+        model: &str,
+    ) -> std::result::Result<usize, Box<dyn StdError + Send + Sync>> {
+        let map_err = |e: String| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::other(e))
+        };
+
+        let affected = self
+            .vector_batcher
+            .execute(
+                "DELETE FROM vectors WHERE model = ?1".into(),
+                vec![model.into_val()],
+            )
+            .await
+            .map_err(map_err)?;
+
+        Ok(affected as usize)
+    }
 }

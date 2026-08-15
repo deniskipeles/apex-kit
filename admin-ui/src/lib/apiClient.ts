@@ -274,6 +274,10 @@ export const apiClient = {
     const res = await pb.admins.revectorizeCollection(collectionId, force);
     return res;
   },
+  flushVectors: async (modelToFlush: string) => {
+    const res = await pb.admins.flushVectors(modelToFlush);
+    return res;
+  },
 
   system: {
     reload: async (target = null) => await pb.admins.reloadSystem(target),

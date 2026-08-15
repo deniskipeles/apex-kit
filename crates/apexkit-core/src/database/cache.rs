@@ -986,6 +986,13 @@ impl VectorStore for CachedDb {
             .search_vector(collection_id, field, vector, limit)
             .await
     }
+
+    async fn flush_vectors_by_model(
+        &self,
+        model: &str,
+    ) -> std::result::Result<usize, Box<dyn StdError + Send + Sync>> {
+        self.inner.flush_vectors_by_model(model).await
+    }
 }
 
 #[async_trait]
