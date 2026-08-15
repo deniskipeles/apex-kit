@@ -1,4 +1,4 @@
-// apexkit-watch.js
+// apexkit-watch.js - ApexKit Developer Tools, Sync Watcher & IntelliSense Engine
 import fs from "fs";
 import path from "path";
 import zlib from "zlib";
@@ -32,12 +32,58 @@ const IS_PULL = ARGS.includes("--pull");
 const IS_COMMIT = ARGS.includes("--commit");
 const NO_AUTO_COMMIT = ARGS.includes("--no-auto-commit");
 
-// --- 3. WORKSPACE FILES GENERATOR (IntelliSense & DB Schema Types) ---
+// --- 3. ALL TRIGGER TYPES DEFINITIONS ---
+const TRIGGER_DEFINITIONS = [
+  { id: "manual", name: "manual (Public/Protected HTTP Webhook Endpoint)", desc: "Triggered via HTTP GET/POST/PUT/DELETE on /api/v1/run/:name" },
+  { id: "before_create_record", name: "before_create_record", desc: "Runs before a record is inserted. Can validate or mutate data." },
+  { id: "after_create_record", name: "after_create_record", desc: "Runs after a record is inserted. Used for notifications/indexes." },
+  { id: "before_update_record", name: "before_update_record", desc: "Runs before an existing record is updated. Can validate changes." },
+  { id: "after_update_record", name: "after_update_record", desc: "Runs after a record is updated." },
+  { id: "before_delete_record", name: "before_delete_record", desc: "Runs before a record is deleted. Can block deletion." },
+  { id: "after_delete_record", name: "after_delete_record", desc: "Runs after a record has been deleted." },
+  { id: "before_list_records", name: "before_list_records", desc: "Intercepts list queries before they execute." },
+  { id: "after_list_records", name: "after_list_records", desc: "Filters or transforms listed records before response." },
+  { id: "before_get_record", name: "before_get_record", desc: "Runs before a single record is fetched." },
+  { id: "after_get_record", name: "after_get_record", desc: "Transforms a fetched record before response." },
+  { id: "before_user_login", name: "before_user_login", desc: "Runs before user authentication. Can verify IP/Rate limits." },
+  { id: "after_user_login", name: "after_user_login", desc: "Runs after successful user login." },
+  { id: "before_user_create", name: "before_user_create", desc: "Runs before user registration. Enforce roles or rules." },
+  { id: "after_user_create", name: "after_user_create", desc: "Runs after user registration. Trigger welcome emails." },
+  { id: "before_user_delete", name: "before_user_delete", desc: "Runs before a user is deleted." },
+  { id: "after_user_delete", name: "after_user_delete", desc: "Runs after a user is deleted." },
+  { id: "before_list_users", name: "before_list_users", desc: "Intercepts user list queries." },
+  { id: "after_list_users", name: "after_list_users", desc: "Transforms user list responses." },
+  { id: "before_collection_create", name: "before_collection_create", desc: "Validates collection schema before creation." },
+  { id: "after_collection_create", name: "after_collection_create", desc: "Runs after collection creation." },
+  { id: "before_collection_update", name: "before_collection_update", desc: "Runs before collection schema updates." },
+  { id: "after_collection_update", name: "after_collection_update", desc: "Runs after collection schema updates." },
+  { id: "before_collection_delete", name: "before_collection_delete", desc: "Runs before collection deletion." },
+  { id: "before_file_upload", name: "before_file_upload", desc: "Runs before a file is written to storage." },
+  { id: "after_file_upload", name: "after_file_upload", desc: "Runs after file upload. Can trigger virus scan or indexing." },
+  { id: "before_file_delete", name: "before_file_delete", desc: "Runs before file is deleted." },
+  { id: "after_file_delete", name: "after_file_delete", desc: "Runs after file is deleted." },
+  { id: "before_relation_create", name: "before_relation_create", desc: "Runs before relationship is linked." },
+  { id: "after_relation_create", name: "after_relation_create", desc: "Runs after relationship is linked." },
+  { id: "before_relation_delete", name: "before_relation_delete", desc: "Runs before relationship is removed." },
+  { id: "after_relation_delete", name: "after_relation_delete", desc: "Runs after relationship is removed." },
+  { id: "before_tenant_create", name: "before_tenant_create", desc: "Runs before a tenant database is provisioned." },
+  { id: "after_tenant_create", name: "after_tenant_create", desc: "Runs after tenant database is provisioned." },
+  { id: "before_tenant_request", name: "before_tenant_request", desc: "Intercepts all incoming HTTP requests to a tenant." },
+  { id: "after_tenant_request", name: "after_tenant_request", desc: "Processes tenant HTTP response metrics." },
+  { id: "before_sandbox_request", name: "before_sandbox_request", desc: "Intercepts sandbox requests." },
+  { id: "after_sandbox_request", name: "after_sandbox_request", desc: "Processes sandbox response metrics." },
+  { id: "before_ai_run", name: "before_ai_run", desc: "Intercepts AI Prompt Actions to inject RAG search vectors." },
+  { id: "after_ai_run", name: "after_ai_run", desc: "Runs after AI Prompt execution." },
+  { id: "on_vectorization_start", name: "on_vectorization_start", desc: "Fires when revectorization job begins." },
+  { id: "cron", name: "cron (Scheduled Job)", desc: "Executed periodically according to Cron expression settings." },
+  { id: "graphql", name: "graphql (Custom Resolver)", desc: "Dynamic Query/Mutation field resolver for GraphQL schema." }
+];
+
+// --- 4. WORKSPACE TYPES GENERATOR ---
 async function generateWorkspaceFiles() {
   console.log("  ⏳ Fetching collection schemas from DB...");
   let collectionsData = [];
   try {
-    // Resolve scope path if targeting a tenant or sandbox
     let scopePath = "";
     if (SCOPE_KEY.startsWith("tenant:")) {
       scopePath = `/tenant/${SCOPE_KEY.replace("tenant:", "")}`;
@@ -45,7 +91,6 @@ async function generateWorkspaceFiles() {
       scopePath = `/sandbox/${SCOPE_KEY.replace("sandbox:", "")}`;
     }
 
-    // Correct endpoint: /api/v1/collections
     const fetchUrl = `${BASE_URL.replace(/\/$/, "")}${scopePath}/api/v1/collections`;
     
     const res = await fetch(fetchUrl, {
@@ -63,9 +108,12 @@ async function generateWorkspaceFiles() {
     console.warn(`  ⚠️ Could not connect to DB for schemas: ${err.message}`);
   }
 
-  // A. Generate Collection Interfaces based on live DB schema
-  let collectionTypesStr = `interface Collections {\n  [key: string]: any;\n`;
+  // A. Generate Collection Interfaces
+  let collectionTypesStr = `export interface Collections {\n`;
+  const collectionNames = [];
+
   collectionsData.forEach((col) => {
+    collectionNames.push(`"${col.name}"`);
     let fieldsStr = "";
     if (col.schema && col.schema.fields) {
       for (const [name, def] of Object.entries(col.schema.fields)) {
@@ -80,7 +128,9 @@ async function generateWorkspaceFiles() {
           case "vector":
             tsType = "number[]"; break;
           case "geopoint":
-            tsType = "{ lat: number, lng: number }"; break;
+            tsType = "{ lat: number; lng: number }"; break;
+          case "json":
+            tsType = "Record<string, any> | any[]"; break;
           case "select":
             tsType = def.options && def.options.length > 0
               ? def.options.map((o) => `"${o}"`).join(" | ")
@@ -93,69 +143,295 @@ async function generateWorkspaceFiles() {
     }
     collectionTypesStr += `  "${col.name}": {\n${fieldsStr}  };\n`;
   });
-  collectionTypesStr += `}\n`;
 
-  // B. Generate Global Types
-  const types = `
-/**
- * ApexKit Global Types
+  if (collectionsData.length === 0) {
+    collectionTypesStr += `  [key: string]: Record<string, any>;\n`;
+  }
+  collectionTypesStr += `}\n\nexport type CollectionName = ${collectionNames.length > 0 ? collectionNames.join(" | ") : "string"};\n`;
+
+  // B. Generate Trigger Types
+  const triggerUnion = TRIGGER_DEFINITIONS.map(t => `  /** ${t.desc} */\n  | "${t.id}"`).join("\n");
+
+  const types = `/**
+ * ApexKit Global Types & IntelliSense
  * Auto-generated by apexkit-watch.js
  */
 
 ${collectionTypesStr}
 
+export type TriggerType =
+${triggerUnion};
+
+export type ScriptType = "webhook" | "custom:module" | "esm:module" | "template" | "ai_action";
+export type ScriptVisibility = "private" | "public";
+
+export interface FileMetadata {
+  /** The unique name/identifier for the script or webhook */
+  name?: string;
+  /** File extension (js or ts) */
+  extension?: "js" | "ts" | "html" | string;
+  /** Target collection if this is a collection-scoped hook */
+  target_collection?: CollectionName | null;
+  /** The structural module type */
+  type?: ScriptType;
+  /** Local project path */
+  path?: string;
+  /** System trigger event */
+  trigger_type?: TriggerType;
+  /** Whether the script is active and running */
+  active?: boolean;
+  /** Visibility for multi-tenant inheritance ('public' allows tenants to inherit) */
+  visibility?: ScriptVisibility;
+}
+
+export interface AuthContext {
+  id: number;
+  email: string;
+  role: string;
+  scope: string;
+}
+
+export interface RecordHookEvent<T = any> {
+  trigger: TriggerType;
+  record: {
+    id: number | null;
+    data: T;
+  };
+  collection: {
+    id: number;
+    name: string;
+    schema?: any;
+  };
+  auth: AuthContext | null;
+}
+
+export interface VoidHookEvent {
+  trigger: TriggerType;
+  data: any;
+  auth: AuthContext | null;
+  timestamp: string;
+}
+
+export interface GraphqlConfig {
+  parent: "Query" | "Mutation" | "User" | "_AuthUser" | string;
+  name: string;
+  args?: Record<string, string>;
+  returnType: string;
+}
+
 declare global {
+  /** Injected file metadata configuration */
+  const __fileMetadata__: FileMetadata;
+
+  /** ApexKit Database Client */
   const $db: {
     records: {
-      list<T extends keyof Collections>(collection: T, options?: any): Promise<{ items: { id: number, data: Collections[T], created: string, updated: string }[]; total: number }>;
-      get<T extends keyof Collections>(collection: T, id: number, expand?: string): Promise<{ id: number, data: Collections[T], created: string, updated: string, expand?: any }>;
-      create<T extends keyof Collections>(collection: T, data: Partial<Collections[T]>): Promise<{ id: number }>;
-      update<T extends keyof Collections>(collection: T, id: number, data: Partial<Collections[T]>): Promise<{ id: number, data: Collections[T], created: string, updated: string }>;
+      list<T extends keyof Collections>(
+        collection: T, 
+        options?: { 
+          page?: number; 
+          per_page?: number; 
+          limit?: number; 
+          offset?: number; 
+          sort?: string; 
+          filter?: string | Record<string, any>; 
+          expand?: string; 
+          fields?: string; 
+        }
+      ): Promise<{ items: { id: number; data: Collections[T]; created: string; updated: string; expand?: any }[]; total: number }>;
+
+      get<T extends keyof Collections>(
+        collection: T, 
+        id: number, 
+        expand?: string
+      ): Promise<{ id: number; data: Collections[T]; created: string; updated: string; expand?: any } | null>;
+
+      create<T extends keyof Collections>(
+        collection: T, 
+        data: Partial<Collections[T]>
+      ): Promise<{ id: number }>;
+
+      update<T extends keyof Collections>(
+        collection: T, 
+        id: number, 
+        data: Partial<Collections[T]>
+      ): Promise<{ id: number; data: Collections[T]; created: string; updated: string }>;
+
       delete(collection: string, id: number): Promise<boolean>;
-      searchVector<T extends keyof Collections>(collection: T, field: string, vector: number[], limit?: number): Promise<{ id: number, data: Collections[T], _score: number }[]>;
-      getVector(collection: string, id: number): Promise<any[]>;
-      instantSearch(collection: string, query: string, limit?: number): Promise<any[]>;
+
+      searchVector<T extends keyof Collections>(
+        collection: T, 
+        field: string, 
+        vector: number[], 
+        limit?: number
+      ): Promise<{ id: number; data: Collections[T]; _score: number }[]>;
+
+      getVector(collection: string, id: number): Promise<{ field_name: string; vector: number[]; model: string }[]>;
+
+      instantSearch(collection: string, query: string, limit?: number): Promise<{ id: number; score: number; snippet: any }[]>;
     };
-    query(queryObject: any): Promise<any[]>;
+
+    query(queryObject: {
+      from: string;
+      select?: any[];
+      where?: Record<string, any>;
+      group_by?: string[];
+      sort?: string;
+      limit?: number;
+      offset?: number;
+      system?: boolean;
+      pipeline?: any[];
+    }): Promise<any[]>;
+
     users: {
-      create(email: string, passwordHash: string, role: string, metadata?: any): Promise<any>;
-      get(email: string): Promise<any>;
+      create(email: string, passwordHash: string, role: string, metadata?: Record<string, any>): Promise<{ id: number; email: string; role: string }>;
+      get(email: string): Promise<{ id: number; email: string; role: string; metadata?: any } | null>;
     };
+
     collections: {
-      list(): Promise<any[]>;
+      list(): Promise<{ id: number; name: string; schema?: any; index?: string }[]>;
     };
+
     files: {
-      list(limit?: number, offset?: number): Promise<any[]>;
+      list(limit?: number, offset?: number): Promise<{ id: number; filename: string; original_name: string; mime_type: string; size: number; created_at: string }[]>;
     };
   };
 
+  /** Root Multitenancy and Administrative Manager (Only available in Root context) */
+  const $root: {
+    db: typeof $db;
+    createTenant(id: string, config?: { name?: string; tier?: string; owner_id?: number }): Promise<boolean>;
+    updateTenant(id: string, updates: { name?: string; status?: string; tier?: string; max_storage_mb?: number; max_vectors?: number; max_ai_requests?: number }): Promise<boolean>;
+    deleteTenant(id: string): Promise<boolean>;
+    getTenantDiskUsage(id: string): Promise<number>;
+    listTenants(): Promise<any[]>;
+    createSandbox(id: string, config?: { name?: string; clone_strategy?: "none" | "schema" | "partial" | "full"; clone_record_limit?: number; collections?: string[]; scripts?: string[]; templates?: string[] }): Promise<boolean>;
+    updateSandbox(id: string, updates: { name?: string; status?: string; expires_at?: string }): Promise<boolean>;
+    deleteSandbox(id: string): Promise<boolean>;
+    getSandboxDiskUsage(id: string): Promise<number>;
+    createKey(name: string, config?: { tenant_id?: string; issuer?: string; env_type?: "sys" | "tnnt" | "sk" | "pk"; roles?: string[]; bypass_cors?: boolean }): Promise<{ key: string; info: any }>;
+    updateKey(id: number, updates: { name?: string; status?: string; roles?: string[]; bypass_cors?: boolean }): Promise<boolean>;
+    deleteKey(id: number): Promise<boolean>;
+    listKeys(): Promise<any[]>;
+  } | null;
+
+  /** Universal HTTP Client */
   const $http: {
     get(url: string): Promise<string>;
     post(url: string, body: any): Promise<string>;
   };
 
+  /** Native Storage & File Engine */
+  const $files: {
+    read(filename: string): Promise<string>;
+    save(filename: string, data: string | ArrayBuffer | Uint8Array, mime?: string): Promise<{ id: number; url: string; filename: string }>;
+    getSignedUrl(filename: string, ttl_secs?: number): Promise<string>;
+    registerMetadata(filename: string, options: { originalName?: string; mimeType?: string; size?: number }): Promise<{ id: number; filename: string; url: string; size: number }>;
+  };
+
+  /** Scoped Virtual File System */
+  const $fs: {
+    read(path: string): Promise<string>;
+    write(path: string, content: string): Promise<boolean>;
+    delete(path: string): Promise<boolean>;
+    list(path: string): Promise<{ name: string; isDir: boolean; size: number }[]>;
+    exists(path: string): Promise<boolean>;
+    mkdir(path: string): Promise<boolean>;
+    stat(path: string): Promise<{ size: number; isDir: boolean; created?: number; modified?: number }>;
+  };
+
+  /** Fast In-Memory Zip Creator & Extractor */
+  const $zip: {
+    create(files: Record<string, string | Uint8Array>): string;
+    extract(base64Zip: string): Record<string, string>;
+    inspect(base64Zip: string): { total_size: number; file_count: number; files: any[] };
+  };
+
+  /** Local AI Embeddings Engine */
   const $ai: {
     embed(text: string): Promise<number[]>;
     meanVector(vectors: number[][]): number[];
     cosineSimilarity(v1: number[], v2: number[]): number;
   };
 
-  const $util: {
-    uuid(): string;
-    slugify(text: string): string;
-    hash(text: string, alg: "sha256" | "sha512"): string;
-    base64Encode(text: string): string;
-    base64Decode(text: string): string;
-    sleep(ms: number): Promise<void>;
+  /** In-Memory & Tenant-Isolated Fast Cache */
+  const $cache: {
+    get(key: string): Promise<string | null>;
+    set(key: string, value: any, ttl_secs?: number): Promise<void>;
+    delete(key: string): Promise<void>;
+    del(key: string): Promise<void>;
+    incr(key: string, delta?: number): Promise<number>;
+    listKeys(): Promise<string[]>;
   };
 
+  /** Background Queue Orchestration System (60s CPU Budget every 5 Minutes) */
+  const $queue: {
+    /**
+     * Spawns an asynchronous background process orchestrated in JavaScript.
+     * @param fnOrCode - The function or module code to execute in background
+     * @param options - Execution options (timeout defaults to 60000ms)
+     */
+    spawn<T = any>(
+      fnOrCode: ((pid: string, req: Request) => Promise<T> | T) | string,
+      options?: { timeoutMs?: number; args?: any }
+    ): Promise<{ pid: string; status: "queued" | "running" }>;
+
+    /**
+     * Queries the active execution status of a spawned queue job.
+     * @param pid - Job ID
+     */
+    status(pid: string): Promise<{
+      pid: string;
+      status: "queued" | "running" | "completed" | "failed" | "timed_out" | "not_found";
+      runtime_ms: number;
+      error?: string;
+    }>;
+
+    /**
+     * Retrieves the final result or error of a completed queue job.
+     * @param pid - Job ID
+     */
+    result<T = any>(pid: string): Promise<{
+      pid: string;
+      status: "queued" | "running" | "completed" | "failed" | "timed_out" | "not_found";
+      runtime_ms: number;
+      result?: T;
+      error?: string;
+    }>;
+  };
+
+  /** Subprocess Runner (Root scope only) */
+  const $cmd: {
+    run(program: string, args?: string[], options?: { cwd?: string; env?: Record<string, string>; timeout?: number }): Promise<{ stdout: string; stderr: string; status: number }>;
+    spawn(program: string, args?: string[], options?: { cwd?: string; env?: Record<string, string>; timeout?: number; onProgress?: { regex?: string; channel?: string; event?: string } }): Promise<{ pid: number; status: string }>;
+    status(pid: number): Promise<any>;
+    setLimit(program: string, limit: number): Promise<any>;
+    kill(pid: number): Promise<any>;
+  };
+
+  /** Outbound SMTP Email Dispatcher */
+  const $mail: {
+    send(to: string, subject: string, body: string): Promise<boolean>;
+  };
+
+  /** Real-time WebSocket & SSE Event Dispatcher */
+  const $realtime: {
+    send(channel: string, event: string, data: any): Promise<boolean>;
+  };
+
+  /** Script Inter-calling Engine */
+  const $run: {
+    script(name: string, payload: any): Promise<any>;
+  };
+
+  /** WebAssembly Raw Loader & WASI Runner */
   const $wasm: {
     call(
       wasmBase64OrName: string,
       funcName: string,
       args: number[],
       options?: { name?: string; memoryMb?: number; timeoutMs?: number }
-    ): Promise<number>;
+    ): Promise<number | number[]>;
     runWasi(
       wasmBase64OrName: string,
       cliArgs?: string[],
@@ -163,40 +439,99 @@ declare global {
     ): Promise<boolean>;
   };
 
-  const $cache: {
-    get(key: string): Promise<string | null>;
-    set(key: string, value: any, ttl_secs?: number): Promise<void>;
-    delete(key: string): Promise<void>;
+  /** Cryptographic & String Utilities */
+  const $util: {
+    uuid(): string;
+    slugify(text: string): string;
+    hash(text: string, alg: "sha256" | "sha512"): string;
+    hmac(text: string, key: string): string;
+    base64Encode(data: string | ArrayBuffer | Uint8Array): string;
+    base64EncodeBuffer(buffer: ArrayBuffer | Uint8Array): string;
+    base64Decode(text: string): string;
+    base64DecodeBuffer(text: string): ArrayBuffer;
+    sleep(ms: number): Promise<void>;
+    randomHex(len?: number): string;
   };
 
-  const $fs: {
-    read(path: string): Promise<string>;
-    write(path: string, content: string): Promise<boolean>;
-    delete(path: string): Promise<boolean>;
-    list(path: string): Promise<any[]>;
+  /** Environment & Configuration Secrets Accessor */
+  const $env: {
+    get(key: string): Promise<string>;
+    readonly APP_URL: string;
+    readonly SMTP_BLOCKED: boolean;
   };
+
+  /** Full Fetch API support */
+  function fetch(input: string | Request | URL, init?: { method?: string; headers?: any; body?: any; redirect?: "follow" | "manual" | "error" }): Promise<Response>;
+
+  /** Full WebAssembly standard namespace */
+  const WebAssembly: {
+    Memory: new (init: { initial: number; maximum?: number }) => { buffer: ArrayBuffer };
+    Instance: new (module: any, imports?: any) => { exports: Record<string, any> };
+    Module: new (bytes: ArrayBuffer | Uint8Array | string) => any;
+    instantiate(bufferSource: ArrayBuffer | Uint8Array | string, importObject?: any): Promise<{ module: any; instance: { exports: Record<string, any> } } | { exports: Record<string, any> }>;
+    instantiateStreaming(source: Response | Promise<Response>, importObject?: any): Promise<{ module: any; instance: { exports: Record<string, any> } }>;
+    compile(bufferSource: ArrayBuffer | Uint8Array | string): Promise<any>;
+  };
+
+  class Headers {
+    constructor(init?: Record<string, string> | [string, string][] | Headers);
+    get(name: string): string | null;
+    set(name: string, value: string): void;
+    has(name: string): boolean;
+    delete(name: string): void;
+    forEach(callback: (value: string, key: string) => void): void;
+  }
 
   class Response {
-    constructor(body?: any, init?: { status?: number, headers?: any });
+    constructor(body?: any, init?: { status?: number; statusText?: string; headers?: Record<string, string> | Headers });
+    readonly status: number;
+    readonly statusText: string;
+    readonly ok: boolean;
+    readonly headers: Headers;
+    readonly url: string;
     json(): Promise<any>;
+    text(): Promise<string>;
+    arrayBuffer(): Promise<ArrayBuffer>;
   }
 
   class Request {
-    method: string;
-    url: string;
-    headers: Map<string, string>;
-    auth: { id: number, email: string, role: string, scope: string } | null;
+    constructor(input: string | { url: string; method?: string; headers?: any; bodyData?: any }, init?: { method?: string; headers?: any; body?: any });
+    readonly method: string;
+    readonly url: string;
+    readonly headers: Headers;
+    readonly auth: AuthContext | null;
+    readonly args: any;
     json(): Promise<any>;
     text(): Promise<string>;
+    arrayBuffer(): Promise<ArrayBuffer>;
     clone(): Request;
+  }
+
+  class URL {
+    constructor(urlStr: string, baseStr?: string);
+    readonly href: string;
+    readonly protocol: string;
+    readonly host: string;
+    readonly hostname: string;
+    readonly port: string;
+    readonly origin: string;
+    readonly pathname: string;
+    readonly search: string;
+    readonly hash: string;
+    readonly searchParams: {
+      get(key: string): string | null;
+      has(key: string): boolean;
+      getAll(key: string): string[];
+    };
+    toString(): string;
   }
 }
 export {};
 `;
   fs.writeFileSync("apexkit.d.ts", types.trim());
-  console.log("  📄 Generated apexkit.d.ts for VS Code IntelliSense (with DB schema types)");
+  console.log("  📄 Generated apexkit.d.ts with full Engine & Collection Typings");
 
-  // C. Generate jsconfig.json for VS Code Auto-Complete and Path Aliasing
+  // C. Generate jsconfig.json
   const jsconfig = {
     compilerOptions: {
       target: "ES2022",
@@ -213,7 +548,7 @@ export {};
     include: ["**/*.js", "**/*.ts", "apexkit.d.ts"]
   };
   fs.writeFileSync("jsconfig.json", JSON.stringify(jsconfig, null, 2));
-  console.log("  📄 Generated jsconfig.json for Module Aliases");
+  console.log("  📄 Generated jsconfig.json for VS Code module alias resolution");
 
   // D. Generate package.json if missing
   if (!fs.existsSync("package.json")) {
@@ -224,20 +559,340 @@ export {};
       dependencies: {}
     };
     fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
-    console.log("  📄 Generated default package.json");
+    console.log("  📄 Generated package.json");
   }
 }
 
-// --- 4. INTERACTIVE FILE CREATION WIZARD (--init-file) ---
+// --- 5. INITIAL CODE GENERATORS BY TRIGGER TYPE ---
+function getBoilerplateCode(fileType, cleanName, ext, triggerType, targetCollection) {
+  const metadata = {
+    name: cleanName,
+    extension: ext,
+    target_collection: targetCollection,
+    type: fileType,
+    path: fileType === "template" ? "./templates/" : (fileType.includes("module") ? "./modules/custom/" : "./webhooks/"),
+    trigger_type: triggerType,
+    active: true,
+    visibility: "private"
+  };
+
+  const header = `/** @type {import("../apexkit").FileMetadata} */\nexport const __fileMetadata__ = ${JSON.stringify(metadata, null, 2)};\n\n`;
+
+  if (fileType === "custom:module") {
+    return `${header}/**
+ * Reusable Helper Module: ${cleanName}
+ * Import elsewhere via: import { ${cleanName.replace(/-/g, "_")} } from "@/custom/${cleanName}";
+ */
+export function ${cleanName.replace(/-/g, "_")}(data = {}) {
+  return {
+    success: true,
+    processed_at: new Date().toISOString(),
+    data
+  };
+}
+`;
+  }
+
+  if (fileType === "template") {
+    return `<!--
+__fileMetadata__ = ${JSON.stringify(metadata, null, 2)}
+-->
+<script type="server/js">
+export default async function (context) {
+  // 1. Fetch live records from database
+  const posts = await $db.records.list("${targetCollection || 'posts'}", { limit: 10 }).catch(() => ({ items: [] }));
+  
+  return {
+    title: "${cleanName.replace(/-/g, ' ').toUpperCase()}",
+    items: posts.items
+  };
+}
+</script>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/static/js/htmx.js"></script>
+  <script src="/static/js/alpine.js" defer></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen p-8">
+  <div class="max-w-4xl mx-auto space-y-6">
+    <h1 class="text-3xl font-bold text-indigo-400">{{ title }}</h1>
+    
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      {% for item in items %}
+      <div class="p-4 bg-slate-800 rounded-lg border border-slate-700 shadow">
+        <h2 class="text-xl font-semibold">{{ item.data.title | default(value="Item #" ~ item.id) }}</h2>
+        <p class="text-slate-400 text-sm mt-2">{{ item.created }}</p>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</body>
+</html>
+`;
+  }
+
+  // --- TRIGGERS ---
+  switch (triggerType) {
+    case "manual":
+      return `${header}/**
+ * HTTP Webhook: ${cleanName}
+ * Endpoint: /api/v1/run/${cleanName} (or /api/v1/webhook/${cleanName})
+ * 
+ * @param {Request} req - The standard incoming WHATWG Request object
+ * @returns {Promise<Response>}
+ */
+export default async function (req) {
+  const url = new URL(req.url);
+  const body = await req.json().catch(() => ({}));
+  
+  // Perform custom API operations
+  return new Response(JSON.stringify({
+    success: true,
+    method: req.method,
+    path: url.pathname,
+    query: Object.fromEntries(url.searchParams),
+    received: body
+  }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" }
+  });
+}
+`;
+
+    case "before_create_record":
+    case "before_update_record":
+      return `${header}/**
+ * Hook: ${triggerType}
+ * Collection: ${targetCollection || 'All Collections'}
+ * 
+ * @param {import("../apexkit").RecordHookEvent} event
+ * @returns {Promise<any>} Return modified record object or throw an Error to block operation
+ */
+export default async function (event) {
+  const data = event.record.data;
+
+  // Example: enforce uppercase titles or sanitize inputs
+  if (data.title && typeof data.title === "string") {
+    data.title = data.title.trim();
+  }
+
+  // Return the record data to proceed
+  return data;
+}
+`;
+
+    case "after_create_record":
+    case "after_update_record":
+      return `${header}/**
+ * Hook: ${triggerType}
+ * Collection: ${targetCollection || 'All Collections'}
+ * 
+ * @param {import("../apexkit").RecordHookEvent} event
+ */
+export default async function (event) {
+  const { id, data } = event.record;
+
+  // Broadcast realtime event to clients
+  await $realtime.send("${targetCollection || 'general'}", "record_changed", {
+    action: "${triggerType}",
+    record_id: id,
+    data
+  });
+}
+`;
+
+    case "before_delete_record":
+      return `${header}/**
+ * Hook: before_delete_record
+ * Collection: ${targetCollection || 'All Collections'}
+ * 
+ * @param {import("../apexkit").RecordHookEvent} event
+ */
+export default async function (event) {
+  // Check authorization or child relations before allowing deletion
+  if (event.auth?.role !== "admin") {
+    throw new Error("Only administrators can delete records in this collection.");
+  }
+}
+`;
+
+    case "after_delete_record":
+      return `${header}/**
+ * Hook: after_delete_record
+ * Collection: ${targetCollection || 'All Collections'}
+ * 
+ * @param {import("../apexkit").RecordHookEvent} event
+ */
+export default async function (event) {
+  await $realtime.send("${targetCollection || 'general'}", "record_deleted", {
+    record_id: event.record.id
+  });
+}
+`;
+
+    case "before_user_login":
+      return `${header}/**
+ * Hook: before_user_login
+ * 
+ * @param {import("../apexkit").VoidHookEvent} event - data contains { email, ip }
+ */
+export default async function (event) {
+  const { email, ip } = event.data;
+  console.log(\`[Auth] Login attempt for \${email} from IP \${ip}\`);
+}
+`;
+
+    case "after_user_login":
+      return `${header}/**
+ * Hook: after_user_login
+ * 
+ * @param {import("../apexkit").VoidHookEvent} event - data contains { id, email, role, scope }
+ */
+export default async function (event) {
+  const user = event.data;
+  await $cache.set(\`user_last_seen:\${user.id}\`, new Date().toISOString(), 86400);
+}
+`;
+
+    case "before_user_create":
+      return `${header}/**
+ * Hook: before_user_create
+ * 
+ * @param {import("../apexkit").VoidHookEvent} event - data contains { email, role, metadata }
+ */
+export default async function (event) {
+  const { email, role } = event.data;
+
+  // Block registration for banned domains
+  if (email.endsWith("@disposable-mail.com")) {
+    throw new Error("Disposable email addresses are not permitted.");
+  }
+}
+`;
+
+    case "after_user_create":
+      return `${header}/**
+ * Hook: after_user_create
+ * 
+ * @param {import("../apexkit").VoidHookEvent} event - data contains { id, email, role }
+ */
+export default async function (event) {
+  const user = event.data;
+  console.log(\`[Auth] New user registered: \${user.email} (ID: \${user.id})\`);
+}
+`;
+
+    case "before_file_upload":
+      return `${header}/**
+ * Hook: before_file_upload
+ * 
+ * @param {import("../apexkit").VoidHookEvent} event
+ */
+export default async function (event) {
+  console.log("[Storage] Incoming file upload request received.");
+}
+`;
+
+    case "after_file_upload":
+      return `${header}/**
+ * Hook: after_file_upload
+ * 
+ * @param {import("../apexkit").VoidHookEvent} event - data contains { id, filename }
+ */
+export default async function (event) {
+  const { id, filename } = event.data;
+  console.log(\`[Storage] File uploaded: \${filename} (ID: \${id})\`);
+}
+`;
+
+    case "before_ai_run":
+      return `${header}/**
+ * Hook: before_ai_run
+ * Injects context or Vector Search documents into AI Prompt variables
+ * 
+ * @param {import("../apexkit").VoidHookEvent} event - data contains { slug, vars }
+ */
+export default async function (event) {
+  const { slug, vars } = event.data;
+
+  if (vars.query) {
+    // Generate embedding and search closest records
+    const vec = await $ai.embed(vars.query);
+    const docs = await $db.records.searchVector("${targetCollection || 'documents'}", "content", vec, 3);
+    vars.context = JSON.stringify(docs.map(d => d.data));
+  }
+
+  return { slug, vars };
+}
+`;
+
+    case "cron":
+      return `${header}/**
+ * Scheduled Cron Job: ${cleanName}
+ * Configure execution frequency in Settings -> Cron Jobs
+ * 
+ * @param {{ trigger: "cron", job: string }} event
+ */
+export default async function (event) {
+  console.log(\`[Cron] Executing scheduled task: \${event.job}\`);
+
+  // Example: prune expired temporary tokens or cache entries
+  await $cache.delete("temp_sync_lock");
+}
+`;
+
+    case "graphql":
+      return `${header}/**
+ * Dynamic GraphQL Field Resolver: ${cleanName}
+ */
+export const graphql = {
+  parent: "Query",
+  name: "${cleanName.replace(/-/g, '_')}",
+  args: {
+    query: "String"
+  },
+  returnType: "JSON"
+};
+
+export default async function (input) {
+  const search = input.query || "";
+  return {
+    status: "ok",
+    query: search,
+    timestamp: new Date().toISOString()
+  };
+}
+`;
+
+    default:
+      return `${header}/**
+ * Trigger: ${triggerType}
+ * 
+ * @param {any} event
+ */
+export default async function (event) {
+  console.log(\`Hook ${triggerType} executed in ${cleanName}\`);
+  return true;
+}
+`;
+  }
+}
+
+// --- 6. INTERACTIVE FILE CREATION WIZARD (--init-file) ---
 async function runInitFile() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-  console.log("🚀 ApexKit Interactive File Wizard\n");
+  console.log("🚀 ApexKit Interactive File Creation Wizard\n");
 
-  console.log("Select Category:");
-  console.log("  1) Webhook / Event Hook / API Endpoint");
+  console.log("Select File Category:");
+  console.log("  1) Webhook / API Endpoint / System Event Hook");
   console.log("  2) Custom Reusable Module (imported via @/custom/...)");
-  console.log("  3) SSR HTML Template");
+  console.log("  3) SSR HTML / Tera Page Template");
   const catChoice = (await rl.question("\nChoice (1-3) [1]: ")).trim() || "1";
 
   let fileType = "webhook";
@@ -259,80 +914,44 @@ async function runInitFile() {
   }
 
   const cleanName = rawName.replace(/[^a-zA-Z0-9_-]/g, "");
-  const ext = fileType === "template" ? "html" : ((await rl.question("Extension (js/ts) [js]: ")).trim() || "js");
+  const ext = fileType === "template" ? "html" : ((await rl.question("Extension (js/ts) [ts]: ")).trim() || "ts");
 
   let triggerType = "manual";
   let targetCollection = null;
 
   if (fileType === "webhook") {
     console.log("\nSelect Trigger Type:");
-    console.log("  1) manual (HTTP API Webhook Endpoint)");
-    console.log("  2) before_create_record");
-    console.log("  3) after_create_record");
-    console.log("  4) before_update_record");
-    console.log("  5) after_update_record");
-    console.log("  6) before_delete_record");
-    console.log("  7) after_delete_record");
-    console.log("  8) before_user_login");
-    console.log("  9) after_user_login");
-    console.log(" 10) before_user_create");
-    console.log(" 11) after_user_create");
-    console.log(" 12) cron");
-    console.log(" 13) graphql");
-    const trigChoice = (await rl.question("\nChoice (1-13) [1]: ")).trim() || "1";
+    TRIGGER_DEFINITIONS.forEach((t, i) => {
+      console.log(`  ${String(i + 1).padStart(2, " ")}) ${t.name}`);
+    });
 
-    const triggerMap = {
-      "1": "manual", "2": "before_create_record", "3": "after_create_record",
-      "4": "before_update_record", "5": "after_update_record", "6": "before_delete_record",
-      "7": "after_delete_record", "8": "before_user_login", "9": "after_user_login",
-      "10": "before_user_create", "11": "after_user_create", "12": "cron", "13": "graphql"
-    };
+    const trigChoice = parseInt((await rl.question("\nChoice (1-42) [1]: ")).trim() || "1", 10);
+    const selectedTrig = TRIGGER_DEFINITIONS[trigChoice - 1] || TRIGGER_DEFINITIONS[0];
+    triggerType = selectedTrig.id;
 
-    triggerType = triggerMap[trigChoice] || "manual";
-
-    if (triggerType.includes("_record")) {
-      const colInput = (await rl.question("\nTarget Collection (leave blank for all): ")).trim();
+    if (triggerType.includes("_record") || triggerType === "before_ai_run") {
+      const colInput = (await rl.question("\nTarget Collection Name (leave blank for all): ")).trim();
       targetCollection = colInput || null;
     }
-  }
-
-  const metadata = {
-    name: cleanName,
-    extension: ext,
-    target_collection: targetCollection,
-    type: fileType,
-    path: targetDir,
-    trigger_type: triggerType,
-    active: true,
-    visibility: "private"
-  };
-
-  let codeBoilerplate = "";
-
-  if (fileType === "custom:module") {
-    codeBoilerplate = `export const __fileMetadata__ = ${JSON.stringify(metadata, null, 2)};\n\n/**\n * Custom Helper Module: ${cleanName}\n * Import in webhooks via: import { helper } from "@/custom/${cleanName}"\n */\nexport function ${cleanName.replace(/-/g, "_")}Helper() {\n  return "Hello from ${cleanName}!";\n}\n`;
   } else if (fileType === "template") {
-    codeBoilerplate = `<!--\n__fileMetadata__ = ${JSON.stringify(metadata, null, 2)}\n-->\n<div class="p-4">\n  <h1 class="text-xl font-bold">Template: ${cleanName}</h1>\n</div>\n`;
-  } else if (triggerType === "manual") {
-    codeBoilerplate = `export const __fileMetadata__ = ${JSON.stringify(metadata, null, 2)};\n\nexport default async function (req) {\n  const body = await req.json().catch(() => ({}));\n\n  return new Response(JSON.stringify({\n    message: "Webhook ${cleanName} executed successfully!",\n    data: body\n  }), { status: 200, headers: { "Content-Type": "application/json" } });\n}\n`;
-  } else if (triggerType.includes("_record")) {
-    codeBoilerplate = `export const __fileMetadata__ = ${JSON.stringify(metadata, null, 2)};\n\nexport default async function (event) {\n  const record = event.record.data;\n  \n  // Perform record validation or transformation\n  console.log("Processing record for ${targetCollection || 'all'} in ${cleanName}");\n\n  return record;\n}\n`;
-  } else {
-    codeBoilerplate = `export const __fileMetadata__ = ${JSON.stringify(metadata, null, 2)};\n\nexport default async function (event) {\n  console.log("Trigger ${triggerType} executed in ${cleanName}");\n  return true;\n}\n`;
+    const colInput = (await rl.question("\nPrimary Collection to Query (e.g. posts, leave blank for none): ")).trim();
+    targetCollection = colInput || null;
   }
+
+  const codeBoilerplate = getBoilerplateCode(fileType, cleanName, ext, triggerType, targetCollection);
 
   fs.mkdirSync(targetDir, { recursive: true });
   const fullFilePath = path.join(targetDir, `${cleanName}.${ext}`);
   fs.writeFileSync(fullFilePath, codeBoilerplate);
 
   console.log(`\n✨ Successfully created: ${fullFilePath}`);
-  console.log(`🚀 Save this file while \`node apexkit-watch.js\` is running to commit it live to ApexKit!`);
+  console.log(`🚀 Save this file while \`node apexkit-watch.js\` is running to sync live to ApexKit!`);
 
   rl.close();
   process.exit(0);
 }
 
-// --- 5. WORKSPACE INIT WIZARD (--init) ---
+// --- 7. WORKSPACE INIT WIZARD (--init) ---
 async function runInit() {
   console.log("🚀 Welcome to ApexKit Local Workspace Setup!\n");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -356,9 +975,9 @@ async function runInit() {
     console.log(`  📁 Created ./${d}`);
   });
 
-  // Since we updated .env we should override our globals for the API fetch
   process.env.APEXKIT_URL = finalUrl;
   process.env.APEXKIT_API_KEY = finalKey;
+  process.env.SCOPE_KEY = finalScope;
 
   await generateWorkspaceFiles();
 
@@ -367,7 +986,7 @@ async function runInit() {
   process.exit(0);
 }
 
-// --- 6. ZIP EXTRACTOR ---
+// --- 8. ZIP EXTRACTOR ---
 function extractZipBuffer(zipBuffer, outputDir = ".") {
   let offset = 0;
   let count = 0;
@@ -398,7 +1017,64 @@ function extractZipBuffer(zipBuffer, outputDir = ".") {
   return count;
 }
 
-// --- 7. MANUAL COMMIT (--commit) ---
+// --- 9. METADATA AUTO-INFERENCE HELPER ---
+function inferFileMetadata(filePath, content) {
+  const ext = path.extname(filePath).replace(/^\./, "");
+  const baseName = path.basename(filePath, `.${ext}`);
+  const normalizedPath = filePath.replace(/\\/g, "/");
+
+  let deducedType = "webhook";
+  let deducedPath = "./webhooks/";
+  let deducedTrigger = "manual";
+
+  if (normalizedPath.includes("templates/")) {
+    deducedType = "template";
+    deducedPath = "./templates/";
+  } else if (normalizedPath.includes("modules/custom/")) {
+    deducedType = "custom:module";
+    deducedPath = "./modules/custom/";
+  } else if (normalizedPath.includes("modules/esm/")) {
+    deducedType = "esm:module";
+    deducedPath = "./modules/esm/";
+  } else if (normalizedPath.includes("ai_actions/")) {
+    deducedType = "ai_action";
+    deducedPath = "./ai_actions/";
+  }
+
+  // Check if __fileMetadata__ is explicitly defined in source
+  const metaRe = /(?:export\s+const\s+__fileMetadata__\s*=\s*|<!--\s*__fileMetadata__\s*=\s*)(\{[\s\S]*?\})(?:;|\s*-->)/;
+  const match = content.match(metaRe);
+
+  let metaObj = {};
+  if (match && match[1]) {
+    try {
+      metaObj = JSON.parse(match[1]);
+    } catch (e) {}
+  }
+
+  const finalMeta = {
+    name: metaObj.name || baseName,
+    extension: metaObj.extension || ext,
+    target_collection: metaObj.target_collection || null,
+    type: metaObj.type || deducedType,
+    path: metaObj.path || deducedPath,
+    trigger_type: metaObj.trigger_type || deducedTrigger,
+    active: metaObj.active !== undefined ? metaObj.active : true,
+    visibility: metaObj.visibility || "private"
+  };
+
+  if (!match) {
+    if (ext === "html") {
+      return `<!--\n__fileMetadata__ = ${JSON.stringify(finalMeta, null, 2)}\n-->\n${content}`;
+    } else {
+      return `/** @type {import("../apexkit").FileMetadata} */\nexport const __fileMetadata__ = ${JSON.stringify(finalMeta, null, 2)};\n\n${content}`;
+    }
+  }
+
+  return content;
+}
+
+// --- 10. MANUAL COMMIT (--commit) ---
 async function runManualCommit() {
   console.log(`🚀 Committing all local files to ApexKit (${BASE_URL})...`);
   
@@ -408,7 +1084,7 @@ async function runManualCommit() {
       const wsModule = await import("ws");
       WSClient = wsModule.default || wsModule;
     } catch(e) {
-      console.error("❌ WebSocket is not natively supported in your Node version. Please upgrade to Node 21+ OR run: npm install ws");
+      console.error("❌ WebSocket is not natively supported in your Node version. Please install 'ws' with: npm install ws");
       process.exit(1);
     }
   }
@@ -427,7 +1103,8 @@ async function runManualCommit() {
         const fullPath = path.join(dir, file);
         if (fs.statSync(fullPath).isFile()) {
           const relativePath = fullPath.replace(/\\/g, "/").replace(/^\.\//, "");
-          const content = fs.readFileSync(fullPath, "utf-8");
+          let content = fs.readFileSync(fullPath, "utf-8");
+          content = inferFileMetadata(relativePath, content);
           
           console.log(`  ⬆️  Pushing ${relativePath}`);
           ws.send(JSON.stringify({
@@ -439,17 +1116,17 @@ async function runManualCommit() {
       });
     });
 
-    console.log(`\n✅ Pushed ${filesSent} files to DB! Closing connection.`);
+    console.log(`\n✅ Pushed ${filesSent} files to ApexKit! Closing connection.`);
     setTimeout(() => process.exit(0), 1000);
   });
 
   ws.addEventListener("error", () => {
-    console.error("❌ Connection failed. Check URL and API Key.");
+    console.error("❌ Connection failed. Verify that the ApexKit server is running and check your API Key.");
     process.exit(1);
   });
 }
 
-// --- 8. WATCHER & SYNC CLIENT (Self-Healing & Debounced) ---
+// --- 11. WATCHER & SYNC CLIENT ---
 let ws;
 let isReconnecting = false;
 let reconnectTimer = null;
@@ -463,7 +1140,7 @@ function scheduleReconnect() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
 
   if (!hasLoggedWaiting) {
-    console.log("🔌 Connection lost or unavailable. Waiting for connection...\n");
+    console.log("🔌 Connection unavailable. Retrying...\n");
     hasLoggedWaiting = true;
   }
 
@@ -484,7 +1161,7 @@ async function connectWebSocket(isRetry = false) {
       const wsModule = await import("ws");
       WSClient = wsModule.default || wsModule;
     } catch(e) {
-      console.error("❌ WebSocket is not natively supported in your Node version. Please upgrade to Node 21+ OR run: npm install ws");
+      console.error("❌ WebSocket is not natively supported in your Node version. Please install 'ws' with: npm install ws");
       process.exit(1);
     }
   }
@@ -544,24 +1221,24 @@ async function connectWebSocket(isRetry = false) {
 }
 
 function startWatcher() {
-  // 1. Establish initial connection
   connectWebSocket();
 
-  // 2. Attach File Watchers EXACTLY ONCE
   const watchDirs = ["./webhooks", "./templates", "./ai_actions", "./modules"];
   watchDirs.forEach((dir) => {
     if (fs.existsSync(dir)) {
       fs.watch(dir, { recursive: true }, (eventType, filename) => {
         if (!filename) return;
         
-        if (filename.endsWith(".js") || filename.endsWith(".html") || filename.endsWith(".json")) {
+        if (filename.endsWith(".js") || filename.endsWith(".ts") || filename.endsWith(".html") || filename.endsWith(".json")) {
           const relativePath = path.join(dir, filename).replace(/\\/g, "/").replace(/^\.\//, "");
           
           clearTimeout(debounceMap.get(relativePath));
           debounceMap.set(relativePath, setTimeout(() => {
             try {
               if (fs.existsSync(relativePath)) {
-                const content = fs.readFileSync(relativePath, "utf-8");
+                let content = fs.readFileSync(relativePath, "utf-8");
+                content = inferFileMetadata(relativePath, content);
+
                 console.log(`📝 Synced: ${relativePath} ${NO_AUTO_COMMIT ? "(VFS Only)" : "(Committed to DB)"}`);
                 
                 if (ws && ws.readyState === 1) {
@@ -576,7 +1253,7 @@ function startWatcher() {
                 }
               }
             } catch (err) {
-              console.error(`⚠️ Could not read ${relativePath} (File might be locked):`, err.message);
+              console.error(`⚠️ Could not read ${relativePath}:`, err.message);
             }
           }, 100));
         }

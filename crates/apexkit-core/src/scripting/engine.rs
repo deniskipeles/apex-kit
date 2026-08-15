@@ -11,10 +11,11 @@ use rquickjs_serde::{from_value, to_value};
 
 use super::builtins::{
     register_ai, register_cache, register_cmd, register_console, register_db, register_env,
-    register_fetch, register_file_tools, register_fs, register_http, register_mail,
+    register_fetch, register_file_tools, register_fs, register_http, register_mail, register_queue,
     register_realtime, register_root, register_util, register_wasm, register_zip,
 };
 use super::context::ScriptContext;
+use super::module_loader::transpile_ts;
 
 static EXECUTION_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 fn get_execution_semaphore() -> &'static Semaphore {
@@ -69,6 +70,88 @@ const JS_PRELUDE: &str = r#"
             delete this.raw[lk]; 
         }
         forEach(callback) { this.map.forEach((v, k) => callback(v, k, this)); }
+    }
+
+    class URLSearchParams {
+        constructor(init = "") {
+            this.map = new Map();
+            if (init instanceof URLSearchParams) {
+                init.forEach((v, k) => this.append(k, v));
+            } else if (Array.isArray(init)) {
+                init.forEach(([k, v]) => this.append(k, v));
+            } else if (typeof init === "string") {
+                let raw = init.startsWith("?") ? init.slice(1) : init;
+                if (raw) {
+                    raw.split("&").forEach(pair => {
+                        if (!pair) return;
+                        const [k, v] = pair.split("=");
+                        if (k) this.append(decodeURIComponent(k), decodeURIComponent(v || ""));
+                    });
+                }
+            } else if (init && typeof init === "object") {
+                Object.entries(init).forEach(([k, v]) => this.append(k, v));
+            }
+        }
+        get(name) {
+            const list = this.map.get(String(name));
+            return list && list.length > 0 ? list[0] : null;
+        }
+        getAll(name) {
+            return this.map.get(String(name)) || [];
+        }
+        has(name) {
+            return this.map.has(String(name));
+        }
+        set(name, value) {
+            this.map.set(String(name), [String(value)]);
+        }
+        append(name, value) {
+            const k = String(name);
+            if (this.map.has(k)) {
+                this.map.get(k).push(String(value));
+            } else {
+                this.map.set(k, [String(value)]);
+            }
+        }
+        delete(name) {
+            this.map.delete(String(name));
+        }
+        *entries() {
+            for (const [k, list] of this.map.entries()) {
+                for (const v of list) {
+                    yield [k, v];
+                }
+            }
+        }
+        *keys() {
+            for (const [k, list] of this.map.entries()) {
+                for (let i = 0; i < list.length; i++) {
+                    yield k;
+                }
+            }
+        }
+        *values() {
+            for (const list of this.map.values()) {
+                for (const v of list) {
+                    yield v;
+                }
+            }
+        }
+        forEach(callback) {
+            for (const [k, v] of this.entries()) {
+                callback(v, k, this);
+            }
+        }
+        [Symbol.iterator]() {
+            return this.entries();
+        }
+        toString() {
+            const pairs = [];
+            for (const [k, v] of this.entries()) {
+                pairs.push(encodeURIComponent(k) + "=" + encodeURIComponent(v));
+            }
+            return pairs.join("&");
+        }
     }
 
     class Response {
@@ -160,24 +243,11 @@ const JS_PRELUDE: &str = r#"
                 this.search = pathAndSearch[1] ? "?" + pathAndSearch[1] : "";
             }
 
-            const params = new Map();
-            let rawQuery = this.search.startsWith('?') ? this.search.slice(1) : this.search;
-            if (rawQuery) {
-                rawQuery.split('&').forEach(pair => {
-                    if (!pair) return;
-                    const [k, v] = pair.split('=');
-                    if (k) params.set(decodeURIComponent(k), decodeURIComponent(v || ''));
-                });
-            }
-            this.searchParams = {
-                get: (k) => params.get(k) || null,
-                has: (k) => params.has(k),
-                getAll: (k) => params.has(k) ? [params.get(k)] : []
-            };
+            this.searchParams = new URLSearchParams(this.search);
         }
 
         toString() {
-            return this.origin + this.pathname + this.search + this.hash;
+            return this.origin + this.pathname + (this.searchParams.toString() ? '?' + this.searchParams.toString() : this.search) + this.hash;
         }
     }
 
@@ -394,6 +464,7 @@ const JS_PRELUDE: &str = r#"
     }
     
     globalThis.URL = URL;
+    globalThis.URLSearchParams = URLSearchParams;
     globalThis.ApexKit = ApexKit;
     globalThis.$apex = new ApexKit();
     globalThis.Headers = Headers;
@@ -405,6 +476,20 @@ const JS_PRELUDE: &str = r#"
         try {
             new Uint8Array(dst).set(new Uint8Array(src, 0, len));
         } catch (e) {}
+    };
+
+    /** Background Queue Orchestration Global */
+    globalThis.$queue = {
+        spawn: async function(fnOrCode, options = {}) {
+            let codeStr = typeof fnOrCode === 'function' ? fnOrCode.toString() : String(fnOrCode || "");
+            return await $__native_queue.spawn(codeStr, options);
+        },
+        status: async function(pid) {
+            return await $__native_queue.status(String(pid));
+        },
+        result: async function(pid) {
+            return await $__native_queue.result(String(pid));
+        }
     };
 
     globalThis.fetch = async function(url, options = {}) {
@@ -484,8 +569,10 @@ impl ScriptEngine {
             .map_err(|e| e.to_string())?;
         let code_cleaned = re_config.replace_all(code, "").to_string();
 
+        let js_code = transpile_ts(&code_cleaned, "script.ts").unwrap_or(code_cleaned);
+
         let module_name = format!("/exec_{}.js", uuid::Uuid::new_v4());
-        self.vfs.set_file("root", &module_name, &code_cleaned);
+        self.vfs.set_file("root", &module_name, &js_code);
         let module_name_vfs = module_name.clone();
 
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
@@ -592,7 +679,6 @@ impl ScriptEngine {
                             .unwrap_or(rquickjs::Value::new_null(js_ctx.clone()));
                         let status_code: u16 = from_value(status_val).unwrap_or(200);
 
-                        // Directly read the mirror object containing all JS response headers
                         let headers_map: serde_json::Map<String, serde_json::Value> = obj
                             .get::<_, rquickjs::Object>("_headers_raw")
                             .ok()
@@ -683,8 +769,10 @@ impl ScriptEngine {
             .map_err(|e| e.to_string())?;
         let code_cleaned = re_config.replace_all(code, "").to_string();
 
+        let js_code = transpile_ts(&code_cleaned, "hook.ts").unwrap_or(code_cleaned);
+
         let module_name = format!("/exec_hook_{}.js", uuid::Uuid::new_v4());
-        self.vfs.set_file("root", &module_name, &code_cleaned);
+        self.vfs.set_file("root", &module_name, &js_code);
         let module_name_vfs = module_name.clone();
 
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
@@ -793,6 +881,7 @@ fn setup_quickjs<'js>(
     register_zip(ctx, app_ctx.clone())?;
     register_db(ctx, app_ctx.clone())?;
     register_cmd(ctx, app_ctx.clone())?;
+    register_queue(ctx, app_ctx.clone())?;
     register_run(ctx, app_ctx.clone())?;
     register_root(ctx, app_ctx.clone())?;
     register_env(ctx, app_ctx.clone())?;

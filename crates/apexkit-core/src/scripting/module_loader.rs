@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
+use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
+use oxc::{Compiler, span::SourceType};
 use regex::Regex;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::module::Declared;
@@ -14,6 +16,33 @@ use zip::write::FileOptions;
 
 use crate::database::traits::Db;
 use crate::models::{CreateTemplateReq, ai::CreateActionReq, script::CreateScriptReq};
+
+/// Transpiles TypeScript / TSX to JavaScript using the Oxc compiler.
+pub fn transpile_ts(source_text: &str, file_path: &str) -> Result<String, String> {
+    let path = Path::new(file_path);
+    let is_explicit_ts = file_path.ends_with(".ts") || file_path.ends_with(".tsx");
+
+    let source_type = if is_explicit_ts {
+        SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts())
+    } else {
+        // Automatically detect TypeScript keywords if file is unnamed or labeled .js
+        if source_text.contains(": ")
+            || source_text.contains("interface ")
+            || source_text.contains("type ")
+            || source_text.contains("as ")
+        {
+            SourceType::ts()
+        } else {
+            return Ok(source_text.to_string());
+        }
+    };
+
+    let mut compiler = Compiler::default();
+    match compiler.execute(source_text, source_type, path) {
+        Ok(js_code) => Ok(js_code),
+        Err(diags) => Err(format!("TypeScript Transpilation Error: {:?}", diags)),
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileMetadata {
@@ -66,12 +95,16 @@ impl VfsState {
             files: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    /// Stores a file in VFS, automatically transpiling TypeScript to JS beforehand.
     pub fn set_file(&self, scope: &str, path: &str, content: &str) {
+        let executable_js = transpile_ts(content, path).unwrap_or_else(|_| content.to_string());
         self.files
             .write()
             .unwrap()
-            .insert((scope.to_string(), path.to_string()), content.to_string());
+            .insert((scope.to_string(), path.to_string()), executable_js);
     }
+
     pub fn get_file(&self, scope: &str, path: &str) -> Option<String> {
         let lock = self.files.read().unwrap();
         if let Some(content) = lock.get(&(scope.to_string(), path.to_string())) {
@@ -84,6 +117,7 @@ impl VfsState {
         }
         None
     }
+
     pub fn remove_file(&self, scope: &str, path: &str) {
         self.files
             .write()
@@ -116,14 +150,14 @@ impl Resolver for ApexModuleResolver {
             let clean = name.strip_prefix("@/custom/").unwrap();
             return Ok(format!(
                 "./modules/custom/{}.js",
-                clean.trim_end_matches(".js")
+                clean.trim_end_matches(".js").trim_end_matches(".ts")
             ));
         }
         if name.starts_with("@/esm/") {
             let clean = name.strip_prefix("@/esm/").unwrap();
             return Ok(format!(
                 "./modules/esm/{}.js",
-                clean.trim_end_matches(".js")
+                clean.trim_end_matches(".js").trim_end_matches(".ts")
             ));
         }
         if name.starts_with("./") || name.starts_with("../") {
@@ -133,10 +167,10 @@ impl Resolver for ApexModuleResolver {
     }
 }
 
-static UREQ_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+static BLOCKING_HTTP_CLIENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 fn get_ureq_agent() -> &'static ureq::Agent {
-    UREQ_AGENT.get_or_init(|| {
+    BLOCKING_HTTP_CLIENT.get_or_init(|| {
         ureq::builder()
             .timeout(Duration::from_secs(15))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -163,13 +197,12 @@ impl Loader for ApexModuleLoader {
     ) -> QjsResult<Module<'js, Declared>> {
         let name_str = name.to_string();
 
-        // Prevent syntax errors when ESM imports a .wasm binary asset directly
         if name_str.ends_with(".wasm") {
             let js_code = format!("export default \"{}\";", name_str);
             return Module::declare(ctx.clone(), name, js_code);
         }
 
-        let code = if name.starts_with("http://") || name.starts_with("https://") {
+        let raw_code = if name.starts_with("http://") || name.starts_with("https://") {
             if let Some(cached) = get_module_cache().read().unwrap().get(name) {
                 cached.clone()
             } else {
@@ -183,7 +216,7 @@ impl Loader for ApexModuleLoader {
                 get_module_cache()
                     .write()
                     .unwrap()
-                    .insert(name_str, downloaded.clone());
+                    .insert(name_str.clone(), downloaded.clone());
                 downloaded
             }
         } else if let Some(content) = self.vfs.get_file("root", name) {
@@ -194,6 +227,7 @@ impl Loader for ApexModuleLoader {
                 .last()
                 .unwrap()
                 .trim_end_matches(".js")
+                .trim_end_matches(".ts")
                 .to_string();
             let db = self.db.clone();
 
@@ -214,7 +248,10 @@ impl Loader for ApexModuleLoader {
             return Err(QjsError::Unknown);
         };
 
-        Module::declare(ctx.clone(), name, code)
+        // Transpile TypeScript to JavaScript with Oxc
+        let executable_code = transpile_ts(&raw_code, name).unwrap_or(raw_code);
+
+        Module::declare(ctx.clone(), name, executable_code)
     }
 }
 
