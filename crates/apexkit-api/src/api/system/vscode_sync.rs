@@ -44,7 +44,7 @@ pub enum SyncMessage {
 pub async fn vscode_sync_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    DatabaseConnection(db): DatabaseConnection,
+    DatabaseConnection(root_db): DatabaseConnection, // Extract as root initially
     Query(query): Query<SyncQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let key = query
@@ -53,6 +53,7 @@ pub async fn vscode_sync_handler(
 
     let mut authenticated = false;
     let mut resolved_scope = "root".to_string();
+    let mut target_db = root_db.clone();
 
     // 1. Check against local .env APEXKIT_API_KEY (Root Admin)
     let local_env_key = std::env::var("APEXKIT_API_KEY").unwrap_or_default();
@@ -61,15 +62,31 @@ pub async fn vscode_sync_handler(
         resolved_scope = "root".to_string();
     }
 
-    // 2. Verify Scoped API Key against Database (Supports tenant:app-1)
+    // 2. Verify Scoped API Key against Database
     if !authenticated {
         if let Some(parsed) = apexkit_core::security::api_keys::parse_and_validate_key(&key) {
-            if let Ok(Some(api_key)) = db
+            // [FIX]: Determine which DB to check based on the key's target tenant
+            let db_to_check = if parsed.tenant_id == "root" {
+                root_db.clone()
+            } else {
+                if let Ok(tenant_db) = state
+                    .tenant_manager
+                    .get_tenant(parsed.tenant_id.clone())
+                    .await
+                {
+                    tenant_db
+                } else {
+                    root_db.clone()
+                }
+            };
+
+            if let Ok(Some(api_key)) = db_to_check
                 .verify_api_key(&parsed.tenant_id, &parsed.key_id, &parsed.secret)
                 .await
             {
                 if api_key.roles.contains(&"admin".to_string()) {
                     authenticated = true;
+                    target_db = db_to_check; // [FIX]: Pass the tenant DB down to the websocket handler
                     resolved_scope = if api_key.tenant_id == "root" {
                         "root".to_string()
                     } else {
@@ -84,7 +101,8 @@ pub async fn vscode_sync_handler(
         return Err(AppError::Unauthorized("Invalid API Key".into()));
     }
 
-    Ok(ws.on_upgrade(move |socket| handle_vscode_socket(socket, state, db, resolved_scope)))
+    // Pass target_db instead of root_db
+    Ok(ws.on_upgrade(move |socket| handle_vscode_socket(socket, state, target_db, resolved_scope)))
 }
 
 async fn handle_vscode_socket(
@@ -95,7 +113,6 @@ async fn handle_vscode_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Keep-alive ping interval (15 seconds)
     let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(15));
 
     loop {
@@ -125,10 +142,7 @@ async fn handle_vscode_socket(
                                     }
                                 }
                                 SyncMessage::PushFile { path, content, commit_to_db } => {
-                                    // 1. Update Live Engine VFS under the isolated SCOPE ID
                                     state.vfs.set_file(&scope_id, &path, &content);
-
-                                    // 2. Commit to the specific Tenant/Root SQLite DB
                                     if commit_to_db {
                                         match WorkspaceManager::commit_file_to_db(&db, &path, &content).await {
                                             Ok(msg) => {
