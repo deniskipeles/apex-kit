@@ -183,9 +183,11 @@ fn get_module_cache() -> &'static RwLock<HashMap<String, String>> {
     MODULE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+// 1. Update the Struct to hold the scope string
 pub struct ApexModuleLoader {
     pub vfs: VfsState,
     pub db: Arc<dyn Db>,
+    pub scope: String, // <--- ADD THIS
 }
 
 impl Loader for ApexModuleLoader {
@@ -219,7 +221,8 @@ impl Loader for ApexModuleLoader {
                     .insert(name_str.clone(), downloaded.clone());
                 downloaded
             }
-        } else if let Some(content) = self.vfs.get_file("root", name) {
+        // 2. Use the dynamic scope string here instead of hardcoded "root"
+        } else if let Some(content) = self.vfs.get_file(&self.scope, name) {
             content
         } else if name.starts_with("./modules/") {
             let script_name = name
@@ -229,6 +232,8 @@ impl Loader for ApexModuleLoader {
                 .trim_end_matches(".js")
                 .trim_end_matches(".ts")
                 .to_string();
+
+            // 3. This will now correctly be the Scoped DB (Tenant/Sandbox)
             let db = self.db.clone();
 
             let code_res = std::thread::spawn(move || {
@@ -248,7 +253,6 @@ impl Loader for ApexModuleLoader {
             return Err(QjsError::Unknown);
         };
 
-        // Transpile TypeScript to JavaScript with Oxc
         let executable_code = transpile_ts(&raw_code, name).unwrap_or(raw_code);
 
         Module::declare(ctx.clone(), name, executable_code)

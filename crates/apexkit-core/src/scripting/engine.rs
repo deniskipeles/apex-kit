@@ -571,9 +571,22 @@ impl ScriptEngine {
 
         let js_code = transpile_ts(&code_cleaned, "script.ts").unwrap_or(code_cleaned);
 
+        // 1. EXTRACT DYNAMIC SCOPE STRING & RESOLVE CURRENT SCOPED DB
+        let scope_str = match context.get_scope() {
+            EventScope::Root => "root".to_string(),
+            EventScope::Tenant(id) => format!("tenant:{}", id),
+            EventScope::Sandbox(id) => format!("sandbox:{}", id),
+            _ => "root".to_string(),
+        };
+
+        let db_arc = super::builtins::db::resolve_db(None, context.clone())
+            .await
+            .unwrap_or_else(|_| context.get_db());
+
         let module_name = format!("/exec_{}.js", uuid::Uuid::new_v4());
-        self.vfs.set_file("root", &module_name, &js_code);
+        self.vfs.set_file(&scope_str, &module_name, &js_code);
         let module_name_vfs = module_name.clone();
+        let scope_str_vfs = scope_str.clone();
 
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
@@ -587,7 +600,6 @@ impl ScriptEngine {
 
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         let vfs = self.vfs.clone();
-        let db = self.db.clone();
 
         let start_time = std::time::Instant::now();
         let max_duration = std::time::Duration::from_millis(total_cpu_budget_ms);
@@ -595,30 +607,17 @@ impl ScriptEngine {
         let task = SendWrapper(async move {
             runtime.set_max_stack_size(0).await;
 
-            if let Some(db_arc) = db {
-                runtime
-                    .set_loader(
-                        super::module_loader::ApexModuleResolver,
-                        super::module_loader::ApexModuleLoader { vfs, db: db_arc },
-                    )
-                    .await;
-            } else {
-                struct DummyLoader;
-                impl rquickjs::loader::Loader for DummyLoader {
-                    fn load<'js>(
-                        &mut self,
-                        _ctx: &rquickjs::Ctx<'js>,
-                        _name: &str,
-                        _attrs: Option<rquickjs::loader::ImportAttributes<'js>>,
-                    ) -> rquickjs::Result<rquickjs::Module<'js, rquickjs::module::Declared>>
-                    {
-                        Err(rquickjs::Error::Unknown)
-                    }
-                }
-                runtime
-                    .set_loader(super::module_loader::ApexModuleResolver, DummyLoader)
-                    .await;
-            }
+            // 2. INJECT SCOPED DATABASE AND SCOPE IDENTIFIER INTO THE LOADER
+            runtime
+                .set_loader(
+                    super::module_loader::ApexModuleResolver,
+                    super::module_loader::ApexModuleLoader {
+                        vfs,
+                        db: db_arc,
+                        scope: scope_str,
+                    },
+                )
+                .await;
 
             runtime
                 .set_interrupt_handler(Some(Box::new(move || start_time.elapsed() > max_duration)))
@@ -747,7 +746,7 @@ impl ScriptEngine {
                 Err(_) => Err(format!("Script timed out after {} seconds.", timeout_secs)),
             };
 
-        self.vfs.remove_file("root", &module_name_vfs);
+        self.vfs.remove_file(&scope_str_vfs, &module_name_vfs);
 
         result
     }
@@ -771,9 +770,22 @@ impl ScriptEngine {
 
         let js_code = transpile_ts(&code_cleaned, "hook.ts").unwrap_or(code_cleaned);
 
+        // 1. EXTRACT DYNAMIC SCOPE STRING & RESOLVE CURRENT SCOPED DB
+        let scope_str = match context.get_scope() {
+            EventScope::Root => "root".to_string(),
+            EventScope::Tenant(id) => format!("tenant:{}", id),
+            EventScope::Sandbox(id) => format!("sandbox:{}", id),
+            _ => "root".to_string(),
+        };
+
+        let db_arc = super::builtins::db::resolve_db(None, context.clone())
+            .await
+            .unwrap_or_else(|_| context.get_db());
+
         let module_name = format!("/exec_hook_{}.js", uuid::Uuid::new_v4());
-        self.vfs.set_file("root", &module_name, &js_code);
+        self.vfs.set_file(&scope_str, &module_name, &js_code);
         let module_name_vfs = module_name.clone();
+        let scope_str_vfs = scope_str.clone();
 
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
@@ -782,19 +794,21 @@ impl ScriptEngine {
 
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         let vfs = self.vfs.clone();
-        let db = self.db.clone();
 
         let task = SendWrapper(async move {
             runtime.set_max_stack_size(0).await;
 
-            if let Some(db_arc) = db {
-                runtime
-                    .set_loader(
-                        super::module_loader::ApexModuleResolver,
-                        super::module_loader::ApexModuleLoader { vfs, db: db_arc },
-                    )
-                    .await;
-            }
+            // 2. INJECT SCOPED DATABASE AND SCOPE IDENTIFIER INTO THE LOADER
+            runtime
+                .set_loader(
+                    super::module_loader::ApexModuleResolver,
+                    super::module_loader::ApexModuleLoader {
+                        vfs,
+                        db: db_arc,
+                        scope: scope_str,
+                    },
+                )
+                .await;
 
             let ctx = AsyncContext::full(&runtime)
                 .await
@@ -858,7 +872,7 @@ impl ScriptEngine {
                 Err(_) => Err(format!("Hook timed out after {} seconds.", timeout_secs)),
             };
 
-        self.vfs.remove_file("root", &module_name_vfs);
+        self.vfs.remove_file(&scope_str_vfs, &module_name_vfs);
 
         result
     }
