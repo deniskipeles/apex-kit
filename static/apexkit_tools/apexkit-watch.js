@@ -108,46 +108,75 @@ async function generateWorkspaceFiles() {
     console.warn(`  ⚠️ Could not connect to DB for schemas: ${err.message}`);
   }
 
-  // A. Generate Collection Interfaces
+  // A. Generate Collection Interfaces & Expand Typings
   let collectionTypesStr = `export interface Collections {\n`;
+  let collectionExpandsStr = `export interface CollectionExpands {\n`;
   const collectionNames = [];
 
   collectionsData.forEach((col) => {
     collectionNames.push(`"${col.name}"`);
     let fieldsStr = "";
-    if (col.schema && col.schema.fields) {
-      for (const [name, def] of Object.entries(col.schema.fields)) {
-        let tsType = "any";
-        switch (def.type) {
-          case "string": case "text": case "email": case "url": case "date": case "blob": case "file":
-            tsType = "string"; break;
-          case "number": case "owner": case "relation":
-            tsType = "number"; break;
-          case "boolean":
-            tsType = "boolean"; break;
-          case "vector":
-            tsType = "number[]"; break;
-          case "geopoint":
-            tsType = "{ lat: number; lng: number }"; break;
-          case "json":
-            tsType = "Record<string, any> | any[]"; break;
-          case "select":
-            tsType = def.options && def.options.length > 0
-              ? def.options.map((o) => `"${o}"`).join(" | ")
-              : "string";
-            break;
+    let expandsStr = "";
+    
+    if (col.schema) {
+      // 1. Standard Fields
+      if (col.schema.fields) {
+        for (const [name, def] of Object.entries(col.schema.fields)) {
+          let tsType = "any";
+          switch (def.type) {
+            case "string": case "text": case "email": case "url": case "date": case "blob": case "file":
+              tsType = "string"; break;
+            case "number":
+              tsType = "number"; break;
+            case "owner": case "relation":
+              tsType = "number | string"; break; // Future compatibility for UUIDs
+            case "boolean":
+              tsType = "boolean"; break;
+            case "vector":
+              tsType = "number[]"; break;
+            case "geopoint":
+              tsType = "{ lat: number; lng: number }"; break;
+            case "json":
+              tsType = "Record<string, any> | any[]"; break;
+            case "select":
+              tsType = def.options && def.options.length > 0
+                ? def.options.map((o) => `"${o}"`).join(" | ")
+                : "string";
+              break;
+          }
+          const safeName = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name) ? name : `"${name}"`;
+          fieldsStr += `    ${safeName}${def.required ? "" : "?"}: ${tsType};\n`;
         }
-        const safeName = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name) ? name : `"${name}"`;
-        fieldsStr += `    ${safeName}${def.required ? "" : "?"}: ${tsType};\n`;
+      }
+
+      // 2. Relations (Mapped as IDs in Data, Objects in Expand)
+      if (col.schema.relations) {
+        for (const [name, rel] of Object.entries(col.schema.relations)) {
+          const isMany = rel.relation_type === "many";
+          
+          // Data Property (IDs)
+          const tsType = isMany ? "(number | string)[]" : "number | string";
+          const safeName = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name) ? name : `"${name}"`;
+          fieldsStr += `    ${safeName}${rel.required ? "" : "?"}: ${tsType};\n`;
+          
+          // Expand Property (Nested Record Items)
+          const targetCol = rel.target_collection;
+          const expandType = `{ id: number | string; data: Collections["${targetCol}"]; created: string; updated: string; expand?: any }`;
+          expandsStr += `    ${safeName}?: ${isMany ? `Array<${expandType}>` : expandType};\n`;
+        }
       }
     }
+    
     collectionTypesStr += `  "${col.name}": {\n${fieldsStr}  };\n`;
+    collectionExpandsStr += `  "${col.name}": {\n${expandsStr}    [reverse_relation: string]: any;\n  };\n`;
   });
 
   if (collectionsData.length === 0) {
     collectionTypesStr += `  [key: string]: Record<string, any>;\n`;
+    collectionExpandsStr += `  [key: string]: any;\n`;
   }
   collectionTypesStr += `}\n\nexport type CollectionName = ${collectionNames.length > 0 ? collectionNames.join(" | ") : "string"};\n`;
+  collectionExpandsStr += `}\n\n`;
 
   // B. Generate Trigger Types
   const triggerUnion = TRIGGER_DEFINITIONS.map(t => `  /** ${t.desc} */\n  | "${t.id}"`).join("\n");
@@ -158,6 +187,7 @@ async function generateWorkspaceFiles() {
  */
 
 ${collectionTypesStr}
+${collectionExpandsStr}
 
 export type TriggerType =
 ${triggerUnion};
@@ -166,36 +196,36 @@ export type ScriptType = "webhook" | "custom:module" | "esm:module" | "template"
 export type ScriptVisibility = "private" | "public";
 
 export interface FileMetadata {
-  /** The unique name/identifier for the script or webhook */
   name?: string;
-  /** File extension (js or ts) */
   extension?: "js" | "ts" | "html" | string;
-  /** Target collection if this is a collection-scoped hook */
   target_collection?: CollectionName | null;
-  /** The structural module type */
   type?: ScriptType;
-  /** Local project path */
   path?: string;
-  /** System trigger event */
   trigger_type?: TriggerType;
-  /** Whether the script is active and running */
   active?: boolean;
-  /** Visibility for multi-tenant inheritance ('public' allows tenants to inherit) */
   visibility?: ScriptVisibility;
 }
 
 export interface AuthContext {
-  id: number;
+  id: number | string;
   email: string;
   role: string;
   scope: string;
 }
 
-export interface RecordHookEvent<T = any> {
+export interface RecordItem<T extends keyof Collections> {
+  id: number | string;
+  data: Collections[T];
+  created: string;
+  updated: string;
+  expand?: CollectionExpands[T];
+}
+
+export interface RecordHookEvent<T extends keyof Collections = any> {
   trigger: TriggerType;
   record: {
-    id: number | null;
-    data: T;
+    id: number | string | null;
+    data: T extends keyof Collections ? Collections[T] : any;
   };
   collection: {
     id: number;
@@ -220,7 +250,6 @@ export interface GraphqlConfig {
 }
 
 declare global {
-  /** Injected file metadata configuration */
   const __fileMetadata__: FileMetadata;
 
   /** ApexKit Database Client */
@@ -238,37 +267,37 @@ declare global {
           expand?: string; 
           fields?: string; 
         }
-      ): Promise<{ items: { id: number; data: Collections[T]; created: string; updated: string; expand?: any }[]; total: number }>;
+      ): Promise<{ items: RecordItem<T>[]; total: number }>;
 
       get<T extends keyof Collections>(
         collection: T, 
-        id: number, 
+        id: number | string, 
         expand?: string
-      ): Promise<{ id: number; data: Collections[T]; created: string; updated: string; expand?: any } | null>;
+      ): Promise<RecordItem<T> | null>;
 
       create<T extends keyof Collections>(
         collection: T, 
         data: Partial<Collections[T]>
-      ): Promise<{ id: number }>;
+      ): Promise<{ id: number | string }>;
 
       update<T extends keyof Collections>(
         collection: T, 
-        id: number, 
+        id: number | string, 
         data: Partial<Collections[T]>
-      ): Promise<{ id: number; data: Collections[T]; created: string; updated: string }>;
+      ): Promise<RecordItem<T>>;
 
-      delete(collection: string, id: number): Promise<boolean>;
+      delete(collection: string, id: number | string): Promise<boolean>;
 
       searchVector<T extends keyof Collections>(
         collection: T, 
         field: string, 
         vector: number[], 
         limit?: number
-      ): Promise<{ id: number; data: Collections[T]; _score: number }[]>;
+      ): Promise<(RecordItem<T> & { _score: number })[]>;
 
-      getVector(collection: string, id: number): Promise<{ field_name: string; vector: number[]; model: string }[]>;
+      getVector(collection: string, id: number | string): Promise<{ field_name: string; vector: number[]; model: string }[]>;
 
-      instantSearch(collection: string, query: string, limit?: number): Promise<{ id: number; score: number; snippet: any }[]>;
+      instantSearch(collection: string, query: string, limit?: number): Promise<{ id: number | string; score: number; snippet: any }[]>;
     };
 
     query(queryObject: {
@@ -284,8 +313,8 @@ declare global {
     }): Promise<any[]>;
 
     users: {
-      create(email: string, passwordHash: string, role: string, metadata?: Record<string, any>): Promise<{ id: number; email: string; role: string }>;
-      get(email: string): Promise<{ id: number; email: string; role: string; metadata?: any } | null>;
+      create(email: string, passwordHash: string, role: string, metadata?: Record<string, any>): Promise<{ id: number | string; email: string; role: string }>;
+      get(email: string): Promise<{ id: number | string; email: string; role: string; metadata?: any } | null>;
     };
 
     collections: {
@@ -293,7 +322,7 @@ declare global {
     };
 
     files: {
-      list(limit?: number, offset?: number): Promise<{ id: number; filename: string; original_name: string; mime_type: string; size: number; created_at: string }[]>;
+      list(limit?: number, offset?: number): Promise<{ id: number | string; filename: string; original_name: string; mime_type: string; size: number; created_at: string }[]>;
     };
   };
 
@@ -310,8 +339,8 @@ declare global {
     deleteSandbox(id: string): Promise<boolean>;
     getSandboxDiskUsage(id: string): Promise<number>;
     createKey(name: string, config?: { tenant_id?: string; issuer?: string; env_type?: "sys" | "tnnt" | "sk" | "pk"; roles?: string[]; bypass_cors?: boolean }): Promise<{ key: string; info: any }>;
-    updateKey(id: number, updates: { name?: string; status?: string; roles?: string[]; bypass_cors?: boolean }): Promise<boolean>;
-    deleteKey(id: number): Promise<boolean>;
+    updateKey(id: number | string, updates: { name?: string; status?: string; roles?: string[]; bypass_cors?: boolean }): Promise<boolean>;
+    deleteKey(id: number | string): Promise<boolean>;
     listKeys(): Promise<any[]>;
   } | null;
 
@@ -324,9 +353,8 @@ declare global {
   /** Native Storage & File Engine */
   const $files: {
     read(filename: string): Promise<string>;
-    save(filename: string, data: string | ArrayBuffer | Uint8Array, mime?: string): Promise<{ id: number; url: string; filename: string }>;
+    save(filename: string, data: string | ArrayBuffer | Uint8Array, mime?: string): Promise<{ id: number | string; url: string; filename: string }>;
     getSignedUrl(filename: string, ttl_secs?: number): Promise<string>;
-    registerMetadata(filename: string, options: { originalName?: string; mimeType?: string; size?: number }): Promise<{ id: number; filename: string; url: string; size: number }>;
   };
 
   /** Scoped Virtual File System */
@@ -364,33 +392,18 @@ declare global {
     listKeys(): Promise<string[]>;
   };
 
-  /** Background Queue Orchestration System (60s CPU Budget every 5 Minutes) */
+  /** Background Queue Orchestration System */
   const $queue: {
-    /**
-     * Spawns an asynchronous background process orchestrated in JavaScript.
-     * @param fnOrCode - The function or module code to execute in background
-     * @param options - Execution options (timeout defaults to 60000ms)
-     */
     spawn<T = any>(
       fnOrCode: ((pid: string, req: Request) => Promise<T> | T) | string,
       options?: { timeoutMs?: number; args?: any }
     ): Promise<{ pid: string; status: "queued" | "running" }>;
-
-    /**
-     * Queries the active execution status of a spawned queue job.
-     * @param pid - Job ID
-     */
     status(pid: string): Promise<{
       pid: string;
       status: "queued" | "running" | "completed" | "failed" | "timed_out" | "not_found";
       runtime_ms: number;
       error?: string;
     }>;
-
-    /**
-     * Retrieves the final result or error of a completed queue job.
-     * @param pid - Job ID
-     */
     result<T = any>(pid: string): Promise<{
       pid: string;
       status: "queued" | "running" | "completed" | "failed" | "timed_out" | "not_found";
@@ -460,18 +473,7 @@ declare global {
     readonly SMTP_BLOCKED: boolean;
   };
 
-  /** Full Fetch API support */
   function fetch(input: string | Request | URL, init?: { method?: string; headers?: any; body?: any; redirect?: "follow" | "manual" | "error" }): Promise<Response>;
-
-  /** Full WebAssembly standard namespace */
-  const WebAssembly: {
-    Memory: new (init: { initial: number; maximum?: number }) => { buffer: ArrayBuffer };
-    Instance: new (module: any, imports?: any) => { exports: Record<string, any> };
-    Module: new (bytes: ArrayBuffer | Uint8Array | string) => any;
-    instantiate(bufferSource: ArrayBuffer | Uint8Array | string, importObject?: any): Promise<{ module: any; instance: { exports: Record<string, any> } } | { exports: Record<string, any> }>;
-    instantiateStreaming(source: Response | Promise<Response>, importObject?: any): Promise<{ module: any; instance: { exports: Record<string, any> } }>;
-    compile(bufferSource: ArrayBuffer | Uint8Array | string): Promise<any>;
-  };
 
   class Headers {
     constructor(init?: Record<string, string> | [string, string][] | Headers);
@@ -505,25 +507,6 @@ declare global {
     text(): Promise<string>;
     arrayBuffer(): Promise<ArrayBuffer>;
     clone(): Request;
-  }
-
-  class URL {
-    constructor(urlStr: string, baseStr?: string);
-    readonly href: string;
-    readonly protocol: string;
-    readonly host: string;
-    readonly hostname: string;
-    readonly port: string;
-    readonly origin: string;
-    readonly pathname: string;
-    readonly search: string;
-    readonly hash: string;
-    readonly searchParams: {
-      get(key: string): string | null;
-      has(key: string): boolean;
-      getAll(key: string): string[];
-    };
-    toString(): string;
   }
 }
 export {};
