@@ -163,6 +163,7 @@ impl VectorStore for ApexKit {
             Box::new(std::io::Error::other(e))
         };
 
+        // 1. Delete rows
         let affected = self
             .vector_batcher
             .execute(
@@ -171,6 +172,13 @@ impl VectorStore for ApexKit {
             )
             .await
             .map_err(map_err)?;
+
+        // 2. Reclaim physical disk space and reset page_count
+        {
+            let conn = self.get_vector_read().await;
+            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+                .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
+        }
 
         Ok(affected as usize)
     }

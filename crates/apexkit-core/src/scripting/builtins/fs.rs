@@ -283,6 +283,62 @@ pub fn register_file_tools<'js>(
     )
     .map_err(|e| e.to_string())?;
 
+    // 4. $files.delete(filename_or_id) -> Promise<boolean>
+    let app_del = app_ctx.clone();
+    let delete_file_fn = Function::new(
+        ctx.clone(),
+        Async(move |js_ctx: Ctx<'js>, filename_or_id: String| {
+            let app = app_del.clone();
+            async move {
+                let db = match resolve_db(None, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                        return Err(js_ctx.throw(js_err.into()));
+                    }
+                };
+                let storage = app.get_storage();
+
+                // 1. Look up file metadata from DB by numeric ID or by storage filename
+                let file_meta = if let Ok(id) = filename_or_id.parse::<i64>() {
+                    db.get_file_metadata(id).await
+                } else {
+                    db.get_file_by_filename(&filename_or_id).await
+                }
+                .ok()
+                .flatten();
+
+                // 2. Resolve the exact storage filename
+                let physical_filename = if let Some(ref meta) = file_meta {
+                    meta.filename.clone()
+                } else {
+                    filename_or_id.clone()
+                };
+
+                // 3. Delete physical file from storage backend (local disk or S3)
+                if let Err(e) = storage.delete(&physical_filename).await {
+                    let js_err = Exception::from_message(
+                        js_ctx.clone(),
+                        &format!("Storage delete failed: {}", e),
+                    )
+                    .unwrap();
+                    return Err(js_ctx.throw(js_err.into()));
+                }
+
+                // 4. Delete metadata row from database registry (_storage_files table)
+                if let Some(meta) = file_meta {
+                    let _ = db.delete_file_metadata(meta.id).await;
+                }
+
+                Ok::<bool, rquickjs::Error>(true)
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    files_obj
+        .set("delete", delete_file_fn)
+        .map_err(|e| e.to_string())?;
     files_obj.set("read", read_fn).map_err(|e| e.to_string())?;
     files_obj.set("save", save_fn).map_err(|e| e.to_string())?;
     files_obj

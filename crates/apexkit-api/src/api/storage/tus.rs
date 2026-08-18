@@ -322,11 +322,16 @@ pub async fn tus_patch(
             .await
             .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-        let extension = std::path::Path::new(&info.original_name)
+        // Convert extension to lowercase to prevent uppercase extension files (.PNG, .JPG, .JPEG)
+        let raw_ext = std::path::Path::new(&info.original_name)
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("bin");
-        let persistent_filename = format!("{}.{}", uuid::Uuid::new_v4(), extension);
+        let extension = raw_ext.to_lowercase();
+
+        // Persistent filename will always have a lowercase extension
+        // Use the upload_id as the persistent filename so it matches the Tus upload session URL
+        let persistent_filename = format!("{}.{}", upload_id, extension);
 
         storage
             .save(&persistent_filename, &assembled_bytes, &info.mime_type)
@@ -375,6 +380,7 @@ pub async fn tus_patch(
         )
         .await;
 
+        // Clean up partial chunks & metadata from tmp
         let _ = tokio::fs::remove_file(&part_path).await;
         let _ = tokio::fs::remove_file(&info_path).await;
 
@@ -387,8 +393,14 @@ pub async fn tus_patch(
         res_headers.insert("X-File-Id", HeaderValue::from_str(&id.to_string()).unwrap());
         res_headers.insert("X-File-Url", HeaderValue::from_str(&file_url).unwrap());
         res_headers.insert(
+            "X-Storage-Filename",
+            HeaderValue::from_str(&persistent_filename).unwrap(),
+        );
+        res_headers.insert(
             "Access-Control-Expose-Headers",
-            HeaderValue::from_static("Upload-Offset, Tus-Resumable, X-File-Id, X-File-Url"),
+            HeaderValue::from_static(
+                "Upload-Offset, Tus-Resumable, X-File-Id, X-File-Url, X-Storage-Filename",
+            ),
         );
 
         return Ok((StatusCode::NO_CONTENT, res_headers).into_response());

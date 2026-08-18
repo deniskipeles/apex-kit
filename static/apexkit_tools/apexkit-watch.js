@@ -353,6 +353,7 @@ declare global {
   /** Native Storage & File Engine */
   const $files: {
     read(filename: string): Promise<string>;
+    delete(filenameOrId: string | number): Promise<boolean>;
     save(filename: string, data: string | ArrayBuffer | Uint8Array, mime?: string): Promise<{ id: number | string; url: string; filename: string }>;
     getSignedUrl(filename: string, ttl_secs?: number): Promise<string>;
   };
