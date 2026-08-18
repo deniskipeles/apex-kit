@@ -63,8 +63,12 @@ pub async fn perform_backup(
         _ => return Err("Unsupported scope for backup".into()),
     };
 
-    let temp_dir = format!("{}/backup_staging_{}", source_dir, timestamp);
-    let archive_path = format!("{}/{}", source_dir, backup_filename);
+    let temp_dir = crate::utils::get_temp_path(&format!("backup_staging_{}", timestamp))
+        .to_string_lossy()
+        .to_string();
+    let archive_path = crate::utils::get_temp_path(&backup_filename)
+        .to_string_lossy()
+        .to_string();
 
     // Inner block isolates critical steps so we can handle errors and perform cleanup reliably
     let backup_result = async {
@@ -273,7 +277,10 @@ pub async fn restore_backup(
         _ => return Err("Invalid scope".into()),
     };
 
-    let temp_restore_dir = format!("{}/restore_staging", target_dir);
+    let temp_restore_dir =
+        crate::utils::get_temp_path(&format!("restore_staging_{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
 
     let local_archive_path = if is_s3 {
         let storage_settings = db.get_config("storage").await.map_err(|e| e.to_string())?;
@@ -318,11 +325,12 @@ pub async fn restore_backup(
             .await
             .map_err(|e: Box<dyn std::error::Error + Send + Sync>| e.to_string())?;
 
-        let temp_download_path = format!(
-            "{}/restore_download_{}.tar.gz",
-            target_dir,
+        let temp_download_path = crate::utils::get_temp_path(&format!(
+            "restore_download_{}.tar.gz",
             uuid::Uuid::new_v4()
-        );
+        ))
+        .to_string_lossy()
+        .to_string();
         fs::write(&temp_download_path, data).map_err(|e| e.to_string())?;
 
         temp_download_path

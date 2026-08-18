@@ -278,6 +278,16 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
                     Ok(_) => Ok(()),
                     Err(e) => Err(e.to_string()),
                 }
+            } else if metric_str.starts_with("temp:") {
+                let new_bytes: u64 = metric_str
+                    .strip_prefix("temp:")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                match crate::utils::check_temp_quota(&state, &scope, new_bytes).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e.to_string()),
+                }
             } else {
                 Ok(())
             }

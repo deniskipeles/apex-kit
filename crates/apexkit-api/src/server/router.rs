@@ -158,6 +158,18 @@ fn make_api_router() -> Router<AppState> {
             "/storage/files/{id}",
             get(storage::get_file).delete(storage::delete_file),
         )
+        // --- Tus 1.0.0 Resumable Upload Endpoints ---
+        .route(
+            "/storage/upload/tus",
+            post(storage::tus_create).options(storage::tus_options),
+        )
+        .route(
+            "/storage/upload/tus/{upload_id}",
+            axum::routing::patch(storage::tus_patch)
+                .head(storage::tus_head)
+                .delete(storage::tus_delete)
+                .options(storage::tus_options),
+        )
         .route("/admin/storage/test", post(storage::test_s3_connection))
         .route("/admin/storage/migrate", post(storage::migrate_storage))
         .route(

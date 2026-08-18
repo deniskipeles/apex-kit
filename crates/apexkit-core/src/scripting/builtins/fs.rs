@@ -25,11 +25,26 @@ fn get_storage_path(subpath: &str) -> String {
     }
 }
 
+fn get_temp_path(subpath: &str) -> PathBuf {
+    let base = std::env::var("APEXKIT_TMP_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("apexkit_tmp"));
+    let clean_sub = subpath.trim_start_matches('/').trim_start_matches("./");
+    base.join(clean_sub)
+}
+
 fn resolve_read_path(scope: &EventScope, requested_path: &str) -> Result<PathBuf, String> {
     if requested_path.contains("..") {
         return Err("Path traversal forbidden".into());
     }
 
+    // 1. Check if the file was written to the local temp scratchpad first
+    let temp_target = resolve_write_path(scope, requested_path)?;
+    if temp_target.exists() {
+        return Ok(temp_target);
+    }
+
+    // 2. Fallback to persistent mounted storage
     let base_dir = match scope {
         EventScope::Root => {
             if let Some(stripped) = requested_path.strip_prefix("tenant:") {
@@ -61,32 +76,32 @@ fn resolve_write_path(scope: &EventScope, requested_path: &str) -> Result<PathBu
         return Err("Path traversal forbidden".into());
     }
 
-    let base_dir = match scope {
+    let scoped_subpath = match scope {
         EventScope::Root => {
             if let Some(stripped) = requested_path.strip_prefix("tenant:") {
                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
                 if parts.len() < 2 {
                     return Err("Invalid format".into());
                 }
-                format!("storage/tenants/{}/tmp/{}", parts[0], parts[1])
+                format!("tenants/{}/tmp/{}", parts[0], parts[1])
             } else if let Some(stripped) = requested_path.strip_prefix("sandbox:") {
                 let parts: Vec<&str> = stripped.splitn(2, '/').collect();
                 if parts.len() < 2 {
                     return Err("Invalid format".into());
                 }
-                format!("storage/sandboxes/session_{}/tmp/{}", parts[0], parts[1])
+                format!("sandboxes/session_{}/tmp/{}", parts[0], parts[1])
             } else {
-                format!("storage/system/tmp/{}", requested_path)
+                format!("system/tmp/{}", requested_path)
             }
         }
-        EventScope::Tenant(id) => format!("storage/tenants/{}/tmp/{}", id, requested_path),
+        EventScope::Tenant(id) => format!("tenants/{}/tmp/{}", id, requested_path),
         EventScope::Sandbox(id) => {
-            format!("storage/sandboxes/session_{}/tmp/{}", id, requested_path)
+            format!("sandboxes/session_{}/tmp/{}", id, requested_path)
         }
         _ => return Err("Invalid scope".into()),
     };
 
-    Ok(PathBuf::from(get_storage_path(&base_dir)))
+    Ok(get_temp_path(&scoped_subpath))
 }
 
 pub fn register_file_tools<'js>(
@@ -311,10 +326,20 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     let app_write = app_ctx.clone();
     let write_fn = Function::new(
         ctx.clone(),
-        Async(move |fname: String, content: String| {
+        Async(move |js_ctx: Ctx<'js>, fname: String, content: String| {
             let app = app_write.clone();
             async move {
                 let scope = app.get_scope();
+                let new_bytes = content.len() as u64;
+
+                // Validate scope-relative temp quota before write
+                app.check_quota(&format!("temp:{}", new_bytes))
+                    .await
+                    .map_err(|e| {
+                        let js_err = rquickjs::Exception::from_message(js_ctx.clone(), &e).unwrap();
+                        js_ctx.throw(js_err.into())
+                    })?;
+
                 let target =
                     resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
 

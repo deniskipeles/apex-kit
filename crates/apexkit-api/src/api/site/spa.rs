@@ -92,7 +92,7 @@ pub async fn deploy_site_handler(
 
             // 2. Create Staging Area
             let staging_id = uuid::Uuid::new_v4();
-            let staging_dir = PathBuf::from(format!("storage/tmp/deploy_{}", staging_id));
+            let staging_dir = crate::utils::get_temp_path(&format!("deploy_{}", staging_id));
             fs::create_dir_all(&staging_dir).map_err(|e| AppError::UnknownError(e.to_string()))?;
 
             // 3. Extract Entire ZIP to Staging

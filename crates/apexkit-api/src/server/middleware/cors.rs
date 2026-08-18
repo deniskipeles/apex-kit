@@ -98,7 +98,7 @@ pub async fn cors_middleware(State(state): State<AppState>, req: Request, next: 
                 HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
             );
 
-            let default_headers = "Authorization, Content-Type, Accept, Origin, X-Requested-With, HX-Request, HX-Current-URL, HX-Target, HX-Trigger";
+            let default_headers = "Authorization, Content-Type, Accept, Origin, X-Requested-With, HX-Request, HX-Current-URL, HX-Target, HX-Trigger, Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Upload-Defer-Length";
             let final_headers = if !request_headers.is_empty() {
                 format!("{}, {}", default_headers, request_headers)
             } else {
@@ -136,7 +136,10 @@ pub async fn cors_middleware(State(state): State<AppState>, req: Request, next: 
         if allow_credentials {
             response.headers_mut().insert(
                 header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                HeaderValue::from_static("true"),
+                // HeaderValue::from_static("true"),
+                HeaderValue::from_static(
+                    "Location, Upload-Offset, Upload-Length, Tus-Resumable, Tus-Version, Tus-Extension, Tus-Max-Size, X-File-Id, X-File-Url"
+                ),
             );
         }
         response

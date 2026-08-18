@@ -360,3 +360,112 @@ pub async fn check_ai_quota(state: &AppState, scope: &EventScope) -> Result<(), 
         _ => Ok(()),
     }
 }
+
+pub fn get_temp_limit_multiplier() -> f64 {
+    std::env::var("TMP_DIR_LIMIT_OF_SCOPE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0)
+}
+
+pub fn get_temp_path(subpath: &str) -> std::path::PathBuf {
+    let base = std::env::var("APEXKIT_TMP_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("apexkit_tmp"));
+
+    let clean_sub = subpath.trim_start_matches('/').trim_start_matches("./");
+    base.join(clean_sub)
+}
+
+pub fn calculate_dir_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut total_size = 0;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                total_size += calculate_dir_size(&entry.path())?;
+            } else {
+                total_size += metadata.len();
+            }
+        }
+    } else if path.exists() {
+        total_size = path.metadata()?.len();
+    }
+    Ok(total_size)
+}
+
+// Verify real-time temp directory quota relative to the scope storage limit
+pub async fn check_temp_quota(
+    state: &AppState,
+    scope: &EventScope,
+    additional_bytes: u64,
+) -> Result<(), AppError> {
+    let multiplier = get_temp_limit_multiplier();
+
+    let (max_storage_mb, temp_dir) = match scope {
+        EventScope::Root => {
+            let general = state.db.get_config("general").await.unwrap_or(None);
+            let max_mb = general
+                .as_ref()
+                .and_then(|v| v.get("max_site_size_mb").and_then(|n| n.as_i64()))
+                .unwrap_or(5000); // 5 GB fallback for root
+            (max_mb, get_temp_path("system/tmp"))
+        }
+        EventScope::Tenant(id) => {
+            let tenants = state
+                .db
+                .list_tenants()
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+            let max_mb = tenants
+                .iter()
+                .find(|t| &t.id == id)
+                .map(|t| t.stats.max_storage_mb)
+                .unwrap_or(500); // 500 MB default
+            (max_mb, get_temp_path(&format!("tenants/{}/tmp", id)))
+        }
+        EventScope::Sandbox(id) => {
+            let sandboxes = state
+                .db
+                .list_sandboxes(None)
+                .await
+                .map_err(|e| AppError::UnknownError(e.to_string()))?;
+            let max_mb = sandboxes
+                .iter()
+                .find(|s| &s.id == id)
+                .map(|s| s.max_storage_mb)
+                .unwrap_or(100); // 100 MB default
+            (
+                max_mb,
+                get_temp_path(&format!("sandboxes/session_{}/tmp", id)),
+            )
+        }
+        _ => return Ok(()),
+    };
+
+    let max_allowed_bytes = ((max_storage_mb as f64) * multiplier * 1024.0 * 1024.0) as u64;
+
+    let current_temp_bytes = tokio::task::spawn_blocking(move || {
+        if temp_dir.exists() {
+            calculate_dir_size(&temp_dir).unwrap_or(0)
+        } else {
+            0
+        }
+    })
+    .await
+    .unwrap_or(0);
+
+    if current_temp_bytes + additional_bytes > max_allowed_bytes {
+        return Err(AppError::Forbidden(format!(
+            "Temp quota exceeded: current {:.2} MB + new {:.2} MB > allowed {:.2} MB (Scope Limit: {} MB × Multiplier: {})",
+            (current_temp_bytes as f64) / (1024.0 * 1024.0),
+            (additional_bytes as f64) / (1024.0 * 1024.0),
+            (max_allowed_bytes as f64) / (1024.0 * 1024.0),
+            max_storage_mb,
+            multiplier
+        )));
+    }
+
+    Ok(())
+}
