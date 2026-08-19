@@ -35,40 +35,33 @@ struct WasmOptions {
     timeout_ms: Option<u64>,
 }
 
-struct CustomResourceLimiter {
-    max_memory_bytes: usize,
-}
-
-impl ResourceLimiter for CustomResourceLimiter {
-    fn memory_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        _maximum: Option<usize>,
-    ) -> Result<bool, wasmtime::Error> {
-        Ok(desired <= self.max_memory_bytes)
-    }
-
-    fn table_growing(
-        &mut self,
-        _current: u32,
-        desired: u32,
-        _maximum: Option<u32>,
-    ) -> Result<bool, wasmtime::Error> {
-        Ok(desired <= 10_000)
-    }
-}
-
 pub struct WasmStoreState {
     wasi: Option<WasiP1Ctx>,
-    limiter: CustomResourceLimiter,
+    limits: StoreLimits,
+}
+
+fn create_engine_config() -> Config {
+    let mut config = Config::new();
+    config.wasm_threads(true);
+    config.wasm_bulk_memory(true);
+    config.wasm_multi_memory(true);
+    config.wasm_simd(true);
+    config
 }
 
 fn get_wasm_cache_dir() -> PathBuf {
-    let base = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
+    if let Ok(custom) = std::env::var("APEXKIT_WASM_CACHE_DIR") {
+        let dir = PathBuf::from(custom);
+        let _ = fs::create_dir_all(&dir);
+        return dir;
+    }
+    if let Ok(base_storage) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
+        let dir = PathBuf::from(base_storage).join(".cache").join("wasm");
+        let _ = fs::create_dir_all(&dir);
+        return dir;
+    }
+
+    let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dir = base.join(".cache").join("wasm");
     let _ = fs::create_dir_all(&dir);
     dir
@@ -135,22 +128,30 @@ fn resolve_wasm_bytes(
     is_root: bool,
 ) -> Result<(Vec<u8>, Option<String>), String> {
     let cache_dir = get_wasm_cache_dir();
-    let clean_input = input
+    let mut clean_input = input
         .trim()
         .trim_start_matches("data:application/wasm;base64,")
         .trim_start_matches("data:application/wasi;base64,")
         .trim_start_matches('/')
-        .trim_start_matches("./");
+        .trim_start_matches("./")
+        .to_string();
 
-    if clean_input.len() < 256 {
-        let cached_file = cache_dir.join(clean_input);
-        if cached_file.exists() && cached_file.is_file() {
-            let bytes = fs::read(&cached_file).map_err(|e| e.to_string())?;
-            return Ok((bytes, Some(clean_input.to_string())));
+    if clean_input.ends_with(".cwasm") {
+        let wasm_alt = clean_input.replace(".cwasm", ".wasm");
+        if cache_dir.join(&wasm_alt).exists() {
+            clean_input = wasm_alt;
         }
     }
 
-    let bytes = match BASE64.decode(clean_input) {
+    if clean_input.len() < 256 {
+        let cached_file = cache_dir.join(&clean_input);
+        if cached_file.exists() && cached_file.is_file() {
+            let bytes = fs::read(&cached_file).map_err(|e| e.to_string())?;
+            return Ok((bytes, Some(clean_input)));
+        }
+    }
+
+    let bytes = match BASE64.decode(&clean_input) {
         Ok(b) if !b.is_empty() => b,
         _ => {
             let storage = app_ctx.get_storage();
@@ -167,11 +168,8 @@ fn resolve_wasm_bytes(
         }
     };
 
-    if !is_root && bytes.len() > 200 * 1024 {
-        return Err(format!(
-            "Tenant WASM upload size ({} KB) exceeds allowed limit (200 KB max).",
-            bytes.len() / 1024
-        ));
+    if !is_root && bytes.len() > 500 * 1024 * 1024 {
+        return Err("WASM binary exceeds max allowed limit".into());
     }
 
     let name = readable_name_opt.map(|s| s.to_string());
@@ -230,22 +228,37 @@ fn instantiate_wasm_module<'js>(
     _imports_val: Option<Value<'js>>,
     is_root: bool,
 ) -> Result<Object<'js>, String> {
-    let config = Config::new();
+    let config = create_engine_config();
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = get_or_compile_module(&engine, bytes, None)?;
 
     let memory_limit_mb = if is_root { 512 } else { 64 };
-    let state = WasmStoreState {
-        wasi: None,
-        limiter: CustomResourceLimiter {
-            max_memory_bytes: memory_limit_mb * 1024 * 1024,
-        },
-    };
+    let limits = StoreLimitsBuilder::new()
+        .memory_size(memory_limit_mb * 1024 * 1024)
+        .table_elements(1_000_000)
+        .build();
+
+    let state = WasmStoreState { wasi: None, limits };
 
     let mut store = Store::new(&engine, state);
-    store.limiter(|s| &mut s.limiter);
+    store.limiter(|s| &mut s.limits);
 
     let mut linker = Linker::new(&engine);
+
+    for import in module.imports() {
+        if let ExternType::Memory(mem_ty) = import.ty() {
+            if mem_ty.is_shared() {
+                if let Ok(memory) = SharedMemory::new(&engine, mem_ty.clone()) {
+                    let _ = linker.define(&mut store, import.module(), import.name(), memory);
+                }
+            } else {
+                if let Ok(memory) = Memory::new(&mut store, mem_ty.clone()) {
+                    let _ = linker.define(&mut store, import.module(), import.name(), memory);
+                }
+            }
+        }
+    }
+
     linker
         .define_unknown_imports_as_default_values(&module)
         .ok();
@@ -268,8 +281,7 @@ fn instantiate_wasm_module<'js>(
 
     let mem_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-    // Allocate the JS ArrayBuffer starting with the WASM module's INITIAL data section
-    let buffer_cap = memory_limit_mb * 1024 * 1024;
+    let buffer_cap = 32 * 1024 * 1024;
     let initial_vec = {
         let mut store_guard = store_arc.lock().unwrap();
         if let Some(memory) = instance_arc.get_memory(&mut *store_guard, "memory") {
@@ -381,7 +393,7 @@ fn instantiate_wasm_module<'js>(
                         return Err(ctx_call.throw(js_err.into()));
                     }
 
-                    // 2. Sync Wasmtime -> JS Memory in-place after execution
+                    // 2. Sync Wasmtime -> JS Memory
                     if let Some(memory) = inst_ref.get_memory(&mut *store_guard, "memory") {
                         let data_slice = memory.data(&*store_guard);
                         let slice_len = data_slice.len();
@@ -412,7 +424,6 @@ fn instantiate_wasm_module<'js>(
                         }
                     }
 
-                    // Handle Multi-Value WebAssembly Returns
                     let ret_val = match results.len() {
                         0 => json!(null),
                         1 => match results[0] {
@@ -564,22 +575,64 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         };
 
                     let task = tokio::task::spawn_blocking(move || {
-                        let config = Config::new();
+                        let config = create_engine_config();
                         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
                         let module =
                             get_or_compile_module(&engine, &bytes, readable_name.as_deref())?;
 
-                        let state = WasmStoreState {
-                            wasi: None,
-                            limiter: CustomResourceLimiter {
-                                max_memory_bytes: memory_limit_mb * 1024 * 1024,
-                            },
-                        };
+                        let limits = StoreLimitsBuilder::new()
+                            .memory_size(memory_limit_mb * 1024 * 1024)
+                            .table_elements(1_000_000)
+                            .build();
+
+                        let state = WasmStoreState { wasi: None, limits };
 
                         let mut store = Store::new(&engine, state);
-                        store.limiter(|s| &mut s.limiter);
+                        store.limiter(|s| &mut s.limits);
 
                         let mut linker = Linker::new(&engine);
+
+                        for import in module.imports() {
+                            match import.ty() {
+                                ExternType::Memory(mem_ty) => {
+                                    if mem_ty.is_shared() {
+                                        let memory = SharedMemory::new(&engine, mem_ty.clone()).map_err(|e| {
+                                            format!("Failed to allocate shared memory '{}:{}': {}", import.module(), import.name(), e)
+                                        })?;
+                                        linker.define(&mut store, import.module(), import.name(), memory).map_err(|e| {
+                                            format!("Failed to define shared memory '{}:{}': {}", import.module(), import.name(), e)
+                                        })?;
+                                    } else {
+                                        let memory = Memory::new(&mut store, mem_ty.clone()).map_err(|e| {
+                                            format!("Failed to allocate imported memory '{}:{}': {}", import.module(), import.name(), e)
+                                        })?;
+                                        linker.define(&mut store, import.module(), import.name(), memory).map_err(|e| {
+                                            format!("Failed to define imported memory '{}:{}': {}", import.module(), import.name(), e)
+                                        })?;
+                                    }
+                                }
+                                ExternType::Table(table_ty) => {
+                                    let null_ref = wasmtime::Ref::null(table_ty.element().heap_type());
+                                    if let Ok(table) = Table::new(&mut store, table_ty, null_ref) {
+                                        let _ = linker.define(&mut store, import.module(), import.name(), table);
+                                    }
+                                }
+                                ExternType::Global(global_ty) => {
+                                    let init_val = match global_ty.content() {
+                                        ValType::I32 => Val::I32(0),
+                                        ValType::I64 => Val::I64(0),
+                                        ValType::F32 => Val::F32(0.0f32.to_bits()),
+                                        ValType::F64 => Val::F64(0.0f64.to_bits()),
+                                        _ => Val::I32(0),
+                                    };
+                                    if let Ok(global) = Global::new(&mut store, global_ty, init_val) {
+                                        let _ = linker.define(&mut store, import.module(), import.name(), global);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
                         linker
                             .define_unknown_imports_as_default_values(&module)
                             .ok();
@@ -677,10 +730,8 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         .unwrap_or_default();
 
                     let is_root = matches!(app.get_scope(), EventScope::Root);
-                    let memory_limit_mb = opts.memory_mb.unwrap_or(if is_root { 512 } else { 64 });
-                    let timeout_ms = opts
-                        .timeout_ms
-                        .unwrap_or(if is_root { 30_000 } else { 300 });
+                    let memory_limit_mb = opts.memory_mb.unwrap_or(if is_root { 512 } else { 256 });
+                    let timeout_ms = opts.timeout_ms.unwrap_or(180_000);
 
                     let (bytes, readable_name) =
                         match resolve_wasm_bytes(&app, &input, opts.name.as_deref(), is_root) {
@@ -691,14 +742,38 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                             }
                         };
 
+                    let scope = app.get_scope();
+                    let scope_temp_dir = match &scope {
+                        EventScope::Root => crate::utils::get_temp_path("system/tmp"),
+                        EventScope::Tenant(id) => crate::utils::get_temp_path(&format!("tenants/{}/tmp", id)),
+                        EventScope::Sandbox(id) => crate::utils::get_temp_path(&format!("sandboxes/session_{}/tmp", id)),
+                        _ => crate::utils::get_temp_path("system/tmp"),
+                    };
+                    std::fs::create_dir_all(&scope_temp_dir).ok();
+
                     let task = tokio::task::spawn_blocking(move || {
-                        let config = Config::new();
+                        let config = create_engine_config();
                         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
                         let module =
                             get_or_compile_module(&engine, &bytes, readable_name.as_deref())?;
 
                         let mut builder = WasiCtxBuilder::new();
-                        builder.inherit_stdio();
+                        builder.inherit_stdout();
+                        builder.inherit_stderr();
+                        builder.inherit_env();
+
+                        builder
+                            .preopened_dir(
+                                &scope_temp_dir,
+                                ".",
+                                wasmtime_wasi::DirPerms::all(),
+                                wasmtime_wasi::FilePerms::all(),
+                            )
+                            .map_err(|e| format!("Failed to preopen WASI dir: {}", e))?;
+
+                        let prog_name = readable_name.as_deref().unwrap_or("ffmpeg");
+                        builder.arg(prog_name);
+
                         if let Some(args) = cli_args {
                             for arg in args {
                                 builder.arg(&arg);
@@ -706,19 +781,63 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         }
                         let wasi_ctx = builder.build_p1();
 
+                        let limits = StoreLimitsBuilder::new()
+                            .memory_size(memory_limit_mb * 1024 * 1024)
+                            .table_elements(1_000_000)
+                            .build();
+
                         let state = WasmStoreState {
                             wasi: Some(wasi_ctx),
-                            limiter: CustomResourceLimiter {
-                                max_memory_bytes: memory_limit_mb * 1024 * 1024,
-                            },
+                            limits,
                         };
 
                         let mut store = Store::new(&engine, state);
-                        store.limiter(|s| &mut s.limiter);
+                        store.limiter(|s| &mut s.limits);
 
                         let mut linker: Linker<WasmStoreState> = Linker::new(&engine);
                         preview1::add_to_linker_sync(&mut linker, |s| s.wasi.as_mut().unwrap())
                             .map_err(|e| e.to_string())?;
+
+                        for import in module.imports() {
+                            match import.ty() {
+                                ExternType::Memory(mem_ty) => {
+                                    if mem_ty.is_shared() {
+                                        let memory = SharedMemory::new(&engine, mem_ty.clone()).map_err(|e| {
+                                            format!("Failed to allocate shared memory '{}:{}': {}", import.module(), import.name(), e)
+                                        })?;
+                                        linker.define(&mut store, import.module(), import.name(), memory).map_err(|e| {
+                                            format!("Failed to define shared memory '{}:{}': {}", import.module(), import.name(), e)
+                                        })?;
+                                    } else {
+                                        let memory = Memory::new(&mut store, mem_ty.clone()).map_err(|e| {
+                                            format!("Failed to allocate imported memory '{}:{}': {}", import.module(), import.name(), e)
+                                        })?;
+                                        linker.define(&mut store, import.module(), import.name(), memory).map_err(|e| {
+                                            format!("Failed to define imported memory '{}:{}': {}", import.module(), import.name(), e)
+                                        })?;
+                                    }
+                                }
+                                ExternType::Table(table_ty) => {
+                                    let null_ref = wasmtime::Ref::null(table_ty.element().heap_type());
+                                    if let Ok(table) = Table::new(&mut store, table_ty, null_ref) {
+                                        let _ = linker.define(&mut store, import.module(), import.name(), table);
+                                    }
+                                }
+                                ExternType::Global(global_ty) => {
+                                    let init_val = match global_ty.content() {
+                                        ValType::I32 => Val::I32(0),
+                                        ValType::I64 => Val::I64(0),
+                                        ValType::F32 => Val::F32(0.0f32.to_bits()),
+                                        ValType::F64 => Val::F64(0.0f64.to_bits()),
+                                        _ => Val::I32(0),
+                                    };
+                                    if let Ok(global) = Global::new(&mut store, global_ty, init_val) {
+                                        let _ = linker.define(&mut store, import.module(), import.name(), global);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
 
                         linker
                             .define_unknown_imports_as_default_values(&module)
@@ -727,12 +846,68 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         let instance = linker
                             .instantiate(&mut store, &module)
                             .map_err(|e| e.to_string())?;
-                        let func = instance
-                            .get_typed_func::<(), ()>(&mut store, "_start")
-                            .map_err(|e| e.to_string())?;
 
-                        func.call(&mut store, ()).map_err(|e| e.to_string())?;
-                        Ok::<bool, String>(true)
+                        let entrypoint = if instance.get_func(&mut store, "_start").is_some() {
+                            "_start"
+                        } else if instance.get_func(&mut store, "_initialize").is_some() {
+                            "_initialize"
+                        } else if instance.get_func(&mut store, "_main").is_some() {
+                            "_main"
+                        } else if instance.get_func(&mut store, "main").is_some() {
+                            "main"
+                        } else {
+                            let available_exports: Vec<String> = module
+                                .exports()
+                                .filter_map(|e| {
+                                    if let ExternType::Func(_) = e.ty() {
+                                        Some(e.name().to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            return Err(format!(
+                                "No standard entrypoint (_start, _initialize, _main, main) found in WASM module. Available exported functions: {:?}",
+                                available_exports
+                            ));
+                        };
+
+                        let func = instance.get_func(&mut store, entrypoint).unwrap();
+                        let func_ty = func.ty(&store);
+                        let param_count = func_ty.params().len();
+                        let result_count = func_ty.results().len();
+
+                        let call_args = vec![Val::I32(0); param_count];
+                        let mut call_results = vec![Val::I32(0); result_count];
+
+                        match func.call(&mut store, &call_args, &mut call_results) {
+                            Ok(()) => {
+                                if let Some(Val::I32(code)) = call_results.first() {
+                                    if *code != 0 {
+                                        return Err(format!("Process main() returned exit code: {}", code));
+                                    }
+                                }
+                                Ok::<bool, String>(true)
+                            }
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                                    if exit.0 == 0 {
+                                        return Ok::<bool, String>(true);
+                                    } else {
+                                        return Err(format!("Process exited with code: {}", exit.0));
+                                    }
+                                }
+                                if err_str.contains("exit code 0")
+                                    || err_str.contains("I32Exit(0)")
+                                    || err_str.contains("status 0")
+                                {
+                                    return Ok::<bool, String>(true);
+                                }
+                                Err(format!("WASI Execution Error: {}", e))
+                            }
+                        }
                     });
 
                     let res = match timeout(Duration::from_millis(timeout_ms), task).await {

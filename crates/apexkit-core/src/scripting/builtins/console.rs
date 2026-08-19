@@ -4,6 +4,7 @@ use rquickjs_serde::from_value;
 use std::sync::Arc;
 
 use super::super::context::ScriptContext;
+use super::db::resolve_db;
 
 pub fn register_console<'js>(
     ctx: &Ctx<'js>,
@@ -32,10 +33,15 @@ pub fn register_console<'js>(
                     }
                     let msg = formatted.join(" ");
 
-                    let db = app_clone.get_db();
+                    // ✅ FIX: Resolve the active tenant/sandbox DB instead of hardcoded root DB
+                    let db = match resolve_db(None, app_clone.clone()).await {
+                        Ok(d) => d,
+                        Err(_) => app_clone.get_db(),
+                    };
+
                     let _ = db.log_system_event(level, "script", &msg).await;
 
-                    Ok::<(), rquickjs::Error>(()) // <-- Type explicitly at the end!
+                    Ok::<(), rquickjs::Error>(())
                 }
             }),
         )

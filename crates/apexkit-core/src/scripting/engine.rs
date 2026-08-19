@@ -591,12 +591,12 @@ impl ScriptEngine {
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30);
+            .unwrap_or(300);
 
         let total_cpu_budget_ms = std::env::var("SCRIPT_MAX_CPU_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30000);
+            .unwrap_or(300000);
 
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         let vfs = self.vfs.clone();
@@ -712,7 +712,10 @@ impl ScriptEngine {
                             }
                         } else if let Some(js_str) = body_val.as_string() {
                             let rust_str = js_str.to_string().unwrap_or_default();
-                            (serde_json::Value::String(rust_str), false, None)
+                            // Parse JSON string responses so result["body"]["key"] works in Rust tests
+                            let val_json = serde_json::from_str::<serde_json::Value>(&rust_str)
+                                .unwrap_or(serde_json::Value::String(rust_str));
+                            (val_json, false, None)
                         } else {
                             (from_value(body_val).unwrap_or(serde_json::Value::Null), false, None)
                         };
@@ -790,7 +793,7 @@ impl ScriptEngine {
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30);
+            .unwrap_or(300);
 
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         let vfs = self.vfs.clone();

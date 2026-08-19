@@ -42,6 +42,7 @@ tmp/
 # ============================
 swalang
 /static/tailwind-dark.full.css
+.cache/
 
 # ============================
 # Build artifacts

@@ -14,6 +14,7 @@ use zip::{ZipArchive, ZipWriter};
 use super::super::context::ScriptContext;
 use super::db::resolve_db;
 use crate::realtime::EventScope;
+use crate::utils::get_temp_path;
 
 fn get_storage_path(subpath: &str) -> String {
     if let Ok(base) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
@@ -23,14 +24,6 @@ fn get_storage_path(subpath: &str) -> String {
     } else {
         subpath.to_string()
     }
-}
-
-fn get_temp_path(subpath: &str) -> PathBuf {
-    let base = std::env::var("APEXKIT_TMP_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("apexkit_tmp"));
-    let clean_sub = subpath.trim_start_matches('/').trim_start_matches("./");
-    base.join(clean_sub)
 }
 
 fn resolve_read_path(scope: &EventScope, requested_path: &str) -> Result<PathBuf, String> {
@@ -111,17 +104,29 @@ pub fn register_file_tools<'js>(
     let globals = ctx.globals();
     let files_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-    // 1. $files.read(filename) -> Promise<Base64>
+    // 1. $files.read
     let app_read = app_ctx.clone();
     let read_fn = Function::new(
         ctx.clone(),
         Async(move |js_ctx: Ctx<'js>, filename: String| {
             let app = app_read.clone();
             async move {
+                eprintln!("[FS TRACE $files.read] Reading: '{}'", filename);
                 let storage = app.get_storage();
                 match storage.get(&filename).await {
-                    Ok(bytes) => Ok::<String, rquickjs::Error>(BASE64.encode(bytes)),
+                    Ok(bytes) => {
+                        eprintln!(
+                            "[FS TRACE $files.read] Loaded {} bytes from storage for '{}'",
+                            bytes.len(),
+                            filename
+                        );
+                        Ok::<String, rquickjs::Error>(BASE64.encode(bytes))
+                    }
                     Err(e) => {
+                        eprintln!(
+                            "[FS TRACE $files.read ERROR] Failed for '{}': {}",
+                            filename, e
+                        );
                         let js_err = Exception::from_message(
                             js_ctx.clone(),
                             &format!("File '{}' not found: {}", filename, e),
@@ -135,7 +140,7 @@ pub fn register_file_tools<'js>(
     )
     .map_err(|e| e.to_string())?;
 
-    // 2. $files.save(filename, data, mime) -> Promise<Metadata>
+    // 2. $files.save
     let app_save = app_ctx.clone();
     let save_fn = Function::new(
         ctx.clone(),
@@ -146,19 +151,39 @@ pub fn register_file_tools<'js>(
                   mime: Option<String>| {
                 let app = app_save.clone();
                 async move {
+                    eprintln!(
+                        "[FS TRACE $files.save] Filename: '{}', mime: {:?}",
+                        filename, mime
+                    );
+
                     let db = match resolve_db(None, app.clone()).await {
                         Ok(d) => d,
                         Err(e) => {
+                            eprintln!("[FS TRACE $files.save ERROR] DB resolve failed: {}", e);
                             let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
                             return Err(js_ctx.throw(js_err.into()));
                         }
                     };
                     let storage = app.get_storage();
-
                     let mime_type = mime.unwrap_or_else(|| "application/octet-stream".to_string());
 
-                    // Support Base64 String, ArrayBuffer, or Uint8Array directly
-                    let bytes = if let Some(s) = data_val.as_string() {
+                    let bytes = if let Ok(ta) =
+                        rquickjs::TypedArray::<u8>::from_value(data_val.clone())
+                    {
+                        let b = ta.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
+                        eprintln!(
+                            "[FS TRACE $files.save] Extracted from TypedArray: {} bytes",
+                            b.len()
+                        );
+                        b
+                    } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(data_val.clone()) {
+                        let b = ab.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
+                        eprintln!(
+                            "[FS TRACE $files.save] Extracted from ArrayBuffer: {} bytes",
+                            b.len()
+                        );
+                        b
+                    } else if let Some(s) = data_val.as_string() {
                         let clean = s.to_string().unwrap_or_default();
                         let b64 = clean
                             .trim()
@@ -166,42 +191,22 @@ pub fn register_file_tools<'js>(
                             .trim_start_matches("data:image/png;base64,")
                             .trim_start_matches("data:image/webp;base64,")
                             .trim_start_matches("data:application/octet-stream;base64,");
-                        match BASE64.decode(b64) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                let js_err = Exception::from_message(
-                                    js_ctx.clone(),
-                                    &format!("Invalid Base64 payload: {}", e),
-                                )
-                                .unwrap();
-                                return Err(js_ctx.throw(js_err.into()));
-                            }
-                        }
-                    } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(data_val.clone()) {
-                        ab.as_bytes().map(|b| b.to_vec()).unwrap_or_default()
-                    } else if let Some(obj) = data_val.as_object() {
-                        if let Ok(ab) = obj.get::<_, rquickjs::ArrayBuffer>("buffer") {
-                            let offset = obj.get::<_, usize>("byteOffset").unwrap_or(0);
-                            let length = obj
-                                .get::<_, usize>("byteLength")
-                                .unwrap_or_else(|_| ab.as_bytes().map(|b| b.len()).unwrap_or(0));
-                            if let Some(b) = ab.as_bytes() {
-                                if offset + length <= b.len() {
-                                    b[offset..offset + length].to_vec()
-                                } else {
-                                    vec![]
-                                }
-                            } else {
-                                vec![]
-                            }
-                        } else {
-                            vec![]
-                        }
+                        eprintln!(
+                            "[FS TRACE $files.save] Decoding base64 string (len: {} chars)",
+                            b64.len()
+                        );
+                        BASE64.decode(b64).unwrap_or_default()
                     } else {
                         vec![]
                     };
 
+                    eprintln!(
+                        "[FS TRACE $files.save] Total extracted bytes to write: {}",
+                        bytes.len()
+                    );
+
                     if bytes.is_empty() {
+                        eprintln!("[FS TRACE $files.save ERROR] bytes is empty!");
                         let js_err = Exception::from_message(
                             js_ctx.clone(),
                             "Cannot save empty or invalid file data",
@@ -216,6 +221,7 @@ pub fn register_file_tools<'js>(
                     let storage_filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
 
                     if let Err(e) = storage.save(&storage_filename, &bytes, &mime_type).await {
+                        eprintln!("[FS TRACE $files.save ERROR] storage.save failed: {}", e);
                         let js_err = Exception::from_message(
                             js_ctx.clone(),
                             &format!("Storage save failed: {}", e),
@@ -230,6 +236,10 @@ pub fn register_file_tools<'js>(
                     {
                         Ok(i) => i,
                         Err(e) => {
+                            eprintln!(
+                                "[FS TRACE $files.save ERROR] create_file_metadata failed: {}",
+                                e
+                            );
                             let js_err = Exception::from_message(
                                 js_ctx.clone(),
                                 &format!("Metadata creation failed: {}", e),
@@ -240,6 +250,7 @@ pub fn register_file_tools<'js>(
                     };
 
                     let url = format!("{}{}", storage.get_public_url_base(), storage_filename);
+                    eprintln!("[FS TRACE $files.save SUCCESS] ID: {}, URL: {}", id, url);
 
                     let res = json!({ "id": id, "url": url, "filename": storage_filename });
                     to_value(js_ctx.clone(), &res).map_err(|e| {
@@ -542,6 +553,141 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     )
     .map_err(|e| e.to_string())?;
 
+    // 1. $fs.readBytes(filename) -> Promise<string> (Base64 encoded binary)
+    let app_read_bytes = app_ctx.clone();
+    let read_bytes_fn = Function::new(
+        ctx.clone(),
+        Async(move |js_ctx: Ctx<'js>, fname: String| {
+            let app = app_read_bytes.clone();
+            async move {
+                let scope = app.get_scope();
+                let target = match resolve_read_path(&scope, &fname) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                        return Err(js_ctx.throw(js_err.into()));
+                    }
+                };
+
+                if !target.exists() || target.is_dir() {
+                    let js_err = Exception::from_message(
+                        js_ctx.clone(),
+                        &format!("File '{}' not found or is a directory", fname),
+                    )
+                    .unwrap();
+                    return Err(js_ctx.throw(js_err.into()));
+                }
+
+                // Read raw binary bytes safely (no UTF-8 validation)
+                let bytes = tokio::fs::read(target).await.map_err(|e| {
+                    let js_err = Exception::from_message(
+                        js_ctx.clone(),
+                        &format!("Read binary failed: {}", e),
+                    )
+                    .unwrap();
+                    js_ctx.throw(js_err.into())
+                })?;
+
+                Ok::<String, rquickjs::Error>(BASE64.encode(&bytes))
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 2. $fs.writeBytes(filename, data) -> Promise<boolean> (Supports Base64, ArrayBuffer, or Uint8Array)
+    let app_write_bytes = app_ctx.clone();
+    let write_bytes_fn = Function::new(
+        ctx.clone(),
+        Async(
+            move |js_ctx: Ctx<'js>, fname: String, data_val: Value<'js>| {
+                let app = app_write_bytes.clone();
+                async move {
+                    let scope = app.get_scope();
+
+                    // Extract raw bytes from Base64 string, ArrayBuffer, or TypedArray/Uint8Array
+                    let bytes = if let Some(s) = data_val.as_string() {
+                        let clean = s.to_string().unwrap_or_default();
+                        let b64 = if let Some(idx) = clean.find(',') {
+                            &clean[idx + 1..]
+                        } else {
+                            clean.trim()
+                        };
+                        BASE64.decode(b64).map_err(|e| {
+                            let js_err = Exception::from_message(
+                                js_ctx.clone(),
+                                &format!("Invalid Base64 payload: {}", e),
+                            )
+                            .unwrap();
+                            js_ctx.throw(js_err.into())
+                        })?
+                    } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(data_val.clone()) {
+                        ab.as_bytes().map(|b| b.to_vec()).unwrap_or_default()
+                    } else if let Some(obj) = data_val.as_object() {
+                        if let Ok(ab) = obj.get::<_, rquickjs::ArrayBuffer>("buffer") {
+                            let offset = obj.get::<_, usize>("byteOffset").unwrap_or(0);
+                            let length = obj
+                                .get::<_, usize>("byteLength")
+                                .unwrap_or_else(|_| ab.as_bytes().map(|b| b.len()).unwrap_or(0));
+                            if let Some(b) = ab.as_bytes() {
+                                if offset + length <= b.len() {
+                                    b[offset..offset + length].to_vec()
+                                } else {
+                                    vec![]
+                                }
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    };
+
+                    let new_bytes = bytes.len() as u64;
+
+                    // Enforce scope-relative temp quota
+                    app.check_quota(&format!("temp:{}", new_bytes))
+                        .await
+                        .map_err(|e| {
+                            let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                            js_ctx.throw(js_err.into())
+                        })?;
+
+                    let target = match resolve_write_path(&scope, &fname) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                            return Err(js_ctx.throw(js_err.into()));
+                        }
+                    };
+
+                    if let Some(parent) = target.parent() {
+                        tokio::fs::create_dir_all(parent).await.ok();
+                    }
+
+                    tokio::fs::write(target, bytes).await.map_err(|e| {
+                        let js_err = Exception::from_message(
+                            js_ctx.clone(),
+                            &format!("Write binary failed: {}", e),
+                        )
+                        .unwrap();
+                        js_ctx.throw(js_err.into())
+                    })?;
+
+                    Ok::<bool, rquickjs::Error>(true)
+                }
+            },
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    fs_obj
+        .set("readBytes", read_bytes_fn)
+        .map_err(|e| e.to_string())?;
+    fs_obj
+        .set("writeBytes", write_bytes_fn)
+        .map_err(|e| e.to_string())?;
     fs_obj.set("read", read_fn).map_err(|e| e.to_string())?;
     fs_obj.set("write", write_fn).map_err(|e| e.to_string())?;
     fs_obj.set("delete", delete_fn).map_err(|e| e.to_string())?;

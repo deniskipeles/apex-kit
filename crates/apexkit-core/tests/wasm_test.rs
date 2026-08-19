@@ -51,6 +51,13 @@ async fn setup_test_context(base_path: &std::path::Path) -> Arc<dyn apexkit_core
     let sys = Connection::open(base_path.join("system.db")).unwrap();
     let vec = Connection::open(base_path.join("vectors.db")).unwrap();
 
+    // ✅ ENABLE SQLITE WAL MODE & BUSY TIMEOUTS TO PREVENT DEADLOCKS
+    apexkit_core::database::sqlite::setup::apply_pragmas(&core).unwrap();
+    apexkit_core::database::sqlite::setup::apply_pragmas(&data).unwrap();
+    apexkit_core::database::sqlite::setup::apply_pragmas(&log).unwrap();
+    apexkit_core::database::sqlite::setup::apply_pragmas(&sys).unwrap();
+    apexkit_core::database::sqlite::setup::apply_pragmas(&vec).unwrap();
+
     apexkit_core::database::sqlite::setup::setup_core(&core).unwrap();
     apexkit_core::database::sqlite::setup::setup_data(&data).unwrap();
     apexkit_core::database::sqlite::setup::setup_logs(&log).unwrap();

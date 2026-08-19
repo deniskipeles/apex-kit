@@ -4,10 +4,20 @@ use std::path::{Path, PathBuf};
 use wasmtime::*;
 
 fn get_wasm_cache_dir() -> PathBuf {
-    let base = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
+    // 1. Check custom override or mounted storage
+    if let Ok(custom) = std::env::var("APEXKIT_WASM_CACHE_DIR") {
+        let dir = PathBuf::from(custom);
+        let _ = fs::create_dir_all(&dir);
+        return dir;
+    }
+    if let Ok(base_storage) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
+        let dir = PathBuf::from(base_storage).join(".cache").join("wasm");
+        let _ = fs::create_dir_all(&dir);
+        return dir;
+    }
+
+    // 2. Default to CWD (Current Working Directory)
+    let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dir = base.join(".cache").join("wasm");
     let _ = fs::create_dir_all(&dir);
     dir

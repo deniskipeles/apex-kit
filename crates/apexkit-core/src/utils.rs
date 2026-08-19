@@ -5,6 +5,16 @@ use ring::{
 };
 use serde_json::{Map, Value};
 use std::fmt::Write;
+use std::path::PathBuf;
+
+/// Resolves paths for volatile / ephemeral operations (always local, fast disk).
+pub fn get_temp_path(subpath: &str) -> PathBuf {
+    let base = std::env::var("APEXKIT_TMP_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("apexkit_tmp"));
+    let clean_sub = subpath.trim_start_matches('/').trim_start_matches("./");
+    base.join(clean_sub)
+}
 
 /// Converts a byte slice to a lowercase hex string
 pub fn to_hex(bytes: &[u8]) -> String {
