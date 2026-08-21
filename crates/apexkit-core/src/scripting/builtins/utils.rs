@@ -51,17 +51,13 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     let b64_enc_fn = Function::new(
         ctx.clone(),
         move |val: Value<'js>| -> rquickjs::Result<String> {
-            eprintln!("[UTIL TRACE $util.base64Encode] Called with type: is_string={}, is_obj={}", val.is_string(), val.is_object());
-
             if let Ok(ta) = rquickjs::TypedArray::<u8>::from_value(val.clone()) {
                 if let Some(bytes) = ta.as_bytes() {
-                    eprintln!("[UTIL TRACE $util.base64Encode] Matched TypedArray (len: {} bytes)", bytes.len());
                     return Ok(STANDARD.encode(bytes));
                 }
             }
             if let Some(ab) = rquickjs::ArrayBuffer::from_value(val.clone()) {
                 if let Some(bytes) = ab.as_bytes() {
-                    eprintln!("[UTIL TRACE $util.base64Encode] Matched ArrayBuffer (len: {} bytes)", bytes.len());
                     return Ok(STANDARD.encode(bytes));
                 }
             }
@@ -72,7 +68,6 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
                         .get::<_, usize>("byteLength")
                         .unwrap_or_else(|_| ab.as_bytes().map(|b| b.len()).unwrap_or(0));
                     if let Some(bytes) = ab.as_bytes() {
-                        eprintln!("[UTIL TRACE $util.base64Encode] Matched Object with .buffer (offset: {}, len: {}, buf_len: {})", offset, length, bytes.len());
                         if offset + length <= bytes.len() {
                             return Ok(STANDARD.encode(&bytes[offset..offset + length]));
                         }
@@ -81,11 +76,9 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
             }
             if let Some(s) = val.as_string() {
                 let s_str = s.to_string().unwrap_or_default();
-                eprintln!("[UTIL TRACE $util.base64Encode] Matched String (len: {})", s_str.len());
                 return Ok(STANDARD.encode(s_str.as_bytes()));
             }
 
-            eprintln!("[UTIL TRACE $util.base64Encode ERROR] Could not extract bytes from value!");
             Ok(String::new())
         },
     )
@@ -139,10 +132,6 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     let b64_dec_buf_fn = Function::new(
         ctx.clone(),
         move |js_ctx: Ctx<'js>, text: String| -> rquickjs::Result<rquickjs::ArrayBuffer<'js>> {
-            eprintln!(
-                "[UTIL TRACE $util.base64DecodeBuffer] Decoding base64 text (len: {} chars)",
-                text.len()
-            );
             let clean = text
                 .trim()
                 .trim_start_matches("data:image/jpeg;base64,")
@@ -150,18 +139,10 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
                 .trim_start_matches("data:image/webp;base64,")
                 .trim_start_matches("data:application/octet-stream;base64,");
 
-            let decoded = STANDARD.decode(clean).map_err(|e| {
-                eprintln!(
-                    "[UTIL TRACE $util.base64DecodeBuffer ERROR] Decode failed: {}",
-                    e
-                );
-                rquickjs::Error::Exception
-            })?;
+            let decoded = STANDARD
+                .decode(clean)
+                .map_err(|_e| rquickjs::Error::Exception)?;
 
-            eprintln!(
-                "[UTIL TRACE $util.base64DecodeBuffer] Decoded {} raw bytes into ArrayBuffer",
-                decoded.len()
-            );
             rquickjs::ArrayBuffer::new(js_ctx, decoded).map_err(|_| rquickjs::Error::Exception)
         },
     )

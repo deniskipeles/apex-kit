@@ -111,22 +111,10 @@ pub fn register_file_tools<'js>(
         Async(move |js_ctx: Ctx<'js>, filename: String| {
             let app = app_read.clone();
             async move {
-                eprintln!("[FS TRACE $files.read] Reading: '{}'", filename);
                 let storage = app.get_storage();
                 match storage.get(&filename).await {
-                    Ok(bytes) => {
-                        eprintln!(
-                            "[FS TRACE $files.read] Loaded {} bytes from storage for '{}'",
-                            bytes.len(),
-                            filename
-                        );
-                        Ok::<String, rquickjs::Error>(BASE64.encode(bytes))
-                    }
+                    Ok(bytes) => Ok::<String, rquickjs::Error>(BASE64.encode(bytes)),
                     Err(e) => {
-                        eprintln!(
-                            "[FS TRACE $files.read ERROR] Failed for '{}': {}",
-                            filename, e
-                        );
                         let js_err = Exception::from_message(
                             js_ctx.clone(),
                             &format!("File '{}' not found: {}", filename, e),
@@ -151,15 +139,9 @@ pub fn register_file_tools<'js>(
                   mime: Option<String>| {
                 let app = app_save.clone();
                 async move {
-                    eprintln!(
-                        "[FS TRACE $files.save] Filename: '{}', mime: {:?}",
-                        filename, mime
-                    );
-
                     let db = match resolve_db(None, app.clone()).await {
                         Ok(d) => d,
                         Err(e) => {
-                            eprintln!("[FS TRACE $files.save ERROR] DB resolve failed: {}", e);
                             let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
                             return Err(js_ctx.throw(js_err.into()));
                         }
@@ -171,17 +153,9 @@ pub fn register_file_tools<'js>(
                         rquickjs::TypedArray::<u8>::from_value(data_val.clone())
                     {
                         let b = ta.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
-                        eprintln!(
-                            "[FS TRACE $files.save] Extracted from TypedArray: {} bytes",
-                            b.len()
-                        );
                         b
                     } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(data_val.clone()) {
                         let b = ab.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
-                        eprintln!(
-                            "[FS TRACE $files.save] Extracted from ArrayBuffer: {} bytes",
-                            b.len()
-                        );
                         b
                     } else if let Some(s) = data_val.as_string() {
                         let clean = s.to_string().unwrap_or_default();
@@ -191,22 +165,13 @@ pub fn register_file_tools<'js>(
                             .trim_start_matches("data:image/png;base64,")
                             .trim_start_matches("data:image/webp;base64,")
                             .trim_start_matches("data:application/octet-stream;base64,");
-                        eprintln!(
-                            "[FS TRACE $files.save] Decoding base64 string (len: {} chars)",
-                            b64.len()
-                        );
+
                         BASE64.decode(b64).unwrap_or_default()
                     } else {
                         vec![]
                     };
 
-                    eprintln!(
-                        "[FS TRACE $files.save] Total extracted bytes to write: {}",
-                        bytes.len()
-                    );
-
                     if bytes.is_empty() {
-                        eprintln!("[FS TRACE $files.save ERROR] bytes is empty!");
                         let js_err = Exception::from_message(
                             js_ctx.clone(),
                             "Cannot save empty or invalid file data",
@@ -221,7 +186,6 @@ pub fn register_file_tools<'js>(
                     let storage_filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
 
                     if let Err(e) = storage.save(&storage_filename, &bytes, &mime_type).await {
-                        eprintln!("[FS TRACE $files.save ERROR] storage.save failed: {}", e);
                         let js_err = Exception::from_message(
                             js_ctx.clone(),
                             &format!("Storage save failed: {}", e),
@@ -236,10 +200,6 @@ pub fn register_file_tools<'js>(
                     {
                         Ok(i) => i,
                         Err(e) => {
-                            eprintln!(
-                                "[FS TRACE $files.save ERROR] create_file_metadata failed: {}",
-                                e
-                            );
                             let js_err = Exception::from_message(
                                 js_ctx.clone(),
                                 &format!("Metadata creation failed: {}", e),
@@ -250,7 +210,6 @@ pub fn register_file_tools<'js>(
                     };
 
                     let url = format!("{}{}", storage.get_public_url_base(), storage_filename);
-                    eprintln!("[FS TRACE $files.save SUCCESS] ID: {}, URL: {}", id, url);
 
                     let res = json!({ "id": id, "url": url, "filename": storage_filename });
                     to_value(js_ctx.clone(), &res).map_err(|e| {

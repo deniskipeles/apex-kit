@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use wasmtime::*;
 use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::pipe::MemoryOutputPipe;
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use super::super::context::ScriptContext;
@@ -350,6 +351,7 @@ fn instantiate_wasm_module<'js>(
                         }
                     };
 
+                    // 1. Sync JS Memory -> Wasmtime before execution
                     if let Some(memory) = inst_ref.get_memory(&mut *store_guard, "memory") {
                         if let Ok(registry) =
                             ctx_call.globals().get::<_, Object>("__wasm_instances")
@@ -408,6 +410,7 @@ fn instantiate_wasm_module<'js>(
                         return Err(ctx_call.throw(js_err.into()));
                     }
 
+                    // 2. Sync Wasmtime -> JS Memory
                     if let Some(memory) = inst_ref.get_memory(&mut *store_guard, "memory") {
                         let data_slice = memory.data(&*store_guard);
                         let slice_len = data_slice.len();
@@ -811,6 +814,10 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         let module =
                             get_or_compile_module(&engine, &bytes, readable_name.as_deref())?;
 
+                        // Create custom stdout/stderr pipes to capture WASM logs in memory
+                        let stdout = MemoryOutputPipe::new(10 * 1024 * 1024);
+                        let stderr = MemoryOutputPipe::new(10 * 1024 * 1024);
+
                         let mut shared_memory_export = None;
                         let temp_store = Store::new(&engine, ());
                         for import in module.imports() {
@@ -830,6 +837,8 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         let scope_temp_dir_spawn = scope_temp_dir.clone();
                         let next_tid = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(1));
                         let memory_limit_mb_spawn = memory_limit_mb;
+                        let stdout_spawn = stdout.clone();
+                        let stderr_spawn = stderr.clone();
 
                         let create_spawn_closure = || {
                             let engine_spawn = engine_spawn.clone();
@@ -837,6 +846,8 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                             let shared_memory_spawn = shared_memory_spawn.clone();
                             let scope_temp_dir_spawn = scope_temp_dir_spawn.clone();
                             let next_tid = next_tid.clone();
+                            let stdout_spawn = stdout_spawn.clone();
+                            let stderr_spawn = stderr_spawn.clone();
 
                             move |_caller: Caller<'_, WasmStoreState>, start_arg: i32| -> i32 {
                                 let tid = next_tid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -844,11 +855,14 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                                 let module = module_spawn.clone();
                                 let shared_memory = shared_memory_spawn.clone();
                                 let scope_temp_dir = scope_temp_dir_spawn.clone();
+                                let stdout_pipe = stdout_spawn.clone();
+                                let stderr_pipe = stderr_spawn.clone();
 
                                 std::thread::spawn(move || {
                                     let mut builder = WasiCtxBuilder::new();
-                                    builder.inherit_stdout();
-                                    builder.inherit_stderr();
+                                    builder.stdout(stdout_pipe);
+                                    builder.stderr(stderr_pipe);
+                                    builder.inherit_env();
                                     let _ = builder.preopened_dir(
                                         &scope_temp_dir,
                                         ".",
@@ -897,8 +911,8 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         };
 
                         let mut builder = WasiCtxBuilder::new();
-                        builder.inherit_stdout();
-                        builder.inherit_stderr();
+                        builder.stdout(stdout.clone());
+                        builder.stderr(stderr.clone());
                         builder.inherit_env();
 
                         builder
@@ -1002,37 +1016,47 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         let call_args = vec![Val::I32(0); param_count];
                         let mut call_results = vec![Val::I32(0); result_count];
 
-                        match func.call(&mut store, &call_args, &mut call_results) {
+                        let success_result = match func.call(&mut store, &call_args, &mut call_results) {
                             Ok(()) => {
                                 if let Some(Val::I32(code)) = call_results.first() {
                                     if *code != 0 {
-                                        return Err(format!("Process main() returned exit code: {}", code));
+                                        Err(format!("Process main() returned exit code: {}", code))
+                                    } else {
+                                        Ok(true)
                                     }
+                                } else {
+                                    Ok(true)
                                 }
-                                Ok::<bool, String>(true)
                             }
                             Err(e) => {
                                 let err_str = e.to_string();
                                 if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
                                     if exit.0 == 0 {
-                                        return Ok::<bool, String>(true);
+                                        Ok(true)
                                     } else {
-                                        return Err(format!("Process exited with code: {}", exit.0));
+                                        Err(format!("Process exited with code: {}", exit.0))
                                     }
-                                }
-                                if err_str.contains("exit code 0")
+                                } else if err_str.contains("exit code 0")
                                     || err_str.contains("I32Exit(0)")
                                     || err_str.contains("status 0")
                                 {
-                                    return Ok::<bool, String>(true);
+                                    Ok(true)
+                                } else {
+                                    Err(format!("WASI Execution Error: {}", e))
                                 }
-                                Err(format!("WASI Execution Error: {}", e))
                             }
-                        }
+                        };
+
+                        let stdout_bytes = stdout.contents().to_vec();
+                        let stderr_bytes = stderr.contents().to_vec();
+                        let stdout_str = String::from_utf8_lossy(&stdout_bytes).to_string();
+                        let stderr_str = String::from_utf8_lossy(&stderr_bytes).to_string();
+
+                        success_result.map(|s| (s, stdout_str, stderr_str))
                     });
 
-                    let res = match timeout(Duration::from_millis(timeout_ms), task).await {
-                        Ok(Ok(Ok(val))) => val,
+                    let (is_success, out_str, err_str) = match timeout(Duration::from_millis(timeout_ms), task).await {
+                        Ok(Ok(Ok(res))) => res,
                         Ok(Ok(Err(e))) => {
                             let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
                             return Err(js_ctx.throw(js_err.into()));
@@ -1052,6 +1076,36 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                             return Err(js_ctx.throw(js_err.into()));
                         }
                     };
+
+                    // Retrieve DB and log output
+                    if let Ok(db) = super::db::resolve_db(None, app.clone()).await {
+                        if !out_str.is_empty() {
+                            let clean_out = out_str.replace("\r", "\n").replace("\n\n", "\n");
+                            let trunc = if clean_out.len() > 10000 { format!("{}... [TRUNC]", &clean_out[..10000]) } else { clean_out };
+                            let _ = db.log_system_event("info", "WASI stdout", &trunc).await;
+                        }
+                        if !err_str.is_empty() {
+                            // Strip carriage returns out to clean up progress bar spam in logs
+                            let mut clean_lines = Vec::new();
+                            for line in err_str.split('\n') {
+                                if let Some(last_carriage) = line.split('\r').last() {
+                                    if !last_carriage.trim().is_empty() {
+                                        clean_lines.push(last_carriage.trim().to_string());
+                                    }
+                                }
+                            }
+                            let clean_err = clean_lines.join("\n");
+                            let trunc = if clean_err.len() > 10000 { format!("{}... [TRUNC]", &clean_err[..10000]) } else { clean_err };
+                            let lvl = if is_success { "info" } else { "error" };
+                            let _ = db.log_system_event(lvl, "WASI stderr", &trunc).await;
+                        }
+                    }
+
+                    let res = json!({
+                        "success": is_success,
+                        "stdout": out_str,
+                        "stderr": err_str
+                    });
 
                     to_value(js_ctx.clone(), &res).map_err(|_| {
                         let js_err =
