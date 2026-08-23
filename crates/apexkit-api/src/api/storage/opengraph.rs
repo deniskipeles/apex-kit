@@ -13,6 +13,134 @@ use tera::Tera;
 use tiny_skia::{Pixmap, Transform};
 use usvg::{Options, Tree};
 
+const DEFAULT_OG_TEMPLATE: &str = r##"
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="1200" y2="630" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A" />
+      <stop offset="0.5" stop-color="#1E293B" />
+      <stop offset="1" stop-color="#090D16" />
+    </linearGradient>
+
+    <radialGradient id="glow-neon" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse"
+      gradientTransform="translate(200 200) scale(500)">
+      <stop stop-color="#CCFF00" stop-opacity="0.15" />
+      <stop offset="1" stop-color="#CCFF00" stop-opacity="0" />
+    </radialGradient>
+
+    <radialGradient id="glow-purple" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse"
+      gradientTransform="translate(1000 500) scale(600)">
+      <stop stop-color="#8B5CF6" stop-opacity="0.12" />
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0" />
+    </radialGradient>
+
+    <filter id="3d-shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="-8" dy="24" stdDeviation="28" flood-color="#000000" flood-opacity="0.5" />
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.3" />
+    </filter>
+
+    <clipPath id="card-clip">
+      <rect width="388" height="388" rx="26" />
+    </clipPath>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg-grad)" />
+  <rect width="1200" height="630" fill="url(#glow-neon)" />
+  <rect width="1200" height="630" fill="url(#glow-purple)" />
+
+  <g transform="translate(100, 115) rotate(-6, 200, 200)" filter="url(#3d-shadow)">
+    <rect x="0" y="0" width="400" height="400" rx="32" fill="#1E293B" stroke="#334155" stroke-width="1.5" />
+    <g transform="translate(6, 6)">
+      <image href="{{ IMAGE_URL }}" x="0" y="0" width="388" height="388" preserveAspectRatio="xMidYMid slice"
+        clip-path="url(#card-clip)" />
+    </g>
+    <rect x="6" y="6" width="388" height="388" rx="26" fill="none" stroke="#FFFFFF" stroke-opacity="0.2"
+      stroke-width="2" />
+  </g>
+
+  <!-- Brand Badge -->
+  <g transform="translate(560, 115)">
+    <rect x="0" y="0" width="220" height="38" rx="19" fill="#CCFF00" />
+    <circle cx="20" cy="19" r="5" fill="#0F172A" />
+    <text x="36" y="24" font-family="sans-serif" font-size="14" font-weight="bold" fill="#0F172A" letter-spacing="0.5">
+      {{ SITE_NAME | default(value="apexkit.pages.dev") | upper }}
+    </text>
+  </g>
+
+  <!-- DYNAMIC TERA TITLE (Max 2 Lines, Smart Word Wrap) -->
+  <text x="560" y="210" font-family="sans-serif" font-size="44" font-weight="bold" fill="#FFFFFF" letter-spacing="-1">
+    {% set t_words = TITLE | default(value="What if a single node was all you ever needed?") | split(pat=" ") %}
+    {% set_global t_line = "" %}
+    {% set_global t_count = 0 %}
+
+    {% for w in t_words %}
+    {% if t_count < 2 %} {% if t_line | length > 0 %}{% set test = t_line ~ " " ~ w %}{% else %}{% set test = w %}{%
+      endif %}
+      {% if test | length > 22 %}
+      {% if t_count == 1 %}
+      <tspan x="560" dy="50">{{ t_line }}...</tspan>
+      {% set_global t_count = 2 %}
+      {% else %}
+      <tspan x="560" dy="{% if t_count == 0 %}0{% else %}50{% endif %}">{{ t_line }}</tspan>
+      {% set_global t_line = w %}
+      {% set_global t_count = t_count + 1 %}
+      {% endif %}
+      {% else %}
+      {% set_global t_line = test %}
+      {% endif %}
+      {% endif %}
+      {% endfor %}
+      {% if t_count < 2 and t_line | length > 0 %}
+        <tspan x="560" dy="{% if t_count == 0 %}0{% else %}50{% endif %}">{{ t_line }}</tspan>
+        {% endif %}
+  </text>
+
+  <!-- DYNAMIC TERA SUBTITLE (Max 3 Lines, Smart Word Wrap) -->
+  <text x="560" y="340" font-family="sans-serif" font-size="20" font-weight="500" fill="#94A3B8">
+    {% set s_words = SUBTITLE | default(value="ApexKit was born from the obsession to maximize modern hardware. By using Rust's safety and SQLite's simplicity, we've built a kit that allows you to build excellent applications with extreme efficiency.") | split(pat=" ") %}
+    {% set_global s_line = "" %}
+    {% set_global s_count = 0 %}
+
+    {% for w in s_words %}
+    {% if s_count < 3 %} {% if s_line | length > 0 %}{% set test = s_line ~ " " ~ w %}{% else %}{% set test = w %}{%
+      endif %}
+      {% if test | length > 45 %}
+      {% if s_count == 2 %}
+      <tspan x="560" dy="28">{{ s_line }}...</tspan>
+      {% set_global s_count = 3 %}
+      {% else %}
+      <tspan x="560" dy="{% if s_count == 0 %}0{% else %}28{% endif %}">{{ s_line }}</tspan>
+      {% set_global s_line = w %}
+      {% set_global s_count = s_count + 1 %}
+      {% endif %}
+      {% else %}
+      {% set_global s_line = test %}
+      {% endif %}
+      {% endif %}
+      {% endfor %}
+      {% if s_count < 3 and s_line | length > 0 %}
+        <tspan x="560" dy="{% if s_count == 0 %}0{% else %}28{% endif %}">{{ s_line }}</tspan>
+        {% endif %}
+  </text>
+
+  <!-- Photographer / Source Credit Footer -->
+  <g transform="translate(560, 475)">
+    <rect x="0" y="0" width="420" height="54" rx="16" fill="#1E293B" stroke="#334155" stroke-width="1" />
+    <text x="20" y="22" font-family="sans-serif" font-size="11" font-weight="bold" fill="#64748B"
+      letter-spacing="0.5">POWERED BY</text>
+    <text x="20" y="41" font-family="sans-serif" font-size="15" font-weight="bold" fill="#F8FAFC">
+      {{ PHOTOGRAPHER | default(value="ApexKit Platform") | truncate(length=24) }}
+    </text>
+
+    <!-- Platform Badge -->
+    <rect x="295" y="12" width="105" height="30" rx="15" fill="#334155" />
+    <text x="347" y="31" font-family="sans-serif" font-size="12" font-weight="bold" fill="#CCFF00" text-anchor="middle">
+      {{ PLATFORM | default(value="APEXKIT") | upper }}
+    </text>
+  </g>
+</svg>
+"##;
+
 pub async fn get_scope_logo_base64(db: &Arc<dyn Db>, storage: &Arc<dyn StorageBackend>) -> String {
     let mut logo_data: Option<(Vec<u8>, String)> = None;
 
@@ -64,11 +192,17 @@ pub async fn generate_opengraph(
     headers: HeaderMap,
     Query(params): Query<OpenGraphQuery>,
 ) -> Result<Response, AppError> {
-    if params.data.len() > 100_000 {
+    let data_str = if params.data.trim().is_empty() {
+        "[]".to_string()
+    } else {
+        params.data.clone()
+    };
+
+    if data_str.len() > 100_000 {
         return Err(AppError::Forbidden("Payload too large".into()));
     }
 
-    let items: Vec<OgItem> = serde_json::from_str(&params.data)
+    let items: Vec<OgItem> = serde_json::from_str(&data_str)
         .map_err(|e| AppError::JsonError(format!("Invalid data JSON array: {}", e)))?;
 
     if items.len() > 8 {
@@ -79,7 +213,7 @@ pub async fn generate_opengraph(
 
     let format_str = params.format.as_deref().unwrap_or("png");
     let quality = params.quality.unwrap_or(80);
-    let data_hash = md5::compute(params.data.as_bytes());
+    let data_hash = md5::compute(data_str.as_bytes());
     let cache_key = format!(
         "og_{}_{}_{}_{:x}",
         params.template, format_str, quality, data_hash
@@ -100,7 +234,9 @@ pub async fn generate_opengraph(
             .unwrap());
     }
 
-    let raw_svg = if let Ok(Some(tmpl)) = db.get_template_by_slug(&params.template).await {
+    let raw_svg = if params.template == "default" {
+        DEFAULT_OG_TEMPLATE.to_string()
+    } else if let Ok(Some(tmpl)) = db.get_template_by_slug(&params.template).await {
         tmpl.content
     } else if let Ok(decoded) = STANDARD.decode(&params.template) {
         String::from_utf8_lossy(&decoded).to_string()
@@ -111,7 +247,10 @@ pub async fn generate_opengraph(
     };
 
     let mut context = tera::Context::new();
-    let mut fallback_logo_cache: Option<String> = None;
+    
+    let default_logo_b64 = get_scope_logo_base64(&db, &storage).await;
+    context.insert("IMAGE_URL", &default_logo_b64);
+    let fallback_logo_cache = default_logo_b64;
 
     for item in items {
         if item.r#type == "image" {
@@ -129,10 +268,10 @@ pub async fn generate_opengraph(
                         if let Ok(bytes) = res.bytes().await {
                             format!("data:{};base64,{}", mime, STANDARD.encode(&bytes))
                         } else {
-                            fallback_logo_cache.clone().unwrap_or_default()
+                            fallback_logo_cache.clone()
                         }
                     }
-                    _ => fallback_logo_cache.clone().unwrap_or_default(),
+                    _ => fallback_logo_cache.clone(),
                 }
             } else {
                 let (clean_filename, query_str) = if let Some((f, q)) = item.value.split_once('?') {
@@ -187,10 +326,7 @@ pub async fn generate_opengraph(
                             "OpenGraph: Local image '{}' not found. Falling back to App Logo.",
                             clean_filename
                         );
-                        if fallback_logo_cache.is_none() {
-                            fallback_logo_cache = Some(get_scope_logo_base64(&db, &storage).await);
-                        }
-                        fallback_logo_cache.clone().unwrap_or_default()
+                        fallback_logo_cache.clone()
                     }
                 }
             };
