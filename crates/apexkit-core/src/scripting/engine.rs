@@ -555,7 +555,7 @@ impl ScriptEngine {
         code: &str,
         input_data: JsonValue,
         context: Arc<dyn ScriptContext>,
-        _base_url: Option<String>,
+        base_url: Option<String>,
         headers: Option<HashMap<String, String>>,
         method: Option<String>,
         url: Option<String>,
@@ -587,6 +587,21 @@ impl ScriptEngine {
         self.vfs.set_file(&scope_str, &module_name, &js_code);
         let module_name_vfs = module_name.clone();
         let scope_str_vfs = scope_str.clone();
+
+        let resolved_base_url = if let Some(u) = base_url {
+            u
+        } else {
+            let db = context.get_db();
+            let mut configured = None;
+            if let Ok(Some(val)) = db.get_config("general").await {
+                if let Some(app_url) = val.get("app_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    configured = Some(app_url.to_string());
+                }
+            }
+            configured
+                .or_else(|| std::env::var("APP_URL").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| format!("http://127.0.0.1:{}", context.get_port()))
+        };
 
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
@@ -629,7 +644,7 @@ impl ScriptEngine {
 
             #[allow(deprecated)]
             let res = rquickjs::async_with!(ctx => |js_ctx| {
-                setup_quickjs(&js_ctx, context.clone())?;
+                setup_quickjs(&js_ctx, context.clone(), resolved_base_url.clone())?;
 
                 let import_code = format!("import('{}')", module_name);
                 let promise: Promise = js_ctx.eval(import_code)
@@ -712,7 +727,6 @@ impl ScriptEngine {
                             }
                         } else if let Some(js_str) = body_val.as_string() {
                             let rust_str = js_str.to_string().unwrap_or_default();
-                            // Parse JSON string responses so result["body"]["key"] works in Rust tests
                             let val_json = serde_json::from_str::<serde_json::Value>(&rust_str)
                                 .unwrap_or(serde_json::Value::String(rust_str));
                             (val_json, false, None)
@@ -759,7 +773,7 @@ impl ScriptEngine {
         code: &str,
         event_data: JsonValue,
         context: Arc<dyn ScriptContext>,
-        _base_url: Option<String>,
+        base_url: Option<String>,
         _scope: Option<EventScope>,
     ) -> Result<Option<JsonValue>, String> {
         let _permit = get_execution_semaphore()
@@ -790,6 +804,21 @@ impl ScriptEngine {
         let module_name_vfs = module_name.clone();
         let scope_str_vfs = scope_str.clone();
 
+        let resolved_base_url = if let Some(u) = base_url {
+            u
+        } else {
+            let db = context.get_db();
+            let mut configured = None;
+            if let Ok(Some(val)) = db.get_config("general").await {
+                if let Some(app_url) = val.get("app_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    configured = Some(app_url.to_string());
+                }
+            }
+            configured
+                .or_else(|| std::env::var("APP_URL").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| format!("http://127.0.0.1:{}", context.get_port()))
+        };
+
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -819,7 +848,7 @@ impl ScriptEngine {
 
             #[allow(deprecated)]
             let res = rquickjs::async_with!(ctx => |js_ctx| {
-                setup_quickjs(&js_ctx, context.clone())?;
+                setup_quickjs(&js_ctx, context.clone(), resolved_base_url.clone())?;
 
                 let import_code = format!("import('{}')", module_name);
                 let promise: Promise = js_ctx.eval(import_code)
@@ -884,6 +913,7 @@ impl ScriptEngine {
 fn setup_quickjs<'js>(
     ctx: &rquickjs::Ctx<'js>,
     app_ctx: Arc<dyn ScriptContext>,
+    base_url: String,
 ) -> Result<(), String> {
     ctx.eval::<(), _>(JS_PRELUDE)
         .catch(ctx)
@@ -901,7 +931,7 @@ fn setup_quickjs<'js>(
     register_queue(ctx, app_ctx.clone())?;
     register_run(ctx, app_ctx.clone())?;
     register_root(ctx, app_ctx.clone())?;
-    register_env(ctx, app_ctx.clone())?;
+    register_env(ctx, app_ctx.clone(), base_url)?;
     register_ai(ctx, app_ctx.clone())?;
     register_mail(ctx, app_ctx.clone())?;
     register_realtime(ctx, app_ctx.clone())?;
