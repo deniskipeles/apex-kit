@@ -19,22 +19,50 @@ if (fs.existsSync(".env")) {
   });
 }
 
-// --- 2. CONFIG & CLI FLAGS ---
+// --- 2. CONFIG & CLI COMMAND PARSER ---
 const API_KEY = process.env.APEXKIT_API_KEY || "root_sys_prod_12345678_abcd";
 const SCOPE_KEY = process.env.SCOPE_KEY || "root";
 const BASE_URL = process.env.APEXKIT_URL || `http://localhost:${process.env.PORT || 5000}`;
 const WS_URL = `${BASE_URL.replace(/^http/, "ws")}/dev/sync?api_key=${API_KEY}&scope_key=${SCOPE_KEY}`;
 
-const ARGS = process.argv.slice(2);
-const IS_INIT = ARGS.includes("--init");
-const IS_INIT_FILE = ARGS.includes("--init-file");
-const IS_PULL = ARGS.includes("--pull");
-const IS_COMMIT = ARGS.includes("--commit");
-const NO_AUTO_COMMIT = ARGS.includes("--no-auto-commit");
+const RAW_ARGS = process.argv.slice(2);
+const SUBCOMMAND = RAW_ARGS.find((a) => !a.startsWith("-"))?.toLowerCase() || "";
 
-// --- 3. ALL TRIGGER TYPES DEFINITIONS ---
+const IS_INIT = RAW_ARGS.includes("--init") || SUBCOMMAND === "init";
+const IS_INIT_FILE =
+  RAW_ARGS.includes("--init-file") ||
+  SUBCOMMAND === "create" ||
+  SUBCOMMAND === "new" ||
+  SUBCOMMAND === "init:file" ||
+  SUBCOMMAND === "init-file";
+const IS_PULL = RAW_ARGS.includes("--pull") || SUBCOMMAND === "pull";
+const IS_COMMIT = RAW_ARGS.includes("--commit") || SUBCOMMAND === "commit";
+const IS_PUSH = RAW_ARGS.includes("--push") || SUBCOMMAND === "push";
+const IS_STATUS = RAW_ARGS.includes("--status") || SUBCOMMAND === "status" || SUBCOMMAND === "info";
+const NO_AUTO_COMMIT = RAW_ARGS.includes("--no-auto-commit");
+
+// Helper to construct scope-aware API URLs
+function getScopedApiBase() {
+  let scopePath = "";
+  if (SCOPE_KEY.startsWith("tenant:")) {
+    scopePath = `/tenant/${SCOPE_KEY.replace("tenant:", "")}`;
+  } else if (SCOPE_KEY.startsWith("sandbox:")) {
+    scopePath = `/sandbox/${SCOPE_KEY.replace("sandbox:", "")}`;
+  }
+  return `${BASE_URL.replace(/\/$/, "")}${scopePath}/api/v1`;
+}
+
+function getAuthHeaders() {
+  return {
+    "x-api-key": API_KEY,
+    Authorization: `Bearer ${API_KEY}`,
+    "Content-Type": "application/json",
+  };
+}
+
+// --- 3. TRIGGER TYPES DEFINITIONS ---
 const TRIGGER_DEFINITIONS = [
-  { id: "manual", name: "manual (Public/Protected HTTP Webhook Endpoint)", desc: "Triggered via HTTP GET/POST/PUT/DELETE on /api/v1/run/:name" },
+  { id: "manual", name: "manual (Public/Protected HTTP Webhook Endpoint)", desc: "Triggered via HTTP GET/POST/PUT/DELETE on /api/v1/run/:name or /api/v1/webhook/:name" },
   { id: "before_create_record", name: "before_create_record", desc: "Runs before a record is inserted. Can validate or mutate data." },
   { id: "after_create_record", name: "after_create_record", desc: "Runs after a record is inserted. Used for notifications/indexes." },
   { id: "before_update_record", name: "before_update_record", desc: "Runs before an existing record is updated. Can validate changes." },
@@ -79,26 +107,13 @@ const TRIGGER_DEFINITIONS = [
   { id: "graphql", name: "graphql (Custom Resolver)", desc: "Dynamic Query/Mutation field resolver for GraphQL schema." }
 ];
 
-// --- 4. WORKSPACE TYPES GENERATOR ---
+// --- 4. WORKSPACE TYPES & CONFIG GENERATOR ---
 async function generateWorkspaceFiles() {
   console.log("  ⏳ Fetching collection schemas from DB...");
   let collectionsData = [];
   try {
-    let scopePath = "";
-    if (SCOPE_KEY.startsWith("tenant:")) {
-      scopePath = `/tenant/${SCOPE_KEY.replace("tenant:", "")}`;
-    } else if (SCOPE_KEY.startsWith("sandbox:")) {
-      scopePath = `/sandbox/${SCOPE_KEY.replace("sandbox:", "")}`;
-    }
-
-    const fetchUrl = `${BASE_URL.replace(/\/$/, "")}${scopePath}/api/v1/collections`;
-    
-    const res = await fetch(fetchUrl, {
-      headers: { 
-        "x-api-key": API_KEY,
-        "Authorization": `Bearer ${API_KEY}`
-      }
-    });
+    const fetchUrl = `${getScopedApiBase()}/collections`;
+    const res = await fetch(fetchUrl, { headers: getAuthHeaders() });
     if (res.ok) {
       collectionsData = await res.json();
     } else {
@@ -117,31 +132,46 @@ async function generateWorkspaceFiles() {
     collectionNames.push(`"${col.name}"`);
     let fieldsStr = "";
     let expandsStr = "";
-    
+
     if (col.schema) {
-      // 1. Standard Fields
+      // Standard Fields
       if (col.schema.fields) {
         for (const [name, def] of Object.entries(col.schema.fields)) {
           let tsType = "any";
           switch (def.type) {
-            case "string": case "text": case "email": case "url": case "date": case "blob": case "file":
-              tsType = "string"; break;
+            case "string":
+            case "text":
+            case "email":
+            case "url":
+            case "date":
+            case "blob":
+            case "file":
+              tsType = "string";
+              break;
             case "number":
-              tsType = "number"; break;
-            case "owner": case "relation":
-              tsType = "number | string"; break; // Future compatibility for UUIDs
+              tsType = "number";
+              break;
+            case "owner":
+            case "relation":
+              tsType = "number | string";
+              break;
             case "boolean":
-              tsType = "boolean"; break;
+              tsType = "boolean";
+              break;
             case "vector":
-              tsType = "number[]"; break;
+              tsType = "number[]";
+              break;
             case "geopoint":
-              tsType = "{ lat: number; lng: number }"; break;
+              tsType = "{ lat: number; lng: number }";
+              break;
             case "json":
-              tsType = "Record<string, any> | any[]"; break;
+              tsType = "Record<string, any> | any[]";
+              break;
             case "select":
-              tsType = def.options && def.options.length > 0
-                ? def.options.map((o) => `"${o}"`).join(" | ")
-                : "string";
+              tsType =
+                def.options && def.options.length > 0
+                  ? def.options.map((o) => `"${o}"`).join(" | ")
+                  : "string";
               break;
           }
           const safeName = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name) ? name : `"${name}"`;
@@ -149,24 +179,21 @@ async function generateWorkspaceFiles() {
         }
       }
 
-      // 2. Relations (Mapped as IDs in Data, Objects in Expand)
+      // Relations
       if (col.schema.relations) {
         for (const [name, rel] of Object.entries(col.schema.relations)) {
           const isMany = rel.relation_type === "many";
-          
-          // Data Property (IDs)
           const tsType = isMany ? "(number | string)[]" : "number | string";
           const safeName = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name) ? name : `"${name}"`;
           fieldsStr += `    ${safeName}${rel.required ? "" : "?"}: ${tsType};\n`;
-          
-          // Expand Property (Nested Record Items)
+
           const targetCol = rel.target_collection;
           const expandType = `{ id: number | string; data: Collections["${targetCol}"]; created: string; updated: string; expand?: any }`;
           expandsStr += `    ${safeName}?: ${isMany ? `Array<${expandType}>` : expandType};\n`;
         }
       }
     }
-    
+
     collectionTypesStr += `  "${col.name}": {\n${fieldsStr}  };\n`;
     collectionExpandsStr += `  "${col.name}": {\n${expandsStr}    [reverse_relation: string]: any;\n  };\n`;
   });
@@ -175,11 +202,12 @@ async function generateWorkspaceFiles() {
     collectionTypesStr += `  [key: string]: Record<string, any>;\n`;
     collectionExpandsStr += `  [key: string]: any;\n`;
   }
-  collectionTypesStr += `}\n\nexport type CollectionName = ${collectionNames.length > 0 ? collectionNames.join(" | ") : "string"};\n`;
+  collectionTypesStr += `}\n\nexport type CollectionName = ${
+    collectionNames.length > 0 ? collectionNames.join(" | ") : "string"
+  };\n`;
   collectionExpandsStr += `}\n\n`;
 
-  // B. Generate Trigger Types
-  const triggerUnion = TRIGGER_DEFINITIONS.map(t => `  /** ${t.desc} */\n  | "${t.id}"`).join("\n");
+  const triggerUnion = TRIGGER_DEFINITIONS.map((t) => `  /** ${t.desc} */\n  | "${t.id}"`).join("\n");
 
   const types = `/**
  * ApexKit Global Types & IntelliSense
@@ -196,8 +224,9 @@ export type ScriptType = "webhook" | "custom:module" | "esm:module" | "template"
 export type ScriptVisibility = "private" | "public";
 
 export interface FileMetadata {
+  id?: number;
   name?: string;
-  extension?: "js" | "ts" | "html" | string;
+  extension?: "js" | "ts" | "html" | "json" | string;
   target_collection?: CollectionName | null;
   type?: ScriptType;
   path?: string;
@@ -213,12 +242,12 @@ export interface AuthContext {
   scope: string;
 }
 
-export interface RecordItem<T extends keyof Collections> {
+export interface RecordItem<T extends keyof Collections = any> {
   id: number | string;
-  data: Collections[T];
+  data: T extends keyof Collections ? Collections[T] : any;
   created: string;
   updated: string;
-  expand?: CollectionExpands[T];
+  expand?: T extends keyof CollectionExpands ? CollectionExpands[T] : any;
 }
 
 export interface RecordHookEvent<T extends keyof Collections = any> {
@@ -256,48 +285,55 @@ declare global {
   const $db: {
     records: {
       list<T extends keyof Collections>(
-        collection: T, 
-        options?: { 
-          page?: number; 
-          per_page?: number; 
-          limit?: number; 
-          offset?: number; 
-          sort?: string; 
-          filter?: string | Record<string, any>; 
-          expand?: string; 
-          fields?: string; 
+        collection: T,
+        options?: {
+          page?: number;
+          per_page?: number;
+          limit?: number;
+          offset?: number;
+          sort?: string;
+          filter?: string | Record<string, any>;
+          expand?: string;
+          fields?: string;
         }
       ): Promise<{ items: RecordItem<T>[]; total: number }>;
 
       get<T extends keyof Collections>(
-        collection: T, 
-        id: number | string, 
+        collection: T,
+        id: number | string,
         expand?: string
       ): Promise<RecordItem<T> | null>;
 
       create<T extends keyof Collections>(
-        collection: T, 
+        collection: T,
         data: Partial<Collections[T]>
       ): Promise<{ id: number | string }>;
 
       update<T extends keyof Collections>(
-        collection: T, 
-        id: number | string, 
+        collection: T,
+        id: number | string,
         data: Partial<Collections[T]>
       ): Promise<RecordItem<T>>;
 
       delete(collection: string, id: number | string): Promise<boolean>;
 
       searchVector<T extends keyof Collections>(
-        collection: T, 
-        field: string, 
-        vector: number[], 
+        collection: T,
+        field: string,
+        vector: number[],
         limit?: number
       ): Promise<(RecordItem<T> & { _score: number })[]>;
 
-      getVector(collection: string, id: number | string): Promise<{ field_name: string; vector: number[]; model: string }[]>;
+      getVector(
+        collection: string,
+        id: number | string
+      ): Promise<{ field_name: string; vector: number[]; model: string }[]>;
 
-      instantSearch(collection: string, query: string, limit?: number): Promise<{ id: number | string; score: number; snippet: any }[]>;
+      instantSearch(
+        collection: string,
+        query: string,
+        limit?: number
+      ): Promise<{ id: number | string; score: number; snippet: any }[]>;
     };
 
     query(queryObject: {
@@ -313,7 +349,12 @@ declare global {
     }): Promise<any[]>;
 
     users: {
-      create(email: string, passwordHash: string, role: string, metadata?: Record<string, any>): Promise<{ id: number | string; email: string; role: string }>;
+      create(
+        email: string,
+        passwordHash: string,
+        role: string,
+        metadata?: Record<string, any>
+      ): Promise<{ id: number | string; email: string; role: string }>;
       get(email: string): Promise<{ id: number | string; email: string; role: string; metadata?: any } | null>;
     };
 
@@ -322,7 +363,12 @@ declare global {
     };
 
     files: {
-      list(limit?: number, offset?: number): Promise<{ id: number | string; filename: string; original_name: string; mime_type: string; size: number; created_at: string }[]>;
+      list(
+        limit?: number,
+        offset?: number
+      ): Promise<
+        { id: number | string; filename: string; original_name: string; mime_type: string; size: number; created_at: string }[]
+      >;
     };
   };
 
@@ -354,14 +400,20 @@ declare global {
   const $files: {
     read(filename: string): Promise<string>;
     delete(filenameOrId: string | number): Promise<boolean>;
-    save(filename: string, data: string | ArrayBuffer | Uint8Array, mime?: string): Promise<{ id: number | string; url: string; filename: string }>;
+    save(
+      filename: string,
+      data: string | ArrayBuffer | Uint8Array,
+      mime?: string
+    ): Promise<{ id: number | string; url: string; filename: string }>;
     getSignedUrl(filename: string, ttl_secs?: number): Promise<string>;
   };
 
   /** Scoped Virtual File System */
   const $fs: {
     read(path: string): Promise<string>;
+    readBytes(path: string): Promise<string>;
     write(path: string, content: string): Promise<boolean>;
+    writeBytes(path: string, data: string | ArrayBuffer | Uint8Array): Promise<boolean>;
     delete(path: string): Promise<boolean>;
     list(path: string): Promise<{ name: string; isDir: boolean; size: number }[]>;
     exists(path: string): Promise<boolean>;
@@ -416,8 +468,21 @@ declare global {
 
   /** Subprocess Runner (Root scope only) */
   const $cmd: {
-    run(program: string, args?: string[], options?: { cwd?: string; env?: Record<string, string>; timeout?: number }): Promise<{ stdout: string; stderr: string; status: number }>;
-    spawn(program: string, args?: string[], options?: { cwd?: string; env?: Record<string, string>; timeout?: number; onProgress?: { regex?: string; channel?: string; event?: string } }): Promise<{ pid: number; status: string }>;
+    run(
+      program: string,
+      args?: string[],
+      options?: { cwd?: string; env?: Record<string, string>; timeout?: number }
+    ): Promise<{ stdout: string; stderr: string; status: number }>;
+    spawn(
+      program: string,
+      args?: string[],
+      options?: {
+        cwd?: string;
+        env?: Record<string, string>;
+        timeout?: number;
+        onProgress?: { regex?: string; channel?: string; event?: string };
+      }
+    ): Promise<{ pid: number; status: string }>;
     status(pid: number): Promise<any>;
     setLimit(program: string, limit: number): Promise<any>;
     kill(pid: number): Promise<any>;
@@ -470,11 +535,19 @@ declare global {
   /** Environment & Configuration Secrets Accessor */
   const $env: {
     get(key: string): Promise<string>;
+    has(key: string): Promise<boolean>;
+    list(): Promise<Record<string, string>>;
+    readonly BASE_URL: string;
     readonly APP_URL: string;
+    readonly LOCAL_BASE_URL: string;
+    readonly LOCAL_APP_URL: string;
     readonly SMTP_BLOCKED: boolean;
   };
 
-  function fetch(input: string | Request | URL, init?: { method?: string; headers?: any; body?: any; redirect?: "follow" | "manual" | "error" }): Promise<Response>;
+  function fetch(
+    input: string | Request | URL,
+    init?: { method?: string; headers?: any; body?: any; redirect?: "follow" | "manual" | "error" }
+  ): Promise<Response>;
 
   class Headers {
     constructor(init?: Record<string, string> | [string, string][] | Headers);
@@ -486,7 +559,10 @@ declare global {
   }
 
   class Response {
-    constructor(body?: any, init?: { status?: number; statusText?: string; headers?: Record<string, string> | Headers });
+    constructor(
+      body?: any,
+      init?: { status?: number; statusText?: string; headers?: Record<string, string> | Headers }
+    );
     readonly status: number;
     readonly statusText: string;
     readonly ok: boolean;
@@ -498,7 +574,10 @@ declare global {
   }
 
   class Request {
-    constructor(input: string | { url: string; method?: string; headers?: any; bodyData?: any }, init?: { method?: string; headers?: any; body?: any });
+    constructor(
+      input: string | { url: string; method?: string; headers?: any; bodyData?: any },
+      init?: { method?: string; headers?: any; body?: any }
+    );
     readonly method: string;
     readonly url: string;
     readonly headers: Headers;
@@ -515,7 +594,7 @@ export {};
   fs.writeFileSync("apexkit.d.ts", types.trim());
   console.log("  📄 Generated apexkit.d.ts with full Engine & Collection Typings");
 
-  // C. Generate jsconfig.json
+  // B. Generate jsconfig.json
   const jsconfig = {
     compilerOptions: {
       target: "ES2022",
@@ -524,43 +603,52 @@ export {};
       baseUrl: ".",
       paths: {
         "@/custom/*": ["./modules/custom/*"],
-        "@/esm/*": ["./modules/esm/*"]
+        "@/esm/*": ["./modules/esm/*"],
       },
       allowJs: true,
-      checkJs: false
+      checkJs: true,
     },
-    include: ["**/*.js", "**/*.ts", "apexkit.d.ts"]
+    include: ["**/*.js", "**/*.ts", "apexkit.d.ts"],
   };
   fs.writeFileSync("jsconfig.json", JSON.stringify(jsconfig, null, 2));
   console.log("  📄 Generated jsconfig.json for VS Code module alias resolution");
 
-  // D. Generate package.json if missing
+  // C. Generate package.json if missing
   if (!fs.existsSync("package.json")) {
     const pkg = {
       name: "apexkit-workspace",
       type: "module",
       scope: SCOPE_KEY,
-      dependencies: {}
+      dependencies: {},
     };
     fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
     console.log("  📄 Generated package.json");
   }
 }
 
-// --- 5. INITIAL CODE GENERATORS BY TRIGGER TYPE ---
+// --- 5. INITIAL CODE GENERATORS ---
 function getBoilerplateCode(fileType, cleanName, ext, triggerType, targetCollection) {
   const metadata = {
     name: cleanName,
     extension: ext,
     target_collection: targetCollection,
     type: fileType,
-    path: fileType === "template" ? "./templates/" : (fileType.includes("module") ? "./modules/custom/" : "./webhooks/"),
+    path:
+      fileType === "template"
+        ? "./templates/"
+        : fileType.includes("module")
+        ? "./modules/custom/"
+        : "./webhooks/",
     trigger_type: triggerType,
     active: true,
-    visibility: "private"
+    visibility: "private",
   };
 
-  const header = `/** @type {import("../apexkit").FileMetadata} */\nexport const __fileMetadata__ = ${JSON.stringify(metadata, null, 2)};\n\n`;
+  const header = `/** @type {import("../apexkit").FileMetadata} */\nexport const __fileMetadata__ = ${JSON.stringify(
+    metadata,
+    null,
+    2
+  )};\n\n`;
 
   if (fileType === "custom:module") {
     return `${header}/**
@@ -583,11 +671,9 @@ __fileMetadata__ = ${JSON.stringify(metadata, null, 2)}
 -->
 <script type="server/js">
 export default async function (context) {
-  // 1. Fetch live records from database
-  const posts = await $db.records.list("${targetCollection || 'posts'}", { limit: 10 }).catch(() => ({ items: [] }));
-  
+  const posts = await $db.records.list("${targetCollection || "posts"}", { limit: 10 }).catch(() => ({ items: [] }));
   return {
-    title: "${cleanName.replace(/-/g, ' ').toUpperCase()}",
+    title: "${cleanName.replace(/-/g, " ").toUpperCase()}",
     items: posts.items
   };
 }
@@ -620,31 +706,24 @@ export default async function (context) {
 `;
   }
 
-  // --- TRIGGERS ---
   switch (triggerType) {
     case "manual":
-      return `${header}/**
- * HTTP Webhook: ${cleanName}
- * Endpoint: /api/v1/run/${cleanName} (or /api/v1/webhook/${cleanName})
- * 
- * @param {Request} req - The standard incoming WHATWG Request object
- * @returns {Promise<Response>}
- */
-export default async function (req) {
-  const url = new URL(req.url);
-  const body = await req.json().catch(() => ({}));
-  
-  // Perform custom API operations
-  return new Response(JSON.stringify({
+      return `${header}import { Hono } from "https://esm.sh/hono";
+
+const app = new Hono();
+
+app.all("/", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  return c.json({
     success: true,
-    method: req.method,
-    path: url.pathname,
-    query: Object.fromEntries(url.searchParams),
+    method: c.req.method,
+    path: c.req.path,
     received: body
-  }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" }
   });
+});
+
+export default async function (req) {
+  return app.fetch(req);
 }
 `;
 
@@ -652,20 +731,13 @@ export default async function (req) {
     case "before_update_record":
       return `${header}/**
  * Hook: ${triggerType}
- * Collection: ${targetCollection || 'All Collections'}
+ * Collection: ${targetCollection || "All Collections"}
  * 
  * @param {import("../apexkit").RecordHookEvent} event
  * @returns {Promise<any>} Return modified record object or throw an Error to block operation
  */
 export default async function (event) {
   const data = event.record.data;
-
-  // Example: enforce uppercase titles or sanitize inputs
-  if (data.title && typeof data.title === "string") {
-    data.title = data.title.trim();
-  }
-
-  // Return the record data to proceed
   return data;
 }
 `;
@@ -674,15 +746,13 @@ export default async function (event) {
     case "after_update_record":
       return `${header}/**
  * Hook: ${triggerType}
- * Collection: ${targetCollection || 'All Collections'}
+ * Collection: ${targetCollection || "All Collections"}
  * 
  * @param {import("../apexkit").RecordHookEvent} event
  */
 export default async function (event) {
   const { id, data } = event.record;
-
-  // Broadcast realtime event to clients
-  await $realtime.send("${targetCollection || 'general'}", "record_changed", {
+  await $realtime.send("${targetCollection || "general"}", "record_changed", {
     action: "${triggerType}",
     record_id: id,
     data
@@ -690,173 +760,19 @@ export default async function (event) {
 }
 `;
 
-    case "before_delete_record":
-      return `${header}/**
- * Hook: before_delete_record
- * Collection: ${targetCollection || 'All Collections'}
- * 
- * @param {import("../apexkit").RecordHookEvent} event
- */
-export default async function (event) {
-  // Check authorization or child relations before allowing deletion
-  if (event.auth?.role !== "admin") {
-    throw new Error("Only administrators can delete records in this collection.");
-  }
-}
-`;
-
-    case "after_delete_record":
-      return `${header}/**
- * Hook: after_delete_record
- * Collection: ${targetCollection || 'All Collections'}
- * 
- * @param {import("../apexkit").RecordHookEvent} event
- */
-export default async function (event) {
-  await $realtime.send("${targetCollection || 'general'}", "record_deleted", {
-    record_id: event.record.id
-  });
-}
-`;
-
-    case "before_user_login":
-      return `${header}/**
- * Hook: before_user_login
- * 
- * @param {import("../apexkit").VoidHookEvent} event - data contains { email, ip }
- */
-export default async function (event) {
-  const { email, ip } = event.data;
-  console.log(\`[Auth] Login attempt for \${email} from IP \${ip}\`);
-}
-`;
-
-    case "after_user_login":
-      return `${header}/**
- * Hook: after_user_login
- * 
- * @param {import("../apexkit").VoidHookEvent} event - data contains { id, email, role, scope }
- */
-export default async function (event) {
-  const user = event.data;
-  await $cache.set(\`user_last_seen:\${user.id}\`, new Date().toISOString(), 86400);
-}
-`;
-
-    case "before_user_create":
-      return `${header}/**
- * Hook: before_user_create
- * 
- * @param {import("../apexkit").VoidHookEvent} event - data contains { email, role, metadata }
- */
-export default async function (event) {
-  const { email, role } = event.data;
-
-  // Block registration for banned domains
-  if (email.endsWith("@disposable-mail.com")) {
-    throw new Error("Disposable email addresses are not permitted.");
-  }
-}
-`;
-
-    case "after_user_create":
-      return `${header}/**
- * Hook: after_user_create
- * 
- * @param {import("../apexkit").VoidHookEvent} event - data contains { id, email, role }
- */
-export default async function (event) {
-  const user = event.data;
-  console.log(\`[Auth] New user registered: \${user.email} (ID: \${user.id})\`);
-}
-`;
-
-    case "before_file_upload":
-      return `${header}/**
- * Hook: before_file_upload
- * 
- * @param {import("../apexkit").VoidHookEvent} event
- */
-export default async function (event) {
-  console.log("[Storage] Incoming file upload request received.");
-}
-`;
-
-    case "after_file_upload":
-      return `${header}/**
- * Hook: after_file_upload
- * 
- * @param {import("../apexkit").VoidHookEvent} event - data contains { id, filename }
- */
-export default async function (event) {
-  const { id, filename } = event.data;
-  console.log(\`[Storage] File uploaded: \${filename} (ID: \${id})\`);
-}
-`;
-
-    case "before_ai_run":
-      return `${header}/**
- * Hook: before_ai_run
- * Injects context or Vector Search documents into AI Prompt variables
- * 
- * @param {import("../apexkit").VoidHookEvent} event - data contains { slug, vars }
- */
-export default async function (event) {
-  const { slug, vars } = event.data;
-
-  if (vars.query) {
-    // Generate embedding and search closest records
-    const vec = await $ai.embed(vars.query);
-    const docs = await $db.records.searchVector("${targetCollection || 'documents'}", "content", vec, 3);
-    vars.context = JSON.stringify(docs.map(d => d.data));
-  }
-
-  return { slug, vars };
-}
-`;
-
     case "cron":
       return `${header}/**
  * Scheduled Cron Job: ${cleanName}
- * Configure execution frequency in Settings -> Cron Jobs
- * 
  * @param {{ trigger: "cron", job: string }} event
  */
 export default async function (event) {
   console.log(\`[Cron] Executing scheduled task: \${event.job}\`);
-
-  // Example: prune expired temporary tokens or cache entries
-  await $cache.delete("temp_sync_lock");
-}
-`;
-
-    case "graphql":
-      return `${header}/**
- * Dynamic GraphQL Field Resolver: ${cleanName}
- */
-export const graphql = {
-  parent: "Query",
-  name: "${cleanName.replace(/-/g, '_')}",
-  args: {
-    query: "String"
-  },
-  returnType: "JSON"
-};
-
-export default async function (input) {
-  const search = input.query || "";
-  return {
-    status: "ok",
-    query: search,
-    timestamp: new Date().toISOString()
-  };
 }
 `;
 
     default:
       return `${header}/**
  * Trigger: ${triggerType}
- * 
  * @param {any} event
  */
 export default async function (event) {
@@ -867,7 +783,7 @@ export default async function (event) {
   }
 }
 
-// --- 6. INTERACTIVE FILE CREATION WIZARD (--init-file) ---
+// --- 6. INTERACTIVE FILE WIZARD (create / new / init:file / --init-file) ---
 async function runInitFile() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -898,7 +814,10 @@ async function runInitFile() {
   }
 
   const cleanName = rawName.replace(/[^a-zA-Z0-9_-]/g, "");
-  const ext = fileType === "template" ? "html" : ((await rl.question("Extension (js/ts) [ts]: ")).trim() || "ts");
+  const ext =
+    fileType === "template"
+      ? "html"
+      : ((await rl.question("Extension (js/ts) [js]: ")).trim() || "js");
 
   let triggerType = "manual";
   let targetCollection = null;
@@ -918,7 +837,9 @@ async function runInitFile() {
       targetCollection = colInput || null;
     }
   } else if (fileType === "template") {
-    const colInput = (await rl.question("\nPrimary Collection to Query (e.g. posts, leave blank for none): ")).trim();
+    const colInput = (
+      await rl.question("\nPrimary Collection to Query (e.g. posts, leave blank for none): ")
+    ).trim();
     targetCollection = colInput || null;
   }
 
@@ -935,7 +856,7 @@ async function runInitFile() {
   process.exit(0);
 }
 
-// --- 7. WORKSPACE INIT WIZARD (--init) ---
+// --- 7. WORKSPACE INIT WIZARD (init / --init) ---
 async function runInit() {
   console.log("🚀 Welcome to ApexKit Local Workspace Setup!\n");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -953,8 +874,8 @@ async function runInit() {
   fs.writeFileSync(".env", envContent);
   console.log("\n✅ Saved .env file!");
 
-  const dirs = ["webhooks", "modules/custom", "modules/esm", "templates", "ai_actions"];
-  dirs.forEach(d => {
+  const dirs = ["webhooks", "modules/custom", "modules/esm", "templates", "ai_actions", "schemas"];
+  dirs.forEach((d) => {
     fs.mkdirSync(d, { recursive: true });
     console.log(`  📁 Created ./${d}`);
   });
@@ -965,40 +886,133 @@ async function runInit() {
 
   await generateWorkspaceFiles();
 
-  console.log("\n🎉 Workspace Initialized! Run `node apexkit-watch.js --pull` to download remote files.");
+  console.log("\n🎉 Workspace Initialized! Run `node apexkit-watch.js pull` to download remote files.");
   rl.close();
   process.exit(0);
 }
 
-// --- 8. ZIP EXTRACTOR ---
-function extractZipBuffer(zipBuffer, outputDir = ".") {
-  let offset = 0;
-  let count = 0;
+// --- 8. COMPREHENSIVE PULL (pull / --pull) ---
+async function runPull() {
+  console.log(`📥 Pulling all collections, scripts, templates, and AI actions from ApexKit (${SCOPE_KEY})...\n`);
 
-  while (offset < zipBuffer.length - 30) {
-    const sig = zipBuffer.readUInt32LE(offset);
-    if (sig !== 0x04034b50) break; 
+  const apiBase = getScopedApiBase();
+  const headers = getAuthHeaders();
 
-    const method = zipBuffer.readUInt16LE(offset + 8);
-    const compressedSize = zipBuffer.readUInt32LE(offset + 18);
-    const fileNameLen = zipBuffer.readUInt16LE(offset + 26);
-    const extraLen = zipBuffer.readUInt16LE(offset + 28);
+  const dirs = ["webhooks", "modules/custom", "modules/esm", "templates", "ai_actions", "schemas"];
+  dirs.forEach((d) => fs.mkdirSync(d, { recursive: true }));
 
-    const fileName = zipBuffer.toString("utf-8", offset + 30, offset + 30 + fileNameLen);
-    const dataStart = offset + 30 + fileNameLen + extraLen;
-    const compressedData = zipBuffer.subarray(dataStart, dataStart + compressedSize);
+  let pulledCount = 0;
 
-    if (fileName && !fileName.endsWith("/")) {
-      let uncompressedData = method === 8 ? zlib.inflateRawSync(compressedData) : compressedData;
-      const fullPath = path.join(outputDir, fileName);
-      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      fs.writeFileSync(fullPath, uncompressedData);
-      console.log(`  📥 Extracted: ${fileName}`);
-      count++;
+  // 1. Pull Collections & Schema
+  try {
+    const colRes = await fetch(`${apiBase}/collections`, { headers });
+    if (colRes.ok) {
+      const collections = await colRes.json();
+      fs.writeFileSync("schemas/collections.json", JSON.stringify(collections, null, 2));
+      console.log(`  📦 [Collections]: Saved schemas/collections.json (${collections.length} collections)`);
+      pulledCount += collections.length;
     }
-    offset = dataStart + compressedSize;
+
+    const schemaRes = await fetch(`${apiBase}/admin/export-schema`, { headers });
+    if (schemaRes.ok) {
+      const schemaJson = await schemaRes.json();
+      fs.writeFileSync("schemas/apex_schema.json", JSON.stringify(schemaJson, null, 2));
+      console.log(`  📦 [Schema]: Saved schemas/apex_schema.json`);
+    }
+  } catch (e) {
+    console.warn(`  ⚠️ Schema pull warning: ${e.message}`);
   }
-  return count;
+
+  // 2. Pull Scripts & Modules
+  try {
+    const scriptRes = await fetch(`${apiBase}/admin/scripts`, { headers });
+    if (scriptRes.ok) {
+      const payload = await scriptRes.json();
+      const scripts = Array.isArray(payload) ? payload : payload.local || [];
+
+      scripts.forEach((script) => {
+        const meta = {
+          id: script.id,
+          name: script.name,
+          extension: "js",
+          target_collection: script.target_collection || null,
+          type: script.metadata?.type || "webhook",
+          path: script.metadata?.path || "./webhooks/",
+          trigger_type: script.trigger_type || "manual",
+          active: script.active !== undefined ? script.active : true,
+          visibility: script.visibility || "private",
+        };
+
+        const targetDir = meta.path.replace(/^\.\//, "");
+        fs.mkdirSync(targetDir, { recursive: true });
+
+        const formattedContent = `/** @type {import("../apexkit").FileMetadata} */\nexport const __fileMetadata__ = ${JSON.stringify(
+          meta,
+          null,
+          2
+        )};\n\n${script.code}`;
+
+        const filePath = path.join(targetDir, `${script.name}.${meta.extension}`);
+        fs.writeFileSync(filePath, formattedContent);
+        console.log(`  📜 [Script]: ${filePath}`);
+        pulledCount++;
+      });
+    }
+  } catch (e) {
+    console.warn(`  ⚠️ Scripts pull warning: ${e.message}`);
+  }
+
+  // 3. Pull Templates
+  try {
+    const tmplRes = await fetch(`${apiBase}/admin/templates`, { headers });
+    if (tmplRes.ok) {
+      const templates = await tmplRes.json();
+      templates.forEach((tmpl) => {
+        const meta = {
+          name: tmpl.slug,
+          extension: "html",
+          type: "template",
+          path: "./templates/",
+          active: true,
+        };
+
+        const formattedContent = `<!--\n__fileMetadata__ = ${JSON.stringify(
+          meta,
+          null,
+          2
+        )}\n-->\n${tmpl.content}`;
+
+        const filePath = path.join("templates", `${tmpl.slug}.html`);
+        fs.writeFileSync(filePath, formattedContent);
+        console.log(`  🎨 [Template]: ${filePath}`);
+        pulledCount++;
+      });
+    }
+  } catch (e) {
+    console.warn(`  ⚠️ Templates pull warning: ${e.message}`);
+  }
+
+  // 4. Pull AI Actions
+  try {
+    const aiRes = await fetch(`${apiBase}/admin/ai/actions`, { headers });
+    if (aiRes.ok) {
+      const actions = await aiRes.json();
+      actions.forEach((action) => {
+        const filePath = path.join("ai_actions", `${action.slug}.json`);
+        fs.writeFileSync(filePath, JSON.stringify({ action }, null, 2));
+        console.log(`  🤖 [AI Action]: ${filePath}`);
+        pulledCount++;
+      });
+    }
+  } catch (e) {
+    console.warn(`  ⚠️ AI Actions pull warning: ${e.message}`);
+  }
+
+  // Re-generate local TypeScript IntelliSense engine
+  await generateWorkspaceFiles();
+
+  console.log(`\n✨ Pull complete! Hydrated ${pulledCount} items to local workspace.`);
+  process.exit(0);
 }
 
 // --- 9. METADATA AUTO-INFERENCE HELPER ---
@@ -1025,8 +1039,8 @@ function inferFileMetadata(filePath, content) {
     deducedPath = "./ai_actions/";
   }
 
-  // Check if __fileMetadata__ is explicitly defined in source
-  const metaRe = /(?:export\s+const\s+__fileMetadata__\s*=\s*|<!--\s*__fileMetadata__\s*=\s*)(\{[\s\S]*?\})(?:;|\s*-->)/;
+  const metaRe =
+    /(?:export\s+const\s+__fileMetadata__\s*=\s*|<!--\s*__fileMetadata__\s*=\s*)(\{[\s\S]*?\})(?:;|\s*-->)/;
   const match = content.match(metaRe);
 
   let metaObj = {};
@@ -1044,31 +1058,38 @@ function inferFileMetadata(filePath, content) {
     path: metaObj.path || deducedPath,
     trigger_type: metaObj.trigger_type || deducedTrigger,
     active: metaObj.active !== undefined ? metaObj.active : true,
-    visibility: metaObj.visibility || "private"
+    visibility: metaObj.visibility || "private",
   };
 
   if (!match) {
     if (ext === "html") {
       return `<!--\n__fileMetadata__ = ${JSON.stringify(finalMeta, null, 2)}\n-->\n${content}`;
     } else {
-      return `/** @type {import("../apexkit").FileMetadata} */\nexport const __fileMetadata__ = ${JSON.stringify(finalMeta, null, 2)};\n\n${content}`;
+      return `/** @type {import("../apexkit").FileMetadata} */\nexport const __fileMetadata__ = ${JSON.stringify(
+        finalMeta,
+        null,
+        2
+      )};\n\n${content}`;
     }
   }
 
   return content;
 }
 
-// --- 10. MANUAL COMMIT (--commit) ---
-async function runManualCommit() {
-  console.log(`🚀 Committing all local files to ApexKit (${BASE_URL})...`);
-  
+// --- 10. UNIFIED SYNC PUSH/COMMIT (commit vs push) ---
+async function runManualPushOrCommit(commitToDb) {
+  const modeLabel = commitToDb ? "Push & Commit to DB" : "Commit to VFS (Transient Memory)";
+  console.log(`🚀 [${modeLabel}]: Syncing all local files to ApexKit (${BASE_URL})...\n`);
+
   let WSClient = globalThis.WebSocket;
   if (!WSClient) {
     try {
       const wsModule = await import("ws");
       WSClient = wsModule.default || wsModule;
-    } catch(e) {
-      console.error("❌ WebSocket is not natively supported in your Node version. Please install 'ws' with: npm install ws");
+    } catch (e) {
+      console.error(
+        "❌ WebSocket is not natively supported in your Node version. Please install 'ws' with: npm install ws"
+      );
       process.exit(1);
     }
   }
@@ -1082,25 +1103,27 @@ async function runManualCommit() {
     dirs.forEach((dir) => {
       if (!fs.existsSync(dir)) return;
       const files = fs.readdirSync(dir, { recursive: true });
-      
-      files.forEach(file => {
+
+      files.forEach((file) => {
         const fullPath = path.join(dir, file);
         if (fs.statSync(fullPath).isFile()) {
           const relativePath = fullPath.replace(/\\/g, "/").replace(/^\.\//, "");
           let content = fs.readFileSync(fullPath, "utf-8");
           content = inferFileMetadata(relativePath, content);
-          
-          console.log(`  ⬆️  Pushing ${relativePath}`);
-          ws.send(JSON.stringify({
-            type: "PushFile",
-            payload: { path: relativePath, content: content, commit_to_db: true }
-          }));
+
+          console.log(`  ⬆️  Pushing ${relativePath} (commit_to_db: ${commitToDb})`);
+          ws.send(
+            JSON.stringify({
+              type: "PushFile",
+              payload: { path: relativePath, content: content, commit_to_db: commitToDb },
+            })
+          );
           filesSent++;
         }
       });
     });
 
-    console.log(`\n✅ Pushed ${filesSent} files to ApexKit! Closing connection.`);
+    console.log(`\n✅ Synced ${filesSent} files to ApexKit! Closing connection.`);
     setTimeout(() => process.exit(0), 1000);
   });
 
@@ -1110,7 +1133,7 @@ async function runManualCommit() {
   });
 }
 
-// --- 11. WATCHER & SYNC CLIENT ---
+// --- 11. WATCHER & LIVE SYNC CLIENT (watch / dev / default) ---
 let ws;
 let isReconnecting = false;
 let reconnectTimer = null;
@@ -1138,21 +1161,25 @@ async function connectWebSocket(isRetry = false) {
   if (!isRetry) {
     console.log(`⚡ Connecting to ApexKit (URL: ${BASE_URL}, Scope: ${SCOPE_KEY})...`);
   }
-  
+
   let WSClient = globalThis.WebSocket;
   if (!WSClient) {
     try {
       const wsModule = await import("ws");
       WSClient = wsModule.default || wsModule;
-    } catch(e) {
-      console.error("❌ WebSocket is not natively supported in your Node version. Please install 'ws' with: npm install ws");
+    } catch (e) {
+      console.error(
+        "❌ WebSocket is not natively supported in your Node version. Please install 'ws' with: npm install ws"
+      );
       process.exit(1);
     }
   }
 
   try {
     if (ws) {
-      try { ws.close(); } catch (e) {}
+      try {
+        ws.close();
+      } catch (e) {}
     }
     ws = new WSClient(WS_URL);
   } catch (err) {
@@ -1165,14 +1192,7 @@ async function connectWebSocket(isRetry = false) {
     isReconnecting = false;
     hasLoggedWaiting = false;
     console.log("✅ Connected to ApexKit Live Engine!");
-
-    if (IS_PULL) {
-      console.log("📥 Requesting full workspace pull from remote...");
-      ws.send(JSON.stringify({ type: "PullWorkspace" }));
-      await generateWorkspaceFiles();
-    } else {
-      console.log(`👀 Watching local files... (Auto-Commit: ${!NO_AUTO_COMMIT})`);
-    }
+    console.log(`👀 Watching local files... (Auto-Commit to DB: ${!NO_AUTO_COMMIT})`);
   });
 
   ws.addEventListener("message", (event) => {
@@ -1180,12 +1200,7 @@ async function connectWebSocket(isRetry = false) {
       const dataStr = typeof event.data === "string" ? event.data : event.data.toString();
       const msg = JSON.parse(dataStr);
 
-      if (msg.type === "WorkspaceData" && msg.payload && msg.payload.zip_b64) {
-        console.log("📦 Received workspace ZIP from server. Unpacking...");
-        const zipBuffer = Buffer.from(msg.payload.zip_b64, "base64");
-        const count = extractZipBuffer(zipBuffer, ".");
-        console.log(`✨ Successfully pulled ${count} files!\n`);
-      } else if (msg.type === "SyncAck") {
+      if (msg.type === "SyncAck") {
         console.log(`🚀 [DB Sync]: ${msg.payload.message}`);
       } else if (msg.type === "Error") {
         console.error(`❌ [Error]: ${msg.payload.message}`);
@@ -1212,47 +1227,71 @@ function startWatcher() {
     if (fs.existsSync(dir)) {
       fs.watch(dir, { recursive: true }, (eventType, filename) => {
         if (!filename) return;
-        
-        if (filename.endsWith(".js") || filename.endsWith(".ts") || filename.endsWith(".html") || filename.endsWith(".json")) {
-          const relativePath = path.join(dir, filename).replace(/\\/g, "/").replace(/^\.\//, "");
-          
-          clearTimeout(debounceMap.get(relativePath));
-          debounceMap.set(relativePath, setTimeout(() => {
-            try {
-              if (fs.existsSync(relativePath)) {
-                let content = fs.readFileSync(relativePath, "utf-8");
-                content = inferFileMetadata(relativePath, content);
 
-                console.log(`📝 Synced: ${relativePath} ${NO_AUTO_COMMIT ? "(VFS Only)" : "(Committed to DB)"}`);
-                
-                if (ws && ws.readyState === 1) {
-                  ws.send(JSON.stringify({
-                    type: "PushFile",
-                    payload: {
-                      path: relativePath,
-                      content: content,
-                      commit_to_db: !NO_AUTO_COMMIT
-                    }
-                  }));
+        if (
+          filename.endsWith(".js") ||
+          filename.endsWith(".ts") ||
+          filename.endsWith(".html") ||
+          filename.endsWith(".json")
+        ) {
+          const relativePath = path.join(dir, filename).replace(/\\/g, "/").replace(/^\.\//, "");
+
+          clearTimeout(debounceMap.get(relativePath));
+          debounceMap.set(
+            relativePath,
+            setTimeout(() => {
+              try {
+                if (fs.existsSync(relativePath)) {
+                  let content = fs.readFileSync(relativePath, "utf-8");
+                  content = inferFileMetadata(relativePath, content);
+
+                  console.log(
+                    `📝 Synced: ${relativePath} ${NO_AUTO_COMMIT ? "(VFS Only)" : "(Committed to DB)"}`
+                  );
+
+                  if (ws && ws.readyState === 1) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "PushFile",
+                        payload: {
+                          path: relativePath,
+                          content: content,
+                          commit_to_db: !NO_AUTO_COMMIT,
+                        },
+                      })
+                    );
+                  }
                 }
+              } catch (err) {
+                console.error(`⚠️ Could not read ${relativePath}:`, err.message);
               }
-            } catch (err) {
-              console.error(`⚠️ Could not read ${relativePath}:`, err.message);
-            }
-          }, 100));
+            }, 100)
+          );
         }
       });
     }
   });
 }
 
-// --- BOOTSTRAP ---
+// --- 12. CLI ROUTER ---
 if (IS_INIT) {
   runInit();
 } else if (IS_INIT_FILE) {
   runInitFile();
+} else if (IS_PULL) {
+  runPull();
 } else if (IS_COMMIT) {
-  runManualCommit();
+  runManualPushOrCommit(false); // VFS Only
+} else if (IS_PUSH) {
+  runManualPushOrCommit(true); // Permanent DB Commit
+} else if (IS_STATUS) {
+  console.log(`ApexKit Workspace Information:
+  • Server URL: ${BASE_URL}
+  • Target Scope: ${SCOPE_KEY}
+  • API Key: ${API_KEY.substring(0, 16)}...
+  • Auto-Commit: ${!NO_AUTO_COMMIT}
+`);
+  process.exit(0);
 } else {
   startWatcher();
 }

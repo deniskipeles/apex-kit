@@ -22,20 +22,18 @@ pub async fn handle_generate_embedding(
                 let sandboxes = root_db.list_sandboxes(None).await.unwrap_or_default();
                 if let Some(sb) = sandboxes.iter().find(|s| s.id == sid) {
                     if sb.current_vectors >= sb.max_vectors {
-                        return Err(format!(
-                            "Sandbox {} vector limit exceeded ({} max)",
-                            sid, sb.max_vectors
-                        ));
+                        let msg = format!("Sandbox {} vector limit exceeded ({} max)", sid, sb.max_vectors);
+                        let _ = root_db.log_system_event("error", "vectorization", &msg).await;
+                        return Err(msg);
                     }
                 }
             } else {
                 let tenants = root_db.list_tenants().await.unwrap_or_default();
                 if let Some(t) = tenants.iter().find(|t| &t.id == tid) {
                     if t.stats.vector_count >= t.stats.max_vectors {
-                        return Err(format!(
-                            "Tenant {} vector limit exceeded ({} max)",
-                            tid, t.stats.max_vectors
-                        ));
+                        let msg = format!("Tenant {} vector limit exceeded ({} max)", tid, t.stats.max_vectors);
+                        let _ = root_db.log_system_event("error", "vectorization", &msg).await;
+                        return Err(msg);
                     }
                 }
             }
@@ -62,13 +60,14 @@ pub async fn handle_generate_embedding(
                     is_image_embedding = true;
                     vector_provider.embed_image(&b64).await
                 } else {
-                    Err("Only image files are currently supported for vectorization.".into())
+                    let msg = "Only image files are currently supported for vectorization.";
+                    let _ = db.log_system_event("error", "vectorization", msg).await;
+                    return Err(msg.into());
                 }
             } else {
-                Err(format!(
-                    "File {} not found in storage for vectorization.",
-                    content
-                ))
+                let msg = format!("File {} not found in storage for vectorization.", content);
+                let _ = db.log_system_event("error", "vectorization", &msg).await;
+                return Err(msg);
             }
         } else if content.starts_with("data:image/") {
             is_image_embedding = true;
@@ -91,18 +90,20 @@ pub async fn handle_generate_embedding(
                     .index(collection_id, record_id, &field_name, &vec)
                     .await
                 {
-                    eprintln!("[Job] Failed to index vector: {}", e);
+                    let msg = format!("Failed to index vector: {}", e);
+                    let _ = db.log_system_event("error", "vectorization", &msg).await;
                 }
                 db.save_vector(collection_id, record_id, &field_name, vec, &resolved_model)
                     .await
                     .map_err(|e| e.to_string())?;
-                println!(
-                    "[Job] Successfully vectorized {} for record {}",
-                    field_name, record_id
-                );
+                
+                let msg = format!("Successfully vectorized {} for record {}", field_name, record_id);
+                let _ = db.log_system_event("info", "vectorization", &msg).await;
             }
             Err(e) => {
-                return Err(format!("Failed to generate embedding: {}", e));
+                let msg = format!("Failed to generate embedding: {}", e);
+                let _ = db.log_system_event("error", "vectorization", &msg).await;
+                return Err(msg);
             }
         }
     } else {
@@ -141,7 +142,7 @@ pub async fn handle_delete_record(
     Ok(())
 }
 
-// [NEW] Handles Safe Sequential Bulk Vectorization with DB Pagination
+// Handles Safe Sequential Bulk Vectorization with DB Pagination
 pub async fn handle_revectorize_collection(
     resolver: Arc<dyn JobContext>,
     tenant_id: Option<String>,
@@ -167,10 +168,8 @@ pub async fn handle_revectorize_collection(
             return Ok(());
         }
 
-        tracing::info!(
-            "[Job] Starting bulk revectorization for collection {}",
-            collection_id
-        );
+        let start_msg = format!("Starting bulk revectorization for collection {}", collection_id);
+        let _ = db.log_system_event("info", "vectorization", &start_msg).await;
 
         let mut offset = 0;
         let limit = 1000;
@@ -199,8 +198,6 @@ pub async fn handle_revectorize_collection(
                             "text"
                         };
 
-                        // [RESOLVED MISMAPPED DEPENDENCY]
-                        // Resolve the model name directly via apexkit_vector to preserve crate boundaries.
                         let current_model = if c_type == "file" {
                             apexkit_vector::get_current_vision_model()
                         } else {
@@ -230,48 +227,40 @@ pub async fn handle_revectorize_collection(
                         )
                         .await
                         {
-                            tracing::error!(
-                                "[Job] Failed to vectorize record {}: {}",
-                                record.id,
-                                e
-                            );
+                            let err_msg = format!("Failed to vectorize record {}: {}", record.id, e);
+                            let _ = db.log_system_event("error", "vectorization", &err_msg).await;
                         }
 
-                        // We strictly sleep for 50ms between generation loops.
-                        // This explicitly yields the Tokio task scheduler, giving live HTTP requests
-                        // doing Instant Searches a chance to grab the CandleEmbedder Mutex.
+                        // We strictly sleep for 50ms between generation loops to yield the Tokio task scheduler
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
             }
             offset += limit;
         }
-        tracing::info!(
-            "[Job] Finished bulk revectorization for collection {}",
-            collection_id
-        );
+        
+        let end_msg = format!("Finished bulk revectorization for collection {}", collection_id);
+        let _ = db.log_system_event("info", "vectorization", &end_msg).await;
     }
     Ok(())
 }
 
-// [NEW] Handle Tantivy OSE Indexing in Background
+// Handle Tantivy OSE Indexing in Background
 pub async fn handle_reindex_collection(
     resolver: Arc<dyn JobContext>,
     tenant_id: Option<String>,
     collection_id: i64,
 ) -> Result<(), String> {
     if let Some((db, _)) = resolver.resolve(tenant_id.as_deref()).await {
-        tracing::info!(
-            "[Job] Starting Tantivy index rebuild for collection {}",
-            collection_id
-        );
+        let start_msg = format!("Starting Tantivy index rebuild for collection {}", collection_id);
+        let _ = db.log_system_event("info", "search_index", &start_msg).await;
+
         db.reindex_collection(collection_id)
             .await
             .map_err(|e| e.to_string())?;
-        tracing::info!(
-            "[Job] Finished Tantivy index rebuild for collection {}",
-            collection_id
-        );
+
+        let end_msg = format!("Finished Tantivy index rebuild for collection {}", collection_id);
+        let _ = db.log_system_event("info", "search_index", &end_msg).await;
     }
     Ok(())
 }

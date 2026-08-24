@@ -48,13 +48,13 @@ pub enum Job {
         collection_id: i64,
         record_id: i64,
     },
-    // [NEW] Bulk job for revectorizing an entire collection sequentially
+    // Bulk job for revectorizing an entire collection sequentially
     RevectorizeCollection {
         tenant_id: Option<String>,
         collection_id: i64,
         force: bool,
     },
-    // [NEW] Bulk job for rebuilding the Tantivy search index
+    // Bulk job for rebuilding the Tantivy search index
     ReindexCollection {
         tenant_id: Option<String>,
         collection_id: i64,
@@ -86,9 +86,7 @@ impl JobQueue {
     }
 
     pub async fn enqueue(&self, job: Job) {
-        if let Err(e) = self.sender.send(job).await {
-            eprintln!("Failed to enqueue job: {}", e);
-        }
+        let _ = self.sender.send(job).await;
     }
 }
 
@@ -122,6 +120,13 @@ pub fn start_background_worker(
                     _ => None,
                 };
 
+                // Helper to log job errors cleanly to the active scope DB
+                let log_job_error = |tenant_id: Option<String>, msg: String, res: Arc<dyn JobContext>| async move {
+                    if let Some((db, _)) = res.resolve(tenant_id.as_deref()).await {
+                        let _ = db.log_system_event("error", "background_job", &msg).await;
+                    }
+                };
+
                 match job {
                     Job::SendWelcomeEmail {
                         tenant_id,
@@ -129,15 +134,15 @@ pub fn start_background_worker(
                         user_id,
                     } => {
                         if let Err(e) = super::tasks::emails::handle_welcome_email(
-                            resolver,
+                            resolver.clone(),
                             vault_clone,
-                            tenant_id,
+                            tenant_id.clone(),
                             email,
                             user_id,
                         )
                         .await
                         {
-                            eprintln!("[Job] Welcome email failed: {}", e);
+                            log_job_error(tenant_id, format!("Welcome email failed: {}", e), resolver).await;
                         }
                     }
                     Job::SendPasswordReset {
@@ -146,15 +151,15 @@ pub fn start_background_worker(
                         token,
                     } => {
                         if let Err(e) = super::tasks::emails::handle_password_reset(
-                            resolver,
+                            resolver.clone(),
                             vault_clone,
-                            tenant_id,
+                            tenant_id.clone(),
                             email,
                             token,
                         )
                         .await
                         {
-                            eprintln!("[Job] Reset password email failed: {}", e);
+                            log_job_error(tenant_id, format!("Reset password email failed: {}", e), resolver).await;
                         }
                     }
                     Job::SendVerification {
@@ -163,15 +168,15 @@ pub fn start_background_worker(
                         token,
                     } => {
                         if let Err(e) = super::tasks::emails::handle_verification_email(
-                            resolver,
+                            resolver.clone(),
                             vault_clone,
-                            tenant_id,
+                            tenant_id.clone(),
                             email,
                             token,
                         )
                         .await
                         {
-                            eprintln!("[Job] Verification email failed: {}", e);
+                            log_job_error(tenant_id, format!("Verification email failed: {}", e), resolver).await;
                         }
                     }
                     Job::GenerateEmbedding {
@@ -184,8 +189,8 @@ pub fn start_background_worker(
                         model,
                     } => {
                         if let Err(e) = super::tasks::vectorization::handle_generate_embedding(
-                            resolver,
-                            tenant_id,
+                            resolver.clone(),
+                            tenant_id.clone(),
                             collection_id,
                             record_id,
                             field_name,
@@ -195,7 +200,7 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            eprintln!("[Job] Embedding generation failed: {}", e);
+                            log_job_error(tenant_id, format!("Embedding generation failed: {}", e), resolver).await;
                         }
                     }
                     Job::IndexRecord {
@@ -206,8 +211,8 @@ pub fn start_background_worker(
                         schema,
                     } => {
                         if let Err(e) = super::tasks::vectorization::handle_index_record(
-                            resolver,
-                            tenant_id,
+                            resolver.clone(),
+                            tenant_id.clone(),
                             collection_id,
                             record_id,
                             data,
@@ -215,7 +220,7 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            eprintln!("[Job] Search Indexing failed for {}: {}", record_id, e);
+                            log_job_error(tenant_id, format!("Search Indexing failed for {}: {}", record_id, e), resolver).await;
                         }
                     }
                     Job::DeleteFromIndex {
@@ -224,17 +229,14 @@ pub fn start_background_worker(
                         record_id,
                     } => {
                         if let Err(e) = super::tasks::vectorization::handle_delete_record(
-                            resolver,
-                            tenant_id,
+                            resolver.clone(),
+                            tenant_id.clone(),
                             collection_id,
                             record_id,
                         )
                         .await
                         {
-                            eprintln!(
-                                "[Job] Search Index Deletion failed for {}: {}",
-                                record_id, e
-                            );
+                            log_job_error(tenant_id, format!("Search Index Deletion failed for {}: {}", record_id, e), resolver).await;
                         }
                     }
                     Job::RevectorizeCollection {
@@ -243,14 +245,14 @@ pub fn start_background_worker(
                         force,
                     } => {
                         if let Err(e) = super::tasks::vectorization::handle_revectorize_collection(
-                            resolver,
-                            tenant_id,
+                            resolver.clone(),
+                            tenant_id.clone(),
                             collection_id,
                             force,
                         )
                         .await
                         {
-                            eprintln!("[Job] Bulk revectorization failed: {}", e);
+                            log_job_error(tenant_id, format!("Bulk revectorization failed: {}", e), resolver).await;
                         }
                     }
                     Job::ReindexCollection {
@@ -258,13 +260,13 @@ pub fn start_background_worker(
                         collection_id,
                     } => {
                         if let Err(e) = super::tasks::vectorization::handle_reindex_collection(
-                            resolver,
-                            tenant_id,
+                            resolver.clone(),
+                            tenant_id.clone(),
                             collection_id,
                         )
                         .await
                         {
-                            eprintln!("[Job] Bulk reindexing failed: {}", e);
+                            log_job_error(tenant_id, format!("Bulk reindexing failed: {}", e), resolver).await;
                         }
                     }
                     _ => {}
