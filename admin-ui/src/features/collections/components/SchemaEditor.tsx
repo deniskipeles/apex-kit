@@ -233,6 +233,7 @@ const FieldEditorDialog = ({
                 <Label>Data Type</Label>
                 <div className="grid grid-cols-2 gap-2 max-h-[300px] overflow-y-auto pr-1 custom-scrollbar">
                   {Object.entries(FIELD_TYPES_CONFIG).map(([key, config]) => (
+                    // When changing field type, preserve user flags instead of forcing them off:
                     <button
                       key={key}
                       type="button"
@@ -240,16 +241,10 @@ const FieldEditorDialog = ({
                         setData({
                           ...data,
                           type: key as any,
-                          // Default "Search Index (OSE)" for searchable types
-                          ose_indexed: ['string', 'text', 'email'].includes(key) ? true : false,
-                          // Allow Vectorization on Text and Files
-                          vectorize: ['string', 'text', 'file'].includes(key)
-                            ? data.vectorize
-                            : false,
-                          dimension:
-                            ['string', 'text', 'file'].includes(key) && data.vectorize
-                              ? data.dimension
-                              : null,
+                          ose_indexed: data.ose_indexed || false,
+                          sql_indexed: data.sql_indexed || false,
+                          vectorize: data.vectorize || false,
+                          dimension: data.vectorize ? data.dimension : null,
                         })
                       }
                       className={`flex flex-col items-start p-2.5 rounded-lg border transition-all text-left ${data.type === key ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-border hover:bg-secondary/50 hover:border-primary/30'}`}
@@ -292,6 +287,7 @@ const FieldEditorDialog = ({
               </div>
 
               {/* Common Toggles */}
+              {/* In Settings Toggle Grid (Make tools available for all types) */}
               <div className="grid grid-cols-2 gap-4">
                 <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5">
                   <Label
@@ -305,6 +301,7 @@ const FieldEditorDialog = ({
                     onCheckedChange={(c) => setData({ ...data, required: c })}
                   />
                 </div>
+
                 <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5">
                   <Label
                     className="text-xs cursor-pointer"
@@ -318,7 +315,7 @@ const FieldEditorDialog = ({
                   />
                 </div>
 
-                {/* SQL Index */}
+                {/* SQL Index - Available for all types */}
                 <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5">
                   <div className="space-y-0.5">
                     <Label
@@ -335,52 +332,41 @@ const FieldEditorDialog = ({
                   />
                 </div>
 
-                {/* Search Index (OSE / Tantivy) */}
-                {['string', 'text', 'email', 'url', 'number', 'bool', 'select'].includes(
-                  data.type
-                ) && (
-                  <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5">
-                    <div className="space-y-0.5">
-                      <Label
-                        className="text-xs cursor-pointer flex items-center gap-1"
-                        onClick={() => setData({ ...data, ose_indexed: !data.ose_indexed })}
-                      >
-                        <Search className="h-3 w-3 text-muted-foreground" /> OSE Index
-                      </Label>
-                      <p className="text-[9px] text-muted-foreground">Full-text / Fuzzy</p>
-                    </div>
-                    <Switch
-                      checked={data.ose_indexed || false}
-                      onCheckedChange={(c) => setData({ ...data, ose_indexed: c })}
-                    />
+                {/* OSE Search Index - Available for all types */}
+                <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5">
+                  <div className="space-y-0.5">
+                    <Label
+                      className="text-xs cursor-pointer flex items-center gap-1"
+                      onClick={() => setData({ ...data, ose_indexed: !data.ose_indexed })}
+                    >
+                      <Search className="h-3 w-3 text-muted-foreground" /> OSE Index
+                    </Label>
+                    <p className="text-[9px] text-muted-foreground">Full-text / Fuzzy</p>
                   </div>
-                )}
+                  <Switch
+                    checked={data.ose_indexed || false}
+                    onCheckedChange={(c) => setData({ ...data, ose_indexed: c })}
+                  />
+                </div>
 
-                {/* Vectorize */}
-                {['string', 'text', 'file'].includes(data.type) && (
-                  <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5 col-span-2">
-                    <div className="space-y-0.5">
-                      <Label
-                        className="text-xs cursor-pointer flex items-center gap-1"
-                        onClick={() => setData({ ...data, vectorize: !data.vectorize })}
-                      >
-                        <Zap className="h-3 w-3 text-purple-400" /> Vectorize (AI)
-                      </Label>
-                      <p className="text-[10px] text-muted-foreground">
-                        Auto-generate embeddings for semantic search (Text or Images).
-                      </p>
-                    </div>
-                    <Switch
-                      checked={data.vectorize || false}
-                      onCheckedChange={(c) =>
-                        setData({
-                          ...data,
-                          vectorize: c,
-                        })
-                      }
-                    />
+                {/* Vectorize Toggle - Available for all types */}
+                <div className="flex items-center justify-between p-2 rounded border border-border bg-secondary/5 col-span-2">
+                  <div className="space-y-0.5">
+                    <Label
+                      className="text-xs cursor-pointer flex items-center gap-1"
+                      onClick={() => setData({ ...data, vectorize: !data.vectorize })}
+                    >
+                      <Zap className="h-3 w-3 text-purple-400" /> Vectorize (AI)
+                    </Label>
+                    <p className="text-[10px] text-muted-foreground">
+                      Auto-generate embeddings for semantic search.
+                    </p>
                   </div>
-                )}
+                  <Switch
+                    checked={data.vectorize || false}
+                    onCheckedChange={(c) => setData({ ...data, vectorize: c })}
+                  />
+                </div>
 
                 {/* Auto Inject */}
                 {['owner', 'date'].includes(data.type) && (

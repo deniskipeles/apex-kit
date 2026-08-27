@@ -384,10 +384,10 @@ pub async fn reconcile_sql_indexes(
     new_schema: &CollectionSchema,
     old_schema: Option<&CollectionSchema>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 1. Create SQL indexes for standard fields
     for (name, def) in &new_schema.fields {
         if def.sql_indexed {
             let idx_name = sql_index_name(col_id, &def.uid);
-
             let exists = old_schema
                 .map(|s| s.fields.get(name).map(|f| f.sql_indexed).unwrap_or(false))
                 .unwrap_or(false);
@@ -404,9 +404,52 @@ pub async fn reconcile_sql_indexes(
         }
     }
 
+    // --- ADD: Create SQL indexes for relation fields ---
+    for (name, def) in &new_schema.relations {
+        if def.sql_indexed {
+            let idx_name = sql_index_name(col_id, &def.uid);
+            let exists = old_schema
+                .map(|s| {
+                    s.relations
+                        .get(name)
+                        .map(|f| f.sql_indexed)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+
+            if !exists {
+                let sql = format!(
+                    "CREATE INDEX IF NOT EXISTS {} ON records (json_extract(data, '$.{}')) WHERE collection_id = {}",
+                    idx_name, name, col_id
+                );
+                batcher.execute(sql, vec![]).await.map_err(|e| {
+                    Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+            }
+        }
+    }
+
+    // 2. Drop stale indexes
     if let Some(old) = old_schema {
         for (name, def) in &old.fields {
             let should_drop = if let Some(new_def) = new_schema.fields.get(name) {
+                def.sql_indexed && !new_def.sql_indexed
+            } else {
+                def.sql_indexed
+            };
+
+            if should_drop {
+                let idx_name = sql_index_name(col_id, &def.uid);
+                let sql = format!("DROP INDEX IF EXISTS {}", idx_name);
+                batcher.execute(sql, vec![]).await.map_err(|e| {
+                    Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+            }
+        }
+
+        // --- ADD: Drop stale relation indexes ---
+        for (name, def) in &old.relations {
+            let should_drop = if let Some(new_def) = new_schema.relations.get(name) {
                 def.sql_indexed && !new_def.sql_indexed
             } else {
                 def.sql_indexed

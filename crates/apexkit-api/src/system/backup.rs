@@ -96,6 +96,8 @@ pub async fn perform_backup(
 
             if let Ok(cols) = db.list_collections().await {
                 let schema_json = serde_json::to_string_pretty(&serde_json::json!({
+                    "apexkit_version": env!("CARGO_PKG_VERSION"),
+                    "version": env!("CARGO_PKG_VERSION"),
                     "collections": cols,
                     "strategy": "overwrite"
                 }))

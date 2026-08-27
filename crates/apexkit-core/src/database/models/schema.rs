@@ -44,10 +44,18 @@ pub struct RelationDefinition {
     pub uid: String,
     #[serde(default)]
     pub required: bool,
-    // Stable Index of target collection
+    // --- ADD THESE FIELDS ---
+    #[serde(default)]
+    pub sql_indexed: bool,
+    #[serde(default)]
+    pub ose_indexed: bool,
+    #[serde(default)]
+    pub vectorize: bool,
+    #[serde(default)]
+    pub dimension: Option<usize>,
+    // -------------------------
     #[serde(default)]
     pub target_index: Option<String>,
-    // If true, when the target record is deleted, THIS record is also deleted.
     #[serde(default)]
     pub cascade_on_target_delete: bool,
 }

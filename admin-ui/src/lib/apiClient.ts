@@ -153,6 +153,12 @@ const transformCollection = (col: any): Collection => {
         relationTo: def.target_collection,
         required: def.required || false,
         unique: def.relation_type === 'one' ? true : false,
+        // --- ADD THESE PROPERTIES ---
+        sql_indexed: def.sql_indexed || false,
+        ose_indexed: def.ose_indexed || false,
+        vectorize: def.vectorize || false,
+        dimension: def.dimension || null,
+        // ----------------------------
         originalName: name,
         position: def.position || 999,
         uid: def.uid || 'gen_rel',
@@ -208,6 +214,12 @@ const transformToBackendSchema = (data: Partial<Collection>) => {
           position: field.position,
           required: field.required,
           uid: field.uid,
+          // --- ADD THESE PROPERTIES ---
+          sql_indexed: field.sql_indexed || false,
+          ose_indexed: field.ose_indexed || false,
+          vectorize: field.vectorize || false,
+          dimension: field.dimension || null,
+          // ----------------------------
           cascade_on_target_delete: field.cascade_on_target_delete || false,
         };
         return;
@@ -588,7 +600,15 @@ export const apiClient = {
     exportSchema: async () => {
       const res = await rawFetch('/admin/export-schema');
       const blob = await res.blob();
-      downloadBlob(blob, 'apex_schema.json');
+      const disposition = res.headers.get('Content-Disposition');
+      let filename = 'apexkit-schema.json';
+      if (disposition && disposition.indexOf('filename=') !== -1) {
+        const matches = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(disposition);
+        if (matches != null && matches[1]) {
+          filename = matches[1].replace(/['"]/g, '');
+        }
+      }
+      downloadBlob(blob, filename);
     },
     importSchema: async (file: File, strategy: 'skip' | 'overwrite' | 'error' = 'skip') => {
       return await pb.admins.importSchema(file, strategy);

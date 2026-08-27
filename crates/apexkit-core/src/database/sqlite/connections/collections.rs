@@ -1,8 +1,8 @@
 use super::ApexKit;
 use crate::database::sqlite::utils::{reconcile_sql_indexes, row_to_collection};
 use crate::database::traits::{CollectionStore, IntoSqlVal};
-use crate::models::Collection;
 use crate::models::schema::CollectionSchema;
+use crate::models::{Collection, FieldType};
 use async_trait::async_trait;
 use rusqlite::params;
 
@@ -31,13 +31,20 @@ impl CollectionStore for ApexKit {
                 as Box<dyn std::error::Error + Send + Sync>
         })?;
 
-        if let Some(s) = schema {
-            // Enforce strict field name constraints
-            for field_name in s.fields.keys() {
+        let mut sanitized_schema = schema.clone();
+
+        if let Some(s) = &mut sanitized_schema {
+            // Enforce strict field name constraints & lock `auto` injection
+            for (field_name, def) in &mut s.fields {
                 validate_identifier(field_name).map_err(|e| {
                     Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
                         as Box<dyn std::error::Error + Send + Sync>
                 })?;
+
+                // LOCK: Strictly allow `auto` only on Owner and Date fields
+                if def.auto && !matches!(def.r#type, FieldType::Owner | FieldType::Date) {
+                    def.auto = false;
+                }
             }
             // Enforce strict relation name constraints
             for rel_name in s.relations.keys() {
@@ -48,7 +55,7 @@ impl CollectionStore for ApexKit {
             }
         }
 
-        let schema_str = serde_json::to_string(&schema)?;
+        let schema_str = serde_json::to_string(&sanitized_schema)?;
         let idx = index.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let id = self
@@ -62,8 +69,10 @@ impl CollectionStore for ApexKit {
                 Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
             })?;
 
-        if let Some(s) = schema {
-            if s.fields.values().any(|f| f.ose_indexed) {
+        if let Some(s) = &sanitized_schema {
+            if s.fields.values().any(|f| f.ose_indexed)
+                || s.relations.values().any(|r| r.ose_indexed)
+            {
                 self.search.load_index(id, s)?;
             }
             reconcile_sql_indexes(&self.data_batcher, id, s, None).await?;
@@ -111,12 +120,19 @@ impl CollectionStore for ApexKit {
             })?;
         }
 
-        if let Some(s) = &schema {
-            for field_name in s.fields.keys() {
+        let mut sanitized_schema = schema;
+
+        if let Some(s) = &mut sanitized_schema {
+            for (field_name, def) in &mut s.fields {
                 validate_identifier(field_name).map_err(|e| {
                     Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
                         as Box<dyn std::error::Error + Send + Sync>
                 })?;
+
+                // LOCK: Strictly allow `auto` only on Owner and Date fields
+                if def.auto && !matches!(def.r#type, FieldType::Owner | FieldType::Date) {
+                    def.auto = false;
+                }
             }
             for rel_name in s.relations.keys() {
                 validate_identifier(rel_name).map_err(|e| {
@@ -141,7 +157,7 @@ impl CollectionStore for ApexKit {
                 })?;
         }
 
-        if let Some(s) = &schema {
+        if let Some(s) = &sanitized_schema {
             let s_str = serde_json::to_string(&s)?;
             self.data_batcher
                 .execute(
@@ -272,7 +288,9 @@ impl CollectionStore for ApexKit {
 
             reconcile_sql_indexes(&self.data_batcher, id, s, old_schema.as_ref()).await?;
 
-            if s.fields.values().any(|f| f.ose_indexed) {
+            if s.fields.values().any(|f| f.ose_indexed)
+                || s.relations.values().any(|r| r.ose_indexed)
+            {
                 self.search.load_index(id, s)?;
             }
         }

@@ -16,6 +16,10 @@ use apexkit_core::models::Collection;
 // [NEW] DTO for Schema Import
 #[derive(Deserialize, ToSchema)]
 pub struct ImportSchemaRequestDto {
+    #[serde(default)]
+    pub apexkit_version: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
     pub collections: Vec<Collection>, // Array of full collection objects
     #[serde(default)]
     pub strategy: String, // "skip", "overwrite", "error"

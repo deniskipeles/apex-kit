@@ -1,6 +1,7 @@
 use crate::AppError;
 use crate::DatabaseConnection;
 use apexkit_core::auth::Claims;
+use apexkit_core::realtime::EventScope;
 use axum::{Extension, http::header, response::Response};
 use std::collections::HashMap;
 
@@ -12,11 +13,26 @@ use std::collections::HashMap;
 )]
 pub async fn export_schema_handler(
     Extension(claims): Extension<Claims>,
+    scope: Option<Extension<EventScope>>,
     DatabaseConnection(db): DatabaseConnection,
 ) -> Result<Response, AppError> {
     if claims.role != "admin" {
         return Err(AppError::Forbidden("Admins only".into()));
     }
+
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+    let (scope_type, scope_id) = match event_scope {
+        EventScope::Root => ("root", "root".to_string()),
+        EventScope::Tenant(id) => ("tenant", id),
+        EventScope::Sandbox(id) => ("sandbox", id),
+        _ => ("unknown", "unknown".to_string()),
+    };
+
+    let date_str = chrono::Utc::now().format("%Y%m%d").to_string();
+    let filename = format!(
+        "apexkit-schema-{}-{}-{}.json",
+        scope_type, scope_id, date_str
+    );
 
     // 1. Fetch all collections
     let mut collections = db
@@ -24,12 +40,8 @@ pub async fn export_schema_handler(
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
-    // 2. [FIX] Normalize Relations (Replace DB IDs with Names/Indexes)
-
-    // Build lookup maps
-    // ID -> (Name, Index)
+    // 2. Normalize Relations (Replace DB IDs with Names/Indexes)
     let mut id_lookup: HashMap<String, (String, Option<String>)> = HashMap::new();
-    // Name -> (Name, Index) - needed if target is already a name
     let mut name_lookup: HashMap<String, (String, Option<String>)> = HashMap::new();
 
     for col in &collections {
@@ -38,33 +50,31 @@ pub async fn export_schema_handler(
         name_lookup.insert(col.name.clone(), val);
     }
 
-    // Iterate through schema relations and normalize
     for col in &mut collections {
         if let Some(schema) = &mut col.schema {
             for rel in schema.relations.values_mut() {
                 let target_raw = &rel.target_collection;
 
-                // Case A: Target is an ID (e.g. "17")
                 if let Some((name, idx)) = id_lookup.get(target_raw) {
-                    rel.target_collection = name.clone(); // Replace ID with Name
+                    rel.target_collection = name.clone();
                     if rel.target_index.is_none() {
-                        rel.target_index = idx.clone(); // Inject UUID Index
+                        rel.target_index = idx.clone();
                     }
-                }
-                // Case B: Target is already a Name (e.g. "issues")
-                else if let Some((_, idx)) = name_lookup.get(target_raw)
+                } else if let Some((_, idx)) = name_lookup.get(target_raw)
                     && rel.target_index.is_none()
                 {
-                    rel.target_index = idx.clone(); // Inject UUID Index
+                    rel.target_index = idx.clone();
                 }
             }
         }
     }
 
-    // 3. Serialize & Return
+    // 3. Serialize & Return with Version and Dynamic Filename
     let export_obj = serde_json::json!({
+        "apexkit_version": env!("CARGO_PKG_VERSION"),
+        "version": env!("CARGO_PKG_VERSION"),
         "collections": collections,
-        "strategy": "skip", // Default strategy hint
+        "strategy": "skip",
         "exported_at": chrono::Utc::now().to_rfc3339()
     });
 
@@ -75,7 +85,7 @@ pub async fn export_schema_handler(
         .header(header::CONTENT_TYPE, "application/json")
         .header(
             header::CONTENT_DISPOSITION,
-            "attachment; filename=\"apex_schema.json\"",
+            format!("attachment; filename=\"{}\"", filename),
         )
         .body(json_bytes.into())
         .map_err(|e| AppError::UnknownError(format!("Response build failed: {}", e)))
