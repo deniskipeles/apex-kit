@@ -6,7 +6,11 @@ use rquickjs::{Ctx, Function, Object};
 use rquickjs_serde::to_value;
 use std::sync::Arc;
 
-pub fn register_env<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>, base_url: String) -> Result<(), String> {
+pub fn register_env<'js>(
+    ctx: &Ctx<'js>,
+    app_ctx: Arc<dyn ScriptContext>,
+    base_url: String,
+) -> Result<(), String> {
     let globals = ctx.globals();
     let env_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
@@ -16,8 +20,15 @@ pub fn register_env<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>, base_u
     let host_with_port = base_url_clean.split("://").nth(1).unwrap_or(base_url_clean);
     let host = host_with_port.split(':').next().unwrap_or("");
 
-    let scheme = if base_url_clean.starts_with("https://") { "https" } else { "http" };
-    let is_localhost = host == "localhost" || host == "127.0.0.1" || host.starts_with("192.168.") || host.starts_with("10.");
+    let scheme = if base_url_clean.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    let is_localhost = host == "localhost"
+        || host == "127.0.0.1"
+        || host.starts_with("192.168.")
+        || host.starts_with("10.");
 
     // Check if the current host ends with the root domain but is not EXACTLY the root domain.
     // E.g. host = "abc.example.com", root_domain = "example.com".
@@ -42,10 +53,10 @@ pub fn register_env<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>, base_u
             } else {
                 format!("{}/tenant/{}", root_url, id)
             }
-        },
+        }
         EventScope::Sandbox(id) => {
             format!("{}/sandbox/{}", root_url, id)
-        },
+        }
         _ => root_url.clone(),
     };
 
@@ -60,11 +71,21 @@ pub fn register_env<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>, base_u
     let local_app = format!("{}{}", local_root, scope_path);
 
     // Sync Properties
-    env_obj.set("BASE_URL", root_url.clone()).map_err(|e| e.to_string())?;
-    env_obj.set("APP_URL", app_url.clone()).map_err(|e| e.to_string())?;
-    env_obj.set("LOCAL_BASE_URL", local_root.clone()).map_err(|e| e.to_string())?;
-    env_obj.set("LOCAL_APP_URL", local_app.clone()).map_err(|e| e.to_string())?;
-    env_obj.set("SMTP_BLOCKED", false).map_err(|e| e.to_string())?;
+    env_obj
+        .set("BASE_URL", root_url.clone())
+        .map_err(|e| e.to_string())?;
+    env_obj
+        .set("APP_URL", app_url.clone())
+        .map_err(|e| e.to_string())?;
+    env_obj
+        .set("LOCAL_BASE_URL", local_root.clone())
+        .map_err(|e| e.to_string())?;
+    env_obj
+        .set("LOCAL_APP_URL", local_app.clone())
+        .map_err(|e| e.to_string())?;
+    env_obj
+        .set("SMTP_BLOCKED", false)
+        .map_err(|e| e.to_string())?;
 
     // $env.get(key) -> Promise<string>
     let app_get = app_ctx.clone();
@@ -72,58 +93,67 @@ pub fn register_env<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>, base_u
     let a_url1 = app_url.clone();
     let lr_url1 = local_root.clone();
     let la_url1 = local_app.clone();
-    let get_fn = Function::new(
-        ctx.clone(),
-        Async(move |key: String| {
-            let app = app_get.clone();
-            let r_url = r_url1.clone();
-            let a_url = a_url1.clone();
-            let lr_url = lr_url1.clone();
-            let la_url = la_url1.clone();
+    let get_fn =
+        Function::new(
+            ctx.clone(),
+            Async(move |key: String| {
+                let app = app_get.clone();
+                let r_url = r_url1.clone();
+                let a_url = a_url1.clone();
+                let lr_url = lr_url1.clone();
+                let la_url = la_url1.clone();
 
-            async move {
-                // Intercept dynamic built-ins to maintain fast synchronous-like behavior
-                if key == "BASE_URL" { return Ok::<String, rquickjs::Error>(r_url); }
-                if key == "APP_URL" { return Ok::<String, rquickjs::Error>(a_url); }
-                if key == "LOCAL_BASE_URL" { return Ok::<String, rquickjs::Error>(lr_url); }
-                if key == "LOCAL_APP_URL" { return Ok::<String, rquickjs::Error>(la_url); }
-
-                let db = resolve_db(None, app.clone())
-                    .await
-                    .unwrap_or_else(|_| app.get_db());
-
-                // 1. Attempt to fetch from Database Secrets
-                if let Ok(Some(val)) = db.get_config(&key).await {
-                    if let Ok(enc) = serde_json::from_value::<
-                        crate::security::vault::EncryptedValue,
-                    >(val.clone())
-                    {
-                        return Ok::<String, rquickjs::Error>(
-                            app.get_vault()
-                                .decrypt(&enc)
-                                .map_err(|_| rquickjs::Error::Exception)?,
-                        );
+                async move {
+                    // Intercept dynamic built-ins to maintain fast synchronous-like behavior
+                    if key == "BASE_URL" {
+                        return Ok::<String, rquickjs::Error>(r_url);
+                    }
+                    if key == "APP_URL" {
+                        return Ok::<String, rquickjs::Error>(a_url);
+                    }
+                    if key == "LOCAL_BASE_URL" {
+                        return Ok::<String, rquickjs::Error>(lr_url);
+                    }
+                    if key == "LOCAL_APP_URL" {
+                        return Ok::<String, rquickjs::Error>(la_url);
                     }
 
-                    let val_str = match val {
-                        serde_json::Value::String(s) => s,
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        _ => val.to_string(),
-                    };
-                    return Ok::<String, rquickjs::Error>(val_str);
-                }
+                    let db = resolve_db(None, app.clone())
+                        .await
+                        .unwrap_or_else(|_| app.get_db());
 
-                // 2. Fallback to reading from system environment
-                if let Ok(env_val) = std::env::var(&key) {
-                    return Ok::<String, rquickjs::Error>(env_val);
-                }
+                    // 1. Attempt to fetch from Database Secrets
+                    if let Ok(Some(val)) = db.get_config(&key).await {
+                        if let Ok(enc) = serde_json::from_value::<
+                            crate::security::vault::EncryptedValue,
+                        >(val.clone())
+                        {
+                            return Ok::<String, rquickjs::Error>(
+                                app.get_vault()
+                                    .decrypt(&enc)
+                                    .map_err(|_| rquickjs::Error::Exception)?,
+                            );
+                        }
 
-                Ok::<String, rquickjs::Error>("".to_string())
-            }
-        }),
-    )
-    .map_err(|e| e.to_string())?;
+                        let val_str = match val {
+                            serde_json::Value::String(s) => s,
+                            serde_json::Value::Bool(b) => b.to_string(),
+                            serde_json::Value::Number(n) => n.to_string(),
+                            _ => val.to_string(),
+                        };
+                        return Ok::<String, rquickjs::Error>(val_str);
+                    }
+
+                    // 2. Fallback to reading from system environment
+                    if let Ok(env_val) = std::env::var(&key) {
+                        return Ok::<String, rquickjs::Error>(env_val);
+                    }
+
+                    Ok::<String, rquickjs::Error>("".to_string())
+                }
+            }),
+        )
+        .map_err(|e| e.to_string())?;
 
     // $env.has(key) -> Promise<boolean>
     let app_has = app_ctx.clone();
@@ -132,11 +162,15 @@ pub fn register_env<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>, base_u
         Async(move |key: String| {
             let app = app_has.clone();
             async move {
-                if ["BASE_URL", "APP_URL", "LOCAL_BASE_URL", "LOCAL_APP_URL"].contains(&key.as_str()) {
+                if ["BASE_URL", "APP_URL", "LOCAL_BASE_URL", "LOCAL_APP_URL"]
+                    .contains(&key.as_str())
+                {
                     return Ok::<bool, rquickjs::Error>(true);
                 }
 
-                let db = resolve_db(None, app.clone()).await.unwrap_or_else(|_| app.get_db());
+                let db = resolve_db(None, app.clone())
+                    .await
+                    .unwrap_or_else(|_| app.get_db());
                 if let Ok(Some(_)) = db.get_config(&key).await {
                     return Ok(true);
                 }
@@ -178,7 +212,9 @@ pub fn register_env<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>, base_u
                     env_vars.insert(k, v);
                 }
 
-                let db = resolve_db(None, app.clone()).await.unwrap_or_else(|_| app.get_db());
+                let db = resolve_db(None, app.clone())
+                    .await
+                    .unwrap_or_else(|_| app.get_db());
                 if let Ok(configs) = db.list_configs().await {
                     for config in configs {
                         if !config.encrypted {

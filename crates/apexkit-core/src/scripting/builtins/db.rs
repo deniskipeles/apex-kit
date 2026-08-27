@@ -191,11 +191,21 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-                        let rec_id = args
-                            .0
-                            .get(2)
-                            .and_then(|v| from_value::<i64>(v.clone()).ok())
-                            .unwrap_or(0);
+
+                        // Flexible String parsing fallback without hard-locking struct validation
+                        let rec_id = match args.0.get(2) {
+                            Some(v) if v.is_int() => v.as_int().unwrap() as i64,
+                            Some(v) if v.is_float() => v.as_float().unwrap() as i64,
+                            Some(v) if v.is_string() => v
+                                .as_string()
+                                .unwrap()
+                                .to_string()
+                                .unwrap()
+                                .parse()
+                                .unwrap_or(0),
+                            _ => 0,
+                        };
+
                         let exp = args
                             .0
                             .get(3)
@@ -209,11 +219,20 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-                        let rec_id = args
-                            .0
-                            .get(1)
-                            .and_then(|v| from_value::<i64>(v.clone()).ok())
-                            .unwrap_or(0);
+
+                        let rec_id = match args.0.get(1) {
+                            Some(v) if v.is_int() => v.as_int().unwrap() as i64,
+                            Some(v) if v.is_float() => v.as_float().unwrap() as i64,
+                            Some(v) if v.is_string() => v
+                                .as_string()
+                                .unwrap()
+                                .to_string()
+                                .unwrap()
+                                .parse()
+                                .unwrap_or(0),
+                            _ => 0,
+                        };
+
                         let exp = args
                             .0
                             .get(2)
@@ -316,11 +335,20 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-                        let rec_id = args
-                            .0
-                            .get(2)
-                            .and_then(|v| from_value::<i64>(v.clone()).ok())
-                            .unwrap_or(0);
+
+                        let rec_id = match args.0.get(2) {
+                            Some(v) if v.is_int() => v.as_int().unwrap() as i64,
+                            Some(v) if v.is_float() => v.as_float().unwrap() as i64,
+                            Some(v) if v.is_string() => v
+                                .as_string()
+                                .unwrap()
+                                .to_string()
+                                .unwrap()
+                                .parse()
+                                .unwrap_or(0),
+                            _ => 0,
+                        };
+
                         let d = args.0.get(3).cloned();
                         (c_id, col_name, rec_id, d)
                     }
@@ -331,11 +359,20 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-                        let rec_id = args
-                            .0
-                            .get(1)
-                            .and_then(|v| from_value::<i64>(v.clone()).ok())
-                            .unwrap_or(0);
+
+                        let rec_id = match args.0.get(1) {
+                            Some(v) if v.is_int() => v.as_int().unwrap() as i64,
+                            Some(v) if v.is_float() => v.as_float().unwrap() as i64,
+                            Some(v) if v.is_string() => v
+                                .as_string()
+                                .unwrap()
+                                .to_string()
+                                .unwrap()
+                                .parse()
+                                .unwrap_or(0),
+                            _ => 0,
+                        };
+
                         let d = args.0.get(2).cloned();
                         (None, col_name, rec_id, d)
                     }
@@ -382,11 +419,19 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-                        let rec_id = args
-                            .0
-                            .get(2)
-                            .and_then(|v| from_value::<i64>(v.clone()).ok())
-                            .unwrap_or(0);
+
+                        let rec_id = match args.0.get(2) {
+                            Some(v) if v.is_int() => v.as_int().unwrap() as i64,
+                            Some(v) if v.is_float() => v.as_float().unwrap() as i64,
+                            Some(v) if v.is_string() => v
+                                .as_string()
+                                .unwrap()
+                                .to_string()
+                                .unwrap()
+                                .parse()
+                                .unwrap_or(0),
+                            _ => 0,
+                        };
                         (c_id, col_name, rec_id)
                     }
                     DbMode::Scoped => {
@@ -396,11 +441,19 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-                        let rec_id = args
-                            .0
-                            .get(1)
-                            .and_then(|v| from_value::<i64>(v.clone()).ok())
-                            .unwrap_or(0);
+
+                        let rec_id = match args.0.get(1) {
+                            Some(v) if v.is_int() => v.as_int().unwrap() as i64,
+                            Some(v) if v.is_float() => v.as_float().unwrap() as i64,
+                            Some(v) if v.is_string() => v
+                                .as_string()
+                                .unwrap()
+                                .to_string()
+                                .unwrap()
+                                .parse()
+                                .unwrap_or(0),
+                            _ => 0,
+                        };
                         (None, col_name, rec_id)
                     }
                 };
@@ -518,11 +571,19 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-                        let rec_id = args
-                            .0
-                            .get(2)
-                            .and_then(|v| from_value::<i64>(v.clone()).ok())
-                            .unwrap_or(0);
+
+                        let rec_id = match args.0.get(2) {
+                            Some(v) if v.is_int() => v.as_int().unwrap() as i64,
+                            Some(v) if v.is_float() => v.as_float().unwrap() as i64,
+                            Some(v) if v.is_string() => v
+                                .as_string()
+                                .unwrap()
+                                .to_string()
+                                .unwrap()
+                                .parse()
+                                .unwrap_or(0),
+                            _ => 0,
+                        };
                         (c_id, col_name, rec_id)
                     }
                     DbMode::Scoped => {
@@ -532,11 +593,19 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-                        let rec_id = args
-                            .0
-                            .get(1)
-                            .and_then(|v| from_value::<i64>(v.clone()).ok())
-                            .unwrap_or(0);
+
+                        let rec_id = match args.0.get(1) {
+                            Some(v) if v.is_int() => v.as_int().unwrap() as i64,
+                            Some(v) if v.is_float() => v.as_float().unwrap() as i64,
+                            Some(v) if v.is_string() => v
+                                .as_string()
+                                .unwrap()
+                                .to_string()
+                                .unwrap()
+                                .parse()
+                                .unwrap_or(0),
+                            _ => 0,
+                        };
                         (None, col_name, rec_id)
                     }
                 };

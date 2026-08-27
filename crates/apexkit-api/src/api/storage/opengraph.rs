@@ -247,7 +247,7 @@ pub async fn generate_opengraph(
     };
 
     let mut context = tera::Context::new();
-    
+
     let default_logo_b64 = get_scope_logo_base64(&db, &storage).await;
     context.insert("IMAGE_URL", &default_logo_b64);
     let fallback_logo_cache = default_logo_b64;

@@ -22,8 +22,13 @@ pub async fn handle_generate_embedding(
                 let sandboxes = root_db.list_sandboxes(None).await.unwrap_or_default();
                 if let Some(sb) = sandboxes.iter().find(|s| s.id == sid) {
                     if sb.current_vectors >= sb.max_vectors {
-                        let msg = format!("Sandbox {} vector limit exceeded ({} max)", sid, sb.max_vectors);
-                        let _ = root_db.log_system_event("error", "vectorization", &msg).await;
+                        let msg = format!(
+                            "Sandbox {} vector limit exceeded ({} max)",
+                            sid, sb.max_vectors
+                        );
+                        let _ = root_db
+                            .log_system_event("error", "vectorization", &msg)
+                            .await;
                         return Err(msg);
                     }
                 }
@@ -31,8 +36,13 @@ pub async fn handle_generate_embedding(
                 let tenants = root_db.list_tenants().await.unwrap_or_default();
                 if let Some(t) = tenants.iter().find(|t| &t.id == tid) {
                     if t.stats.vector_count >= t.stats.max_vectors {
-                        let msg = format!("Tenant {} vector limit exceeded ({} max)", tid, t.stats.max_vectors);
-                        let _ = root_db.log_system_event("error", "vectorization", &msg).await;
+                        let msg = format!(
+                            "Tenant {} vector limit exceeded ({} max)",
+                            tid, t.stats.max_vectors
+                        );
+                        let _ = root_db
+                            .log_system_event("error", "vectorization", &msg)
+                            .await;
                         return Err(msg);
                     }
                 }
@@ -96,8 +106,11 @@ pub async fn handle_generate_embedding(
                 db.save_vector(collection_id, record_id, &field_name, vec, &resolved_model)
                     .await
                     .map_err(|e| e.to_string())?;
-                
-                let msg = format!("Successfully vectorized {} for record {}", field_name, record_id);
+
+                let msg = format!(
+                    "Successfully vectorized {} for record {}",
+                    field_name, record_id
+                );
                 let _ = db.log_system_event("info", "vectorization", &msg).await;
             }
             Err(e) => {
@@ -168,8 +181,13 @@ pub async fn handle_revectorize_collection(
             return Ok(());
         }
 
-        let start_msg = format!("Starting bulk revectorization for collection {}", collection_id);
-        let _ = db.log_system_event("info", "vectorization", &start_msg).await;
+        let start_msg = format!(
+            "Starting bulk revectorization for collection {}",
+            collection_id
+        );
+        let _ = db
+            .log_system_event("info", "vectorization", &start_msg)
+            .await;
 
         let mut offset = 0;
         let limit = 1000;
@@ -227,8 +245,11 @@ pub async fn handle_revectorize_collection(
                         )
                         .await
                         {
-                            let err_msg = format!("Failed to vectorize record {}: {}", record.id, e);
-                            let _ = db.log_system_event("error", "vectorization", &err_msg).await;
+                            let err_msg =
+                                format!("Failed to vectorize record {}: {}", record.id, e);
+                            let _ = db
+                                .log_system_event("error", "vectorization", &err_msg)
+                                .await;
                         }
 
                         // We strictly sleep for 50ms between generation loops to yield the Tokio task scheduler
@@ -238,8 +259,11 @@ pub async fn handle_revectorize_collection(
             }
             offset += limit;
         }
-        
-        let end_msg = format!("Finished bulk revectorization for collection {}", collection_id);
+
+        let end_msg = format!(
+            "Finished bulk revectorization for collection {}",
+            collection_id
+        );
         let _ = db.log_system_event("info", "vectorization", &end_msg).await;
     }
     Ok(())
@@ -252,14 +276,22 @@ pub async fn handle_reindex_collection(
     collection_id: i64,
 ) -> Result<(), String> {
     if let Some((db, _)) = resolver.resolve(tenant_id.as_deref()).await {
-        let start_msg = format!("Starting Tantivy index rebuild for collection {}", collection_id);
-        let _ = db.log_system_event("info", "search_index", &start_msg).await;
+        let start_msg = format!(
+            "Starting Tantivy index rebuild for collection {}",
+            collection_id
+        );
+        let _ = db
+            .log_system_event("info", "search_index", &start_msg)
+            .await;
 
         db.reindex_collection(collection_id)
             .await
             .map_err(|e| e.to_string())?;
 
-        let end_msg = format!("Finished Tantivy index rebuild for collection {}", collection_id);
+        let end_msg = format!(
+            "Finished Tantivy index rebuild for collection {}",
+            collection_id
+        );
         let _ = db.log_system_event("info", "search_index", &end_msg).await;
     }
     Ok(())

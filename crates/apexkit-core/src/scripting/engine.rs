@@ -594,7 +594,11 @@ impl ScriptEngine {
             let db = context.get_db();
             let mut configured = None;
             if let Ok(Some(val)) = db.get_config("general").await {
-                if let Some(app_url) = val.get("app_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(app_url) = val
+                    .get("app_url")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     configured = Some(app_url.to_string());
                 }
             }
@@ -810,7 +814,11 @@ impl ScriptEngine {
             let db = context.get_db();
             let mut configured = None;
             if let Ok(Some(val)) = db.get_config("general").await {
-                if let Some(app_url) = val.get("app_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(app_url) = val
+                    .get("app_url")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     configured = Some(app_url.to_string());
                 }
             }

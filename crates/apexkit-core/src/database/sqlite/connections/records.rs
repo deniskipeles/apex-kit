@@ -127,8 +127,9 @@ impl RecordStore for ApexKit {
             let conn = self.get_data_read().await;
 
             if expand.is_none() || expand.as_ref().unwrap().trim().is_empty() {
+                // Applied SQL CAST logic for dynamic string/int matching
                 let mut stmt = conn.prepare(
-                    "SELECT id,json(data),NULL,created,updated FROM records WHERE collection_id = ?1 AND id = ?2"
+                    "SELECT id,json(data),NULL,created,updated FROM records WHERE collection_id = ?1 AND (id = ?2 OR CAST(id AS TEXT) = CAST(?2 AS TEXT))"
                 )?;
                 let mut rows = stmt.query(rusqlite::params![collection_id, record_id])?;
                 match rows.next()? {
@@ -180,8 +181,9 @@ impl RecordStore for ApexKit {
                     &id_map,
                 );
 
+                // Applied SQL CAST logic
                 let sql = format!(
-                    "SELECT id,json(data),{},created,updated FROM records WHERE collection_id = ?1 AND id = ?2",
+                    "SELECT id,json(data),{},created,updated FROM records WHERE collection_id = ?1 AND (id = ?2 OR CAST(id AS TEXT) = CAST(?2 AS TEXT))",
                     expand_json_sql
                 );
 
@@ -231,8 +233,9 @@ impl RecordStore for ApexKit {
             .ok_or("Collection not found")?;
 
             let existing = {
+                // Applied SQL CAST logic
                 let mut stmt = conn.prepare(
-                    "SELECT id,json(data),NULL,created,updated FROM records WHERE collection_id = ?1 AND id = ?2"
+                    "SELECT id,json(data),NULL,created,updated FROM records WHERE collection_id = ?1 AND (id = ?2 OR CAST(id AS TEXT) = CAST(?2 AS TEXT))"
                 )?;
                 let mut rows = stmt.query(rusqlite::params![collection_id, record_id])?;
                 if let Some(row) = rows.next()? {
@@ -272,8 +275,9 @@ impl RecordStore for ApexKit {
             enforce_uniqueness(&conn, collection_id, Some(record_id), &merged_data, &schema)?;
         }
 
+        // Applied SQL CAST logic
         self.data_batcher.execute(
-            "UPDATE records SET data = ?1,updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND id = ?3".into(),
+            "UPDATE records SET data = ?1,updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND (id = ?3 OR CAST(id AS TEXT) = CAST(?3 AS TEXT))".into(),
             vec![rusqlite::types::Value::Blob(jsonb_bytes), collection_id.into_val(), record_id.into_val()]
         ).await.map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
 
@@ -310,7 +314,6 @@ impl RecordStore for ApexKit {
         let mut to_delete = vec![(collection_id, record_id)];
         let mut visited = std::collections::HashSet::new();
 
-        // Pre-load schemas to quickly analyze cascade conditions
         let collections = self.list_collections().await?;
         let mut schema_map = std::collections::HashMap::new();
         let mut name_to_id = std::collections::HashMap::new();
@@ -323,14 +326,12 @@ impl RecordStore for ApexKit {
             name_to_id.insert(c.id.to_string(), c.id);
         }
 
-        // Process Deletions iteratively (Graph Traversal)
         while let Some((col_id, rec_id)) = to_delete.pop() {
             if visited.contains(&(col_id, rec_id)) {
                 continue;
             }
             visited.insert((col_id, rec_id));
 
-            // Find any records that point to THIS record and have cascade_on_target_delete = true
             for (other_col_id, other_schema) in &schema_map {
                 for (rel_name, rel_def) in &other_schema.relations {
                     if rel_def.cascade_on_target_delete {
@@ -342,7 +343,7 @@ impl RecordStore for ApexKit {
                         if targets_us {
                             let origin_ids: Vec<i64> = {
                                 let conn = self.get_data_read().await;
-                                let mut stmt = conn.prepare("SELECT origin_rec_id FROM _relations WHERE origin_col_id = ?1 AND target_col_id = ?2 AND target_rec_id = ?3 AND rel_name = ?4").map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                let mut stmt = conn.prepare("SELECT origin_rec_id FROM _relations WHERE origin_col_id = ?1 AND target_col_id = ?2 AND (target_rec_id = ?3 OR CAST(target_rec_id AS TEXT) = CAST(?3 AS TEXT)) AND rel_name = ?4").map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                                 let mut rows = stmt
                                     .query(rusqlite::params![
                                         other_col_id,
@@ -375,33 +376,32 @@ impl RecordStore for ApexKit {
             }
         }
 
-        // Execute all collected deletions
         for (del_col_id, del_rec_id) in visited {
+            // Applied SQL CAST logic
             let f1 = self.data_batcher.execute(
-                "DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(),
+                "DELETE FROM records WHERE collection_id = ?1 AND (id = ?2 OR CAST(id AS TEXT) = CAST(?2 AS TEXT))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
             let f2 = self.data_batcher.execute(
-                "DELETE FROM _unique_values WHERE record_id = ?1".into(),
+                "DELETE FROM _unique_values WHERE record_id = ?1 OR CAST(record_id AS TEXT) = CAST(?1 AS TEXT)".into(),
                 vec![del_rec_id.into_val()],
             );
             let f3 = self.data_batcher.execute(
-                "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(),
+                "DELETE FROM _relations WHERE origin_col_id=?1 AND (origin_rec_id=?2 OR CAST(origin_rec_id AS TEXT) = CAST(?2 AS TEXT))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
             let f4 = self.data_batcher.execute(
-                "DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id=?2".into(),
+                "DELETE FROM _relations WHERE target_col_id=?1 AND (target_rec_id=?2 OR CAST(target_rec_id AS TEXT) = CAST(?2 AS TEXT))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
             let f5 = self.vector_batcher.execute(
-                "DELETE FROM vectors WHERE collection_id = ?1 AND record_id = ?2".into(),
+                "DELETE FROM vectors WHERE collection_id = ?1 AND (record_id = ?2 OR CAST(record_id AS TEXT) = CAST(?2 AS TEXT))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
 
             let _ = tokio::try_join!(f1, f2, f3, f4).map_err(map_err)?;
             let _ = f5.await.map_err(map_err)?;
 
-            // Keep Tantivy Search Engine in sync
             let _ = self.search.delete_record(del_col_id, del_rec_id);
         }
 
@@ -510,8 +510,9 @@ impl ApexKit {
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for (rel_name, rel_def) in &schema.relations {
             if let Some(val) = data.get(rel_name) {
+                // Applied SQL CAST logic
                 self.data_batcher.execute(
-                    "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2 AND rel_name=?3".into(),
+                    "DELETE FROM _relations WHERE origin_col_id=?1 AND (origin_rec_id=?2 OR CAST(origin_rec_id AS TEXT) = CAST(?2 AS TEXT)) AND rel_name=?3".into(),
                     vec![collection_id.into_val(), record_id.into_val(), rel_name.clone().into_val()]
                 ).await.map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
 

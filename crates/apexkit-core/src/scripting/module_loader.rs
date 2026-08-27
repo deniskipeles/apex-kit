@@ -335,12 +335,15 @@ impl WorkspaceManager {
         _path: &str,
         content: &str,
     ) -> Result<String, String> {
-        let meta_re = Regex::new(r"(?s)(?:export\s+const\s+__fileMetadata__\s*=\s*|<!--\s*__fileMetadata__\s*=\s*)(\{[\s\S]*?\})(?:;|\s*-->)").unwrap();
+        // ✅ Updated regex: Captures and strips the preceding JSDoc comment `/** @type ... */` as well
+        let meta_re = Regex::new(r"(?s)(?:\/\*\*[\s\S]*?\*\/\s*)?(?:export\s+const\s+__fileMetadata__\s*=\s*|<!--\s*__fileMetadata__\s*=\s*)(\{[\s\S]*?\})(?:;|\s*-->)").unwrap();
 
         if let Some(caps) = meta_re.captures(content) {
             let meta_json = caps.get(1).unwrap().as_str();
             let meta: FileMetadata = serde_json::from_str(meta_json)
                 .map_err(|e| format!("Invalid __fileMetadata__: {}", e))?;
+
+            // Clean code is now guaranteed to have no metadata or JSDoc header artifacts
             let clean_code = meta_re.replace(content, "").trim().to_string();
             let meta_val = serde_json::to_value(&meta).ok();
 

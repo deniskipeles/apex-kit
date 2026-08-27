@@ -121,11 +121,12 @@ pub fn start_background_worker(
                 };
 
                 // Helper to log job errors cleanly to the active scope DB
-                let log_job_error = |tenant_id: Option<String>, msg: String, res: Arc<dyn JobContext>| async move {
-                    if let Some((db, _)) = res.resolve(tenant_id.as_deref()).await {
-                        let _ = db.log_system_event("error", "background_job", &msg).await;
-                    }
-                };
+                let log_job_error =
+                    |tenant_id: Option<String>, msg: String, res: Arc<dyn JobContext>| async move {
+                        if let Some((db, _)) = res.resolve(tenant_id.as_deref()).await {
+                            let _ = db.log_system_event("error", "background_job", &msg).await;
+                        }
+                    };
 
                 match job {
                     Job::SendWelcomeEmail {
@@ -142,7 +143,12 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            log_job_error(tenant_id, format!("Welcome email failed: {}", e), resolver).await;
+                            log_job_error(
+                                tenant_id,
+                                format!("Welcome email failed: {}", e),
+                                resolver,
+                            )
+                            .await;
                         }
                     }
                     Job::SendPasswordReset {
@@ -159,7 +165,12 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            log_job_error(tenant_id, format!("Reset password email failed: {}", e), resolver).await;
+                            log_job_error(
+                                tenant_id,
+                                format!("Reset password email failed: {}", e),
+                                resolver,
+                            )
+                            .await;
                         }
                     }
                     Job::SendVerification {
@@ -176,7 +187,12 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            log_job_error(tenant_id, format!("Verification email failed: {}", e), resolver).await;
+                            log_job_error(
+                                tenant_id,
+                                format!("Verification email failed: {}", e),
+                                resolver,
+                            )
+                            .await;
                         }
                     }
                     Job::GenerateEmbedding {
@@ -200,7 +216,12 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            log_job_error(tenant_id, format!("Embedding generation failed: {}", e), resolver).await;
+                            log_job_error(
+                                tenant_id,
+                                format!("Embedding generation failed: {}", e),
+                                resolver,
+                            )
+                            .await;
                         }
                     }
                     Job::IndexRecord {
@@ -220,7 +241,12 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            log_job_error(tenant_id, format!("Search Indexing failed for {}: {}", record_id, e), resolver).await;
+                            log_job_error(
+                                tenant_id,
+                                format!("Search Indexing failed for {}: {}", record_id, e),
+                                resolver,
+                            )
+                            .await;
                         }
                     }
                     Job::DeleteFromIndex {
@@ -236,7 +262,12 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            log_job_error(tenant_id, format!("Search Index Deletion failed for {}: {}", record_id, e), resolver).await;
+                            log_job_error(
+                                tenant_id,
+                                format!("Search Index Deletion failed for {}: {}", record_id, e),
+                                resolver,
+                            )
+                            .await;
                         }
                     }
                     Job::RevectorizeCollection {
@@ -252,7 +283,12 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            log_job_error(tenant_id, format!("Bulk revectorization failed: {}", e), resolver).await;
+                            log_job_error(
+                                tenant_id,
+                                format!("Bulk revectorization failed: {}", e),
+                                resolver,
+                            )
+                            .await;
                         }
                     }
                     Job::ReindexCollection {
@@ -266,7 +302,12 @@ pub fn start_background_worker(
                         )
                         .await
                         {
-                            log_job_error(tenant_id, format!("Bulk reindexing failed: {}", e), resolver).await;
+                            log_job_error(
+                                tenant_id,
+                                format!("Bulk reindexing failed: {}", e),
+                                resolver,
+                            )
+                            .await;
                         }
                     }
                     _ => {}
