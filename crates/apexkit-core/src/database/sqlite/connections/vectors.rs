@@ -100,12 +100,15 @@ impl VectorStore for ApexKit {
         &self,
         collection_id: i64,
         model: &str,
+        limit: i64,
+        offset: i64,
     ) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> {
         let conn = self.get_vector_read().await;
+        // Apply pagination parameters to query
         let mut stmt = conn.prepare(
-            "SELECT record_id,field_name,vector FROM vectors WHERE collection_id = ?1 AND model = ?2"
+            "SELECT record_id,field_name,vector FROM vectors WHERE collection_id = ?1 AND model = ?2 LIMIT ?3 OFFSET ?4"
         )?;
-        let mut rows = stmt.query(params![collection_id, model.to_string()])?;
+        let mut rows = stmt.query(params![collection_id, model.to_string(), limit, offset])?;
 
         let mut vectors = Vec::new();
         while let Some(row) = rows.next()? {

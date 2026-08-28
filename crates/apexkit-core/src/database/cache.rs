@@ -969,9 +969,11 @@ impl VectorStore for CachedDb {
         &self,
         collection_id: i64,
         model: &str,
+        limit: i64,
+        offset: i64,
     ) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> {
         self.inner
-            .get_vectors_for_collection(collection_id, model)
+            .get_vectors_for_collection(collection_id, model, limit, offset)
             .await
     }
 

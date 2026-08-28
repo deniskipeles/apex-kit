@@ -651,20 +651,36 @@ impl SandboxManager {
             if let Ok(cols) = db_clone.list_collections().await {
                 for col in cols {
                     for active_model in [&active_text_model, &active_vision_model] {
-                        if let Ok(vecs) = db_clone
-                            .get_vectors_for_collection(col.id, active_model)
-                            .await
-                        {
-                            let count = vecs.len();
-                            for (rid, field, v) in vecs {
-                                let _ = vec_prov_clone.index(col.id, rid, &field, &v).await;
+                        // Paginated Hydration
+                        let mut offset = 0;
+                        let limit = 2000;
+                        let mut count = 0;
+
+                        loop {
+                            if let Ok(vecs) = db_clone
+                                .get_vectors_for_collection(col.id, active_model, limit, offset)
+                                .await
+                            {
+                                if vecs.is_empty() {
+                                    break;
+                                }
+                                count += vecs.len();
+                                for (rid, field, v) in vecs {
+                                    let _ = vec_prov_clone.index(col.id, rid, &field, &v).await;
+                                }
+                                offset += limit;
+                                // Yield execution
+                                tokio::task::yield_now().await;
+                            } else {
+                                break;
                             }
-                            if count > 0 {
-                                info!(
-                                    "Sandbox {}: Hydrated {} vectors for col {} (Model: {})",
-                                    session_id_str, count, col.id, active_model
-                                );
-                            }
+                        }
+
+                        if count > 0 {
+                            info!(
+                                "Sandbox {}: Hydrated {} vectors for col {} (Model: {})",
+                                session_id_str, count, col.id, active_model
+                            );
                         }
                     }
                 }

@@ -26,6 +26,10 @@ pub enum Commands {
         #[arg(long, value_name = "URL")]
         get: Option<String>,
 
+        /// Import, sanitize, precompile, and cache a local WASM binary file
+        #[arg(short, long, value_name = "PATH")]
+        file: Option<String>,
+
         /// Optional custom readable name for symlinking (e.g. ffmpeg.wasm)
         #[arg(short, long)]
         name: Option<String>,
@@ -104,7 +108,12 @@ pub async fn execute(command: Commands) -> Result<(), String> {
     match command {
         Commands::User(cmd) => user::execute(cmd).await,
         Commands::Data(cmd) => data::execute(cmd).await,
-        Commands::Wasm { get, name, list } => wasm::execute(get, name, list).await,
+        Commands::Wasm {
+            get,
+            file,
+            name,
+            list,
+        } => wasm::execute(get, file, name, list).await,
         Commands::Backup { root, tenants, out } => backup::handle_backup(root, tenants, out).await,
         Commands::Restore { file, yes } => backup::handle_restore(file, yes).await,
     }

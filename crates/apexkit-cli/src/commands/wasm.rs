@@ -52,6 +52,7 @@ fn create_readable_symlink(cache_dir: &Path, readable_name: &str, target_filenam
 
 pub async fn execute(
     get_url: Option<String>,
+    local_file: Option<String>,
     custom_name: Option<String>,
     list: bool,
 ) -> Result<(), String> {
@@ -59,12 +60,39 @@ pub async fn execute(
         return handle_list().await;
     }
 
+    if let Some(path) = local_file {
+        return handle_file(path, custom_name).await;
+    }
+
     if let Some(url) = get_url {
         return handle_get(url, custom_name).await;
     }
 
-    println!("⚠️ No action specified for WASM tool. Use --get <URL> or --list.");
+    println!("⚠️ No action specified for WASM tool. Use --file <PATH>, --get <URL>, or --list.");
     Ok(())
+}
+
+async fn handle_file(file_path: String, custom_name: Option<String>) -> Result<(), String> {
+    println!("🔍 Reading local WASM binary from: {}...", file_path);
+
+    let path = PathBuf::from(&file_path);
+    if !path.exists() {
+        return Err(format!("File not found: {}", file_path));
+    }
+
+    let bytes = fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))?;
+    if bytes.is_empty() {
+        return Err("WASM file is empty (0 bytes).".to_string());
+    }
+
+    let readable_name = custom_name.unwrap_or_else(|| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("module.wasm")
+            .to_string()
+    });
+
+    process_and_cache_wasm(bytes, readable_name).await
 }
 
 async fn handle_get(url: String, custom_name: Option<String>) -> Result<(), String> {
@@ -98,24 +126,7 @@ async fn handle_get(url: String, custom_name: Option<String>) -> Result<(), Stri
         return Err("Downloaded file is empty (0 bytes).".to_string());
     }
 
-    println!("🔍 Sanitizing and validating WebAssembly module...");
-
-    let mut config = Config::new();
-    config.consume_fuel(true);
-
-    let engine = Engine::new(&config).map_err(|e| format!("Wasmtime Engine init failed: {}", e))?;
-
-    let module = Module::from_binary(&engine, &bytes).map_err(|e| {
-        format!(
-            "❌ Validation Failed: Provided URL did not return a valid WebAssembly module: {}",
-            e
-        )
-    })?;
-
-    // Determine readable name
-    let readable_name = if let Some(name) = custom_name {
-        name
-    } else {
+    let readable_name = custom_name.unwrap_or_else(|| {
         url.split('/')
             .last()
             .unwrap_or("module.wasm")
@@ -123,13 +134,24 @@ async fn handle_get(url: String, custom_name: Option<String>) -> Result<(), Stri
             .next()
             .unwrap_or("module.wasm")
             .to_string()
-    };
+    });
 
-    let readable_name = if readable_name.is_empty() {
-        "module.wasm".to_string()
-    } else {
-        readable_name
-    };
+    process_and_cache_wasm(bytes, readable_name).await
+}
+
+async fn process_and_cache_wasm(bytes: Vec<u8>, readable_name: String) -> Result<(), String> {
+    println!("🔍 Sanitizing and validating WebAssembly module...");
+
+    let mut config = Config::new();
+    config.consume_fuel(true);
+
+    let engine = Engine::new(&config).map_err(|e| format!("Wasmtime Engine init failed: {}", e))?;
+    let module = Module::from_binary(&engine, &bytes).map_err(|e| {
+        format!(
+            "❌ Validation Failed: Provided file is not a valid WebAssembly module: {}",
+            e
+        )
+    })?;
 
     // Calculate SHA-256 Hash
     let hash_bytes = digest(&SHA256, &bytes);

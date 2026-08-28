@@ -312,12 +312,27 @@ impl TenantManager {
             if let Ok(cols) = db_clone.list_collections().await {
                 for col in cols {
                     for active_model in [&active_text_model, &active_vision_model] {
-                        if let Ok(vecs) = db_clone
-                            .get_vectors_for_collection(col.id, active_model)
-                            .await
-                        {
-                            for (rid, field, vec) in vecs {
-                                let _ = vec_provider_clone.index(col.id, rid, &field, &vec).await;
+                        // Paginated Hydration to prevent OOM & Tokio Freezes
+                        let mut offset = 0;
+                        let limit = 2000;
+
+                        loop {
+                            if let Ok(vecs) = db_clone
+                                .get_vectors_for_collection(col.id, active_model, limit, offset)
+                                .await
+                            {
+                                if vecs.is_empty() {
+                                    break;
+                                }
+                                for (rid, field, vec) in vecs {
+                                    let _ =
+                                        vec_provider_clone.index(col.id, rid, &field, &vec).await;
+                                }
+                                offset += limit;
+                                // Critical: Yield execution to allow HTTP traffic through
+                                tokio::task::yield_now().await;
+                            } else {
+                                break;
                             }
                         }
                     }

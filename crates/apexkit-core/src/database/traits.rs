@@ -848,6 +848,8 @@ pub trait VectorStore: Send + Sync {
         &self,
         collection_id: i64,
         model: &str,
+        limit: i64,
+        offset: i64,
     ) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>>;
 
     /// Searches numeric dimensions utilizing L2 distance equations.

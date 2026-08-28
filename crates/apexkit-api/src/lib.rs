@@ -314,16 +314,30 @@ pub async fn start(port: u16) {
         for col in &all_collections {
             // Check for BOTH text and image vectors
             for active_model in [&active_text_model, &active_vision_model] {
-                if let Ok(vectors_to_load) = cached_db
-                    .get_vectors_for_collection(col.id, active_model)
-                    .await
-                {
-                    for (rec_id, field_name, vector) in vectors_to_load {
-                        vector_provider
-                            .index(col.id, rec_id, &field_name, &vector)
-                            .await
-                            .ok();
-                        total_vectors_loaded += 1;
+                // Paginated Hydration to prevent OOM
+                let mut offset = 0;
+                let limit = 2000;
+
+                loop {
+                    if let Ok(vecs) = cached_db
+                        .get_vectors_for_collection(col.id, active_model, limit, offset)
+                        .await
+                    {
+                        if vecs.is_empty() {
+                            break;
+                        }
+                        for (rec_id, field_name, vector) in vecs {
+                            vector_provider
+                                .index(col.id, rec_id, &field_name, &vector)
+                                .await
+                                .ok();
+                            total_vectors_loaded += 1;
+                        }
+                        offset += limit;
+                        // Yield CPU back to Tokio to prevent freezing during startup
+                        tokio::task::yield_now().await;
+                    } else {
+                        break;
                     }
                 }
             }
