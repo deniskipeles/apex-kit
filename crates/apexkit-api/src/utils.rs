@@ -405,11 +405,11 @@ pub async fn check_temp_quota(
 
     let (max_storage_mb, temp_dir) = match scope {
         EventScope::Root => {
-            let general = state.db.get_config("general").await.unwrap_or(None);
-            let max_mb = general
-                .as_ref()
-                .and_then(|v| v.get("max_site_size_mb").and_then(|n| n.as_i64()))
-                .unwrap_or(5000); // 5 GB fallback for root
+            // [UPDATED] Read ROOT_TMP_DIR_LIMIT_IN_MB from env, defaulting to 1GB (1024 MB)
+            let max_mb = std::env::var("ROOT_TMP_DIR_LIMIT_IN_MB")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(1024);
             (max_mb, get_temp_path("system/tmp"))
         }
         EventScope::Tenant(id) => {
