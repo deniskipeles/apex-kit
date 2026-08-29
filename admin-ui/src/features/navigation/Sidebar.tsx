@@ -52,7 +52,7 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
     { icon: Table, label: 'Records', page: 'records' },
     { icon: Users, label: 'Users', page: 'users' },
     { icon: Folder, label: 'Files', page: 'files' },
-    { icon: FileCode, label: 'Scripts', page: 'scripts' },
+    { icon: FileCode, label: 'Webhooks', page: 'scripts' },
     { icon: LayoutTemplate, label: 'Templates', page: 'templates' },
     { icon: Sparkles, label: 'AI Actions', page: 'ai-actions' },
     { icon: BrainCircuit, label: 'Vector Search', page: 'vector-search' },

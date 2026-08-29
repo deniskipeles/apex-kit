@@ -17,7 +17,7 @@ import { SchemaField, Collection } from '../../../types';
 import { JSONEditor } from '../../../components/form/JsonEditor';
 
 interface CollectionFormProps {
-  onSave: (data: any) => void;
+  onSave: (data: any) => Promise<void> | void;
   onCancel: () => void;
   isEmbedded?: boolean;
   zIndex?: number;
@@ -109,6 +109,7 @@ export const CollectionForm = ({
   initialValues,
 }: CollectionFormProps) => {
   const [name, setName] = useState(initialValues?.name || '');
+  const [isSaving, setIsSaving] = useState(false);
   const [schema, setSchema] = useState<SchemaField[]>(
     initialValues?.schema || [
       {
@@ -148,7 +149,7 @@ export const CollectionForm = ({
 
   const effectiveZIndex = zIndex > 0 ? zIndex : 70;
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const identifierRegex = /^[a-zA-Z0-9_]+$/;
     if (!identifierRegex.test(name)) {
       alert('Name can only contain letters, numbers, and underscores.');
@@ -176,13 +177,19 @@ export const CollectionForm = ({
       }
     }
 
-    // Combine everything
-    onSave({
-      name,
-      schema,
-      rules: cleanRules,
-      compositeUnique,
-    });
+    setIsSaving(true);
+    try {
+      await onSave({
+        name,
+        schema,
+        rules: cleanRules,
+        compositeUnique,
+      });
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   // [NEW] Helper to render the unified policy input
@@ -276,10 +283,10 @@ export const CollectionForm = ({
         )}
         {isEmbedded && <div></div>}
         <div className="flex gap-3">
-          <Button variant="ghost" onClick={onCancel}>
+          <Button variant="ghost" onClick={onCancel} disabled={isSaving}>
             Cancel
           </Button>
-          <Button onClick={handleSave}>
+          <Button onClick={handleSave} isLoading={isSaving} disabled={isSaving || !name.trim()}>
             <Save className="mr-2 h-4 w-4" /> Save Collection
           </Button>
         </div>

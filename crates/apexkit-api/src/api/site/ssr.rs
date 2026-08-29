@@ -39,16 +39,29 @@ fn merge_json(a: &mut Value, b: Value) {
 }
 
 fn extract_ssr_js(content: &str) -> (Option<String>, String) {
-    // 1. Matches <script server>, <script server lang="ts">, <script type="module" server>, or <script type="server/js">
-    let server_script_re = Regex::new(
-        r#"(?is)<script\b(?=[^>]*\b(?:server|type=["']server/(?:js|ts)["']))[^>]*>(.*?)</script>"#,
-    )
-    .unwrap();
+    // 1. Matches <script ...>...</script> without using unsupported look-around
+    let script_re = Regex::new(r"(?is)<script\b([^>]*)>(.*?)</script>").unwrap();
 
-    if let Some(caps) = server_script_re.captures(content) {
-        if let Some(js_match) = caps.get(1) {
-            let js_code = js_match.as_str().trim().to_string();
-            let html_content = server_script_re.replace(content, "").to_string();
+    for caps in script_re.captures_iter(content) {
+        let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let attrs_lower = attrs.to_lowercase();
+
+        let has_server_attr = attrs_lower
+            .split_whitespace()
+            .any(|part| part == "server" || part.starts_with("server="));
+
+        let has_server_type = attrs_lower.contains("type=\"server/js\"")
+            || attrs_lower.contains("type='server/js'")
+            || attrs_lower.contains("type=\"server/ts\"")
+            || attrs_lower.contains("type='server/ts'");
+
+        if has_server_attr || has_server_type {
+            let full_match = caps.get(0).unwrap().as_str();
+            let js_code = caps
+                .get(2)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default();
+            let html_content = content.replacen(full_match, "", 1);
             return (Some(js_code), html_content);
         }
     }

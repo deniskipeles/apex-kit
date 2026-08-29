@@ -363,64 +363,163 @@ impl WorkspaceManager {
 
     pub async fn commit_file_to_db(
         db: &Arc<dyn Db>,
-        _path: &str,
+        path: &str,
         content: &str,
     ) -> Result<String, String> {
-        // ✅ Updated regex: Captures and strips the preceding JSDoc comment `/** @type ... */` as well
-        let meta_re = Regex::new(r"(?s)(?:\/\*\*[\s\S]*?\*\/\s*)?(?:export\s+const\s+__fileMetadata__\s*=\s*|<!--\s*__fileMetadata__\s*=\s*)(\{[\s\S]*?\})(?:;|\s*-->)").unwrap();
+        let clean_path = path.replace('\\', "/");
+        let filename = Path::new(&clean_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
 
-        if let Some(caps) = meta_re.captures(content) {
+        // 0. Ignore system/hidden files like .gitkeep
+        if filename.starts_with('.') || filename.ends_with(".gitkeep") {
+            return Ok("Ignored hidden/system file".to_string());
+        }
+
+        // 1. Check for AI Actions (.json or ai_actions/)
+        if clean_path.starts_with("ai_actions/") || clean_path.ends_with(".json") {
+            let json_str = content.trim();
+            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let action_val = payload.get("action").cloned().unwrap_or(payload);
+                if let Ok(action_req) =
+                    serde_json::from_value::<CreateActionReq>(action_val.clone())
+                {
+                    let name = action_req.name.clone();
+                    db.create_ai_action(action_req)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok(format!("AI Action '{}' committed to DB", name));
+                } else if let Some(obj) = action_val.as_object() {
+                    let slug = obj
+                        .get("slug")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            Path::new(&clean_path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("action")
+                                .to_string()
+                        });
+                    let name = obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&slug)
+                        .to_string();
+                    let model = obj
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("gemini-2.5-flash")
+                        .to_string();
+                    let template = obj
+                        .get("template")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{{prompt}}")
+                        .to_string();
+                    let system_prompt = obj
+                        .get("system_prompt")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let config = obj.get("config").cloned();
+
+                    let action_req = CreateActionReq {
+                        slug: slug.clone(),
+                        name: name.clone(),
+                        model,
+                        system_prompt,
+                        template,
+                        config,
+                    };
+                    db.create_ai_action(action_req)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok(format!("AI Action '{}' committed to DB", name));
+                }
+            }
+            return Err("Invalid AI action JSON format".to_string());
+        }
+
+        // 2. Check for Templates (.html or templates/)
+        if clean_path.starts_with("templates/") || clean_path.ends_with(".html") {
+            let html_meta_re =
+                Regex::new(r"(?s)<!--\s*__fileMetadata__\s*=\s*(\{.*?\})\s*-->").unwrap();
+            let mut slug = Path::new(&clean_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("template")
+                .to_string();
+
+            let mut clean_html = content.trim().to_string();
+
+            if let Some(caps) = html_meta_re.captures(content) {
+                if let Some(meta_str) = caps.get(1) {
+                    if let Ok(meta) = serde_json::from_str::<FileMetadata>(meta_str.as_str()) {
+                        if !meta.name.is_empty() {
+                            slug = meta.name;
+                        }
+                    }
+                }
+                clean_html = html_meta_re.replace(content, "").trim().to_string();
+            }
+
+            db.create_template(CreateTemplateReq {
+                slug: slug.clone(),
+                content: clean_html,
+                script_id: None,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            return Ok(format!("Template '{}' committed to DB", slug));
+        }
+
+        // 3. Check for Scripts / Webhooks / Custom Modules with JS export metadata
+        let js_meta_re = Regex::new(
+            r"(?s)(?:\/\*\*.*?\*\/\s*)?export\s+const\s+__fileMetadata__\s*=\s*(\{.*?\});?",
+        )
+        .unwrap();
+
+        if let Some(caps) = js_meta_re.captures(content) {
             let meta_json = caps.get(1).unwrap().as_str();
             let meta: FileMetadata = serde_json::from_str(meta_json)
                 .map_err(|e| format!("Invalid __fileMetadata__: {}", e))?;
 
-            // Clean code is now guaranteed to have no metadata or JSDoc header artifacts
-            let clean_code = meta_re.replace(content, "").trim().to_string();
+            let clean_code = js_meta_re.replace(content, "").trim().to_string();
             let meta_val = serde_json::to_value(&meta).ok();
 
-            match meta.r#type.as_str() {
-                "webhook" | "custom:module" | "esm:module" => {
-                    db.create_script(CreateScriptReq {
-                        name: meta.name.clone(),
-                        trigger_type: meta.trigger_type,
-                        target_collection: meta.target_collection,
-                        code: clean_code,
-                        active: meta.active,
-                        visibility: meta.visibility,
-                        metadata: meta_val,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                    Ok(format!("Script/Module '{}' committed to DB", meta.name))
-                }
-                "template" => {
-                    db.create_template(CreateTemplateReq {
-                        slug: meta.name.clone(),
-                        content: clean_code,
-                        script_id: None,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                    Ok(format!("Template '{}' committed to DB", meta.name))
-                }
-                "ai_action" => {
-                    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) {
-                        if let Some(action) = payload.get("action") {
-                            let action_req: CreateActionReq =
-                                serde_json::from_value(action.clone())
-                                    .map_err(|e| e.to_string())?;
-                            db.create_ai_action(action_req)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            return Ok(format!("AI Action '{}' committed to DB", meta.name));
-                        }
-                    }
-                    Err("Invalid AI action file format".to_string())
-                }
-                _ => Err("Unsupported metadata type".to_string()),
-            }
-        } else {
-            Err("No __fileMetadata__ header block found in file".to_string())
+            db.create_script(CreateScriptReq {
+                name: meta.name.clone(),
+                trigger_type: meta.trigger_type,
+                target_collection: meta.target_collection,
+                code: clean_code,
+                active: meta.active,
+                visibility: meta.visibility,
+                metadata: meta_val,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            return Ok(format!("Script/Module '{}' committed to DB", meta.name));
         }
+
+        // Fallback for raw scripts without metadata header
+        let default_name = Path::new(&clean_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("script")
+            .to_string();
+
+        db.create_script(CreateScriptReq {
+            name: default_name.clone(),
+            trigger_type: "manual".to_string(),
+            target_collection: None,
+            code: content.trim().to_string(),
+            active: true,
+            visibility: "private".to_string(),
+            metadata: None,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(format!("Script/Module '{}' committed to DB", default_name))
     }
 }

@@ -60,7 +60,8 @@ impl AiActionStore for ApexKit {
     ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let config_str = serde_json::to_string(&action.config.unwrap_or(serde_json::json!({})))?;
         let id = self.sys_batcher.insert(
-            "INSERT INTO _ai_actions (slug,name,model,system_prompt,template,config) VALUES (?1,?2,?3,?4,?5,?6)".into(),
+            "INSERT INTO _ai_actions (slug,name,model,system_prompt,template,config) VALUES (?1,?2,?3,?4,?5,?6) \
+             ON CONFLICT(slug) DO UPDATE SET name=excluded.name,model=excluded.model,system_prompt=excluded.system_prompt,template=excluded.template,config=excluded.config,created_at=CURRENT_TIMESTAMP".into(),
             vec![
                 action.slug.into_val(),
                 action.name.into_val(),
