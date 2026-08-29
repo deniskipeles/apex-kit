@@ -16,7 +16,7 @@ export const Breadcrumb = ({ items, onNavigate }: BreadcrumbProps) => {
   return (
     <nav className="flex items-center text-sm font-medium text-muted-foreground">
       <button
-        onClick={() => onNavigate('dashboard')}
+        onClick={() => onNavigate(items[0]?.view || 'dashboard')}
         className="flex items-center gap-1.5 hover:text-primary transition-colors"
       >
         <Home className="h-4 w-4" />
@@ -26,7 +26,7 @@ export const Breadcrumb = ({ items, onNavigate }: BreadcrumbProps) => {
           <ChevronRight className="h-4 w-4 mx-1" />
           <button
             onClick={() => onNavigate(item.view)}
-            className={`capitalize ${index === items.length - 2 ? 'text-foreground' : 'hover:text-primary transition-colors'}`}
+            className={`capitalize ${index === items.length - 2 ? 'text-foreground font-semibold' : 'hover:text-primary transition-colors'}`}
           >
             {item.label}
           </button>

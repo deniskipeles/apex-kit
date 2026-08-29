@@ -179,17 +179,52 @@ pub async fn serve_static_asset(scope: Option<Extension<EventScope>>, uri: Uri) 
 }
 
 // 5. DASHBOARD HANDLER (React SPA Logic)
-pub async fn dashboard_handler(uri: Uri) -> impl IntoResponse {
-    let path = uri.path().trim_start_matches('/').to_string();
+pub async fn dashboard_handler(
+    scope: Option<Extension<EventScope>>,
+    uri: Uri,
+) -> impl IntoResponse {
+    let full_path = uri.path();
 
-    if path == "_dashboard" || path == "_dashboard/" {
-        return serve_embedded("dashboard/index.html");
+    // 1. Serve static JS/CSS assets under _dashboard/
+    if let Some(idx) = full_path.find("_dashboard/") {
+        let subpath = &full_path[idx + "_dashboard/".len()..];
+        let asset_path = format!("dashboard/{}", subpath);
+        if Assets::get(&asset_path).is_some() {
+            return serve_embedded(&asset_path);
+        }
     }
 
-    let relative_path = path.replace("_dashboard/", "dashboard/");
+    // 2. Resolve scope and root domain from environment
+    let root_domain = std::env::var("APEXKIT_ROOT_DOMAIN").unwrap_or_default();
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+    let (scope_type, scope_id) = match &event_scope {
+        EventScope::Root => ("root", "".to_string()),
+        EventScope::Tenant(id) => ("tenant", id.clone()),
+        EventScope::Sandbox(id) => ("sandbox", id.clone()),
+        _ => ("root", "".to_string()),
+    };
 
-    if Assets::get(&relative_path).is_some() {
-        return serve_embedded(&relative_path);
+    // 3. Inject window.__APEXKIT_ROOT_DOMAIN__ and window.__APEX_SCOPE__
+    if let Some(content) = Assets::get("dashboard/index.html") {
+        let raw_html = String::from_utf8_lossy(&content.data);
+        let injection = format!(
+            "<script>\
+                window.__APEXKIT_ROOT_DOMAIN__ = \"{}\";\
+                window.__APEX_SCOPE__ = {{ type: \"{}\", id: \"{}\" }};\
+            </script>",
+            root_domain, scope_type, scope_id
+        );
+        let injected_html = if raw_html.contains("<head>") {
+            raw_html.replacen("<head>", &format!("<head>{}", injection), 1)
+        } else {
+            format!("{}{}", injection, raw_html)
+        };
+
+        return Response::builder()
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+            .body(Body::from(injected_html))
+            .unwrap();
     }
 
     serve_embedded("dashboard/index.html")

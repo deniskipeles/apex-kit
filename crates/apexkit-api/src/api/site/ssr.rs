@@ -39,14 +39,17 @@ fn merge_json(a: &mut Value, b: Value) {
 }
 
 fn extract_ssr_js(content: &str) -> (Option<String>, String) {
-    // 1. NEW: Clean <script type="server/js"> syntax
-    if let Ok(re) = Regex::new(r#"(?is)<script[^>]*type=["']server/js["'][^>]*>(.*?)</script>"#) {
-        if let Some(caps) = re.captures(content) {
-            if let Some(js_match) = caps.get(1) {
-                let js_code = js_match.as_str().trim().to_string();
-                let html_content = re.replace(content, "").to_string();
-                return (Some(js_code), html_content);
-            }
+    // 1. Matches <script server>, <script server lang="ts">, <script type="module" server>, or <script type="server/js">
+    let server_script_re = Regex::new(
+        r#"(?is)<script\b(?=[^>]*\b(?:server|type=["']server/(?:js|ts)["']))[^>]*>(.*?)</script>"#,
+    )
+    .unwrap();
+
+    if let Some(caps) = server_script_re.captures(content) {
+        if let Some(js_match) = caps.get(1) {
+            let js_code = js_match.as_str().trim().to_string();
+            let html_content = server_script_re.replace(content, "").to_string();
+            return (Some(js_code), html_content);
         }
     }
 

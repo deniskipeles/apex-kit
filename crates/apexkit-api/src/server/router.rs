@@ -397,6 +397,12 @@ pub fn app_router(state: AppState) -> Router {
         .route("/ws", get(websocket::websocket_handler))
         .route("/logo", get(storage::serve_app_logo))
         .route("/app-name", get(settings::get_public_app_name))
+        .route("/app-details", get(settings::get_app_details))
+        // --- ADD DASHBOARD ROUTES FOR SANDBOXES ---
+        .route("/_dashboard", get(assets::dashboard_handler))
+        .route("/_dashboard/", get(assets::dashboard_handler))
+        .route("/_dashboard/{*path}", get(assets::dashboard_handler))
+        // ------------------------------------------
         .layer(middleware::from_fn_with_state(
             state.clone(),
             sandbox_lifecycle_middleware,
@@ -419,6 +425,12 @@ pub fn app_router(state: AppState) -> Router {
         .route("/ws", get(websocket::websocket_handler))
         .route("/logo", get(storage::serve_app_logo))
         .route("/app-name", get(settings::get_public_app_name))
+        .route("/app-details", get(settings::get_app_details))
+        // --- ADD DASHBOARD ROUTES FOR TENANTS ---
+        .route("/_dashboard", get(assets::dashboard_handler))
+        .route("/_dashboard/", get(assets::dashboard_handler))
+        .route("/_dashboard/{*path}", get(assets::dashboard_handler))
+        // ----------------------------------------
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -441,6 +453,7 @@ pub fn app_router(state: AppState) -> Router {
         )
         .route("/logo", get(storage::serve_app_logo))
         .route("/app-name", get(settings::get_public_app_name))
+        .route("/app-details", get(settings::get_app_details))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

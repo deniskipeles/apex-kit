@@ -36,13 +36,15 @@ export const pb = new Proxy(basePb, {
     if (typeof window !== 'undefined') {
       const path = window.location.pathname;
 
-      const tenantMatch = path.match(/^\/_dashboard\/tenant\/([^/]+)/);
+      const tenantMatch =
+        path.match(/\/(?:_dashboard\/)?tenant\/([^/]+)/) || path.match(/\/tenant\/([^/]+)/);
       if (tenantMatch && tenantMatch[1]) {
         const tenantInstance = target.tenant(tenantMatch[1]);
         return Reflect.get(tenantInstance, prop, receiver);
       }
 
-      const sandboxMatch = path.match(/^\/_dashboard\/sandbox\/([^/]+)/);
+      const sandboxMatch =
+        path.match(/\/(?:_dashboard\/)?sandbox\/([^/]+)/) || path.match(/\/sandbox\/([^/]+)/);
       if (sandboxMatch && sandboxMatch[1]) {
         const sandboxInstance = target.sandbox(sandboxMatch[1]);
         return Reflect.get(sandboxInstance, prop, receiver);
@@ -54,23 +56,14 @@ export const pb = new Proxy(basePb, {
 
 export const realtime = new ApexKitRealtime(pb.baseUrl, pb.getToken());
 
-const downloadBlob = (blob: Blob, filename: string) => {
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  window.URL.revokeObjectURL(url);
-};
-
 const rawFetch = async (path: string) => {
   let baseUrl = apiUrl;
   if (typeof window !== 'undefined') {
     const pathName = window.location.pathname;
-    const tenantMatch = pathName.match(/^\/_dashboard\/tenant\/([^/]+)/);
-    const sandboxMatch = pathName.match(/^\/_dashboard\/sandbox\/([^/]+)/);
+    const tenantMatch =
+      pathName.match(/\/(?:_dashboard\/)?tenant\/([^/]+)/) || pathName.match(/\/tenant\/([^/]+)/);
+    const sandboxMatch =
+      pathName.match(/\/(?:_dashboard\/)?sandbox\/([^/]+)/) || pathName.match(/\/sandbox\/([^/]+)/);
 
     if (tenantMatch) baseUrl += `/tenant/${tenantMatch[1]}`;
     else if (sandboxMatch) baseUrl += `/sandbox/${sandboxMatch[1]}`;
@@ -92,8 +85,10 @@ const rawFetchWithBody = async (path: string, body: FormData) => {
   let baseUrl = apiUrl;
   if (typeof window !== 'undefined') {
     const pathName = window.location.pathname;
-    const tenantMatch = pathName.match(/^\/_dashboard\/tenant\/([^/]+)/);
-    const sandboxMatch = pathName.match(/^\/_dashboard\/sandbox\/([^/]+)/);
+    const tenantMatch =
+      pathName.match(/\/(?:_dashboard\/)?tenant\/([^/]+)/) || pathName.match(/\/tenant\/([^/]+)/);
+    const sandboxMatch =
+      pathName.match(/\/(?:_dashboard\/)?sandbox\/([^/]+)/) || pathName.match(/\/sandbox\/([^/]+)/);
     if (tenantMatch) baseUrl += `/tenant/${tenantMatch[1]}`;
     else if (sandboxMatch) baseUrl += `/sandbox/${sandboxMatch[1]}`;
   }
@@ -106,6 +101,17 @@ const rawFetchWithBody = async (path: string, body: FormData) => {
   });
   if (!res.ok) throw new Error(await res.text());
   return await res.json();
+};
+
+const downloadBlob = (blob: Blob, filename: string) => {
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
 };
 
 const transformCollection = (col: any): Collection => {
@@ -789,6 +795,20 @@ export const apiClient = {
       }
       downloadBlob(blob, filename);
     },
+  },
+
+  getAppDetails: async () => {
+    const token = localStorage.getItem(APEX_TOKEN);
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const res = await fetch(`${pb.baseUrl}/app-details`, { headers });
+    if (!res.ok) {
+      throw new Error(`Failed to fetch app details from ${pb.baseUrl}/app-details`);
+    }
+    return await res.json();
   },
 
   testS3Connection: async (config: any) => {

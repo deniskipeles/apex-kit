@@ -4,7 +4,10 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use oxc::{Compiler, span::SourceType};
+use oxc::{
+    CompilerInterface, codegen::CodegenReturn, diagnostics::Diagnostics, span::SourceType,
+    transformer::TransformOptions,
+};
 use regex::Regex;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::module::Declared;
@@ -17,31 +20,59 @@ use zip::write::FileOptions;
 use crate::database::traits::Db;
 use crate::models::{CreateTemplateReq, ai::CreateActionReq, script::CreateScriptReq};
 
-/// Transpiles TypeScript / TSX to JavaScript using the Oxc compiler.
+struct TypeScriptCompiler {
+    transform_options: TransformOptions,
+    pub output: String,
+    pub errors: Vec<String>,
+}
+
+impl Default for TypeScriptCompiler {
+    fn default() -> Self {
+        Self {
+            transform_options: TransformOptions::default(),
+            output: String::new(),
+            errors: Vec::new(),
+        }
+    }
+}
+
+impl CompilerInterface for TypeScriptCompiler {
+    fn transform_options(&self) -> Option<&TransformOptions> {
+        Some(&self.transform_options)
+    }
+
+    fn after_codegen(&mut self, ret: CodegenReturn<'_>) {
+        self.output = ret.code;
+    }
+
+    fn handle_errors(&mut self, errors: Diagnostics) {
+        for err in errors {
+            self.errors.push(err.to_string());
+        }
+    }
+}
+
+/// Transpiles TypeScript / TSX to clean JavaScript using the Oxc transformer.
 pub fn transpile_ts(source_text: &str, file_path: &str) -> Result<String, String> {
     let path = Path::new(file_path);
-    let is_explicit_ts = file_path.ends_with(".ts") || file_path.ends_with(".tsx");
-
-    let source_type = if is_explicit_ts {
-        SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts())
+    let is_jsx = file_path.ends_with(".tsx") || file_path.ends_with(".jsx");
+    let source_type = if is_jsx {
+        SourceType::tsx()
     } else {
-        // Automatically detect TypeScript keywords if file is unnamed or labeled .js
-        if source_text.contains(": ")
-            || source_text.contains("interface ")
-            || source_text.contains("type ")
-            || source_text.contains("as ")
-        {
-            SourceType::ts()
-        } else {
-            return Ok(source_text.to_string());
-        }
+        SourceType::ts()
     };
 
-    let mut compiler = Compiler::default();
-    match compiler.execute(source_text, source_type, path) {
-        Ok(js_code) => Ok(js_code),
-        Err(diags) => Err(format!("TypeScript Transpilation Error: {:?}", diags)),
+    let mut compiler = TypeScriptCompiler::default();
+    compiler.compile(source_text, source_type, path);
+
+    if !compiler.errors.is_empty() {
+        return Err(format!(
+            "TypeScript Transpilation Error: {:?}",
+            compiler.errors
+        ));
     }
+
+    Ok(compiler.output)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

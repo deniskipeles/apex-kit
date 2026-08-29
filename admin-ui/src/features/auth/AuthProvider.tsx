@@ -12,6 +12,7 @@ import { APEX_TOKEN, APEX_USER } from '@/src/constants';
 import { apiClient } from '@/src/lib/apiClient';
 import { ApexKit } from '@/src/lib/sdk';
 import { APP_CONFIG } from '@/src/config/app.config';
+import { getSubdomainTenant } from '@/src/lib/subdomain';
 
 interface AuthContextType {
   user: AuthUser | null;
@@ -28,13 +29,27 @@ export const AuthProvider = ({ children }: { children?: ReactNode }) => {
   const [isLoading, setIsLoading] = useState(true);
 
   const getCurrentUrlScope = () => {
+    // 1. Subdomain matching against __APEXKIT_ROOT_DOMAIN__
+    const subTenant = getSubdomainTenant();
+    if (subTenant) {
+      return `tenant:${subTenant}`;
+    }
+
+    // 2. Authoritative Backend Injected Scope
+    if (typeof window !== 'undefined' && window.__APEX_SCOPE__) {
+      const s = window.__APEX_SCOPE__;
+      if (s.type === 'tenant' && s.id) return `tenant:${s.id}`;
+      if (s.type === 'sandbox' && s.id) return `sandbox:${s.id}`;
+    }
+
+    // 3. Fallback for Root Admin drilled routes (/ _dashboard/tenant/:id/...)
     const path = window.location.pathname;
     if (path.includes('/tenant/')) {
-      const id = path.split('/tenant/')[1].split('/')[0];
+      const id = path.split('/tenant/')[1]?.split('/')[0];
       return `tenant:${id}`;
     }
     if (path.includes('/sandbox/')) {
-      const id = path.split('/sandbox/')[1].split('/')[0];
+      const id = path.split('/sandbox/')[1]?.split('/')[0];
       return `sandbox:${id}`;
     }
     return 'root';

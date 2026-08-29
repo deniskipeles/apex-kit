@@ -85,9 +85,13 @@ pub async fn get_settings(
             .and_then(|v| v.as_str())
             .map(String::from),
         app_url: final_app_url,
-        allow_public_registration: general
-            .get("allow_public_registration")
-            .and_then(|v| v.as_bool()),
+        // Always return Some(bool), defaulting to false
+        allow_public_registration: Some(
+            general
+                .get("allow_public_registration")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        ),
         theme: general
             .get("theme")
             .and_then(|v| v.as_str())
@@ -452,4 +456,163 @@ pub async fn get_public_app_name(
         .to_string();
 
     Ok(Json(AppNameResponse { app_name }))
+}
+
+#[derive(Serialize, ToSchema, Default)]
+pub struct ResourceQuotaDetails {
+    pub current_storage_mb: f64,
+    pub max_storage_mb: i64,
+    pub current_vectors: i64,
+    pub max_vectors: i64,
+    pub current_ai_requests: i64,
+    pub max_ai_requests: i64,
+    pub temp_storage_multiplier: f64,
+    pub max_temp_storage_mb: f64,
+}
+
+#[derive(Serialize, ToSchema, Default)]
+pub struct AppDetailsResponse {
+    pub app_name: String,
+    pub app_url: String,
+    pub local_app_url: String,
+    pub local_base_url: String,
+    pub logo_url: String,
+    pub scope: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub smtp_blocked: bool,
+    pub version: String,
+    pub resources: ResourceQuotaDetails,
+}
+
+#[utoipa::path(
+    get,
+    path = "/app-details",
+    responses((status = 200, body = AppDetailsResponse))
+)]
+pub async fn get_app_details(
+    DatabaseConnection(db): DatabaseConnection,
+    State(state): State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    scope: Option<Extension<apexkit_core::realtime::EventScope>>,
+) -> Result<Json<AppDetailsResponse>, AppError> {
+    use apexkit_core::realtime::EventScope;
+
+    let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
+
+    let general = db
+        .get_config("general")
+        .await
+        .unwrap_or(None)
+        .unwrap_or(json!({}));
+    let smtp = db
+        .get_config("smtp")
+        .await
+        .unwrap_or(None)
+        .unwrap_or(json!({}));
+    let smtp_blocked = smtp
+        .get("block_smtp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let app_name = general
+        .get("app_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ApexKit App")
+        .to_string();
+
+    let temp_multiplier = crate::utils::get_temp_limit_multiplier();
+
+    let (scope_type, scope_id, scope_str) = match &event_scope {
+        EventScope::Root => ("root".to_string(), "root".to_string(), "root".to_string()),
+        EventScope::Tenant(id) => ("tenant".to_string(), id.clone(), format!("tenant:{}", id)),
+        EventScope::Sandbox(id) => ("sandbox".to_string(), id.clone(), format!("sandbox:{}", id)),
+        _ => ("unknown".to_string(), "".to_string(), "unknown".to_string()),
+    };
+
+    let mut current_storage_mb = 0.0;
+    let mut max_storage_mb = general
+        .get("max_site_size_mb")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(5000);
+    let mut current_vectors = 0;
+    let mut max_vectors = 0;
+    let mut current_ai_requests = 0;
+    let mut max_ai_requests = 0;
+
+    match &event_scope {
+        EventScope::Root => {
+            // Root has global site limit, unbounded internal limits
+            max_vectors = general
+                .get("max_sandbox_vectors")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(10000);
+            max_ai_requests = general
+                .get("max_sandbox_ai_requests")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(100);
+        }
+        EventScope::Tenant(id) => {
+            if let Ok(tenants) = state.db.list_tenants().await {
+                if let Some(t) = tenants.iter().find(|t| &t.id == id) {
+                    current_storage_mb = t.stats.storage_mb;
+                    max_storage_mb = t.stats.max_storage_mb;
+                    current_vectors = t.stats.vector_count;
+                    max_vectors = t.stats.max_vectors;
+                    current_ai_requests = t.stats.ai_requests;
+                    max_ai_requests = t.stats.max_ai_requests;
+                }
+            }
+        }
+        EventScope::Sandbox(id) => {
+            if let Ok(sandboxes) = state.db.list_sandboxes(None).await {
+                if let Some(sb) = sandboxes.iter().find(|s| &s.id == id) {
+                    current_storage_mb = sb.current_storage_mb;
+                    max_storage_mb = sb.max_storage_mb;
+                    current_vectors = sb.current_vectors;
+                    max_vectors = sb.max_vectors;
+                    current_ai_requests = sb.current_ai_requests;
+                    max_ai_requests = sb.max_ai_requests;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let max_temp_storage_mb = (max_storage_mb as f64) * temp_multiplier;
+
+    let port = state.port;
+    let local_base_url = format!("http://127.0.0.1:{}", port);
+    let scope_subpath = match &event_scope {
+        EventScope::Tenant(id) => format!("/tenant/{}", id),
+        EventScope::Sandbox(id) => format!("/sandbox/{}", id),
+        _ => "".to_string(),
+    };
+
+    let local_app_url = format!("{}{}", local_base_url, scope_subpath);
+    let app_url = format!("{}{}", base_url, scope_subpath);
+    let logo_url = format!("{}/logo", app_url);
+
+    Ok(Json(AppDetailsResponse {
+        app_name,
+        app_url,
+        local_app_url,
+        local_base_url,
+        logo_url,
+        scope: scope_str,
+        scope_type,
+        scope_id,
+        smtp_blocked,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        resources: ResourceQuotaDetails {
+            current_storage_mb,
+            max_storage_mb,
+            current_vectors,
+            max_vectors,
+            current_ai_requests,
+            max_ai_requests,
+            temp_storage_multiplier: temp_multiplier,
+            max_temp_storage_mb,
+        },
+    }))
 }

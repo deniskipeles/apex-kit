@@ -361,48 +361,93 @@ export const SecuritySettings = ({ settings, onChange, onSave }: SecuritySetting
         </CardContent>
       </Card>
 
-      {/* ... Rate Limiting Card ... */}
+      {/* Rate Limiting Card (Scope Aware) */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Activity className="h-4 w-4" /> Rate Limiting
+            <Badge variant="outline" className="text-[10px] font-mono uppercase ml-1">
+              {apiClient.getScope().type}
+            </Badge>
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="space-y-2">
-              <Label>Global/Root API Limit</Label>
-              <Input
-                type="number"
-                placeholder="e.g. 600"
-                value={settings.security.globalRateLimit || 600}
-                onChange={(e: any) => updateSecurity('globalRateLimit', Number(e.target.value))}
-              />
-              <p className="text-[10px] text-muted-foreground">Requests per minute per IP.</p>
+          {/* ROOT SCOPE: Show Global API limit + Tier presets */}
+          {apiClient.getScope().type === 'root' && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="space-y-2">
+                <Label>Global / Root API Limit</Label>
+                <Input
+                  type="number"
+                  placeholder="e.g. 600"
+                  value={settings.security.globalRateLimit || 600}
+                  onChange={(e: any) => updateSecurity('globalRateLimit', Number(e.target.value))}
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Requests per minute per IP on Root API.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label>Tenant (Free Tier) Limit</Label>
+                <Input
+                  type="number"
+                  placeholder="e.g. 120"
+                  value={settings.security.tenantFreeRateLimit || 120}
+                  onChange={(e: any) =>
+                    updateSecurity('tenantFreeRateLimit', Number(e.target.value))
+                  }
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Default for tenants on 'free' tier.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label>Tenant (Pro Tier) Limit</Label>
+                <Input
+                  type="number"
+                  placeholder="e.g. 3000"
+                  value={settings.security.tenantProRateLimit || 3000}
+                  onChange={(e: any) =>
+                    updateSecurity('tenantProRateLimit', Number(e.target.value))
+                  }
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Default for tenants on 'pro' tier.
+                </p>
+              </div>
             </div>
-            <div className="space-y-2">
-              <Label>Tenant (Free Tier) Limit</Label>
-              <Input
-                type="number"
-                placeholder="e.g. 120"
-                value={settings.security.tenantFreeRateLimit || 120}
-                onChange={(e: any) => updateSecurity('tenantFreeRateLimit', Number(e.target.value))}
-              />
-              <p className="text-[10px] text-muted-foreground">
-                Applies to tenants on 'free' tier.
+          )}
+
+          {/* TENANT SCOPE: Show only the rate limit form for this tenant */}
+          {apiClient.getScope().type === 'tenant' && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-2">
+                <Label>Tenant API Rate Limit</Label>
+                <Input
+                  type="number"
+                  placeholder="e.g. 120"
+                  value={settings.security.tenantFreeRateLimit || 120}
+                  onChange={(e: any) =>
+                    updateSecurity('tenantFreeRateLimit', Number(e.target.value))
+                  }
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Requests per minute per client IP for this tenant.
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* SANDBOX SCOPE: Show sandbox-specific notice */}
+          {apiClient.getScope().type === 'sandbox' && (
+            <div className="p-3.5 bg-secondary/15 rounded-lg border border-border text-xs text-muted-foreground">
+              <p className="font-semibold text-foreground text-sm">Sandbox Rate Limit</p>
+              <p className="mt-1">
+                Sandbox environments are locked to <strong>60 requests per minute</strong> per IP to
+                protect ephemeral session resources.
               </p>
             </div>
-            <div className="space-y-2">
-              <Label>Tenant (Pro Tier) Limit</Label>
-              <Input
-                type="number"
-                placeholder="e.g. 3000"
-                value={settings.security.tenantProRateLimit || 3000}
-                onChange={(e: any) => updateSecurity('tenantProRateLimit', Number(e.target.value))}
-              />
-              <p className="text-[10px] text-muted-foreground">Applies to tenants on 'pro' tier.</p>
-            </div>
-          </div>
+          )}
         </CardContent>
       </Card>
 

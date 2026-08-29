@@ -151,9 +151,10 @@ pub async fn register(
             .await
             .map_err(|e| AppError::UnknownError(e.to_string()))?;
 
+        // Default to false when unset
         let allow_registration = general_settings
             .and_then(|v| v.get("allow_public_registration").and_then(|b| b.as_bool()))
-            .unwrap_or(true); // Default true
+            .unwrap_or(false);
 
         if !allow_registration {
             return Err(AppError::Forbidden(

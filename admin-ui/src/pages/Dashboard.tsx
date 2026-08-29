@@ -13,6 +13,10 @@ import {
   BrainCircuit,
   Search,
   Folder,
+  Cpu,
+  ShieldAlert,
+  Check,
+  Copy,
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Button, Badge } from '../components/ui/Elements';
 import { Dialog } from '../components/ui/Dialog';
@@ -22,7 +26,9 @@ import { useToast } from '../components/feedback/Toast';
 
 export const Dashboard = () => {
   const [data, setData] = useState<any>(null);
+  const [appDetails, setAppDetails] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [detailModal, setDetailModal] = useState<
     'db' | 'vectors' | 'indexes' | 'collections' | null
   >(null);
@@ -31,8 +37,12 @@ export const Dashboard = () => {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const res = await apiClient.getAdminDashboardStats();
-      setData(res);
+      const [statsRes, detailsRes] = await Promise.all([
+        apiClient.getAdminDashboardStats(),
+        apiClient.getAppDetails().catch(() => null),
+      ]);
+      setData(statsRes);
+      setAppDetails(detailsRes);
     } catch (e: any) {
       toast(e.message || 'Failed to load dashboard data', 'error');
     } finally {
@@ -43,6 +53,13 @@ export const Dashboard = () => {
   useEffect(() => {
     fetchData();
   }, []);
+
+  const handleCopy = (text: string, key: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedKey(key);
+    toast('Copied to clipboard', 'success');
+    setTimeout(() => setCopiedKey(null), 2000);
+  };
 
   if (loading && !data) {
     return (
@@ -103,6 +120,167 @@ export const Dashboard = () => {
           </Button>
         </div>
       </div>
+
+      {/* --- NEW: ENVIRONMENT & RESOURCE ALLOCATION BANNER --- */}
+      {appDetails && (
+        <Card className="border-primary/20 bg-gradient-to-br from-secondary/15 via-background to-background">
+          <CardHeader className="pb-3 border-b border-border/40">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-lg bg-primary/10 text-primary">
+                  <Cpu className="h-5 w-5" />
+                </div>
+                <div>
+                  <CardTitle className="text-base font-bold flex items-center gap-2">
+                    {appDetails.app_name}
+                    <Badge variant="outline" className="font-mono text-[10px] uppercase">
+                      v{appDetails.version}
+                    </Badge>
+                  </CardTitle>
+                  <span className="text-xs text-muted-foreground font-mono">
+                    Scope: <strong>{appDetails.scope}</strong>
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {appDetails.smtp_blocked ? (
+                  <Badge variant="destructive" className="text-[10px] gap-1">
+                    <ShieldAlert className="h-3 w-3" /> SMTP Blocked
+                  </Badge>
+                ) : (
+                  <Badge variant="success" className="text-[10px]">
+                    SMTP Ready
+                  </Badge>
+                )}
+                <Badge variant="secondary" className="text-[10px] uppercase font-mono">
+                  {appDetails.scope_type}
+                </Badge>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="pt-4 space-y-4">
+            {/* Quota Progress Grid */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              {/* Storage Quota */}
+              <div className="p-3 rounded-lg border border-border/60 bg-card/60 space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="text-muted-foreground font-medium flex items-center gap-1">
+                    <HardDrive className="h-3.5 w-3.5 text-purple-400" /> Persistent Disk
+                  </span>
+                  <span className="font-mono font-bold">
+                    {appDetails.resources.current_storage_mb.toFixed(1)} /{' '}
+                    {appDetails.resources.max_storage_mb} MB
+                  </span>
+                </div>
+                <div className="h-1.5 w-full bg-secondary rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-purple-500 rounded-full"
+                    style={{
+                      width: `${Math.min(100, (appDetails.resources.current_storage_mb / (appDetails.resources.max_storage_mb || 1)) * 100)}%`,
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* Vector Capacity */}
+              <div className="p-3 rounded-lg border border-border/60 bg-card/60 space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="text-muted-foreground font-medium flex items-center gap-1">
+                    <BrainCircuit className="h-3.5 w-3.5 text-indigo-400" /> Vector Limit
+                  </span>
+                  <span className="font-mono font-bold">
+                    {appDetails.resources.current_vectors.toLocaleString()} /{' '}
+                    {appDetails.resources.max_vectors > 0
+                      ? appDetails.resources.max_vectors.toLocaleString()
+                      : '∞'}
+                  </span>
+                </div>
+                <div className="h-1.5 w-full bg-secondary rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-indigo-500 rounded-full"
+                    style={{
+                      width: `${appDetails.resources.max_vectors > 0 ? Math.min(100, (appDetails.resources.current_vectors / appDetails.resources.max_vectors) * 100) : 0}%`,
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* AI Request Window */}
+              <div className="p-3 rounded-lg border border-border/60 bg-card/60 space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="text-muted-foreground font-medium flex items-center gap-1">
+                    <Activity className="h-3.5 w-3.5 text-blue-400" /> AI Runs (30m)
+                  </span>
+                  <span className="font-mono font-bold">
+                    {appDetails.resources.current_ai_requests} /{' '}
+                    {appDetails.resources.max_ai_requests > 0
+                      ? appDetails.resources.max_ai_requests
+                      : '∞'}
+                  </span>
+                </div>
+                <div className="h-1.5 w-full bg-secondary rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-blue-500 rounded-full"
+                    style={{
+                      width: `${appDetails.resources.max_ai_requests > 0 ? Math.min(100, (appDetails.resources.current_ai_requests / appDetails.resources.max_ai_requests) * 100) : 0}%`,
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* Temp Storage Allocation */}
+              <div className="p-3 rounded-lg border border-border/60 bg-card/60 space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="text-muted-foreground font-medium flex items-center gap-1">
+                    <Folder className="h-3.5 w-3.5 text-amber-400" /> Temp Scratchpad
+                  </span>
+                  <span className="font-mono font-bold">
+                    {appDetails.resources.max_temp_storage_mb.toFixed(0)} MB (
+                    {appDetails.resources.temp_storage_multiplier}x)
+                  </span>
+                </div>
+                <div className="h-1.5 w-full bg-secondary rounded-full overflow-hidden">
+                  <div className="h-full bg-amber-500 rounded-full w-full opacity-60" />
+                </div>
+              </div>
+            </div>
+
+            {/* Endpoints Table */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2 pt-1">
+              {[
+                { label: 'Public App URL', val: appDetails.app_url, key: 'app_url' },
+                { label: 'Local App Gateway', val: appDetails.local_app_url, key: 'local_app' },
+                { label: 'Local Root Base', val: appDetails.local_base_url, key: 'local_base' },
+              ].map((item) => (
+                <div
+                  key={item.key}
+                  className="flex items-center justify-between p-2 rounded bg-secondary/20 border border-border/40 text-xs font-mono"
+                >
+                  <div className="min-w-0 flex-1 pr-2">
+                    <div className="text-[10px] text-muted-foreground font-sans uppercase font-semibold">
+                      {item.label}
+                    </div>
+                    <div className="truncate text-foreground font-medium">{item.val}</div>
+                  </div>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-6 w-6 shrink-0"
+                    onClick={() => handleCopy(item.val, item.key)}
+                  >
+                    {copiedKey === item.key ? (
+                      <Check className="h-3 w-3 text-emerald-500" />
+                    ) : (
+                      <Copy className="h-3 w-3" />
+                    )}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Top Metric Cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">

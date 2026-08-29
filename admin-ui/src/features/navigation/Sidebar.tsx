@@ -29,7 +29,7 @@ interface SidebarProps {
 }
 
 export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarProps) => {
-  const { user, logout } = useAuth(); // [UPDATED] Added user destructuring
+  const { user, logout } = useAuth();
   const { isSidebarOpen: storeIsOpen, closeSidebar: storeClose } = useUiStore();
 
   const showSidebar = isOpen !== undefined ? isOpen : storeIsOpen;
@@ -85,27 +85,37 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
     return page;
   };
 
-  // [ADDED] Dynamic visibility check for the context exit button
+  // Direct path routing check: e.g. /tenant/apexkit-drive/_dashboard OR /sandbox/uuid/_dashboard
+  const isDirectPath =
+    typeof window !== 'undefined' &&
+    (window.location.pathname.startsWith('/tenant/') ||
+      window.location.pathname.startsWith('/sandbox/'));
+
+  // Exit button shows ONLY when drilled down from root (/_dashboard/tenant/... or /_dashboard/sandbox/...)
+  // and is completely hidden when accessing direct scoped routes (/tenant/:id/_dashboard or /sandbox/:id/_dashboard)
   const showExitButton = () => {
-    if (contextType === 'root') return false;
+    if (contextType === 'root' || isDirectPath) return false;
+
     if (contextType === 'tenant') {
-      // Only root admins can exit a tenant back to the main dashboard
       return user?.scope === 'root';
     }
-    return true; // Always allow exiting from a sandbox
+
+    if (contextType === 'sandbox') {
+      return true;
+    }
+
+    return false;
   };
 
-  // [ADDED] Dynamic redirection logic for sandbox vs tenant
   const handleExitContext = () => {
     if (contextType === 'sandbox') {
       if (user?.scope && user.scope.startsWith('tenant:')) {
         const tenantId = user.scope.replace('tenant:', '');
-        window.location.href = `/_dashboard/tenant/${tenantId}`;
+        window.location.href = `/_dashboard/tenant/${tenantId}/dashboard`;
       } else {
         window.location.href = '/_dashboard';
       }
-    } else {
-      // contextType === 'tenant'
+    } else if (contextType === 'tenant') {
       window.location.href = '/_dashboard';
     }
   };
@@ -146,7 +156,6 @@ export const Sidebar = ({ currentView, onChangeView, isOpen, onClose }: SidebarP
         </div>
 
         <div className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
-          {/* [UPDATED] Conditional rendering based on user scope and context rules */}
           {showExitButton() && (
             <button
               onClick={handleExitContext}
