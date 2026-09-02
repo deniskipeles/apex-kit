@@ -7,6 +7,6 @@ https://unpkg.com/htmx.org@1.9.10/dist/htmx.min.js
 # Download Petite-Vue
 https://unpkg.com/petite-vue@0.4.1/dist/petite-vue.iife.js
 
-# Download Tailwind CSS
+# Download Tailwind CSS :: DEPRECATED
 https://unpkg.com/tailwindcss@2.2.19/dist/tailwind.css
 https://unpkg.com/tailwindcss@2.2.19/dist/tailwind-dark.css

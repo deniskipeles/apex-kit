@@ -1,7 +1,6 @@
 // apexkit-watch.js - ApexKit Developer Tools, Sync Watcher & IntelliSense Engine
 import fs from "fs";
 import path from "path";
-import zlib from "zlib";
 import * as readline from "readline/promises";
 
 // --- 1. ENV LOADER ---
@@ -41,7 +40,31 @@ const IS_PUSH = RAW_ARGS.includes("--push") || SUBCOMMAND === "push";
 const IS_STATUS = RAW_ARGS.includes("--status") || SUBCOMMAND === "status" || SUBCOMMAND === "info";
 const NO_AUTO_COMMIT = RAW_ARGS.includes("--no-auto-commit");
 
-// Parse --delete-remote flag (e.g. --delete-remote=scripts or --delete-remote=all)
+// --- CATEGORY FLAGS: --scripts | --templates | --actions | --all (Default: scripts) ---
+const hasScriptsFlag = RAW_ARGS.includes("--scripts") || RAW_ARGS.includes("-s");
+const hasTemplatesFlag = RAW_ARGS.includes("--templates") || RAW_ARGS.includes("-t");
+const hasActionsFlag =
+  RAW_ARGS.includes("--actions") || RAW_ARGS.includes("--ai-actions") || RAW_ARGS.includes("-a");
+const hasAllFlag = RAW_ARGS.includes("--all") || RAW_ARGS.includes("-A");
+
+let syncScripts = false;
+let syncTemplates = false;
+let syncActions = false;
+
+if (hasAllFlag) {
+  syncScripts = true;
+  syncTemplates = true;
+  syncActions = true;
+} else if (hasScriptsFlag || hasTemplatesFlag || hasActionsFlag) {
+  syncScripts = hasScriptsFlag;
+  syncTemplates = hasTemplatesFlag;
+  syncActions = hasActionsFlag;
+} else {
+  // Default to scripts only if no flag is specified
+  syncScripts = true;
+}
+
+// Parse --delete-remote flag
 const deleteRemoteArg = RAW_ARGS.find((a) => a.startsWith("--delete-remote"));
 let DELETE_REMOTE_TYPES = [];
 if (deleteRemoteArg) {
@@ -53,7 +76,6 @@ if (deleteRemoteArg) {
   }
 }
 
-// Helper to construct scope-aware API URLs
 function getScopedApiBase() {
   let scopePath = "";
   if (SCOPE_KEY.startsWith("tenant:")) {
@@ -72,7 +94,7 @@ function getAuthHeaders() {
   };
 }
 
-// --- 3. TRIGGER TYPES DEFINITIONS ---
+// --- 3. TRIGGER DEFINITIONS ---
 const TRIGGER_DEFINITIONS = [
   { id: "manual", name: "manual (Public/Protected HTTP Webhook Endpoint)", desc: "Triggered via HTTP GET/POST/PUT/DELETE on /api/v1/run/:name or /api/v1/webhook/:name" },
   { id: "before_create_record", name: "before_create_record", desc: "Runs before a record is inserted. Can validate or mutate data." },
@@ -128,8 +150,6 @@ async function generateWorkspaceFiles() {
     const res = await fetch(fetchUrl, { headers: getAuthHeaders() });
     if (res.ok) {
       collectionsData = await res.json();
-    } else {
-      console.warn(`  ⚠️ Failed to fetch schemas. HTTP ${res.status}`);
     }
   } catch (err) {
     console.warn(`  ⚠️ Could not connect to DB for schemas: ${err.message}`);
@@ -280,13 +300,6 @@ export interface VoidHookEvent {
   timestamp: string;
 }
 
-export interface GraphqlConfig {
-  parent: "Query" | "Mutation" | "User" | "_AuthUser" | string;
-  name: string;
-  args?: Record<string, string>;
-  returnType: string;
-}
-
 declare global {
   const __fileMetadata__: FileMetadata;
 
@@ -381,24 +394,6 @@ declare global {
     };
   };
 
-  /** Root Multitenancy and Administrative Manager (Only available in Root context) */
-  const $root: {
-    db: typeof $db;
-    createTenant(id: string, config?: { name?: string; tier?: string; owner_id?: number }): Promise<boolean>;
-    updateTenant(id: string, updates: { name?: string; status?: string; tier?: string; max_storage_mb?: number; max_vectors?: number; max_ai_requests?: number }): Promise<boolean>;
-    deleteTenant(id: string): Promise<boolean>;
-    getTenantDiskUsage(id: string): Promise<number>;
-    listTenants(): Promise<any[]>;
-    createSandbox(id: string, config?: { name?: string; clone_strategy?: "none" | "schema" | "partial" | "full"; clone_record_limit?: number; collections?: string[]; scripts?: string[]; templates?: string[] }): Promise<boolean>;
-    updateSandbox(id: string, updates: { name?: string; status?: string; expires_at?: string }): Promise<boolean>;
-    deleteSandbox(id: string): Promise<boolean>;
-    getSandboxDiskUsage(id: string): Promise<number>;
-    createKey(name: string, config?: { tenant_id?: string; issuer?: string; env_type?: "sys" | "tnnt" | "sk" | "pk"; roles?: string[]; bypass_cors?: boolean }): Promise<{ key: string; info: any }>;
-    updateKey(id: number | string, updates: { name?: string; status?: string; roles?: string[]; bypass_cors?: boolean }): Promise<boolean>;
-    deleteKey(id: number | string): Promise<boolean>;
-    listKeys(): Promise<any[]>;
-  } | null;
-
   /** Universal HTTP Client */
   const $http: {
     get(url: string): Promise<string>;
@@ -430,20 +425,6 @@ declare global {
     stat(path: string): Promise<{ size: number; isDir: boolean; created?: number; modified?: number }>;
   };
 
-  /** Fast In-Memory Zip Creator & Extractor */
-  const $zip: {
-    create(files: Record<string, string | Uint8Array>): string;
-    extract(base64Zip: string): Record<string, string>;
-    inspect(base64Zip: string): { total_size: number; file_count: number; files: any[] };
-  };
-
-  /** Local AI Embeddings Engine */
-  const $ai: {
-    embed(text: string): Promise<number[]>;
-    meanVector(vectors: number[][]): number[];
-    cosineSimilarity(v1: number[], v2: number[]): number;
-  };
-
   /** In-Memory & Tenant-Isolated Fast Cache */
   const $cache: {
     get(key: string): Promise<string | null>;
@@ -452,49 +433,6 @@ declare global {
     del(key: string): Promise<void>;
     incr(key: string, delta?: number): Promise<number>;
     listKeys(): Promise<string[]>;
-  };
-
-  /** Background Queue Orchestration System */
-  const $queue: {
-    spawn<T = any>(
-      fnOrCode: ((pid: string, req: Request) => Promise<T> | T) | string,
-      options?: { timeoutMs?: number; args?: any }
-    ): Promise<{ pid: string; status: "queued" | "running" }>;
-    status(pid: string): Promise<{
-      pid: string;
-      status: "queued" | "running" | "completed" | "failed" | "timed_out" | "not_found";
-      runtime_ms: number;
-      error?: string;
-    }>;
-    result<T = any>(pid: string): Promise<{
-      pid: string;
-      status: "queued" | "running" | "completed" | "failed" | "timed_out" | "not_found";
-      runtime_ms: number;
-      result?: T;
-      error?: string;
-    }>;
-  };
-
-  /** Subprocess Runner (Root scope only) */
-  const $cmd: {
-    run(
-      program: string,
-      args?: string[],
-      options?: { cwd?: string; env?: Record<string, string>; timeout?: number }
-    ): Promise<{ stdout: string; stderr: string; status: number }>;
-    spawn(
-      program: string,
-      args?: string[],
-      options?: {
-        cwd?: string;
-        env?: Record<string, string>;
-        timeout?: number;
-        onProgress?: { regex?: string; channel?: string; event?: string };
-      }
-    ): Promise<{ pid: number; status: string }>;
-    status(pid: number): Promise<any>;
-    setLimit(program: string, limit: number): Promise<any>;
-    kill(pid: number): Promise<any>;
   };
 
   /** Outbound SMTP Email Dispatcher */
@@ -510,21 +448,6 @@ declare global {
   /** Script Inter-calling Engine */
   const $run: {
     script(name: string, payload: any): Promise<any>;
-  };
-
-  /** WebAssembly Raw Loader & WASI Runner */
-  const $wasm: {
-    call(
-      wasmBase64OrName: string,
-      funcName: string,
-      args: number[],
-      options?: { name?: string; memoryMb?: number; timeoutMs?: number }
-    ): Promise<number | number[]>;
-    runWasi(
-      wasmBase64OrName: string,
-      cliArgs?: string[],
-      options?: { name?: string; memoryMb?: number; timeoutMs?: number }
-    ): Promise<boolean>;
   };
 
   /** Cryptographic & String Utilities */
@@ -557,56 +480,17 @@ declare global {
     input: string | Request | URL,
     init?: { method?: string; headers?: any; body?: any; redirect?: "follow" | "manual" | "error" }
   ): Promise<Response>;
-
-  class Headers {
-    constructor(init?: Record<string, string> | [string, string][] | Headers);
-    get(name: string): string | null;
-    set(name: string, value: string): void;
-    has(name: string): boolean;
-    delete(name: string): void;
-    forEach(callback: (value: string, key: string) => void): void;
-  }
-
-  class Response {
-    constructor(
-      body?: any,
-      init?: { status?: number; statusText?: string; headers?: Record<string, string> | Headers }
-    );
-    readonly status: number;
-    readonly statusText: string;
-    readonly ok: boolean;
-    readonly headers: Headers;
-    readonly url: string;
-    json(): Promise<any>;
-    text(): Promise<string>;
-    arrayBuffer(): Promise<ArrayBuffer>;
-  }
-
-  class Request {
-    constructor(
-      input: string | { url: string; method?: string; headers?: any; bodyData?: any },
-      init?: { method?: string; headers?: any; body?: any }
-    );
-    readonly method: string;
-    readonly url: string;
-    readonly headers: Headers;
-    readonly auth: AuthContext | null;
-    readonly args: any;
-    json(): Promise<any>;
-    text(): Promise<string>;
-    arrayBuffer(): Promise<ArrayBuffer>;
-    clone(): Request;
-  }
 }
 export {};
 `;
   fs.writeFileSync("apexkit.d.ts", types.trim());
-  console.log("  📄 Generated apexkit.d.ts with full Engine & Collection Typings");
+  console.log("  📄 Generated apexkit.d.ts with Engine & Collection Typings");
 
   const jsconfig = {
     compilerOptions: {
       target: "ES2022",
       module: "ESNext",
+      ignoreDeprecations: "6.0",
       moduleResolution: "node",
       baseUrl: ".",
       paths: {
@@ -616,24 +500,13 @@ export {};
       allowJs: true,
       checkJs: true,
     },
-    include: ["**/*.js", "**/*.ts", "apexkit.d.ts"],
+    include: ["**/*.js", "**/*.ts", "**/*.html", "apexkit.d.ts"],
   };
   fs.writeFileSync("jsconfig.json", JSON.stringify(jsconfig, null, 2));
-  console.log("  📄 Generated jsconfig.json for VS Code module alias resolution");
-
-  if (!fs.existsSync("package.json")) {
-    const pkg = {
-      name: "apexkit-workspace",
-      type: "module",
-      scope: SCOPE_KEY,
-      dependencies: {},
-    };
-    fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
-    console.log("  📄 Generated package.json");
-  }
+  console.log("  📄 Generated jsconfig.json for module resolution");
 }
 
-// --- 5. INITIAL CODE GENERATORS ---
+// --- 5. INITIAL CODE GENERATOR ---
 function getBoilerplateCode(fileType, cleanName, ext, triggerType, targetCollection) {
   const metadata = {
     name: cleanName,
@@ -676,11 +549,13 @@ export function ${cleanName.replace(/-/g, "_")}(data = {}) {
     return `<!--
 __fileMetadata__ = ${JSON.stringify(metadata, null, 2)}
 -->
-<script type="server/js">
+<script server>
+/// <reference path="../apexkit.d.ts" />
+
 export default async function (context) {
-  const posts = await $db.records.list("${targetCollection || "posts"}", { limit: 10 }).catch(() => ({ items: [] }));
+  const posts = await $db.records.list(\`${targetCollection || "posts"}\`, { limit: 10 }).catch(() => ({ items: [] }));
   return {
-    title: "${cleanName.replace(/-/g, " ").toUpperCase()}",
+    title: \`${cleanName.replace(/-/g, " ").toUpperCase()}\`,
     items: posts.items
   };
 }
@@ -691,7 +566,7 @@ export default async function (context) {
 <head>
   <meta charset="UTF-8">
   <title>{{ title }}</title>
-  <link rel="stylesheet" href="/styles.css">
+  <script src="https://cdn.tailwindcss.com"></script>
   <script src="/static/js/htmx.js"></script>
   <script src="/static/js/alpine.js" defer></script>
 </head>
@@ -700,10 +575,10 @@ export default async function (context) {
     <h1 class="text-3xl font-bold text-indigo-400">{{ title }}</h1>
     
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-      {% for item in items %}
+      {% for post in posts %}
       <div class="p-4 bg-slate-800 rounded-lg border border-slate-700 shadow">
-        <h2 class="text-xl font-semibold">{{ item.data.title | default(value="Item #" ~ item.id) }}</h2>
-        <p class="text-slate-400 text-sm mt-2">{{ item.created }}</p>
+        <h2 class="text-xl font-semibold">{{ post.data.title | default(value="Item #" ~ post.id) }}</h2>
+        <p class="text-slate-400 text-sm mt-2">{{ post.created }}</p>
       </div>
       {% endfor %}
     </div>
@@ -759,21 +634,11 @@ export default async function (event) {
  */
 export default async function (event) {
   const { id, data } = event.record;
-  await $realtime.send("${targetCollection || "general"}", "record_changed", {
-    action: "${triggerType}",
+  await $realtime.send(\`${targetCollection || "general"}\`, "record_changed", {
+    action: \`${triggerType}\`,
     record_id: id,
     data
   });
-}
-`;
-
-    case "cron":
-      return `${header}/**
- * Scheduled Cron Job: ${cleanName}
- * @param {{ trigger: "cron", job: string }} event
- */
-export default async function (event) {
-  console.log(\`[Cron] Executing scheduled task: \${event.job}\`);
 }
 `;
 
@@ -790,7 +655,7 @@ export default async function (event) {
   }
 }
 
-// --- 6. INTERACTIVE FILE WIZARD (create / new / init:file / --init-file) ---
+// --- 6. INTERACTIVE FILE WIZARD ---
 async function runInitFile() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -863,7 +728,7 @@ async function runInitFile() {
   process.exit(0);
 }
 
-// --- 7. WORKSPACE INIT WIZARD (init / --init) ---
+// --- 7. WORKSPACE INIT WIZARD ---
 async function runInit() {
   console.log("🚀 Welcome to ApexKit Local Workspace Setup!\n");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -898,17 +763,7 @@ async function runInit() {
   process.exit(0);
 }
 
-// --- HELPER: Strip existing metadata & JSDoc comments from code ---
-function stripMetadata(content) {
-  if (!content) return "";
-  return content
-    // Strip JSDoc + JS __fileMetadata__ export
-    .replace(/(?:\/\*\*[\s\S]*?\*\/\s*)?export\s+const\s+__fileMetadata__\s*=\s*\{[\s\S]*?\};?\s*/, "")
-    // Strip HTML <!-- __fileMetadata__ = ... --> comments
-    .replace(/<!--[\s\S]*?__fileMetadata__[\s\S]*?-->\s*/, "")
-    .trim();
-}
-// --- 8. COMPREHENSIVE PULL (pull / --pull) ---
+// --- 8. COMPREHENSIVE PULL ---
 async function runPull() {
   console.log(`📥 Pulling all collections, scripts, templates, and AI actions from ApexKit (${SCOPE_KEY})...\n`);
 
@@ -1037,27 +892,52 @@ function inferFileMetadata(filePath, content) {
   const baseName = path.basename(filePath, `.${ext}`);
   const normalizedPath = filePath.replace(/\\/g, "/");
 
+  // Ignore system/hidden files
+  if (baseName.startsWith(".") || ext === "gitkeep" || baseName === ".gitkeep") {
+    return null;
+  }
+
+  // 1. JSON files (AI Actions) -> Pure JSON
+  if (normalizedPath.includes("ai_actions/") || ext === "json") {
+    try {
+      const parsed = JSON.parse(content);
+      return JSON.stringify(parsed, null, 2);
+    } catch (e) {
+      return content;
+    }
+  }
+
+  // 2. HTML files (Templates) -> HTML Comment metadata
+  if (normalizedPath.includes("templates/") || ext === "html") {
+    const htmlMetaRe = /<!--\s*__fileMetadata__\s*=\s*(\{[\s\S]*?\})\s*-->/;
+    if (!htmlMetaRe.test(content)) {
+      const finalMeta = {
+        name: baseName,
+        extension: "html",
+        type: "template",
+        path: "./templates/",
+        active: true,
+      };
+      return `<!--\n__fileMetadata__ = ${JSON.stringify(finalMeta, null, 2)}\n-->\n${content}`;
+    }
+    return content;
+  }
+
+  // 3. Scripts / Webhooks / Modules -> JS Export metadata
   let deducedType = "webhook";
   let deducedPath = "./webhooks/";
   let deducedTrigger = "manual";
 
-  if (normalizedPath.includes("templates/")) {
-    deducedType = "template";
-    deducedPath = "./templates/";
-  } else if (normalizedPath.includes("modules/custom/")) {
+  if (normalizedPath.includes("modules/custom/")) {
     deducedType = "custom:module";
     deducedPath = "./modules/custom/";
   } else if (normalizedPath.includes("modules/esm/")) {
     deducedType = "esm:module";
     deducedPath = "./modules/esm/";
-  } else if (normalizedPath.includes("ai_actions/")) {
-    deducedType = "ai_action";
-    deducedPath = "./ai_actions/";
   }
 
-  const metaRe =
-    /(?:export\s+const\s+__fileMetadata__\s*=\s*|<!--\s*__fileMetadata__\s*=\s*)(\{[\s\S]*?\})(?:;|\s*-->)/;
-  const match = content.match(metaRe);
+  const jsMetaRe = /(?:export\s+const\s+__fileMetadata__\s*=\s*)(\{[\s\S]*?\});?/;
+  const match = content.match(jsMetaRe);
 
   let metaObj = {};
   if (match && match[1]) {
@@ -1068,7 +948,7 @@ function inferFileMetadata(filePath, content) {
 
   const finalMeta = {
     name: metaObj.name || baseName,
-    extension: metaObj.extension || ext,
+    extension: metaObj.extension || ext || "js",
     target_collection: metaObj.target_collection || null,
     type: metaObj.type || deducedType,
     path: metaObj.path || deducedPath,
@@ -1078,15 +958,11 @@ function inferFileMetadata(filePath, content) {
   };
 
   if (!match) {
-    if (ext === "html") {
-      return `<!--\n__fileMetadata__ = ${JSON.stringify(finalMeta, null, 2)}\n-->\n${content}`;
-    } else {
-      return `/** @type {import("../apexkit").FileMetadata} */\nexport const __fileMetadata__ = ${JSON.stringify(
-        finalMeta,
-        null,
-        2
-      )};\n\n${content}`;
-    }
+    return `/** @type {import("../apexkit").FileMetadata} */\nexport const __fileMetadata__ = ${JSON.stringify(
+      finalMeta,
+      null,
+      2
+    )};\n\n${content}`;
   }
 
   return content;
@@ -1101,7 +977,6 @@ async function pruneRemoteOrphans(localScripts, localTemplates, localAiActions) 
 
   console.log(`\n🧹 [Prune Remote]: Checking for orphaned items in ApexKit (${DELETE_REMOTE_TYPES.join(", ")})...`);
 
-  // 1. Prune Scripts & Webhook Modules
   if (DELETE_REMOTE_TYPES.includes("scripts") || DELETE_REMOTE_TYPES.includes("all")) {
     try {
       const res = await fetch(`${apiBase}/admin/scripts`, { headers });
@@ -1112,10 +987,7 @@ async function pruneRemoteOrphans(localScripts, localTemplates, localAiActions) 
         for (const script of remoteScripts) {
           if (!localScripts.has(script.name)) {
             console.log(`  🗑️ [Deleted Remote Script]: ${script.name} (ID: ${script.id})`);
-            await fetch(`${apiBase}/admin/scripts/${script.id}`, {
-              method: "DELETE",
-              headers,
-            });
+            await fetch(`${apiBase}/admin/scripts/${script.id}`, { method: "DELETE", headers });
           }
         }
       }
@@ -1124,7 +996,6 @@ async function pruneRemoteOrphans(localScripts, localTemplates, localAiActions) 
     }
   }
 
-  // 2. Prune Templates
   if (DELETE_REMOTE_TYPES.includes("templates") || DELETE_REMOTE_TYPES.includes("all")) {
     try {
       const res = await fetch(`${apiBase}/admin/templates`, { headers });
@@ -1133,10 +1004,7 @@ async function pruneRemoteOrphans(localScripts, localTemplates, localAiActions) 
         for (const tmpl of remoteTemplates) {
           if (!localTemplates.has(tmpl.slug)) {
             console.log(`  🗑️ [Deleted Remote Template]: ${tmpl.slug} (ID: ${tmpl.id})`);
-            await fetch(`${apiBase}/admin/templates/${tmpl.id}`, {
-              method: "DELETE",
-              headers,
-            });
+            await fetch(`${apiBase}/admin/templates/${tmpl.id}`, { method: "DELETE", headers });
           }
         }
       }
@@ -1145,7 +1013,6 @@ async function pruneRemoteOrphans(localScripts, localTemplates, localAiActions) 
     }
   }
 
-  // 3. Prune AI Actions
   if (
     DELETE_REMOTE_TYPES.includes("ai_actions") ||
     DELETE_REMOTE_TYPES.includes("actions") ||
@@ -1158,10 +1025,7 @@ async function pruneRemoteOrphans(localScripts, localTemplates, localAiActions) 
         for (const action of remoteActions) {
           if (!localAiActions.has(action.slug)) {
             console.log(`  🗑️ [Deleted Remote AI Action]: ${action.slug} (ID: ${action.id})`);
-            await fetch(`${apiBase}/admin/ai/actions/${action.id}`, {
-              method: "DELETE",
-              headers,
-            });
+            await fetch(`${apiBase}/admin/ai/actions/${action.id}`, { method: "DELETE", headers });
           }
         }
       }
@@ -1171,10 +1035,15 @@ async function pruneRemoteOrphans(localScripts, localTemplates, localAiActions) 
   }
 }
 
-// --- 10. UNIFIED SYNC PUSH/COMMIT (commit vs push) ---
+// --- 10. UNIFIED SYNC PUSH/COMMIT (With Scope & Category Filtering) ---
 async function runManualPushOrCommit(commitToDb) {
-  const modeLabel = commitToDb ? "Push & Commit to DB" : "Commit to VFS (Transient Memory)";
-  console.log(`🚀 [${modeLabel}]: Syncing all local files to ApexKit (${BASE_URL})...\n`);
+  const selectedCategories = [];
+  if (syncScripts) selectedCategories.push("Scripts (--scripts)");
+  if (syncTemplates) selectedCategories.push("Templates (--templates)");
+  if (syncActions) selectedCategories.push("AI Actions (--actions)");
+
+  const modeLabel = commitToDb ? "Push & Commit to DB" : "Commit to VFS (Memory)";
+  console.log(`🚀 [${modeLabel}]: Syncing ${selectedCategories.join(", ")} to ApexKit (${BASE_URL})...\n`);
 
   let WSClient = globalThis.WebSocket;
   if (!WSClient) {
@@ -1191,77 +1060,126 @@ async function runManualPushOrCommit(commitToDb) {
 
   const ws = new WSClient(WS_URL);
 
-  ws.addEventListener("open", async () => {
-    const dirs = ["./webhooks", "./templates", "./ai_actions", "./modules"];
-    let filesSent = 0;
+  const targetDirs = [];
+  if (syncScripts) {
+    targetDirs.push("./webhooks", "./modules");
+  }
+  if (syncTemplates) {
+    targetDirs.push("./templates");
+  }
+  if (syncActions) {
+    targetDirs.push("./ai_actions");
+  }
 
-    const localScripts = new Set();
-    const localTemplates = new Set();
-    const localAiActions = new Set();
+  const filesToPush = [];
+  const localScripts = new Set();
+  const localTemplates = new Set();
+  const localAiActions = new Set();
 
-    dirs.forEach((dir) => {
-      if (!fs.existsSync(dir)) return;
-      const files = fs.readdirSync(dir, { recursive: true });
+  targetDirs.forEach((dir) => {
+    if (!fs.existsSync(dir)) return;
+    const files = fs.readdirSync(dir, { recursive: true });
 
-      files.forEach((file) => {
-        const fullPath = path.join(dir, file);
-        if (fs.statSync(fullPath).isFile()) {
-          const relativePath = fullPath.replace(/\\/g, "/").replace(/^\.\//, "");
-          let content = fs.readFileSync(fullPath, "utf-8");
-          content = inferFileMetadata(relativePath, content);
+    files.forEach((file) => {
+      const fullPath = path.join(dir, file);
+      if (fs.statSync(fullPath).isFile()) {
+        const relativePath = fullPath.replace(/\\/g, "/").replace(/^\.\//, "");
+        const baseName = path.basename(relativePath);
 
-          // Extract metadata to track active names
-          const metaMatch = content.match(
-            /(?:export\s+const\s+__fileMetadata__\s*=\s*|<!--\s*__fileMetadata__\s*=\s*)(\{[\s\S]*?\})(?:;|\s*-->)/
-          );
-          if (metaMatch && metaMatch[1]) {
-            try {
-              const meta = JSON.parse(metaMatch[1]);
-              if (meta.type === "template") {
-                localTemplates.add(meta.name);
-              } else if (meta.type === "ai_action") {
-                localAiActions.add(meta.name);
-              } else {
-                localScripts.add(meta.name);
-              }
-            } catch (e) {}
-          } else if (relativePath.startsWith("ai_actions/")) {
-            try {
-              const parsed = JSON.parse(content);
-              if (parsed.action?.slug) localAiActions.add(parsed.action.slug);
-            } catch (e) {}
-          }
+        // Explicitly skip .gitkeep and hidden files
+        if (baseName.startsWith(".") || baseName.endsWith(".gitkeep")) return;
 
-          console.log(`  ⬆️  Pushing ${relativePath} (commit_to_db: ${commitToDb})`);
-          ws.send(
-            JSON.stringify({
-              type: "PushFile",
-              payload: { path: relativePath, content: content, commit_to_db: commitToDb },
-            })
-          );
-          filesSent++;
+        const rawContent = fs.readFileSync(fullPath, "utf-8");
+        const content = inferFileMetadata(relativePath, rawContent);
+
+        if (!content) return; // Skip ignored/hidden files
+
+        // Track local entities
+        if (relativePath.startsWith("templates/") || relativePath.endsWith(".html")) {
+          const stem = path.basename(relativePath, path.extname(relativePath));
+          localTemplates.add(stem);
+        } else if (relativePath.startsWith("ai_actions/") || relativePath.endsWith(".json")) {
+          try {
+            const parsed = JSON.parse(content);
+            const slug = parsed.action?.slug || parsed.slug || path.basename(relativePath, ".json");
+            localAiActions.add(slug);
+          } catch (e) {}
+        } else {
+          const stem = path.basename(relativePath, path.extname(relativePath));
+          localScripts.add(stem);
         }
-      });
+
+        filesToPush.push({ path: relativePath, content });
+      }
     });
+  });
 
-    console.log(`\n✅ Synced ${filesSent} files to ApexKit!`);
+  if (filesToPush.length === 0) {
+    console.log(`⚠️ No files found for the selected targets (${selectedCategories.join(", ")}).`);
+    process.exit(0);
+  }
 
-    // Prune remote records that were deleted locally
+  let acksReceived = 0;
+  let hasErrors = false;
+
+  ws.addEventListener("message", (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "SyncAck") {
+        acksReceived++;
+        console.log(`  ✅ [Committed]: ${msg.payload.message}`);
+      } else if (msg.type === "Error") {
+        acksReceived++;
+        hasErrors = true;
+        console.error(`  ❌ [Error]: ${msg.payload.message}`);
+      }
+
+      if (acksReceived >= filesToPush.length) {
+        finishSync();
+      }
+    } catch (e) {}
+  });
+
+  async function finishSync() {
     if (commitToDb && DELETE_REMOTE_TYPES.length > 0) {
       await pruneRemoteOrphans(localScripts, localTemplates, localAiActions);
     }
+    console.log(`\n🎉 Done! ${filesToPush.length} file(s) processed.`);
+    setTimeout(() => {
+      try {
+        ws.close();
+      } catch (e) {}
+      process.exit(hasErrors ? 1 : 0);
+    }, 200);
+  }
 
-    console.log(`\n🏁 Operation completed. Closing connection.`);
-    setTimeout(() => process.exit(0), 1000);
+  ws.addEventListener("open", () => {
+    filesToPush.forEach((item) => {
+      console.log(`  ⬆️  Pushing ${item.path} (commit_to_db: ${commitToDb})`);
+      ws.send(
+        JSON.stringify({
+          type: "PushFile",
+          payload: { path: item.path, content: item.content, commit_to_db: commitToDb },
+        })
+      );
+    });
+
+    // Safety timeout in case a socket ACK drops
+    setTimeout(() => {
+      if (acksReceived < filesToPush.length) {
+        console.log(`\n⚠️ Finished pushing. Waiting response timeout reached.`);
+        finishSync();
+      }
+    }, 4000);
   });
 
-  ws.addEventListener("error", () => {
-    console.error("❌ Connection failed. Verify that the ApexKit server is running and check your API Key.");
+  ws.addEventListener("error", (err) => {
+    console.error("❌ Connection failed. Verify that ApexKit is running and check your API Key / Port.");
     process.exit(1);
   });
 }
 
-// --- 11. WATCHER & LIVE SYNC CLIENT (watch / dev / default) ---
+// --- 11. WATCHER & LIVE SYNC CLIENT ---
 let ws;
 let isReconnecting = false;
 let reconnectTimer = null;
@@ -1370,8 +1288,10 @@ function startWatcher() {
             setTimeout(() => {
               try {
                 if (fs.existsSync(relativePath)) {
-                  let content = fs.readFileSync(relativePath, "utf-8");
-                  content = inferFileMetadata(relativePath, content);
+                  let raw = fs.readFileSync(relativePath, "utf-8");
+                  let content = inferFileMetadata(relativePath, raw);
+
+                  if (!content) return; // Skip ignored/hidden files
 
                   console.log(
                     `📝 Synced: ${relativePath} ${NO_AUTO_COMMIT ? "(VFS Only)" : "(Committed to DB)"}`
@@ -1418,6 +1338,7 @@ if (IS_INIT) {
   • Target Scope: ${SCOPE_KEY}
   • API Key: ${API_KEY.substring(0, 16)}...
   • Auto-Commit: ${!NO_AUTO_COMMIT}
+  • Sync Targets: ${syncScripts ? "Scripts " : ""}${syncTemplates ? "Templates " : ""}${syncActions ? "Actions " : ""}
   • Prune Flags: ${DELETE_REMOTE_TYPES.length > 0 ? DELETE_REMOTE_TYPES.join(", ") : "none"}
 `);
   process.exit(0);

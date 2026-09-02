@@ -76,7 +76,6 @@ cron = "0.12"
 # Templates
 tera = "1.19" 
 serde_qs = "0.13" # To parse query strings/form data for scripts
-railwind = "0.1.2"
 
 chrono = { version = "0.4", features = ["serde"] }
 # Image processing and Caching

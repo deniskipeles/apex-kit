@@ -67,7 +67,7 @@ RULES:
     `<script src="/static/js/htmx.js"></script>`
     `<script src="/static/js/alpine.js" defer></script>`
     `<script src="/static/js/apex.js"></script>`
-    `<link rel="stylesheet" href="/styles.css">`
+    `<script src="https://cdn.tailwindcss.com"></script>`
 
 JSON MANIFEST FORMAT:
 {

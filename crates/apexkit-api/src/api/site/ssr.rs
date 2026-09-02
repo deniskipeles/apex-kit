@@ -340,12 +340,15 @@ async fn render_view_core(
         serde_json::to_string(&ssr_state).unwrap_or_else(|_| "{}".to_string())
     );
     let apex_script = "\n    <script src=\"/static/js/apex.js\"></script>";
+    let tailwind_script = "\n    <script src=\"https://cdn.tailwindcss.com\"></script>";
 
-    let injection = if rendered.contains("apex.js") {
-        state_script
-    } else {
-        format!("{}{}", state_script, apex_script)
-    };
+    let mut injection = state_script;
+    if !rendered.contains("apex.js") {
+        injection.push_str(apex_script);
+    }
+    if !rendered.contains("cdn.tailwindcss.com") {
+        injection.push_str(tailwind_script);
+    }
 
     if rendered.contains("</head>") {
         rendered = rendered.replace("</head>", &format!("{}</head>", injection));
@@ -365,7 +368,6 @@ async fn render_view_core(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // Path-based routing is required if Host matches the Root Domain
     let is_path_routing = match &scope {
         EventScope::Tenant(_) | EventScope::Sandbox(_) => {
             root_domain.is_empty() || host.contains(&root_domain)
@@ -382,9 +384,9 @@ async fn render_view_core(
     }
 
     if !scope_prefix.is_empty() {
-        // Rewrite "/render/" and "/styles.css" links recursively to prepend scope prefix
+        // Rewrite "/render/" links recursively to prepend scope prefix
         let re_links = Regex::new(
-            r#"(href|action|hx-get|hx-post|hx-put|hx-patch|hx-delete)="(/render/[^"]*|/styles\.css)""#,
+            r#"(href|action|hx-get|hx-post|hx-put|hx-patch|hx-delete)="(/render/[^"]*)""#,
         )
         .unwrap();
         rendered = re_links

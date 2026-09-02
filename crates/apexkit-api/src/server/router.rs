@@ -28,7 +28,7 @@ use crate::api::{
     },
     realtime::{sse, websocket},
     scripts as script_routes,
-    site::{assets, serve_css, spa, ssr},
+    site::{assets, spa, ssr},
     storage,
     system::{api_keys, backup as backup_routes, config as config_routes, settings},
     templates as template_routes,
@@ -382,7 +382,6 @@ pub fn app_router(state: AppState) -> Router {
 
     let sandbox_router = Router::new()
         .nest("/api/v1", core_api.clone())
-        .route("/styles.css", get(serve_css::serve_styles))
         // Explicit route for sandbox renderer (2 params)
         .route(
             "/render/{*slug}",
@@ -410,7 +409,6 @@ pub fn app_router(state: AppState) -> Router {
 
     let tenant_path_router = Router::new()
         .nest("/api/v1", core_api.clone())
-        .route("/styles.css", get(serve_css::serve_styles))
         // Explicit route for tenant renderer (2 params)
         .route(
             "/render/{*slug}",
@@ -498,7 +496,6 @@ pub fn app_router(state: AppState) -> Router {
         .route("/metrics", get(crate::api::system::metrics_handler))
         .route("/healthz", get(crate::api::system::health_check))
         .route("/version", get(crate::api::system::get_versions_handler))
-        .route("/styles.css", get(serve_css::serve_styles))
         // [NEW] Explicit Scoped Roots
         // These handle GET /tenant/{id} and GET /sandbox/{id} directly
         .route("/tenant/{tenant_id}", get(assets::scoped_index_handler))
@@ -547,7 +544,6 @@ pub fn app_router(state: AppState) -> Router {
         vector_routes::query_image_vector_search,
         vector_routes::query_text_image_vector_search,
         vector_routes::flush_model_vectors_handler,
-        serve_css::serve_styles,
         tenant_routes::create_tenant_handler,
         sse::sse_handler,
         sandbox_routes::list_sandboxes_handler,

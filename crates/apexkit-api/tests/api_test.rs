@@ -11,7 +11,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use moka::future::Cache;
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
@@ -185,7 +184,6 @@ async fn setup_test_state(base_path: &std::path::Path) -> AppState {
             apexkit_core::scripting::ScriptEngine::with_vfs(vfs.clone(), Some(cached_db.clone()))
                 .await,
         ),
-        css_cache: Arc::new(RwLock::new(HashMap::new())),
         thumb_cache: Cache::builder().max_capacity(1000).build(),
         embedder: Arc::new(apexkit_core::embeddings::EmbedderService::new()),
         vector_provider: vp,

@@ -20,7 +20,7 @@ pub use dto::{
 };
 pub use server::router::ApiDoc;
 pub use state::{AppState, DynRateLimiter};
-use std::{collections::HashMap, net::SocketAddr};
+use std::net::SocketAddr;
 use tower_http::compression::CompressionLayer;
 pub use utils::{BaseUrl, DatabaseConnection, StorageConnection};
 
@@ -441,7 +441,6 @@ pub async fn start(port: u16) {
         schema: Arc::new(RwLock::new(empty_schema)),
         scheduler: scheduler_arc.clone(),
         script_engine,
-        css_cache: Arc::new(RwLock::new(HashMap::new())),
         thumb_cache: Cache::builder().max_capacity(1000).build(),
         embedder,
         vector_provider,

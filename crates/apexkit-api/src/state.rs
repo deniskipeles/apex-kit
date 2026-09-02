@@ -10,7 +10,6 @@ use async_graphql::dynamic::Schema;
 use governor::{RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use metrics_exporter_prometheus::PrometheusHandle;
 use moka::future::Cache;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 
@@ -30,7 +29,6 @@ pub struct AppState {
     pub schema: Arc<RwLock<Schema>>,
     pub scheduler: Arc<RwLock<crate::system::scheduler::SchedulerService>>,
     pub script_engine: Arc<ScriptEngine>,
-    pub css_cache: Arc<RwLock<HashMap<String, String>>>,
     pub thumb_cache: Cache<String, Arc<Vec<u8>>>,
     pub embedder: Arc<apexkit_core::embeddings::EmbedderService>,
     pub vector_provider: Arc<dyn VectorProvider>,

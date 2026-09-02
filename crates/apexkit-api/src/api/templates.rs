@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::{AppError, AppState, DatabaseConnection};
 use apexkit_core::{
     auth::Claims,
@@ -64,25 +62,18 @@ pub async fn list_templates(
 )]
 pub async fn create_template(
     Extension(claims): Extension<Claims>,
-    DatabaseConnection(db): DatabaseConnection, // [FIX] Use contextual DB
-    State(state): State<AppState>,              // Keep state for css_cache
+    DatabaseConnection(db): DatabaseConnection,
+    State(_state): State<AppState>,
     Json(payload): Json<CreateTemplateReq>,
 ) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" {
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // [FIX] Use db
     let id = db
         .create_template(payload)
         .await
         .map_err(|e| AppError::UnknownError(format!("Failed to create template: {}", e)))?;
-
-    // Clear global CSS cache (this is fine to be global as styles might be shared or recompiled)
-    {
-        let mut cache = state.css_cache.write().await;
-        *cache = HashMap::new();
-    }
 
     Ok(Json(json!({ "id": id })))
 }
@@ -95,8 +86,8 @@ pub async fn create_template(
 )]
 pub async fn update_template(
     Extension(claims): Extension<Claims>,
-    DatabaseConnection(db): DatabaseConnection, // [FIX] Use contextual DB
-    State(state): State<AppState>,
+    DatabaseConnection(db): DatabaseConnection,
+    State(_state): State<AppState>,
     Path(path): Path<IdPath>,
     Json(payload): Json<UpdateTemplateReq>,
 ) -> Result<Json<Value>, AppError> {
@@ -104,15 +95,9 @@ pub async fn update_template(
         return Err(AppError::Forbidden("Admins only".into()));
     }
 
-    // [FIX] Use db
     db.update_template(path.id, payload.content, payload.script_id)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    {
-        let mut cache = state.css_cache.write().await;
-        *cache = HashMap::new();
-    }
 
     Ok(Json(json!({ "success": true })))
 }
@@ -125,7 +110,7 @@ pub async fn update_template(
 pub async fn delete_template(
     Extension(claims): Extension<Claims>,
     DatabaseConnection(db): DatabaseConnection,
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(path): Path<IdPath>,
 ) -> Result<Json<Value>, AppError> {
     if claims.role != "admin" {
@@ -135,11 +120,6 @@ pub async fn delete_template(
     db.delete_template(path.id)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
-
-    {
-        let mut cache = state.css_cache.write().await;
-        *cache = HashMap::new();
-    }
 
     Ok(Json(json!({ "success": true })))
 }
