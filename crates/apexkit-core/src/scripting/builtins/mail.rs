@@ -1,7 +1,7 @@
 use super::super::context::ScriptContext;
 use super::db::resolve_db;
 use rquickjs::function::Async;
-use rquickjs::{Ctx, Function, Object};
+use rquickjs::{Ctx, Exception, Function, Object};
 use std::sync::Arc;
 
 pub fn register_mail<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
@@ -11,20 +11,40 @@ pub fn register_mail<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_send = app_ctx.clone();
     let send_fn = Function::new(
         ctx.clone(),
-        Async(move |to: String, subj: String, body: String| {
-            let app = app_send.clone();
-            async move {
-                let db = resolve_db(None, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+        Async(
+            move |js_ctx: Ctx<'js>, to: String, subj: String, body: String| {
+                let app = app_send.clone();
+                async move {
+                    let db = match resolve_db(None, app.clone()).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                            return Err(js_ctx.throw(err.into()));
+                        }
+                    };
 
-                crate::workers::tasks::emails::send_email(db, app.get_vault(), &to, &subj, &body)
+                    match crate::workers::tasks::emails::send_email(
+                        db,
+                        app.get_vault(),
+                        &to,
+                        &subj,
+                        &body,
+                    )
                     .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-
-                Ok::<bool, rquickjs::Error>(true)
-            }
-        }),
+                    {
+                        Ok(_) => Ok::<bool, rquickjs::Error>(true),
+                        Err(e) => {
+                            let err = Exception::from_message(
+                                js_ctx.clone(),
+                                &format!("Failed to send email: {}", e),
+                            )
+                            .unwrap();
+                            Err(js_ctx.throw(err.into()))
+                        }
+                    }
+                }
+            },
+        ),
     )
     .map_err(|e| e.to_string())?;
 

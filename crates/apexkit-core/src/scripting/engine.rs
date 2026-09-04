@@ -680,13 +680,37 @@ impl ScriptEngine {
                 let promise: Promise = handler
                     .call((request_obj,))
                     .catch(&js_ctx)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| {
+                        if let Some(err_obj) = js_ctx.catch().as_exception() {
+                            let msg = err_obj.message().unwrap_or_default();
+                            let stack = err_obj.stack().unwrap_or_default();
+                            if !stack.is_empty() {
+                                format!("{}: {}\n{}", e, msg, stack)
+                            } else {
+                                format!("{}: {}", e, msg)
+                            }
+                        } else {
+                            e.to_string()
+                        }
+                    })?;
 
                 let result_val: rquickjs::Value = promise
                     .into_future::<rquickjs::Value>()
                     .await
                     .catch(&js_ctx)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| {
+                        if let Some(err_obj) = js_ctx.catch().as_exception() {
+                            let msg = err_obj.message().unwrap_or_default();
+                            let stack = err_obj.stack().unwrap_or_default();
+                            if !stack.is_empty() {
+                                format!("{}: {}\n{}", e, msg, stack)
+                            } else {
+                                format!("{}: {}", e, msg)
+                            }
+                        } else {
+                            e.to_string()
+                        }
+                    })?;
 
                 let res_val = if let Some(obj) = result_val.as_object() {
                     if obj.contains_key("body").unwrap_or(false)
@@ -875,13 +899,27 @@ impl ScriptEngine {
                     let promise: Promise = handler
                         .call((js_event,))
                         .catch(&js_ctx)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| {
+                            if let Some(err_obj) = js_ctx.catch().as_exception() {
+                                let msg = err_obj.message().unwrap_or_default();
+                                format!("{}: {}", e, msg)
+                            } else {
+                                e.to_string()
+                            }
+                        })?;
 
                     let result_val: rquickjs::Value = promise
                         .into_future::<rquickjs::Value>()
                         .await
                         .catch(&js_ctx)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| {
+                            if let Some(err_obj) = js_ctx.catch().as_exception() {
+                                let msg = err_obj.message().unwrap_or_default();
+                                format!("{}: {}", e, msg)
+                            } else {
+                                e.to_string()
+                            }
+                        })?;
 
                     if result_val.is_null() || result_val.is_undefined() {
                         None
@@ -981,7 +1019,12 @@ fn register_run<'js>(
 
                     if let Some(script) = script_opt {
                         if !script.active {
-                            return Err(rquickjs::Error::Exception);
+                            let js_err = rquickjs::Exception::from_message(
+                                js_ctx.clone(),
+                                &format!("Script '{}' is inactive", name),
+                            )
+                            .unwrap();
+                            return Err(js_ctx.throw(js_err.into()));
                         }
 
                         let mut call_payload = payload_json.clone();
@@ -989,14 +1032,36 @@ fn register_run<'js>(
                             obj.insert("__caller_scope".to_string(), json!(current_scope));
                         }
 
-                        let res = app
+                        let res = match app
                             .execute_shared_script(script.code, call_payload, exec_scope)
                             .await
-                            .map_err(|_| rquickjs::Error::Exception)?;
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let js_err = rquickjs::Exception::from_message(
+                                    js_ctx.clone(),
+                                    &format!("Subscript '{}' execution failed: {}", name, e),
+                                )
+                                .unwrap();
+                                return Err(js_ctx.throw(js_err.into()));
+                            }
+                        };
 
-                        to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                        to_value(js_ctx.clone(), &res).map_err(|e| {
+                            let js_err = rquickjs::Exception::from_message(
+                                js_ctx.clone(),
+                                &format!("Failed to serialize subscript return value: {}", e),
+                            )
+                            .unwrap();
+                            js_ctx.throw(js_err.into())
+                        })
                     } else {
-                        Err(rquickjs::Error::Exception)
+                        let js_err = rquickjs::Exception::from_message(
+                            js_ctx.clone(),
+                            &format!("Script '{}' not found", name),
+                        )
+                        .unwrap();
+                        Err(js_ctx.throw(js_err.into()))
                     }
                 }
             },

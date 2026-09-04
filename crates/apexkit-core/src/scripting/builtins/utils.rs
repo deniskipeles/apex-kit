@@ -2,11 +2,16 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
-use rquickjs::{Ctx, Function, Object, Value, function::Async};
+use rquickjs::{Ctx, Exception, Function, Object, Value, function::Async};
 use std::sync::Arc;
 
 use super::super::context::ScriptContext;
 use crate::utils::{generate_random_hex, hmac_sha256, sha256, sha512, slugify};
+
+fn throw_err<'js, T>(ctx: &Ctx<'js>, msg: &str) -> rquickjs::Result<T> {
+    let err = Exception::from_message(ctx.clone(), msg).unwrap();
+    Err(ctx.throw(err.into()))
+}
 
 pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
     let globals = ctx.globals();
@@ -28,11 +33,17 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     // 3. $util.hash(text, alg) -> String
     let hash_fn = Function::new(
         ctx.clone(),
-        move |text: String, alg: String| -> rquickjs::Result<String> {
+        move |js_ctx: Ctx<'js>, text: String, alg: String| -> rquickjs::Result<String> {
             match alg.to_lowercase().as_str() {
                 "sha256" => Ok(sha256(&text)),
                 "sha512" => Ok(sha512(&text)),
-                _ => Err(rquickjs::Error::Exception),
+                other => throw_err(
+                    &js_ctx,
+                    &format!(
+                        "Unsupported hash algorithm '{}'. Supported algorithms: 'sha256', 'sha512'",
+                        other
+                    ),
+                ),
             }
         },
     )
@@ -110,7 +121,7 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     // 7. $util.base64Decode(text) -> String
     let b64_dec_fn = Function::new(
         ctx.clone(),
-        move |text: String| -> rquickjs::Result<String> {
+        move |js_ctx: Ctx<'js>, text: String| -> rquickjs::Result<String> {
             let decoded = STANDARD
                 .decode(&text)
                 .or_else(|_| URL_SAFE_NO_PAD.decode(&text))
@@ -122,7 +133,7 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
                     let s = String::from_utf8(bytes).unwrap_or_default();
                     Ok(s)
                 }
-                Err(_) => Err(rquickjs::Error::Exception),
+                Err(e) => throw_err(&js_ctx, &format!("Base64 decoding failed: {}", e)),
             }
         },
     )
@@ -141,9 +152,17 @@ pub fn register_util<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
 
             let decoded = STANDARD
                 .decode(clean)
-                .map_err(|_e| rquickjs::Error::Exception)?;
+                .or_else(|_| URL_SAFE_NO_PAD.decode(clean))
+                .or_else(|_| URL_SAFE.decode(clean))
+                .or_else(|_| STANDARD_NO_PAD.decode(clean));
 
-            rquickjs::ArrayBuffer::new(js_ctx, decoded).map_err(|_| rquickjs::Error::Exception)
+            match decoded {
+                Ok(bytes) => rquickjs::ArrayBuffer::new(js_ctx.clone(), bytes).map_err(|e| {
+                    let err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(err.into())
+                }),
+                Err(e) => throw_err(&js_ctx, &format!("Invalid Base64 buffer: {}", e)),
+            }
         },
     )
     .map_err(|e| e.to_string())?;

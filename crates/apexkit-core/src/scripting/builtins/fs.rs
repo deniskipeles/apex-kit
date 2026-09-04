@@ -16,6 +16,11 @@ use super::db::resolve_db;
 use crate::realtime::EventScope;
 use crate::utils::get_temp_path;
 
+fn throw_err<'js, T>(ctx: &Ctx<'js>, msg: &str) -> rquickjs::Result<T> {
+    let err = Exception::from_message(ctx.clone(), msg).unwrap();
+    Err(ctx.throw(err.into()))
+}
+
 fn get_storage_path(subpath: &str) -> String {
     if let Ok(base) = std::env::var("APEXKIT_MOUNTED_FILE_STORAGE") {
         let clean_base = base.trim_end_matches('/');
@@ -114,14 +119,7 @@ pub fn register_file_tools<'js>(
                 let storage = app.get_storage();
                 match storage.get(&filename).await {
                     Ok(bytes) => Ok::<String, rquickjs::Error>(BASE64.encode(bytes)),
-                    Err(e) => {
-                        let js_err = Exception::from_message(
-                            js_ctx.clone(),
-                            &format!("File '{}' not found: {}", filename, e),
-                        )
-                        .unwrap();
-                        Err(js_ctx.throw(js_err.into()))
-                    }
+                    Err(e) => throw_err(&js_ctx, &format!("File '{}' not found: {}", filename, e)),
                 }
             }
         }),
@@ -141,10 +139,7 @@ pub fn register_file_tools<'js>(
                 async move {
                     let db = match resolve_db(None, app.clone()).await {
                         Ok(d) => d,
-                        Err(e) => {
-                            let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
-                            return Err(js_ctx.throw(js_err.into()));
-                        }
+                        Err(e) => return throw_err(&js_ctx, &e),
                     };
                     let storage = app.get_storage();
                     let mime_type = mime.unwrap_or_else(|| "application/octet-stream".to_string());
@@ -152,11 +147,9 @@ pub fn register_file_tools<'js>(
                     let bytes = if let Ok(ta) =
                         rquickjs::TypedArray::<u8>::from_value(data_val.clone())
                     {
-                        let b = ta.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
-                        b
+                        ta.as_bytes().map(|b| b.to_vec()).unwrap_or_default()
                     } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(data_val.clone()) {
-                        let b = ab.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
-                        b
+                        ab.as_bytes().map(|b| b.to_vec()).unwrap_or_default()
                     } else if let Some(s) = data_val.as_string() {
                         let clean = s.to_string().unwrap_or_default();
                         let b64 = clean
@@ -172,12 +165,7 @@ pub fn register_file_tools<'js>(
                     };
 
                     if bytes.is_empty() {
-                        let js_err = Exception::from_message(
-                            js_ctx.clone(),
-                            "Cannot save empty or invalid file data",
-                        )
-                        .unwrap();
-                        return Err(js_ctx.throw(js_err.into()));
+                        return throw_err(&js_ctx, "Cannot save empty or invalid file data");
                     }
 
                     let size = bytes.len() as i64;
@@ -186,12 +174,7 @@ pub fn register_file_tools<'js>(
                     let storage_filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
 
                     if let Err(e) = storage.save(&storage_filename, &bytes, &mime_type).await {
-                        let js_err = Exception::from_message(
-                            js_ctx.clone(),
-                            &format!("Storage save failed: {}", e),
-                        )
-                        .unwrap();
-                        return Err(js_ctx.throw(js_err.into()));
+                        return throw_err(&js_ctx, &format!("Storage save failed: {}", e));
                     }
 
                     let id = match db
@@ -200,18 +183,13 @@ pub fn register_file_tools<'js>(
                     {
                         Ok(i) => i,
                         Err(e) => {
-                            let js_err = Exception::from_message(
-                                js_ctx.clone(),
-                                &format!("Metadata creation failed: {}", e),
-                            )
-                            .unwrap();
-                            return Err(js_ctx.throw(js_err.into()));
+                            return throw_err(&js_ctx, &format!("Metadata creation failed: {}", e));
                         }
                     };
 
                     let url = format!("{}{}", storage.get_public_url_base(), storage_filename);
-
                     let res = json!({ "id": id, "url": url, "filename": storage_filename });
+
                     to_value(js_ctx.clone(), &res).map_err(|e| {
                         let js_err = Exception::from_message(
                             js_ctx.clone(),
@@ -238,14 +216,7 @@ pub fn register_file_tools<'js>(
                     let storage = app.get_storage();
                     match storage.get_signed_url(&filename, ttl).await {
                         Ok(url) => Ok::<String, rquickjs::Error>(url),
-                        Err(e) => {
-                            let js_err = Exception::from_message(
-                                js_ctx.clone(),
-                                &format!("Get signed URL failed: {}", e),
-                            )
-                            .unwrap();
-                            Err(js_ctx.throw(js_err.into()))
-                        }
+                        Err(e) => throw_err(&js_ctx, &format!("Get signed URL failed: {}", e)),
                     }
                 }
             },
@@ -262,14 +233,10 @@ pub fn register_file_tools<'js>(
             async move {
                 let db = match resolve_db(None, app.clone()).await {
                     Ok(d) => d,
-                    Err(e) => {
-                        let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
-                        return Err(js_ctx.throw(js_err.into()));
-                    }
+                    Err(e) => return throw_err(&js_ctx, &e),
                 };
                 let storage = app.get_storage();
 
-                // 1. Look up file metadata from DB by numeric ID or by storage filename
                 let file_meta = if let Ok(id) = filename_or_id.parse::<i64>() {
                     db.get_file_metadata(id).await
                 } else {
@@ -278,24 +245,16 @@ pub fn register_file_tools<'js>(
                 .ok()
                 .flatten();
 
-                // 2. Resolve the exact storage filename
                 let physical_filename = if let Some(ref meta) = file_meta {
                     meta.filename.clone()
                 } else {
                     filename_or_id.clone()
                 };
 
-                // 3. Delete physical file from storage backend (local disk or S3)
                 if let Err(e) = storage.delete(&physical_filename).await {
-                    let js_err = Exception::from_message(
-                        js_ctx.clone(),
-                        &format!("Storage delete failed: {}", e),
-                    )
-                    .unwrap();
-                    return Err(js_ctx.throw(js_err.into()));
+                    return throw_err(&js_ctx, &format!("Storage delete failed: {}", e));
                 }
 
-                // 4. Delete metadata row from database registry (_storage_files table)
                 if let Some(meta) = file_meta {
                     let _ = db.delete_file_metadata(meta.id).await;
                 }
@@ -328,22 +287,26 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     let app_read = app_ctx.clone();
     let read_fn = Function::new(
         ctx.clone(),
-        Async(move |fname: String| {
+        Async(move |js_ctx: Ctx<'js>, fname: String| {
             let app = app_read.clone();
             async move {
                 let scope = app.get_scope();
-                let target =
-                    resolve_read_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target = match resolve_read_path(&scope, &fname) {
+                    Ok(p) => p,
+                    Err(e) => return throw_err(&js_ctx, &e),
+                };
 
                 if !target.exists() || target.is_dir() {
-                    return Err(rquickjs::Error::Exception);
+                    return throw_err(
+                        &js_ctx,
+                        &format!("File '{}' not found or is a directory", fname),
+                    );
                 }
 
-                let content = tokio::fs::read_to_string(target)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-
-                Ok::<String, rquickjs::Error>(content)
+                match tokio::fs::read_to_string(target).await {
+                    Ok(content) => Ok::<String, rquickjs::Error>(content),
+                    Err(e) => throw_err(&js_ctx, &format!("Failed to read file: {}", e)),
+                }
             }
         }),
     )
@@ -358,26 +321,23 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
                 let scope = app.get_scope();
                 let new_bytes = content.len() as u64;
 
-                // Validate scope-relative temp quota before write
-                app.check_quota(&format!("temp:{}", new_bytes))
-                    .await
-                    .map_err(|e| {
-                        let js_err = rquickjs::Exception::from_message(js_ctx.clone(), &e).unwrap();
-                        js_ctx.throw(js_err.into())
-                    })?;
+                if let Err(e) = app.check_quota(&format!("temp:{}", new_bytes)).await {
+                    return throw_err(&js_ctx, &e);
+                }
 
-                let target =
-                    resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target = match resolve_write_path(&scope, &fname) {
+                    Ok(p) => p,
+                    Err(e) => return throw_err(&js_ctx, &e),
+                };
 
                 if let Some(parent) = target.parent() {
                     tokio::fs::create_dir_all(parent).await.ok();
                 }
 
-                tokio::fs::write(target, content)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-
-                Ok::<bool, rquickjs::Error>(true)
+                match tokio::fs::write(target, content).await {
+                    Ok(_) => Ok::<bool, rquickjs::Error>(true),
+                    Err(e) => throw_err(&js_ctx, &format!("Failed to write file: {}", e)),
+                }
             }
         }),
     )
@@ -386,28 +346,29 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     let app_del = app_ctx.clone();
     let delete_fn = Function::new(
         ctx.clone(),
-        Async(move |fname: String| {
+        Async(move |js_ctx: Ctx<'js>, fname: String| {
             let app = app_del.clone();
             async move {
                 let scope = app.get_scope();
-                let target =
-                    resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
-
-                if !target.exists() {
-                    return Err(rquickjs::Error::Exception);
-                }
-
-                if target.is_dir() {
-                    tokio::fs::remove_dir_all(target)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                } else {
-                    tokio::fs::remove_file(target)
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                let target = match resolve_write_path(&scope, &fname) {
+                    Ok(p) => p,
+                    Err(e) => return throw_err(&js_ctx, &e),
                 };
 
-                Ok::<bool, rquickjs::Error>(true)
+                if !target.exists() {
+                    return throw_err(&js_ctx, &format!("File '{}' not found", fname));
+                }
+
+                let res = if target.is_dir() {
+                    tokio::fs::remove_dir_all(target).await
+                } else {
+                    tokio::fs::remove_file(target).await
+                };
+
+                match res {
+                    Ok(_) => Ok::<bool, rquickjs::Error>(true),
+                    Err(e) => throw_err(&js_ctx, &format!("Failed to delete: {}", e)),
+                }
             }
         }),
     )
@@ -420,31 +381,37 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
             let app = app_list.clone();
             async move {
                 let scope = app.get_scope();
-                let target =
-                    resolve_read_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target = match resolve_read_path(&scope, &fname) {
+                    Ok(p) => p,
+                    Err(e) => return throw_err(&js_ctx, &e),
+                };
 
                 if !target.exists() {
-                    return Err(rquickjs::Error::Exception);
+                    return throw_err(&js_ctx, &format!("Directory '{}' not found", fname));
                 }
 
                 let mut entries = Vec::new();
-                let mut dir = tokio::fs::read_dir(target)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let mut dir = match tokio::fs::read_dir(target).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return throw_err(&js_ctx, &format!("Failed to open directory: {}", e));
+                    }
+                };
 
                 while let Ok(Some(entry)) = dir.next_entry().await {
-                    let meta = entry
-                        .metadata()
-                        .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    entries.push(json!({
-                        "name": entry.file_name().to_string_lossy(),
-                        "isDir": meta.is_dir(),
-                        "size": meta.len()
-                    }));
+                    if let Ok(meta) = entry.metadata().await {
+                        entries.push(json!({
+                            "name": entry.file_name().to_string_lossy(),
+                            "isDir": meta.is_dir(),
+                            "size": meta.len()
+                        }));
+                    }
                 }
 
-                to_value(js_ctx, &json!(entries)).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &json!(entries)).map_err(|e| {
+                    let err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(err.into())
+                })
             }
         }),
     )
@@ -453,7 +420,7 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     let app_exists = app_ctx.clone();
     let exists_fn = Function::new(
         ctx.clone(),
-        Async(move |fname: String| {
+        Async(move |_js_ctx: Ctx<'js>, fname: String| {
             let app = app_exists.clone();
             async move {
                 let scope = app.get_scope();
@@ -469,18 +436,19 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
     let app_mkdir = app_ctx.clone();
     let mkdir_fn = Function::new(
         ctx.clone(),
-        Async(move |fname: String| {
+        Async(move |js_ctx: Ctx<'js>, fname: String| {
             let app = app_mkdir.clone();
             async move {
                 let scope = app.get_scope();
-                let target =
-                    resolve_write_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target = match resolve_write_path(&scope, &fname) {
+                    Ok(p) => p,
+                    Err(e) => return throw_err(&js_ctx, &e),
+                };
 
-                tokio::fs::create_dir_all(target)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-
-                Ok::<bool, rquickjs::Error>(true)
+                match tokio::fs::create_dir_all(target).await {
+                    Ok(_) => Ok::<bool, rquickjs::Error>(true),
+                    Err(e) => throw_err(&js_ctx, &format!("Failed to create directory: {}", e)),
+                }
             }
         }),
     )
@@ -493,11 +461,15 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
             let app = app_stat.clone();
             async move {
                 let scope = app.get_scope();
-                let target = resolve_read_path(&scope, &fname).map_err(|_| rquickjs::Error::Exception)?;
+                let target = match resolve_read_path(&scope, &fname) {
+                    Ok(p) => p,
+                    Err(e) => return throw_err(&js_ctx, &e),
+                };
 
-                let meta = tokio::fs::metadata(target)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let meta = match tokio::fs::metadata(target).await {
+                    Ok(m) => m,
+                    Err(e) => return throw_err(&js_ctx, &format!("Failed to get stat: {}", e)),
+                };
 
                 let res = json!({
                     "size": meta.len(),
@@ -506,7 +478,10 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
                     "modified": meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs_f64())
                 });
 
-                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &res).map_err(|e| {
+                    let err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(err.into())
+                })
             }
         }),
     )
@@ -522,38 +497,26 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
                 let scope = app.get_scope();
                 let target = match resolve_read_path(&scope, &fname) {
                     Ok(p) => p,
-                    Err(e) => {
-                        let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
-                        return Err(js_ctx.throw(js_err.into()));
-                    }
+                    Err(e) => return throw_err(&js_ctx, &e),
                 };
 
                 if !target.exists() || target.is_dir() {
-                    let js_err = Exception::from_message(
-                        js_ctx.clone(),
+                    return throw_err(
+                        &js_ctx,
                         &format!("File '{}' not found or is a directory", fname),
-                    )
-                    .unwrap();
-                    return Err(js_ctx.throw(js_err.into()));
+                    );
                 }
 
-                // Read raw binary bytes safely (no UTF-8 validation)
-                let bytes = tokio::fs::read(target).await.map_err(|e| {
-                    let js_err = Exception::from_message(
-                        js_ctx.clone(),
-                        &format!("Read binary failed: {}", e),
-                    )
-                    .unwrap();
-                    js_ctx.throw(js_err.into())
-                })?;
-
-                Ok::<String, rquickjs::Error>(BASE64.encode(&bytes))
+                match tokio::fs::read(target).await {
+                    Ok(bytes) => Ok::<String, rquickjs::Error>(BASE64.encode(&bytes)),
+                    Err(e) => throw_err(&js_ctx, &format!("Read binary failed: {}", e)),
+                }
             }
         }),
     )
     .map_err(|e| e.to_string())?;
 
-    // 2. $fs.writeBytes(filename, data) -> Promise<boolean> (Supports Base64, ArrayBuffer, or Uint8Array)
+    // 2. $fs.writeBytes(filename, data) -> Promise<boolean>
     let app_write_bytes = app_ctx.clone();
     let write_bytes_fn = Function::new(
         ctx.clone(),
@@ -563,7 +526,6 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
                 async move {
                     let scope = app.get_scope();
 
-                    // Extract raw bytes from Base64 string, ArrayBuffer, or TypedArray/Uint8Array
                     let bytes = if let Some(s) = data_val.as_string() {
                         let clean = s.to_string().unwrap_or_default();
                         let b64 = if let Some(idx) = clean.find(',') {
@@ -571,14 +533,15 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
                         } else {
                             clean.trim()
                         };
-                        BASE64.decode(b64).map_err(|e| {
-                            let js_err = Exception::from_message(
-                                js_ctx.clone(),
-                                &format!("Invalid Base64 payload: {}", e),
-                            )
-                            .unwrap();
-                            js_ctx.throw(js_err.into())
-                        })?
+                        match BASE64.decode(b64) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                return throw_err(
+                                    &js_ctx,
+                                    &format!("Invalid Base64 payload: {}", e),
+                                );
+                            }
+                        }
                     } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(data_val.clone()) {
                         ab.as_bytes().map(|b| b.to_vec()).unwrap_or_default()
                     } else if let Some(obj) = data_val.as_object() {
@@ -605,36 +568,23 @@ pub fn register_fs<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Resu
 
                     let new_bytes = bytes.len() as u64;
 
-                    // Enforce scope-relative temp quota
-                    app.check_quota(&format!("temp:{}", new_bytes))
-                        .await
-                        .map_err(|e| {
-                            let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
-                            js_ctx.throw(js_err.into())
-                        })?;
+                    if let Err(e) = app.check_quota(&format!("temp:{}", new_bytes)).await {
+                        return throw_err(&js_ctx, &e);
+                    }
 
                     let target = match resolve_write_path(&scope, &fname) {
                         Ok(p) => p,
-                        Err(e) => {
-                            let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
-                            return Err(js_ctx.throw(js_err.into()));
-                        }
+                        Err(e) => return throw_err(&js_ctx, &e),
                     };
 
                     if let Some(parent) = target.parent() {
                         tokio::fs::create_dir_all(parent).await.ok();
                     }
 
-                    tokio::fs::write(target, bytes).await.map_err(|e| {
-                        let js_err = Exception::from_message(
-                            js_ctx.clone(),
-                            &format!("Write binary failed: {}", e),
-                        )
-                        .unwrap();
-                        js_ctx.throw(js_err.into())
-                    })?;
-
-                    Ok::<bool, rquickjs::Error>(true)
+                    match tokio::fs::write(target, bytes).await {
+                        Ok(_) => Ok::<bool, rquickjs::Error>(true),
+                        Err(e) => throw_err(&js_ctx, &format!("Write binary failed: {}", e)),
+                    }
                 }
             },
         ),
@@ -674,14 +624,21 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
 
     let create_fn = Function::new(
         ctx.clone(),
-        move |files_val: Value<'js>| -> rquickjs::Result<String> {
+        move |js_ctx: Ctx<'js>, files_val: Value<'js>| -> rquickjs::Result<String> {
             let limit = get_limit();
-            let files_json: serde_json::Value =
-                from_value(files_val).map_err(|_| rquickjs::Error::Exception)?;
+            let files_json: serde_json::Value = match from_value(files_val) {
+                Ok(v) => v,
+                Err(e) => return throw_err(&js_ctx, &format!("Invalid files parameter: {}", e)),
+            };
 
-            let files = files_json.as_object().ok_or(rquickjs::Error::Exception)?;
+            let files = match files_json.as_object() {
+                Some(f) => f,
+                None => {
+                    return throw_err(&js_ctx, "Expected an object mapping filenames to contents");
+                }
+            };
+
             let mut buffer = Cursor::new(Vec::new());
-
             {
                 let mut zip = ZipWriter::new(&mut buffer);
                 let options = FileOptions::default()
@@ -704,20 +661,31 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
 
                     estimated_size += data.len();
                     if estimated_size > limit * 2 {
-                        return Err(rquickjs::Error::Exception);
+                        return throw_err(&js_ctx, "Estimated archive size exceeds memory limit");
                     }
 
-                    zip.start_file(name, options)
-                        .map_err(|_| rquickjs::Error::Exception)?;
-                    zip.write_all(&data)
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                    if zip.start_file(name, options).is_err() || zip.write_all(&data).is_err() {
+                        return throw_err(
+                            &js_ctx,
+                            &format!("Failed writing '{}' to zip archive", name),
+                        );
+                    }
                 }
-                zip.finish().map_err(|_| rquickjs::Error::Exception)?;
+                if let Err(e) = zip.finish() {
+                    return throw_err(&js_ctx, &format!("Failed to finalize zip: {}", e));
+                }
             }
 
             let zip_bytes = buffer.into_inner();
             if zip_bytes.len() > limit {
-                return Err(rquickjs::Error::Exception);
+                return throw_err(
+                    &js_ctx,
+                    &format!(
+                        "Zip size ({} bytes) exceeds limit ({} bytes)",
+                        zip_bytes.len(),
+                        limit
+                    ),
+                );
             }
 
             Ok(BASE64.encode(zip_bytes))
@@ -729,24 +697,34 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
         ctx.clone(),
         move |js_ctx: Ctx<'js>, b64_str: String| -> rquickjs::Result<rquickjs::Value<'js>> {
             let limit = get_limit();
+            let bytes = match BASE64.decode(&b64_str) {
+                Ok(b) => b,
+                Err(e) => return throw_err(&js_ctx, &format!("Invalid base64 payload: {}", e)),
+            };
 
-            let bytes = BASE64
-                .decode(&b64_str)
-                .map_err(|_| rquickjs::Error::Exception)?;
             if bytes.len() > limit {
-                return Err(rquickjs::Error::Exception);
+                return throw_err(&js_ctx, "Zip payload exceeds maximum allowed size");
             }
 
             let cursor = Cursor::new(bytes);
-            let mut archive = ZipArchive::new(cursor).map_err(|_| rquickjs::Error::Exception)?;
+            let mut archive = match ZipArchive::new(cursor) {
+                Ok(a) => a,
+                Err(e) => return throw_err(&js_ctx, &format!("Failed to open zip archive: {}", e)),
+            };
 
             let mut output = serde_json::Map::new();
             let mut total_extracted = 0;
 
             for i in 0..archive.len() {
-                let mut file = archive
-                    .by_index(i)
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let mut file = match archive.by_index(i) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return throw_err(
+                            &js_ctx,
+                            &format!("Failed reading zip index {}: {}", i, e),
+                        );
+                    }
+                };
                 if file.is_dir() {
                     continue;
                 }
@@ -755,15 +733,16 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
                 let mut content_buf = Vec::new();
 
                 if file.size() > (limit as u64) {
-                    return Err(rquickjs::Error::Exception);
+                    return throw_err(&js_ctx, &format!("Entry '{}' exceeds file limit", name));
                 }
 
-                file.read_to_end(&mut content_buf)
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                if let Err(e) = file.read_to_end(&mut content_buf) {
+                    return throw_err(&js_ctx, &format!("Failed extracting '{}': {}", name, e));
+                }
                 total_extracted += content_buf.len();
 
                 if total_extracted > limit {
-                    return Err(rquickjs::Error::Exception);
+                    return throw_err(&js_ctx, "Extracted content exceeds archive limit");
                 }
 
                 let val = match String::from_utf8(content_buf.clone()) {
@@ -773,8 +752,10 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
                 output.insert(name, val);
             }
 
-            to_value(js_ctx, &serde_json::Value::Object(output))
-                .map_err(|_| rquickjs::Error::Exception)
+            to_value(js_ctx.clone(), &serde_json::Value::Object(output)).map_err(|e| {
+                let err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                js_ctx.throw(err.into())
+            })
         },
     )
     .map_err(|e| e.to_string())?;
@@ -782,20 +763,28 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
     let inspect_fn = Function::new(
         ctx.clone(),
         move |js_ctx: Ctx<'js>, b64_str: String| -> rquickjs::Result<rquickjs::Value<'js>> {
-            let bytes = BASE64
-                .decode(&b64_str)
-                .map_err(|_| rquickjs::Error::Exception)?;
+            let bytes = match BASE64.decode(&b64_str) {
+                Ok(b) => b,
+                Err(e) => return throw_err(&js_ctx, &format!("Invalid base64 payload: {}", e)),
+            };
+
             let cursor = Cursor::new(bytes.clone());
-            let mut archive = ZipArchive::new(cursor).map_err(|_| rquickjs::Error::Exception)?;
+            let mut archive = match ZipArchive::new(cursor) {
+                Ok(a) => a,
+                Err(e) => return throw_err(&js_ctx, &format!("Failed to open zip: {}", e)),
+            };
 
             let mut files_meta = Vec::new();
             let mut total_uncompressed: u64 = 0;
             let mut total_compressed: u64 = 0;
 
             for i in 0..archive.len() {
-                let file = archive
-                    .by_index(i)
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let file = match archive.by_index(i) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return throw_err(&js_ctx, &format!("Failed reading index {}: {}", i, e));
+                    }
+                };
 
                 let size = file.size();
                 let comp_size = file.compressed_size();
@@ -833,7 +822,10 @@ pub fn register_zip<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> Re
                 "files": files_meta
             });
 
-            to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+            to_value(js_ctx.clone(), &res).map_err(|e| {
+                let err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                js_ctx.throw(err.into())
+            })
         },
     )
     .map_err(|e| e.to_string())?;

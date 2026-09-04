@@ -1,11 +1,16 @@
 use rquickjs::function::Async;
-use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs::{Ctx, Exception, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde_json::json;
 use std::sync::Arc;
 
 use super::super::context::ScriptContext;
 use crate::realtime::EventScope;
+
+fn throw_err<'js, T>(ctx: &Ctx<'js>, msg: &str) -> rquickjs::Result<T> {
+    let err = Exception::from_message(ctx.clone(), msg).unwrap();
+    Err(ctx.throw(err.into()))
+}
 
 pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Result<(), String> {
     let globals = ctx.globals();
@@ -30,32 +35,38 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_c_tenant = app_ctx.clone();
     let create_tenant_fn = Function::new(
         ctx.clone(),
-        Async(move |id: String, config_val: Option<Value<'js>>| {
-            let config = config_val.and_then(|v| from_value::<serde_json::Value>(v).ok());
-            let app = app_c_tenant.clone();
-            async move {
-                let (name, tier, owner_id) = if let Some(serde_json::Value::Object(map)) = config {
-                    (
-                        map.get("name").and_then(|v| v.as_str()).map(String::from),
-                        map.get("tier").and_then(|v| v.as_str()).map(String::from),
-                        map.get("owner_id").and_then(|v| v.as_i64()),
-                    )
-                } else {
-                    (None, None, None)
-                };
+        Async(
+            move |js_ctx: Ctx<'js>, id: String, config_val: Option<Value<'js>>| {
+                let config = config_val.and_then(|v| from_value::<serde_json::Value>(v).ok());
+                let app = app_c_tenant.clone();
+                async move {
+                    let (name, tier, owner_id) =
+                        if let Some(serde_json::Value::Object(map)) = config {
+                            (
+                                map.get("name").and_then(|v| v.as_str()).map(String::from),
+                                map.get("tier").and_then(|v| v.as_str()).map(String::from),
+                                map.get("owner_id").and_then(|v| v.as_i64()),
+                            )
+                        } else {
+                            (None, None, None)
+                        };
 
-                app.get_db()
-                    .register_tenant(&id, owner_id, name, tier)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                    if let Err(e) = app
+                        .get_db()
+                        .register_tenant(&id, owner_id, name, tier)
+                        .await
+                    {
+                        return throw_err(&js_ctx, &format!("Failed to register tenant: {}", e));
+                    }
 
-                app.admin_create_tenant(id)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                    if let Err(e) = app.admin_create_tenant(id).await {
+                        return throw_err(&js_ctx, &format!("Failed to provision tenant: {}", e));
+                    }
 
-                Ok::<bool, rquickjs::Error>(true)
-            }
-        }),
+                    Ok::<bool, rquickjs::Error>(true)
+                }
+            },
+        ),
     )
     .map_err(|e| e.to_string())?;
 
@@ -63,16 +74,18 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_u_tenant = app_ctx.clone();
     let update_tenant_fn = Function::new(
         ctx.clone(),
-        Async(move |id: String, updates_val: Value<'js>| {
-            let updates: serde_json::Value = from_value(updates_val).unwrap_or(json!({}));
-            let app = app_u_tenant.clone();
-            async move {
-                app.admin_update_tenant(id, updates)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                Ok::<bool, rquickjs::Error>(true)
-            }
-        }),
+        Async(
+            move |js_ctx: Ctx<'js>, id: String, updates_val: Value<'js>| {
+                let updates: serde_json::Value = from_value(updates_val).unwrap_or(json!({}));
+                let app = app_u_tenant.clone();
+                async move {
+                    if let Err(e) = app.admin_update_tenant(id, updates).await {
+                        return throw_err(&js_ctx, &format!("Failed to update tenant: {}", e));
+                    }
+                    Ok::<bool, rquickjs::Error>(true)
+                }
+            },
+        ),
     )
     .map_err(|e| e.to_string())?;
 
@@ -80,12 +93,12 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_d_tenant = app_ctx.clone();
     let delete_tenant_fn = Function::new(
         ctx.clone(),
-        Async(move |id: String| {
+        Async(move |js_ctx: Ctx<'js>, id: String| {
             let app = app_d_tenant.clone();
             async move {
-                app.admin_delete_tenant(id)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                if let Err(e) = app.admin_delete_tenant(id).await {
+                    return throw_err(&js_ctx, &format!("Failed to delete tenant: {}", e));
+                }
                 Ok::<bool, rquickjs::Error>(true)
             }
         }),
@@ -96,14 +109,13 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_usage_tenant = app_ctx.clone();
     let get_tenant_usage_fn = Function::new(
         ctx.clone(),
-        Async(move |id: String| {
+        Async(move |js_ctx: Ctx<'js>, id: String| {
             let app = app_usage_tenant.clone();
             async move {
-                let bytes = app
-                    .admin_get_tenant_usage(id)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                Ok::<f64, rquickjs::Error>(bytes as f64)
+                match app.admin_get_tenant_usage(id).await {
+                    Ok(bytes) => Ok::<f64, rquickjs::Error>(bytes as f64),
+                    Err(e) => throw_err(&js_ctx, &format!("Failed to get tenant usage: {}", e)),
+                }
             }
         }),
     )
@@ -116,12 +128,14 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
         Async(move |js_ctx: Ctx<'js>| {
             let app = app_list_tenants.clone();
             async move {
-                let tenants = app
-                    .get_db()
-                    .list_tenants()
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                to_value(js_ctx, &json!(tenants)).map_err(|_| rquickjs::Error::Exception)
+                let tenants = match app.get_db().list_tenants().await {
+                    Ok(t) => t,
+                    Err(e) => return throw_err(&js_ctx, &format!("Failed to list tenants: {}", e)),
+                };
+                to_value(js_ctx.clone(), &json!(tenants)).map_err(|e| {
+                    let err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(err.into())
+                })
             }
         }),
     )
@@ -133,61 +147,67 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_c_sandbox = app_ctx.clone();
     let create_sandbox_fn = Function::new(
         ctx.clone(),
-        Async(move |id: String, config_val: Option<Value<'js>>| {
-            let config = config_val
-                .and_then(|v| from_value::<serde_json::Value>(v).ok())
-                .unwrap_or_else(|| json!({}));
-            let app = app_c_sandbox.clone();
+        Async(
+            move |js_ctx: Ctx<'js>, id: String, config_val: Option<Value<'js>>| {
+                let config = config_val
+                    .and_then(|v| from_value::<serde_json::Value>(v).ok())
+                    .unwrap_or_else(|| json!({}));
+                let app = app_c_sandbox.clone();
 
-            async move {
-                let (name, owner_id, expires_at) = if let Some(map) = config.as_object() {
-                    (
-                        map.get("name").and_then(|v| v.as_str()).map(String::from),
-                        map.get("owner_id").and_then(|v| v.as_i64()),
-                        map.get("expires_at")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                    )
-                } else {
-                    (None, None, None)
-                };
+                async move {
+                    let (name, owner_id, expires_at) = if let Some(map) = config.as_object() {
+                        (
+                            map.get("name").and_then(|v| v.as_str()).map(String::from),
+                            map.get("owner_id").and_then(|v| v.as_i64()),
+                            map.get("expires_at")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
 
-                app.admin_create_sandbox(id.clone(), config)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                    if let Err(e) = app.admin_create_sandbox(id.clone(), config).await {
+                        return throw_err(&js_ctx, &format!("Failed to provision sandbox: {}", e));
+                    }
 
-                let general_config = app.get_db().get_config("general").await.unwrap_or_default();
-                let max_storage_mb = general_config
-                    .as_ref()
-                    .and_then(|v| v.get("max_sandbox_storage_mb").and_then(|n| n.as_i64()))
-                    .unwrap_or(100);
-                let max_vectors = general_config
-                    .as_ref()
-                    .and_then(|v| v.get("max_sandbox_vectors").and_then(|n| n.as_i64()))
-                    .unwrap_or(10000);
-                let max_ai_requests = general_config
-                    .as_ref()
-                    .and_then(|v| v.get("max_sandbox_ai_requests").and_then(|n| n.as_i64()))
-                    .unwrap_or(100);
+                    let general_config =
+                        app.get_db().get_config("general").await.unwrap_or_default();
+                    let max_storage_mb = general_config
+                        .as_ref()
+                        .and_then(|v| v.get("max_sandbox_storage_mb").and_then(|n| n.as_i64()))
+                        .unwrap_or(100);
+                    let max_vectors = general_config
+                        .as_ref()
+                        .and_then(|v| v.get("max_sandbox_vectors").and_then(|n| n.as_i64()))
+                        .unwrap_or(10000);
+                    let max_ai_requests = general_config
+                        .as_ref()
+                        .and_then(|v| v.get("max_sandbox_ai_requests").and_then(|n| n.as_i64()))
+                        .unwrap_or(100);
 
-                app.get_db()
-                    .register_sandbox(
-                        &id,
-                        owner_id,
-                        name,
-                        expires_at,
-                        "root",
-                        None,
-                        max_storage_mb,
-                        max_vectors,
-                        max_ai_requests,
-                    )
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                    if let Err(e) = app
+                        .get_db()
+                        .register_sandbox(
+                            &id,
+                            owner_id,
+                            name,
+                            expires_at,
+                            "root",
+                            None,
+                            max_storage_mb,
+                            max_vectors,
+                            max_ai_requests,
+                        )
+                        .await
+                    {
+                        return throw_err(&js_ctx, &format!("Failed to register sandbox: {}", e));
+                    }
 
-                Ok::<bool, rquickjs::Error>(true)
-            }
-        }),
+                    Ok::<bool, rquickjs::Error>(true)
+                }
+            },
+        ),
     )
     .map_err(|e| e.to_string())?;
 
@@ -195,16 +215,18 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_u_sandbox = app_ctx.clone();
     let update_sandbox_fn = Function::new(
         ctx.clone(),
-        Async(move |id: String, updates_val: Value<'js>| {
-            let updates: serde_json::Value = from_value(updates_val).unwrap_or(json!({}));
-            let app = app_u_sandbox.clone();
-            async move {
-                app.admin_update_sandbox(id, updates)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                Ok::<bool, rquickjs::Error>(true)
-            }
-        }),
+        Async(
+            move |js_ctx: Ctx<'js>, id: String, updates_val: Value<'js>| {
+                let updates: serde_json::Value = from_value(updates_val).unwrap_or(json!({}));
+                let app = app_u_sandbox.clone();
+                async move {
+                    if let Err(e) = app.admin_update_sandbox(id, updates).await {
+                        return throw_err(&js_ctx, &format!("Failed to update sandbox: {}", e));
+                    }
+                    Ok::<bool, rquickjs::Error>(true)
+                }
+            },
+        ),
     )
     .map_err(|e| e.to_string())?;
 
@@ -212,12 +234,12 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_d_sandbox = app_ctx.clone();
     let delete_sandbox_fn = Function::new(
         ctx.clone(),
-        Async(move |id: String| {
+        Async(move |js_ctx: Ctx<'js>, id: String| {
             let app = app_d_sandbox.clone();
             async move {
-                app.admin_delete_sandbox(id)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                if let Err(e) = app.admin_delete_sandbox(id).await {
+                    return throw_err(&js_ctx, &format!("Failed to delete sandbox: {}", e));
+                }
                 Ok::<bool, rquickjs::Error>(true)
             }
         }),
@@ -228,14 +250,13 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_usage_sandbox = app_ctx.clone();
     let get_sandbox_usage_fn = Function::new(
         ctx.clone(),
-        Async(move |id: String| {
+        Async(move |js_ctx: Ctx<'js>, id: String| {
             let app = app_usage_sandbox.clone();
             async move {
-                let bytes = app
-                    .admin_get_sandbox_usage(id)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                Ok::<f64, rquickjs::Error>(bytes as f64)
+                match app.admin_get_sandbox_usage(id).await {
+                    Ok(bytes) => Ok::<f64, rquickjs::Error>(bytes as f64),
+                    Err(e) => throw_err(&js_ctx, &format!("Failed to get sandbox usage: {}", e)),
+                }
             }
         }),
     )
@@ -290,18 +311,26 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                             )
                         };
 
-                    let (raw_key, info) = app
+                    let (raw_key, info) = match app
                         .get_db()
                         .create_api_key(&name, &tenant_id, &issuer, &env_type, roles, bypass)
                         .await
-                        .map_err(|_| rquickjs::Error::Exception)?;
+                    {
+                        Ok(res) => res,
+                        Err(e) => {
+                            return throw_err(&js_ctx, &format!("Failed to create API key: {}", e));
+                        }
+                    };
 
                     let res = json!({
                         "key": raw_key,
                         "info": info
                     });
 
-                    to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                    to_value(js_ctx.clone(), &res).map_err(|e| {
+                        let err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                        js_ctx.throw(err.into())
+                    })
                 }
             },
         ),
@@ -312,7 +341,7 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_u_key = app_ctx.clone();
     let update_key_fn = Function::new(
         ctx.clone(),
-        Async(move |id: i64, config_val: Value<'js>| {
+        Async(move |js_ctx: Ctx<'js>, id: i64, config_val: Value<'js>| {
             let config: serde_json::Value = from_value(config_val).unwrap_or(json!({}));
             let app = app_u_key.clone();
 
@@ -332,10 +361,13 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                     (None, None, None, None)
                 };
 
-                app.get_db()
+                if let Err(e) = app
+                    .get_db()
                     .update_api_key(id, name, status, roles, bypass)
                     .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                {
+                    return throw_err(&js_ctx, &format!("Failed to update API key: {}", e));
+                }
 
                 Ok::<bool, rquickjs::Error>(true)
             }
@@ -347,13 +379,12 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
     let app_d_key = app_ctx.clone();
     let delete_key_fn = Function::new(
         ctx.clone(),
-        Async(move |id: i64| {
+        Async(move |js_ctx: Ctx<'js>, id: i64| {
             let app = app_d_key.clone();
             async move {
-                app.get_db()
-                    .delete_api_key(id)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                if let Err(e) = app.get_db().delete_api_key(id).await {
+                    return throw_err(&js_ctx, &format!("Failed to delete API key: {}", e));
+                }
                 Ok::<bool, rquickjs::Error>(true)
             }
         }),
@@ -367,12 +398,16 @@ pub fn register_root<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
         Async(move |js_ctx: Ctx<'js>| {
             let app = app_l_key.clone();
             async move {
-                let keys = app
-                    .get_db()
-                    .list_api_keys()
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                to_value(js_ctx, &json!(keys)).map_err(|_| rquickjs::Error::Exception)
+                let keys = match app.get_db().list_api_keys().await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        return throw_err(&js_ctx, &format!("Failed to list API keys: {}", e));
+                    }
+                };
+                to_value(js_ctx.clone(), &json!(keys)).map_err(|e| {
+                    let err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(err.into())
+                })
             }
         }),
     )

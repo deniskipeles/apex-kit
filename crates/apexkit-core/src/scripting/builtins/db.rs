@@ -1,5 +1,5 @@
 use rquickjs::function::{Async, Rest};
-use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs::{Ctx, Exception, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde_json::{Value as JsonValue, json};
 use std::sync::Arc;
@@ -9,7 +9,10 @@ use crate::Db;
 use crate::query::{ApexQuery, QueryOptions};
 use crate::realtime::EventScope;
 
-// --- HELPERS ---
+fn throw_js_err<'js, T>(ctx: &Ctx<'js>, msg: &str) -> rquickjs::Result<T> {
+    let js_err = Exception::from_message(ctx.clone(), msg).unwrap();
+    Err(ctx.throw(js_err.into()))
+}
 
 async fn resolve_collection_local(db: Arc<dyn Db>, identifier: &str) -> Result<i64, String> {
     if let Ok(id) = identifier.parse::<i64>() {
@@ -32,14 +35,14 @@ pub async fn resolve_db(
             return app_ctx
                 .resolve_tenant_db(tid)
                 .await
-                .ok_or(format!("Tenant {} not found", tid));
+                .ok_or(format!("Tenant '{}' not found", tid));
         }
         if s.starts_with("sandbox:") {
             let sid = s.strip_prefix("sandbox:").unwrap();
             return app_ctx
                 .resolve_sandbox_db(sid)
                 .await
-                .ok_or(format!("Sandbox {} not found", sid));
+                .ok_or(format!("Sandbox '{}' not found", sid));
         }
         if s == "root" {
             return Ok(app_ctx.get_db());
@@ -51,11 +54,11 @@ pub async fn resolve_db(
         EventScope::Tenant(id) => app_ctx
             .resolve_tenant_db(&id)
             .await
-            .ok_or(format!("Current Tenant {} context not found", id)),
+            .ok_or(format!("Current Tenant '{}' context not found", id)),
         EventScope::Sandbox(id) => app_ctx
             .resolve_sandbox_db(&id)
             .await
-            .ok_or(format!("Current Sandbox {} context not found", id)),
+            .ok_or(format!("Current Sandbox '{}' context not found", id)),
         _ => Ok(app_ctx.get_db()),
     }
 }
@@ -76,7 +79,7 @@ pub fn create_db_object<'js>(
     // --- 1. RECORDS ---
     let records_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
 
-    // list(col, opts) OR list(ctx, col, opts)
+    // list(col, opts)
     let app_list = app_ctx.clone();
     let list_records = Function::new(
         ctx.clone(),
@@ -111,12 +114,14 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let col_id = resolve_collection_local(db.clone(), &col)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let col_id = match resolve_collection_local(db.clone(), &col).await {
+                    Ok(id) => id,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
 
                 let mut opts = QueryOptions::default();
                 if let Some(v) = opts_val {
@@ -142,13 +147,11 @@ pub fn create_db_object<'js>(
                                 .and_then(|v| v.as_f64())
                                 .map(|n| n as u64)
                                 .or(map.get("offset").and_then(|v| v.as_u64()));
-
                             opts.sort = map.get("sort").and_then(|v| v.as_str()).map(String::from);
                             opts.expand =
                                 map.get("expand").and_then(|v| v.as_str()).map(String::from);
                             opts.fields =
                                 map.get("fields").and_then(|v| v.as_str()).map(String::from);
-
                             opts.filter = map.get("filter").map(|v| {
                                 if v.is_string() {
                                     v.as_str().unwrap().to_string()
@@ -160,18 +163,21 @@ pub fn create_db_object<'js>(
                     }
                 }
 
-                let list = db
-                    .list_records(col_id, opts)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let list = match db.list_records(col_id, opts).await {
+                    Ok(l) => l,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &list).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &list).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
     .map_err(|e| e.to_string())?;
 
-    // get(col, id, expand) OR get(ctx, col, id, expand)
+    // get(col, id, expand)
     let app_get = app_ctx.clone();
     let get_record = Function::new(
         ctx.clone(),
@@ -191,8 +197,6 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-
-                        // Flexible String parsing fallback without hard-locking struct validation
                         let rec_id = match args.0.get(2) {
                             Some(v) if v.is_int() => v.as_int().unwrap() as i64,
                             Some(v) if v.is_float() => v.as_float().unwrap() as i64,
@@ -205,7 +209,6 @@ pub fn create_db_object<'js>(
                                 .unwrap_or(0),
                             _ => 0,
                         };
-
                         let exp = args
                             .0
                             .get(3)
@@ -219,7 +222,6 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-
                         let rec_id = match args.0.get(1) {
                             Some(v) if v.is_int() => v.as_int().unwrap() as i64,
                             Some(v) if v.is_float() => v.as_float().unwrap() as i64,
@@ -232,7 +234,6 @@ pub fn create_db_object<'js>(
                                 .unwrap_or(0),
                             _ => 0,
                         };
-
                         let exp = args
                             .0
                             .get(2)
@@ -241,24 +242,29 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let col_id = resolve_collection_local(db.clone(), &col)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let rec = db
-                    .get_record(col_id, id, expand)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let col_id = match resolve_collection_local(db.clone(), &col).await {
+                    Ok(id) => id,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let rec = match db.get_record(col_id, id, expand).await {
+                    Ok(r) => r,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &rec).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &rec).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
     .map_err(|e| e.to_string())?;
 
-    // create(col, data) OR create(ctx, col, data)
+    // create(col, data)
     let app_create = app_ctx.clone();
     let create_record = Function::new(
         ctx.clone(),
@@ -293,29 +299,34 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let col_id = resolve_collection_local(db.clone(), &col)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let col_id = match resolve_collection_local(db.clone(), &col).await {
+                    Ok(id) => id,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
 
                 let data: JsonValue = data_val
                     .and_then(|v| from_value(v).ok())
                     .unwrap_or(json!({}));
-                let id = db
-                    .create_record(col_id, &data)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let id = match db.create_record(col_id, &data).await {
+                    Ok(id) => id,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
                 let res = json!({ "id": id });
-                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &res).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
     .map_err(|e| e.to_string())?;
 
-    // update(col, id, data) OR update(ctx, col, id, data)
+    // update(col, id, data)
     let app_update = app_ctx.clone();
     let update_record = Function::new(
         ctx.clone(),
@@ -335,7 +346,6 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-
                         let rec_id = match args.0.get(2) {
                             Some(v) if v.is_int() => v.as_int().unwrap() as i64,
                             Some(v) if v.is_float() => v.as_float().unwrap() as i64,
@@ -348,7 +358,6 @@ pub fn create_db_object<'js>(
                                 .unwrap_or(0),
                             _ => 0,
                         };
-
                         let d = args.0.get(3).cloned();
                         (c_id, col_name, rec_id, d)
                     }
@@ -359,7 +368,6 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-
                         let rec_id = match args.0.get(1) {
                             Some(v) if v.is_int() => v.as_int().unwrap() as i64,
                             Some(v) if v.is_float() => v.as_float().unwrap() as i64,
@@ -372,38 +380,42 @@ pub fn create_db_object<'js>(
                                 .unwrap_or(0),
                             _ => 0,
                         };
-
                         let d = args.0.get(2).cloned();
                         (None, col_name, rec_id, d)
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let col_id = resolve_collection_local(db.clone(), &col)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let col_id = match resolve_collection_local(db.clone(), &col).await {
+                    Ok(id) => id,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
 
                 let data: JsonValue = data_val
                     .and_then(|v| from_value(v).ok())
                     .unwrap_or(json!({}));
-                let rec = db
-                    .update_record(col_id, id, &data)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let rec = match db.update_record(col_id, id, &data).await {
+                    Ok(r) => r,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &rec).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &rec).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
     .map_err(|e| e.to_string())?;
 
-    // delete(col, id) OR delete(ctx, col, id)
+    // delete(col, id)
     let app_delete = app_ctx.clone();
     let delete_record = Function::new(
         ctx.clone(),
-        Async(move |args: Rest<Value<'js>>| {
+        Async(move |js_ctx: Ctx<'js>, args: Rest<Value<'js>>| {
             let app = app_delete.clone();
             async move {
                 let (ctx_id, col, id) = match mode {
@@ -419,7 +431,6 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-
                         let rec_id = match args.0.get(2) {
                             Some(v) if v.is_int() => v.as_int().unwrap() as i64,
                             Some(v) if v.is_float() => v.as_float().unwrap() as i64,
@@ -441,7 +452,6 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-
                         let rec_id = match args.0.get(1) {
                             Some(v) if v.is_int() => v.as_int().unwrap() as i64,
                             Some(v) if v.is_float() => v.as_float().unwrap() as i64,
@@ -458,18 +468,19 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let col_id = resolve_collection_local(db.clone(), &col)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let col_id = match resolve_collection_local(db.clone(), &col).await {
+                    Ok(id) => id,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
 
-                db.delete_record(col_id, id)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-
-                Ok::<bool, rquickjs::Error>(true)
+                match db.delete_record(col_id, id).await {
+                    Ok(_) => Ok::<bool, rquickjs::Error>(true),
+                    Err(e) => throw_js_err(&js_ctx, &e.to_string()),
+                }
             }
         }),
     )
@@ -532,20 +543,25 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let col_id = resolve_collection_local(db.clone(), &col)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let col_id = match resolve_collection_local(db.clone(), &col).await {
+                    Ok(id) => id,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
 
                 let vector: Vec<f32> = vec_val.and_then(|v| from_value(v).ok()).unwrap_or_default();
-                let recs = db
-                    .search_vector(col_id, &field, vector, limit)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let recs = match db.search_vector(col_id, &field, vector, limit).await {
+                    Ok(r) => r,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &recs).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &recs).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
@@ -571,7 +587,6 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-
                         let rec_id = match args.0.get(2) {
                             Some(v) if v.is_int() => v.as_int().unwrap() as i64,
                             Some(v) if v.is_float() => v.as_float().unwrap() as i64,
@@ -593,7 +608,6 @@ pub fn create_db_object<'js>(
                             .and_then(|v| v.as_string())
                             .map(|s| s.to_string().unwrap_or_default())
                             .unwrap_or_default();
-
                         let rec_id = match args.0.get(1) {
                             Some(v) if v.is_int() => v.as_int().unwrap() as i64,
                             Some(v) if v.is_float() => v.as_float().unwrap() as i64,
@@ -610,19 +624,24 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let col_id = resolve_collection_local(db.clone(), &col)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let col_id = match resolve_collection_local(db.clone(), &col).await {
+                    Ok(id) => id,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
 
-                let vecs = db
-                    .get_record_vectors(col_id, id)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let vecs = match db.get_record_vectors(col_id, id).await {
+                    Ok(v) => v,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &vecs).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &vecs).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
@@ -683,19 +702,24 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let col_id = resolve_collection_local(db.clone(), &col)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let col_id = match resolve_collection_local(db.clone(), &col).await {
+                    Ok(id) => id,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
 
-                let results = db
-                    .instant_search(col_id, &query, limit)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let results = match db.instant_search(col_id, &query, limit).await {
+                    Ok(r) => r,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &results).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &results).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
@@ -761,19 +785,28 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
 
                 let q_json: JsonValue = q_val.and_then(|v| from_value(v).ok()).unwrap_or(json!({}));
-                let query: ApexQuery =
-                    serde_json::from_value(q_json).map_err(|_| rquickjs::Error::Exception)?;
+                let query: ApexQuery = match serde_json::from_value(q_json) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        return throw_js_err(&js_ctx, &format!("Invalid query schema: {}", e));
+                    }
+                };
 
-                let res = db
-                    .query_engine(query)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                to_value(js_ctx, &res).map_err(|_| rquickjs::Error::Exception)
+                let res = match db.query_engine(query).await {
+                    Ok(r) => r,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
+
+                to_value(js_ctx.clone(), &res).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
@@ -821,15 +854,19 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let files = db
-                    .list_files(limit, offset)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let files = match db.list_files(limit, offset).await {
+                    Ok(f) => f,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &files).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &files).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
@@ -874,15 +911,19 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let u = db
-                    .get_user_by_email(&email)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let u = match db.get_user_by_email(&email).await {
+                    Ok(u) => u,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &u).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &u).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
@@ -944,17 +985,23 @@ pub fn create_db_object<'js>(
                     }
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let hash =
-                    crate::auth::hash_password(&pass).map_err(|_| rquickjs::Error::Exception)?;
-                let u = db
-                    .create_user(&email, &hash, &role, None)
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let hash = match crate::auth::hash_password(&pass) {
+                    Ok(h) => h,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
+                let u = match db.create_user(&email, &hash, &role, None).await {
+                    Ok(u) => u,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &u).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &u).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
@@ -982,15 +1029,19 @@ pub fn create_db_object<'js>(
                     DbMode::Scoped => None,
                 };
 
-                let db = resolve_db(ctx_id, app.clone())
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let cols = db
-                    .list_collections()
-                    .await
-                    .map_err(|_| rquickjs::Error::Exception)?;
+                let db = match resolve_db(ctx_id, app.clone()).await {
+                    Ok(d) => d,
+                    Err(e) => return throw_js_err(&js_ctx, &e),
+                };
+                let cols = match db.list_collections().await {
+                    Ok(c) => c,
+                    Err(e) => return throw_js_err(&js_ctx, &e.to_string()),
+                };
 
-                to_value(js_ctx, &cols).map_err(|_| rquickjs::Error::Exception)
+                to_value(js_ctx.clone(), &cols).map_err(|e| {
+                    let js_err = Exception::from_message(js_ctx.clone(), &e.to_string()).unwrap();
+                    js_ctx.throw(js_err.into())
+                })
             }
         }),
     )
@@ -998,7 +1049,7 @@ pub fn create_db_object<'js>(
 
     cols_obj.set("list", cols_list).map_err(|e| e.to_string())?;
 
-    // Build Final Object
+    // Bind Final Object
     db_obj
         .set("records", records_obj)
         .map_err(|e| e.to_string())?;
