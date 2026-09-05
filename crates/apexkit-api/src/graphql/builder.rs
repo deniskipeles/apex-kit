@@ -121,8 +121,8 @@ pub async fn build_schema(
         }
     }
 
-    // B. Collection Reverse Relations: Target Col ID -> Vec<(Origin Col ID, Origin Col Name, Rel Field Name, Origin Policy)>
-    let mut reverse_relations_map: HashMap<i64, Vec<(i64, String, String, String)>> =
+    // B. Collection Reverse Relations: Target Col ID -> Vec<(Origin Col ID, Origin Col Name, Rel Field Name, Origin Policy, RelationType)>
+    let mut reverse_relations_map: HashMap<i64, Vec<(i64, String, String, String, RelationType)>> =
         HashMap::new();
     for other_col in &collections {
         if let Some(schema) = &other_col.schema {
@@ -141,6 +141,7 @@ pub async fn build_schema(
                         other_col.name.clone(),
                         rel_name.clone(),
                         origin_policy.clone(),
+                        def.relation_type.clone(), // Record cardinality
                     ));
                 }
             }
@@ -541,7 +542,6 @@ pub async fn build_schema(
                 let t_col_name = resolved_target_name.clone();
                 let origin_col_id = col.id;
                 let r_name = rel_name.clone();
-                let is_list = rel_def.relation_type == RelationType::Many;
 
                 let target_read_policy = collections
                     .iter()
@@ -550,11 +550,9 @@ pub async fn build_schema(
                     .map(|s| s.policies.read.clone())
                     .unwrap_or("public".to_string());
 
-                let type_ref = if is_list {
-                    TypeRef::List(Box::new(TypeRef::named(&target_type_name)))
-                } else {
-                    TypeRef::named(&target_type_name)
-                };
+                // FORWARD RELATION: A foreign field on this collection points to ONE target entity.
+                // It must ALWAYS be a single Map (Object), NEVER a List/Array!
+                let type_ref = TypeRef::named(&target_type_name);
 
                 let fname = get_unique_field_name(&type_name, rel_name, &mut field_tracker);
 
@@ -563,7 +561,6 @@ pub async fn build_schema(
                     let t_col_name = t_col_name.clone();
                     let policy_rule = target_read_policy.clone();
 
-                    // Extract state from the GraphQL Context dynamically
                     let state = ctx.data::<AppState>().unwrap().clone();
                     let db_for_policy = state.db.clone();
 
@@ -587,9 +584,8 @@ pub async fn build_schema(
                             .map_err(async_graphql::Error::new)?
                             .unwrap_or_default();
 
-                        let mut filtered_records = Vec::new();
+                        let mut target_record = None;
                         for r in records {
-                            // Clone the extracted db_for_policy per loop iteration
                             if policies::check_access(
                                 &policy_rule,
                                 claims,
@@ -599,43 +595,25 @@ pub async fn build_schema(
                             )
                             .await
                             {
-                                filtered_records.push(r);
+                                target_record = Some(r);
+                                break;
                             }
                         }
 
-                        if is_list {
-                            Ok(Some(FieldValue::list(
-                                filtered_records.into_iter().map(FieldValue::owned_any),
-                            )))
-                        } else {
-                            Ok(filtered_records
-                                .into_iter()
-                                .next()
-                                .map(FieldValue::owned_any))
-                        }
+                        // Returns a single Map or null (NEVER an empty array [])
+                        Ok(target_record.map(FieldValue::owned_any))
                     })
                 });
                 object = object.field(field);
 
-                let create_rel_type = if is_list {
-                    if rel_def.required {
-                        TypeRef::named_nn_list_nn(TypeRef::ID)
-                    } else {
-                        TypeRef::named_list(TypeRef::ID)
-                    }
-                } else {
-                    if rel_def.required {
-                        TypeRef::named_nn(TypeRef::ID)
-                    } else {
-                        TypeRef::named(TypeRef::ID)
-                    }
-                };
-
-                let update_rel_type = if is_list {
-                    TypeRef::named_list(TypeRef::ID)
+                // Input types for mutations: scalar ID, not [ID]
+                let create_rel_type = if rel_def.required {
+                    TypeRef::named_nn(TypeRef::ID)
                 } else {
                     TypeRef::named(TypeRef::ID)
                 };
+
+                let update_rel_type = TypeRef::named(TypeRef::ID);
 
                 create_input = create_input.field(InputValue::new(rel_name, create_rel_type));
                 create_fields_count += 1;
@@ -648,17 +626,21 @@ pub async fn build_schema(
         // --- 4A. HYDRATE COLLECTION REVERSE RELATIONS ---
         if let Some(rev_rels) = reverse_relations_map.get(&col_id) {
             let mut field_names_count: HashMap<String, usize> = HashMap::new();
-            for (_, origin_col_name, _, _) in rev_rels {
+            for (_, origin_col_name, _, _, _) in rev_rels {
                 *field_names_count
                     .entry(origin_col_name.clone())
                     .or_insert(0) += 1;
             }
 
-            for (origin_col_id, origin_col_name, rel_field, origin_policy) in rev_rels {
+            for (origin_col_id, origin_col_name, rel_field, origin_policy, rel_cardinality) in
+                rev_rels
+            {
                 let origin_col_id = *origin_col_id;
                 let rel_field_clone = rel_field.clone();
                 let o_policy = origin_policy.clone();
                 let list_type = format!("{}List", capitalize(origin_col_name));
+                let single_type = capitalize(origin_col_name);
+                let is_reverse_many = *rel_cardinality == RelationType::Many;
 
                 let is_duplicate = *field_names_count.get(origin_col_name).unwrap_or(&0) > 1;
                 let base_key = if is_duplicate {
@@ -669,75 +651,99 @@ pub async fn build_schema(
 
                 let fname = get_unique_field_name(&type_name, &base_key, &mut field_tracker);
 
-                object = object.field(
-                    Field::new(fname, TypeRef::named(&list_type), move |ctx| {
-                        let s_col_id = origin_col_id;
-                        let s_rel_field = rel_field_clone.clone();
-                        let policy_rule = o_policy.clone();
+                // Return List if reverse Many, or single Object if reverse One (unique)
+                let type_ref = if is_reverse_many {
+                    TypeRef::named(&list_type)
+                } else {
+                    TypeRef::named(&single_type)
+                };
 
-                        FieldFuture::new(async move {
-                            let state = ctx.data::<AppState>().unwrap().clone();
-                            let parent_record = ctx.parent_value.try_downcast_ref::<Record>()?;
-                            let claims = ctx.data::<Claims>().ok();
+                let mut field_builder = Field::new(fname, type_ref, move |ctx| {
+                    let s_col_id = origin_col_id;
+                    let s_rel_field = rel_field_clone.clone();
+                    let policy_rule = o_policy.clone();
 
-                            let rls_sql = policies::compile_to_sql(
-                                &policy_rule,
-                                claims,
-                                None,
-                                Some(state.db.clone()),
-                            )
-                            .await
-                            .unwrap_or("1=0".to_string());
-                            if rls_sql == "1=0" {
+                    FieldFuture::new(async move {
+                        let state = ctx.data::<AppState>().unwrap().clone();
+                        let parent_record = ctx.parent_value.try_downcast_ref::<Record>()?;
+                        let claims = ctx.data::<Claims>().ok();
+
+                        let rls_sql = policies::compile_to_sql(
+                            &policy_rule,
+                            claims,
+                            None,
+                            Some(state.db.clone()),
+                        )
+                        .await
+                        .unwrap_or("1=0".to_string());
+
+                        if rls_sql == "1=0" {
+                            if is_reverse_many {
                                 return Ok(Some(FieldValue::owned_any(ListResult {
                                     items: vec![],
                                     total: 0,
                                 })));
+                            } else {
+                                return Ok(None);
                             }
+                        }
 
-                            let limit = ctx.args.get("limit").and_then(|v| v.u64().ok());
-                            let offset = ctx.args.get("offset").and_then(|v| v.u64().ok());
+                        let limit = ctx.args.get("limit").and_then(|v| v.u64().ok());
+                        let offset = ctx.args.get("offset").and_then(|v| v.u64().ok());
 
-                            let rel_filter =
-                                serde_json::json!({ s_rel_field.clone(): parent_record.id });
+                        let rel_filter =
+                            serde_json::json!({ s_rel_field.clone(): parent_record.id });
 
-                            let filter_str = match ctx.args.get("where") {
-                                Some(accessor) => {
-                                    let mut user_where = accessor
-                                        .deserialize::<serde_json::Value>()
-                                        .unwrap_or(serde_json::json!({}));
-                                    if let Some(obj) = user_where.as_object_mut() {
-                                        obj.insert(
-                                            s_rel_field.clone(),
-                                            serde_json::json!(parent_record.id),
-                                        );
-                                    } else {
-                                        user_where = rel_filter;
-                                    }
-                                    Some(user_where.to_string())
+                        let filter_str = match ctx.args.get("where") {
+                            Some(accessor) => {
+                                let mut user_where = accessor
+                                    .deserialize::<serde_json::Value>()
+                                    .unwrap_or(serde_json::json!({}));
+                                if let Some(obj) = user_where.as_object_mut() {
+                                    obj.insert(
+                                        s_rel_field.clone(),
+                                        serde_json::json!(parent_record.id),
+                                    );
+                                } else {
+                                    user_where = rel_filter;
                                 }
-                                None => Some(rel_filter.to_string()),
-                            };
+                                Some(user_where.to_string())
+                            }
+                            None => Some(rel_filter.to_string()),
+                        };
 
-                            let mut options = QueryOptions::default();
-                            options.limit = limit.or(Some(100));
-                            options.offset = offset;
-                            options.filter = filter_str;
-                            options.rls_sql = Some(rls_sql);
+                        let mut options = QueryOptions::default();
+                        options.limit = if is_reverse_many {
+                            limit.or(Some(100))
+                        } else {
+                            Some(1)
+                        };
+                        options.offset = offset;
+                        options.filter = filter_str;
+                        options.rls_sql = Some(rls_sql);
 
-                            let result = state
-                                .db
-                                .list_records(s_col_id, options)
-                                .await
-                                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                        let result = state
+                            .db
+                            .list_records(s_col_id, options)
+                            .await
+                            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
+                        if is_reverse_many {
                             Ok(Some(FieldValue::owned_any(result)))
-                        })
+                        } else {
+                            Ok(result.items.into_iter().next().map(FieldValue::owned_any))
+                        }
                     })
-                    .argument(InputValue::new("limit", TypeRef::named(TypeRef::INT)))
-                    .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
-                    .argument(InputValue::new("where", TypeRef::named("JSON"))),
-                );
+                });
+
+                if is_reverse_many {
+                    field_builder = field_builder
+                        .argument(InputValue::new("limit", TypeRef::named(TypeRef::INT)))
+                        .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
+                        .argument(InputValue::new("where", TypeRef::named("JSON")));
+                }
+
+                object = object.field(field_builder);
             }
         }
 

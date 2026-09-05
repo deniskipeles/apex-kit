@@ -38,7 +38,6 @@ pub fn sanitize_and_validate(
         // B. Coerce Types for Standard Fields
         for (field_name, field_def) in &schema.fields {
             if let Some(val) = map.get_mut(field_name) {
-                // If the field is Owner or Relation, force it to be an Integer
                 if (field_def.r#type == FieldType::Owner || field_def.r#type == FieldType::Relation)
                     && let Some(str_val) = val.as_str()
                     && let Ok(num) = str_val.parse::<i64>()
@@ -46,7 +45,6 @@ pub fn sanitize_and_validate(
                     *val = serde_json::json!(num);
                 }
 
-                // Remove empty strings for nullable numbers/relations/dates to avoid type errors
                 if val.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
                     && (field_def.r#type == FieldType::Number
                         || field_def.r#type == FieldType::Relation
@@ -58,18 +56,10 @@ pub fn sanitize_and_validate(
             }
         }
 
-        // C. Coerce Types for Virtual Relation Arrays/IDs
+        // C. Coerce scalar string IDs to integers for Relations (do NOT allow array conversions)
         for rel_name in schema.relations.keys() {
             if let Some(val) = map.get_mut(rel_name) {
-                if let Value::Array(arr) = val {
-                    for item in arr.iter_mut() {
-                        if let Some(s) = item.as_str()
-                            && let Ok(num) = s.parse::<i64>()
-                        {
-                            *item = serde_json::json!(num);
-                        }
-                    }
-                } else if let Some(s) = val.as_str()
+                if let Some(s) = val.as_str()
                     && let Ok(num) = s.parse::<i64>()
                 {
                     *val = serde_json::json!(num);
@@ -98,6 +88,7 @@ pub fn validate_record(
         }
     };
 
+    // 1. Validate Schema Fields
     for (field_name, field_def) in &schema.fields {
         let value = data_map.get(field_name);
 
@@ -110,6 +101,17 @@ pub fn validate_record(
 
         let val = value.unwrap();
 
+        // Enforce: Owner or Relation fields defined in fields must NOT be arrays
+        if (field_def.r#type == FieldType::Relation || field_def.r#type == FieldType::Owner)
+            && val.is_array()
+        {
+            errors.push(ValidationError::InvalidType(
+                field_name.clone(),
+                "Expected scalar foreign key ID (number). Arrays are not permitted.".into(),
+            ));
+            continue;
+        }
+
         if let Err(msg) = validate_field_type(val, field_def) {
             errors.push(ValidationError::InvalidType(
                 field_name.clone(),
@@ -119,6 +121,36 @@ pub fn validate_record(
             errors.push(ValidationError::ConstraintViolation(
                 field_name.clone(),
                 msg,
+            ));
+        }
+    }
+
+    // 2. BULLETPROOF: Validate Relation Fields in schema.relations
+    for (rel_name, rel_def) in &schema.relations {
+        let value = data_map.get(rel_name);
+
+        if value.is_none() || value.unwrap().is_null() {
+            if rel_def.required {
+                errors.push(ValidationError::MissingRequiredField(rel_name.clone()));
+            }
+            continue;
+        }
+
+        let val = value.unwrap();
+
+        // STRICT CHECK: Reject arrays on relation fields completely
+        if val.is_array() {
+            errors.push(ValidationError::InvalidType(
+                rel_name.clone(),
+                "Expected scalar foreign key ID (number). Arrays are not permitted; relation_type only defines cardinality/uniqueness.".into(),
+            ));
+            continue;
+        }
+
+        if !val.is_number() && !val.is_string() {
+            errors.push(ValidationError::InvalidType(
+                rel_name.clone(),
+                "Expected scalar foreign key ID (number or integer string).".into(),
             ));
         }
     }

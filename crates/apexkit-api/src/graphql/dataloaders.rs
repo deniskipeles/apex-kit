@@ -66,11 +66,45 @@ impl Loader<RelationKey> for RelationLoader {
 
         for ((o_col, rel), o_ids) in grouped_keys {
             for o_id in o_ids {
-                if let Ok(links) = self.db.get_related_ids(o_col, o_id, &rel).await
-                    && let Some(key) = keys_cloned.iter().find(|k| {
-                        k.origin_col_id == o_col && k.origin_rec_id == o_id && k.rel_name == rel
-                    })
-                {
+                let mut links = self
+                    .db
+                    .get_related_ids(o_col, o_id, &rel)
+                    .await
+                    .unwrap_or_default();
+
+                // FALLBACK: If _relations table is empty, check origin_record.data[rel_name] directly
+                if links.is_empty() {
+                    if let Ok(Some(origin_rec)) = self.db.get_record(o_col, o_id, None).await {
+                        if let Some(val) = origin_rec.data.get(&rel) {
+                            let mut fallback_ids = Vec::new();
+                            if let Some(arr) = val.as_array() {
+                                for v in arr {
+                                    if let Some(id) = v
+                                        .as_i64()
+                                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                    {
+                                        fallback_ids.push(id);
+                                    }
+                                }
+                            } else if let Some(id) = val
+                                .as_i64()
+                                .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
+                            {
+                                fallback_ids.push(id);
+                            }
+
+                            if !fallback_ids.is_empty() {
+                                for t_id in fallback_ids {
+                                    links.push((0, t_id));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(key) = keys_cloned.iter().find(|k| {
+                    k.origin_col_id == o_col && k.origin_rec_id == o_id && k.rel_name == rel
+                }) {
                     target_ids_map.insert(key.clone(), links.clone());
                     for (_, t_rec_id) in links {
                         needed_records
