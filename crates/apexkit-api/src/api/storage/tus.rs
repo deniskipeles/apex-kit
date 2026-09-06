@@ -94,6 +94,13 @@ pub async fn tus_create(
 ) -> Result<Response, AppError> {
     let claims = auth.map(|Extension(c)| c);
     let user_id = claims.as_ref().map(|c| c.uid);
+    // 1. [SECURITY FIX] Reject anonymous upload requests
+    if user_id.is_none() {
+        return Err(AppError::Unauthorized(
+            "Login required to upload files".into(),
+        ));
+    }
+
     let event_scope = scope.map(|s| s.0).unwrap_or(EventScope::Root);
 
     let total_size = headers
@@ -107,6 +114,20 @@ pub async fn tus_create(
             "Upload size exceeds maximum allowed size".into(),
         ));
     }
+
+    // 2. [HOOK FIX] Trigger `before_file_upload` hook to allow custom security checks
+    trigger_void_hook(
+        &state,
+        "before_file_upload",
+        serde_json::json!({
+            "protocol": "tus",
+            "size": total_size
+        }),
+        claims.as_ref(),
+        Some(&event_scope.clone()),
+        Some(base_url.clone()),
+    )
+    .await?;
 
     check_storage_quota(&state, &event_scope).await?;
     check_temp_quota(&state, &event_scope, total_size).await?;
