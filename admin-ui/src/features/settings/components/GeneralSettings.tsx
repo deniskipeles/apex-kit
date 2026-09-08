@@ -75,6 +75,7 @@ export const GeneralSettings = ({ settings, onChange, onSave }: GeneralSettingsP
         maxSandboxStorageMb: settings.maxSandboxStorageMb,
         maxSandboxVectors: settings.maxSandboxVectors,
         maxSandboxAiRequests: settings.maxSandboxAiRequests,
+        imageProcessingStep: settings.imageProcessingStep,
       });
     } finally {
       setIsSaving(false);
@@ -235,6 +236,19 @@ export const GeneralSettings = ({ settings, onChange, onSave }: GeneralSettingsP
                   />
                   <p className="text-[10px] text-muted-foreground whitespace-nowrap">
                     Per 30min window
+                  </p>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label>Image Quantize Step</Label>
+                  <Input
+                    type="number"
+                    value={settings.imageProcessingStep || 10}
+                    onChange={(e: any) => onChange({ imageProcessingStep: Number(e.target.value) })}
+                  />
+                  <p className="text-[10px] text-muted-foreground whitespace-nowrap">
+                    Rounds quality/blur to nearest step (e.g., 10).
                   </p>
                 </div>
               </div>

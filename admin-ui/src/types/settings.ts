@@ -134,6 +134,7 @@ export interface AppSettings {
   maxSandboxStorageMb?: number;
   maxSandboxVectors?: number;
   maxSandboxAiRequests?: number;
+  imageProcessingStep?: number;
   ai: AIProvider;
 }
 

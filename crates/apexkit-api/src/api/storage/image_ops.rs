@@ -52,7 +52,27 @@ pub async fn process_image(
             .unwrap());
     }
 
-    let quality = req_quality.unwrap_or(80).clamp(1, 100);
+    let step = state
+        .db
+        .get_config("general")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.get("image_processing_step").and_then(|n| n.as_f64()))
+        .unwrap_or(10.0);
+
+    let quality = req_quality
+        .map(|q| {
+            let q_step = step.max(1.0);
+            ((q as f64 / q_step).round() * q_step) as u8
+        })
+        .unwrap_or(80)
+        .clamp(1, 100);
+
+    let req_blur = req_blur.map(|b| {
+        let b_step = step as f32;
+        ((b / b_step).round() * b_step).clamp(0.1, 50.0)
+    });
 
     let (target_format, target_mime) =
         match req_format.as_deref().unwrap_or("").to_lowercase().as_str() {

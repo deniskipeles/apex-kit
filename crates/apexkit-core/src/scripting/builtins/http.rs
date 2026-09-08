@@ -14,6 +14,8 @@ async fn execute_http_request(
     headers_val: Option<HashMap<String, String>>,
     body_val: Option<serde_json::Value>,
     redirect_mode: Option<String>,
+    timeout_ms: Option<u64>,
+    task_id: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     let policy = match redirect_mode.as_deref() {
         Some("manual") => reqwest::redirect::Policy::none(),
@@ -23,8 +25,13 @@ async fn execute_http_request(
         _ => reqwest::redirect::Policy::default(),
     };
 
-    let client = reqwest::Client::builder()
-        .redirect(policy)
+    let mut client_builder = reqwest::Client::builder().redirect(policy);
+
+    if let Some(ms) = timeout_ms {
+        client_builder = client_builder.timeout(std::time::Duration::from_millis(ms));
+    }
+
+    let client = client_builder
         .build()
         .map_err(|e| format!("Client Build Error: {}", e))?;
 
@@ -46,7 +53,19 @@ async fn execute_http_request(
         }
     }
 
-    match req_builder.send().await {
+    if let Some(id) = task_id {
+        crate::scripting::scheduler::get_quantum_scheduler().pause_for_io(id);
+    }
+
+    let start_time = std::time::Instant::now();
+    let res_result = req_builder.send().await;
+    let wall_time = start_time.elapsed().as_millis() as u64;
+
+    if let Some(id) = task_id {
+        crate::scripting::scheduler::get_quantum_scheduler().resume_from_io(id);
+    }
+
+    match res_result {
         Ok(res) => {
             let status = res.status().as_u16();
             let status_text = res.status().canonical_reason().unwrap_or("").to_string();
@@ -71,7 +90,8 @@ async fn execute_http_request(
                 "url": final_url,
                 "headers": res_headers,
                 "body": body_text,
-                "body_b64": body_b64
+                "body_b64": body_b64,
+                "wallTime": wall_time
             }))
         }
         Err(e) => Err(format!("Network Error: {}", e)),
@@ -85,10 +105,12 @@ pub fn register_fetch<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> 
         ctx.clone(),
         Async(
             move |js_ctx: Ctx<'js>, url: String, Opt(opts_val): Opt<Value<'js>>| async move {
+                let task_id: Option<u64> = js_ctx.globals().get("__TASK_ID").ok();
                 let mut method = "GET".to_string();
                 let mut headers = None;
                 let mut body = None;
                 let mut redirect = None;
+                let mut timeout_ms = None;
 
                 if let Some(v) = opts_val {
                     if let Ok(opts) = from_value::<serde_json::Value>(v) {
@@ -106,10 +128,17 @@ pub fn register_fetch<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> 
                         if let Some(r) = opts.get("redirect").and_then(|v| v.as_str()) {
                             redirect = Some(r.to_string());
                         }
+                        if let Some(t) = opts.get("timeout").and_then(|v| v.as_u64()) {
+                            timeout_ms = Some(t);
+                        }
                     }
                 }
 
-                let res = match execute_http_request(url, method, headers, body, redirect).await {
+                let res = match execute_http_request(
+                    url, method, headers, body, redirect, timeout_ms, task_id,
+                )
+                .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
@@ -141,13 +170,17 @@ pub fn register_http<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
     let get_fn = Function::new(
         ctx.clone(),
         Async(move |js_ctx: Ctx<'js>, url: String| async move {
-            let res = match execute_http_request(url, "GET".to_string(), None, None, None).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
-                    return Err(js_ctx.throw(js_err.into()));
-                }
-            };
+            let task_id: Option<u64> = js_ctx.globals().get("__TASK_ID").ok();
+            let res =
+                match execute_http_request(url, "GET".to_string(), None, None, None, None, task_id)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let js_err = Exception::from_message(js_ctx.clone(), &e).unwrap();
+                        return Err(js_ctx.throw(js_err.into()));
+                    }
+                };
 
             let body = res
                 .get("body")
@@ -164,6 +197,7 @@ pub fn register_http<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
         ctx.clone(),
         Async(
             move |js_ctx: Ctx<'js>, url: String, body_val: Value<'js>| async move {
+                let task_id: Option<u64> = js_ctx.globals().get("__TASK_ID").ok();
                 let body_json: serde_json::Value = from_value(body_val).unwrap_or(json!({}));
                 let res = match execute_http_request(
                     url,
@@ -171,6 +205,8 @@ pub fn register_http<'js>(ctx: &Ctx<'js>, _app_ctx: Arc<dyn ScriptContext>) -> R
                     None,
                     Some(body_json),
                     None,
+                    None,
+                    task_id,
                 )
                 .await
                 {

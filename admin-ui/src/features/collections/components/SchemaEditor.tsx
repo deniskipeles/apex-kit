@@ -662,6 +662,31 @@ const FieldEditorDialog = ({
           </Button>
         </div>
       </div>
+
+      {isCollectionCreatorOpen && (
+        <Dialog
+          isOpen={true}
+          onClose={() => setIsCollectionCreatorOpen(false)}
+          title="Create Related Collection"
+          size="xl"
+          zIndex={zIndex + 20}
+        >
+          <Suspense
+            fallback={
+              <div className="flex p-4 justify-center">
+                <Loader2 className="animate-spin text-primary h-6 w-6" />
+              </div>
+            }
+          >
+            <CollectionForm
+              onSave={handleCreateCollection}
+              onCancel={() => setIsCollectionCreatorOpen(false)}
+              isEmbedded={true}
+              zIndex={zIndex + 20}
+            />
+          </Suspense>
+        </Dialog>
+      )}
     </Dialog>
   );
 };

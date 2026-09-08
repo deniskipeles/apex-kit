@@ -117,6 +117,9 @@ pub async fn get_settings(
         max_sandbox_ai_requests: general
             .get("max_sandbox_ai_requests")
             .and_then(|v| v.as_i64()),
+        image_processing_step: general
+            .get("image_processing_step")
+            .and_then(|v| v.as_u64()),
         smtp: None,
         storage: None,
         security: None,
@@ -281,6 +284,9 @@ pub async fn update_settings(
     }
     if let Some(v) = &payload.max_sandbox_ai_requests {
         general["max_sandbox_ai_requests"] = json!(v);
+    }
+    if let Some(v) = &payload.image_processing_step {
+        general["image_processing_step"] = json!(v);
     }
 
     db.set_config("general", &general, false)

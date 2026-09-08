@@ -515,7 +515,8 @@ const JS_PRELUDE: &str = r#"
         const nativeRes = await $__native_fetch(urlString, {
             method: options.method || 'GET',
             headers: headersObj,
-            body: options.body
+            body: options.body,
+            timeout: options.timeout
         });
 
         let res = new Response(nativeRes.body, {
@@ -525,6 +526,7 @@ const JS_PRELUDE: &str = r#"
             url: nativeRes.url
         });
         res._body_b64 = nativeRes.body_b64;
+        res.wallTime = nativeRes.wallTime;
         return res;
     };
 "#;
@@ -620,10 +622,14 @@ impl ScriptEngine {
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         let vfs = self.vfs.clone();
 
-        let start_time = std::time::Instant::now();
-        let max_duration = std::time::Duration::from_millis(total_cpu_budget_ms);
+        let task_id = crate::scripting::scheduler::get_quantum_scheduler().register_task(
+            std::time::Duration::from_millis(total_cpu_budget_ms),
+            std::time::Duration::from_millis(10),
+        );
 
         let task = SendWrapper(async move {
+            let _guard = crate::scripting::scheduler::QuantumGuard::new(task_id);
+
             runtime.set_max_stack_size(0).await;
 
             // 2. INJECT SCOPED DATABASE AND SCOPE IDENTIFIER INTO THE LOADER
@@ -639,7 +645,9 @@ impl ScriptEngine {
                 .await;
 
             runtime
-                .set_interrupt_handler(Some(Box::new(move || start_time.elapsed() > max_duration)))
+                .set_interrupt_handler(Some(Box::new(move || {
+                    crate::scripting::scheduler::get_quantum_scheduler().check_and_yield(task_id)
+                })))
                 .await;
 
             let ctx = AsyncContext::full(&runtime)
@@ -648,6 +656,7 @@ impl ScriptEngine {
 
             #[allow(deprecated)]
             let res = rquickjs::async_with!(ctx => |js_ctx| {
+                js_ctx.globals().set("__TASK_ID", task_id).unwrap();
                 setup_quickjs(&js_ctx, context.clone(), resolved_base_url.clone())?;
 
                 let import_code = format!("import('{}')", module_name);
@@ -856,11 +865,29 @@ impl ScriptEngine {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(300);
 
+        let total_cpu_budget_ms = std::env::var("SCRIPT_MAX_CPU_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(300000);
+
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         let vfs = self.vfs.clone();
 
+        let task_id = crate::scripting::scheduler::get_quantum_scheduler().register_task(
+            std::time::Duration::from_millis(total_cpu_budget_ms),
+            std::time::Duration::from_millis(10),
+        );
+
         let task = SendWrapper(async move {
+            let _guard = crate::scripting::scheduler::QuantumGuard::new(task_id);
+
             runtime.set_max_stack_size(0).await;
+
+            runtime
+                .set_interrupt_handler(Some(Box::new(move || {
+                    crate::scripting::scheduler::get_quantum_scheduler().check_and_yield(task_id)
+                })))
+                .await;
 
             // 2. INJECT SCOPED DATABASE AND SCOPE IDENTIFIER INTO THE LOADER
             runtime
@@ -880,6 +907,7 @@ impl ScriptEngine {
 
             #[allow(deprecated)]
             let res = rquickjs::async_with!(ctx => |js_ctx| {
+                js_ctx.globals().set("__TASK_ID", task_id).unwrap();
                 setup_quickjs(&js_ctx, context.clone(), resolved_base_url.clone())?;
 
                 let import_code = format!("import('{}')", module_name);

@@ -211,8 +211,24 @@ pub async fn generate_opengraph(
         ));
     }
 
+    let step = state
+        .db
+        .get_config("general")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.get("image_processing_step").and_then(|n| n.as_f64()))
+        .unwrap_or(10.0);
+
     let format_str = params.format.as_deref().unwrap_or("png");
-    let quality = params.quality.unwrap_or(80);
+    let quality = params
+        .quality
+        .map(|q| {
+            let q_step = step.max(1.0);
+            ((q as f64 / q_step).round() * q_step) as u8
+        })
+        .unwrap_or(80)
+        .clamp(1, 100);
     let data_hash = md5::compute(data_str.as_bytes());
     let cache_key = format!(
         "og_{}_{}_{}_{:x}",
@@ -298,7 +314,10 @@ pub async fn generate_opengraph(
                                 if let Ok(processed_img) = tokio::task::spawn_blocking(move || {
                                     let mut img = image::load_from_memory(&bytes)?;
                                     if let Some(b) = blur {
-                                        img = img.blur(b.clamp(0.1, 50.0));
+                                        let b_step = step as f32;
+                                        let quantized_blur =
+                                            ((b / b_step).round() * b_step).clamp(0.1, 50.0);
+                                        img = img.blur(quantized_blur);
                                     }
                                     let mut buf = std::io::Cursor::new(Vec::new());
                                     let mut encoder =

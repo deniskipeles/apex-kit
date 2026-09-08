@@ -21,6 +21,7 @@ pub struct AppSettingsDto {
     pub max_sandbox_storage_mb: Option<u64>,
     pub max_sandbox_vectors: Option<i64>,
     pub max_sandbox_ai_requests: Option<i64>,
+    pub image_processing_step: Option<u64>,
     pub backups: Option<BackupConfigDto>,
 }
 
