@@ -19,6 +19,7 @@ import {
   CardTitle,
   CardContent,
   Skeleton,
+  Badge,
 } from '../components/ui/Elements';
 import { DataGrid } from '../components/data/DataGrid';
 import { Pagination } from '../components/data/Pagination';
@@ -33,6 +34,130 @@ import { useToast } from '../components/feedback/Toast';
 import { ConfirmDialog } from '../components/feedback/ConfirmDialog';
 import { usePagination } from '../hooks/usePagination';
 import { OpenGraphTesterModal } from '../features/files/components/OpenGraphTesterModal';
+import { Dialog } from '../components/ui/Dialog';
+import { AlertTriangle, Database, FolderSearch } from 'lucide-react';
+import { apiClient } from '../lib/apiClient';
+
+const OrphansModal = ({ isOpen, onClose, onRefresh }: any) => {
+  const [report, setReport] = useState<{ storage_orphans: any[]; db_orphans: any[] } | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const { toast } = useToast();
+
+  useEffect(() => {
+    if (isOpen) {
+      setIsLoading(true);
+      apiClient.files
+        .listOrphans()
+        .then(setReport)
+        .catch(() => toast('Failed to load orphans report', 'error'))
+        .finally(() => setIsLoading(false));
+    } else {
+      setReport(null);
+    }
+  }, [isOpen]);
+
+  const handleResolve = async (action: 'flush_storage' | 'register_storage' | 'flush_db') => {
+    if (!confirm('Are you sure you want to proceed with this operation?')) return;
+    setIsProcessing(true);
+    try {
+      const res = await apiClient.files.resolveOrphans(action);
+      toast(`Successfully processed ${res.processed} items`, 'success');
+      onRefresh(); // Trigger parent reload
+
+      // Reload report
+      const newReport = await apiClient.files.listOrphans();
+      setReport(newReport);
+    } catch (e: any) {
+      toast(e.message || 'Operation failed', 'error');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <Dialog isOpen={isOpen} onClose={onClose} title="Orphaned Files Scanner" size="lg">
+      <div className="space-y-6">
+        <p className="text-sm text-muted-foreground">
+          Compare physical files in Storage (S3/Local) against the metadata tracked in the Database.
+        </p>
+
+        {isLoading ? (
+          <div className="p-12 text-center text-muted-foreground animate-pulse">
+            Scanning entire storage...
+          </div>
+        ) : !report ? null : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {/* Storage Orphans */}
+            <div className="border border-amber-500/30 rounded-xl bg-amber-500/5 overflow-hidden flex flex-col">
+              <div className="p-3 border-b border-amber-500/20 bg-amber-500/10 flex justify-between items-center">
+                <span className="text-xs font-bold text-amber-600 flex items-center gap-1.5">
+                  <FolderSearch className="h-4 w-4" /> Unlinked Storage Files
+                </span>
+                <Badge
+                  variant="outline"
+                  className="text-amber-600 border-amber-500/30 bg-amber-500/10"
+                >
+                  {report.storage_orphans.length}
+                </Badge>
+              </div>
+              <div className="p-4 flex-1 text-sm text-muted-foreground">
+                These files exist physically on disk/S3, but they have no associated database
+                records. They are taking up space.
+              </div>
+              <div className="p-3 border-t border-amber-500/20 flex flex-col gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={report.storage_orphans.length === 0 || isProcessing}
+                  onClick={() => handleResolve('register_storage')}
+                >
+                  Register to DB
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  disabled={report.storage_orphans.length === 0 || isProcessing}
+                  onClick={() => handleResolve('flush_storage')}
+                >
+                  Delete Files Permanently
+                </Button>
+              </div>
+            </div>
+
+            {/* DB Orphans */}
+            <div className="border border-red-500/30 rounded-xl bg-red-500/5 overflow-hidden flex flex-col">
+              <div className="p-3 border-b border-red-500/20 bg-red-500/10 flex justify-between items-center">
+                <span className="text-xs font-bold text-red-600 flex items-center gap-1.5">
+                  <Database className="h-4 w-4" /> Missing Storage Files
+                </span>
+                <Badge variant="outline" className="text-red-600 border-red-500/30 bg-red-500/10">
+                  {report.db_orphans.length}
+                </Badge>
+              </div>
+              <div className="p-4 flex-1 text-sm text-muted-foreground">
+                These are "ghost" database records that point to physical files which no longer
+                exist in Storage.
+              </div>
+              <div className="p-3 border-t border-red-500/20 flex flex-col gap-2 mt-auto">
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  disabled={report.db_orphans.length === 0 || isProcessing}
+                  onClick={() => handleResolve('flush_db')}
+                >
+                  Delete Ghost DB Records
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </Dialog>
+  );
+};
 
 export const FilesPage = () => {
   const [files, setFiles] = useState<StoredFile[]>([]);
@@ -43,6 +168,7 @@ export const FilesPage = () => {
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [fileToDelete, setFileToDelete] = useState<StoredFile | null>(null);
   const [isOgModalOpen, setIsOgModalOpen] = useState(false);
+  const [isOrphansOpen, setIsOrphansOpen] = useState(false);
 
   const { page, perPage, setPage, setPerPage } = usePagination(1, 24); // 24 fits nicely in grids
   const [totalItems, setTotalItems] = useState(0);
@@ -208,9 +334,16 @@ export const FilesPage = () => {
           <Button
             variant="outline"
             onClick={() => setIsOgModalOpen(true)}
-            className="gap-2 border-purple-500/30 text-purple-400 hover:bg-purple-500/10"
+            className="hidden lg:flex gap-2 border-purple-500/30 text-purple-400 hover:bg-purple-500/10"
           >
             <Sparkles className="h-4 w-4" /> OG Studio
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => setIsOrphansOpen(true)}
+            className="gap-2 text-amber-500 border-amber-500/30 hover:bg-amber-500/10"
+          >
+            <AlertTriangle className="h-4 w-4" /> Scanner
           </Button>
           <Button onClick={() => setIsUploadOpen(true)}>
             <Upload className="mr-2 h-4 w-4" /> Upload
@@ -394,6 +527,12 @@ export const FilesPage = () => {
         onConfirm={handleDelete}
         onCancel={() => setFileToDelete(null)}
         variant="destructive"
+      />
+
+      <OrphansModal
+        isOpen={isOrphansOpen}
+        onClose={() => setIsOrphansOpen(false)}
+        onRefresh={fetchFiles}
       />
 
       {/* --- [NEW] RENDER OPENGRAPH TESTER MODAL AT BOTTOM --- */}

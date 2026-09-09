@@ -20,10 +20,12 @@ import { TokenSettings } from '../components/TokenSettings';
 import { AiSettings } from '../components/AiSettings';
 import { ConfigSettings } from '../components/ConfigSettings';
 import { SiteSettings } from '../components/SiteSettings';
+import { WasmSettings } from '../components/WasmSettings';
 import { settingsService } from '../services/settingsService';
 import { AppSettings } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
 import { OauthSettings } from '../components/OauthSettings';
+import { apiClient } from '@/src/lib/apiClient';
 
 type Tab =
   | 'general'
@@ -35,7 +37,8 @@ type Tab =
   | 'tokens'
   | 'ai'
   | 'config'
-  | 'hosting';
+  | 'hosting'
+  | 'wasm';
 
 export const SettingsPage = () => {
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -98,6 +101,15 @@ export const SettingsPage = () => {
     { id: 'tokens', label: 'API Keys', icon: Key, desc: 'Manage access tokens' },
     { id: 'hosting', label: 'Static Hosting', icon: Globe, desc: 'Deploy frontend assets' },
   ];
+
+  if (apiClient.getScope().type === 'root') {
+    tabs.push({
+      id: 'wasm',
+      label: 'WASM Binaries',
+      icon: Database,
+      desc: 'Manage local WebAssembly extensions',
+    });
+  }
 
   if (isLoading || !settings) {
     return (
@@ -218,6 +230,7 @@ export const SettingsPage = () => {
               />
             )}
             {activeTab === 'hosting' && <SiteSettings />}
+            {activeTab === 'wasm' && <WasmSettings />}
           </div>
         </div>
       </div>

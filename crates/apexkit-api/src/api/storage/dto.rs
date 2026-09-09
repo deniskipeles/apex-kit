@@ -105,3 +105,27 @@ pub struct OgItem {
     pub value: String,
     pub target: String,
 }
+
+#[derive(Serialize, ToSchema)]
+pub struct StorageOrphan {
+    pub filename: String,
+    pub size: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DbOrphan {
+    pub id: i64,
+    pub filename: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct OrphanReport {
+    pub storage_orphans: Vec<StorageOrphan>,
+    pub db_orphans: Vec<DbOrphan>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct ResolveOrphansReq {
+    /// "flush_storage", "register_storage", or "flush_db"
+    pub action: String,
+}

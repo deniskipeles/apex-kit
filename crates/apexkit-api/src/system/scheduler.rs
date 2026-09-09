@@ -38,6 +38,14 @@ impl SchedulerService {
     }
 
     pub async fn load_jobs(&self, state: AppState) {
+        let master_url = std::env::var("APEXKIT_MASTER_URL").unwrap_or_default();
+        if !master_url.trim().is_empty() {
+            tracing::info!(
+                "[Scheduler] Running as a replica. Cron jobs are locked to the master node."
+            );
+            return;
+        }
+
         // ---------------------------------------------------------
         // 1. GLOBAL ROOT JOBS (Static)
         // ---------------------------------------------------------

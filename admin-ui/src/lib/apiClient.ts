@@ -448,6 +448,12 @@ export const apiClient = {
       }
     },
     publishSandbox: async (id: string) => await pb.admins.publishSandbox(id),
+    // wasm files management
+    listWasm: async () => await pb.admins.listWasm(),
+    uploadWasm: async (name: string, file: File) => await pb.admins.uploadWasm(name, file),
+    fetchWasm: async (url: string, name?: string | undefined) =>
+      await pb.admins.fetchWasm(url, name),
+    deleteWasm: async (name: string) => await pb.admins.deleteWasm(name),
   },
 
   auth: {
@@ -866,6 +872,12 @@ export const apiClient = {
     },
     delete: async (id: string): Promise<void> => {
       await pb.files.delete(id);
+    },
+    listOrphans: async () => {
+      return await pb.files.listOrphans();
+    },
+    resolveOrphans: async (action: 'flush_storage' | 'register_storage' | 'flush_db') => {
+      return await pb.files.resolveOrphans(action);
     },
     getFileUrl: (filename: string) => pb.files.getFileUrl(filename),
   },

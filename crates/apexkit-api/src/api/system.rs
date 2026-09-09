@@ -19,6 +19,7 @@ pub mod backup;
 pub mod config;
 pub mod settings;
 pub mod vscode_sync;
+pub mod wasm_management;
 
 #[utoipa::path(
     get,
@@ -136,12 +137,9 @@ pub async fn reload_system(
                 *lock = new_schema;
             }
 
-            // Reload background jobs
-            state.scheduler.read().await.load_jobs(state.clone()).await;
-
             Ok(Json(serde_json::json!({
                 "status": "ok",
-                "message": "Root System reloaded (Schema & Jobs refreshed)"
+                "message": "Root System reloaded (Schema refreshed)"
             })))
         }
         EventScope::Tenant(id) => {

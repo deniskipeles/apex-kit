@@ -291,7 +291,42 @@ impl RecordStore for ApexKit {
 
         let sync_future = self.sync_relations(collection_id, record_id, &merged_data, &schema);
 
-        tokio::try_join!(unique_future, sync_future)?;
+        if let Err(e) = tokio::try_join!(unique_future, sync_future) {
+            // COMPENSATING ROLLBACK: Restore previous data state if the uniqueness constraint failed
+            if let Ok(old_jsonb) = serde_sqlite_jsonb::to_vec(&existing.data) {
+                let _ = self.data_batcher.execute(
+                    "UPDATE records SET data = ?1, updated = ?2 WHERE collection_id = ?3 AND (id = ?4 OR CAST(id AS TEXT) = CAST(?4 AS TEXT))".into(),
+                    vec![
+                        rusqlite::types::Value::Blob(old_jsonb),
+                        existing.updated.clone().into_val(),
+                        collection_id.into_val(),
+                        record_id.into_val()
+                    ]
+                ).await;
+            }
+            // Restore previous unique values
+            let _ = commit_uniqueness(
+                &self.data_batcher,
+                collection_id,
+                record_id,
+                &existing.data,
+                &schema,
+            )
+            .await;
+            // Restore previous relations
+            let _ = self
+                .sync_relations(collection_id, record_id, &existing.data, &schema)
+                .await;
+
+            let err_msg = e.to_string();
+            if err_msg.contains("UNIQUE constraint failed") {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "Unique constraint violation: This value or combination already exists.",
+                )));
+            }
+            return Err(e);
+        }
 
         Ok(Record {
             id: record_id,
@@ -496,7 +531,40 @@ impl ApexKit {
         let relation_future =
             self.sync_relations(collection_id, actual_record_id, &final_data, &schema);
 
-        tokio::try_join!(unique_future, relation_future)?;
+        if let Err(e) = tokio::try_join!(unique_future, relation_future) {
+            // COMPENSATING ROLLBACK: Prevent leaked duplicate records during high-concurrency race conditions
+            let _ = self
+                .data_batcher
+                .execute(
+                    "DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(),
+                    vec![collection_id.into_val(), actual_record_id.into_val()],
+                )
+                .await;
+            let _ = self
+                .data_batcher
+                .execute(
+                    "DELETE FROM _unique_values WHERE record_id = ?1".into(),
+                    vec![actual_record_id.into_val()],
+                )
+                .await;
+            let _ = self
+                .data_batcher
+                .execute(
+                    "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(),
+                    vec![collection_id.into_val(), actual_record_id.into_val()],
+                )
+                .await;
+
+            // Format the raw SQLite constraint error for the user
+            let err_msg = e.to_string();
+            if err_msg.contains("UNIQUE constraint failed") {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "Unique constraint violation: This value or combination already exists.",
+                )));
+            }
+            return Err(e);
+        }
 
         Ok(actual_record_id)
     }

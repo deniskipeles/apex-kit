@@ -30,7 +30,9 @@ use crate::api::{
     scripts as script_routes,
     site::{assets, spa, ssr},
     storage,
-    system::{api_keys, backup as backup_routes, config as config_routes, settings},
+    system::{
+        api_keys, backup as backup_routes, config as config_routes, settings, wasm_management,
+    },
     templates as template_routes,
     workspace::{sandbox as sandbox_routes, tenant as tenant_routes},
 };
@@ -173,6 +175,10 @@ fn make_api_router() -> Router<AppState> {
         .route("/admin/storage/test", post(storage::test_s3_connection))
         .route("/admin/storage/migrate", post(storage::migrate_storage))
         .route(
+            "/admin/storage/orphans",
+            get(storage::list_orphans_handler).post(storage::resolve_orphans_handler),
+        )
+        .route(
             "/admin/settings",
             get(settings::get_settings)
                 .patch(settings::update_settings)
@@ -206,6 +212,19 @@ fn make_api_router() -> Router<AppState> {
         )
         .route("/admin/backup", post(backup_routes::trigger_backup_handler))
         .route("/admin/backups", get(backup_routes::list_backups_handler))
+        .route("/admin/wasm", get(wasm_management::list_wasm_handler))
+        .route(
+            "/admin/wasm/upload",
+            post(wasm_management::upload_wasm_handler),
+        )
+        .route(
+            "/admin/wasm/fetch",
+            post(wasm_management::fetch_wasm_handler),
+        )
+        .route(
+            "/admin/wasm/{name}",
+            axum::routing::delete(wasm_management::delete_wasm_handler),
+        )
         .route(
             "/admin/backups/{filename}",
             get(backup_routes::download_backup_handler),
@@ -599,6 +618,8 @@ pub fn app_router(state: AppState) -> Router {
         vector_routes::TextVectorSearchReq,
         vector_routes::FlushVectorsReq,
         tenant_routes::TenantResponse,tenant_routes::CreateTenantReq,
+        wasm_management::FetchWasmReq,
+        wasm_management::WasmModuleDto,
     )),
     tags((name = "ApexKit",description = "ApexKit API"))
 )]

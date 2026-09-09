@@ -49,9 +49,39 @@ impl StorageBackend for LocalStorage {
     }
     async fn list_prefix(
         &self,
-        _prefix: &str,
+        prefix: &str,
     ) -> Result<Vec<(String, u64, String)>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(vec![])
+        let base_path = self.base_path.clone();
+        let target_dir = base_path.join(prefix);
+
+        let res = tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            if !target_dir.exists() {
+                return results;
+            }
+
+            for entry in walkdir::WalkDir::new(&target_dir).into_iter().flatten() {
+                if entry.file_type().is_file() {
+                    let path = entry.path();
+                    if let Ok(rel_path) = path.strip_prefix(&base_path) {
+                        let name = rel_path.to_string_lossy().replace("\\", "/");
+                        let meta = entry.metadata().unwrap();
+                        let size = meta.len();
+                        let time = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs().to_string())
+                            .unwrap_or_default();
+                        results.push((name, size, time));
+                    }
+                }
+            }
+            results
+        })
+        .await?;
+
+        Ok(res)
     }
     fn get_public_url_base(&self) -> String {
         self.base_url.clone()

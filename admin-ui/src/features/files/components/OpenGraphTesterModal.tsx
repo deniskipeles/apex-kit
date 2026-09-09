@@ -33,8 +33,8 @@ interface OgDataItem {
 export const OpenGraphTesterModal = ({ isOpen, onClose }: OpenGraphTesterModalProps) => {
   const { toast } = useToast();
   const [templates, setTemplates] = useState<Template[]>([]);
-  const [templateSlug, setTemplateSlug] = useState('');
-  const [format, setFormat] = useState<'png' | 'webp' | 'jpeg'>('png');
+  const [templateSlug, setTemplateSlug] = useState('default');
+  const [format, setFormat] = useState<'png' | 'webp' | 'jpeg'>('webp');
   const [quality, setQuality] = useState(80);
 
   // Initial preset variables
@@ -53,9 +53,12 @@ export const OpenGraphTesterModal = ({ isOpen, onClose }: OpenGraphTesterModalPr
   useEffect(() => {
     if (isOpen) {
       templatesService.list().then((tmpls) => {
-        setTemplates(tmpls);
+        setTemplates([
+          { slug: 'default', content: '', created_at: '', id: '0', script_id: '' },
+          ...tmpls,
+        ]);
         if (tmpls.length > 0 && !templateSlug) {
-          setTemplateSlug(tmpls[0].slug);
+          setTemplateSlug('default');
         }
       });
     }

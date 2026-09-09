@@ -1,5 +1,7 @@
 use super::backends::get_storage_path;
+use super::dto::{DbOrphan, OrphanReport, ResolveOrphansReq, StorageOrphan};
 use super::dto::{MigrateStorageReq, MigrationResult, TestS3ConfigReq};
+use crate::StorageConnection;
 use crate::system::dto::StorageConfigDto;
 use crate::{AppError, AppState, DatabaseConnection};
 use apexkit_core::auth::Claims;
@@ -7,6 +9,156 @@ use apexkit_core::security::vault::EncryptedValue;
 use apexkit_core::storage::{LocalStorage, S3Storage, StorageBackend};
 use axum::{Extension, Json, extract::State};
 use std::sync::Arc;
+
+// Helper to cross-reference DB vs Storage and compute orphans
+async fn calculate_orphans(
+    db: &Arc<dyn apexkit_core::Db>,
+    storage: &Arc<dyn StorageBackend>,
+) -> Result<(Vec<StorageOrphan>, Vec<DbOrphan>), AppError> {
+    let mut db_map = std::collections::HashMap::new();
+    let mut offset = 0;
+    let limit = 5000;
+
+    // Fetch all files from the DB iteratively
+    loop {
+        let files = db
+            .list_files(limit, offset)
+            .await
+            .map_err(|e| AppError::UnknownError(e.to_string()))?;
+        if files.is_empty() {
+            break;
+        }
+        for f in files {
+            db_map.insert(f.filename, f.id);
+        }
+        offset += limit;
+    }
+
+    // Fetch all physical files from storage
+    let storage_files = storage
+        .list_prefix("")
+        .await
+        .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    let mut storage_orphans = Vec::new();
+    let mut db_orphans = Vec::new();
+    let mut storage_set = std::collections::HashSet::new();
+
+    // Identify Storage Orphans (exists on disk/S3 but NOT in SQLite metadata)
+    for (fname, size, _) in storage_files {
+        storage_set.insert(fname.clone());
+        if !db_map.contains_key(&fname) {
+            storage_orphans.push(StorageOrphan {
+                filename: fname,
+                size,
+            });
+        }
+    }
+
+    // Identify DB Orphans (metadata exists in SQLite but physical file is missing from disk/S3)
+    for (fname, id) in db_map {
+        if !storage_set.contains(&fname) {
+            db_orphans.push(DbOrphan {
+                id,
+                filename: fname,
+            });
+        }
+    }
+
+    Ok((storage_orphans, db_orphans))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/storage/orphans",
+    responses((status = 200, body = OrphanReport))
+)]
+pub async fn list_orphans_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    StorageConnection(storage): StorageConnection,
+) -> Result<Json<OrphanReport>, AppError> {
+    let claims = auth
+        .ok_or(AppError::Unauthorized("Login required".into()))?
+        .0;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+
+    let (storage_orphans, db_orphans) = calculate_orphans(&db, &storage).await?;
+
+    Ok(Json(OrphanReport {
+        storage_orphans,
+        db_orphans,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/storage/orphans",
+    request_body = ResolveOrphansReq,
+    responses((status = 200, description = "Operation successful"))
+)]
+pub async fn resolve_orphans_handler(
+    auth: Option<Extension<Claims>>,
+    DatabaseConnection(db): DatabaseConnection,
+    StorageConnection(storage): StorageConnection,
+    Json(payload): Json<ResolveOrphansReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let claims = auth
+        .ok_or(AppError::Unauthorized("Login required".into()))?
+        .0;
+    if claims.role != "admin" {
+        return Err(AppError::Forbidden("Admins only".into()));
+    }
+
+    let (storage_orphans, db_orphans) = calculate_orphans(&db, &storage).await?;
+
+    let mut processed = 0;
+
+    if payload.action == "flush_storage" {
+        for orphan in storage_orphans {
+            if storage.delete(&orphan.filename).await.is_ok() {
+                processed += 1;
+            }
+        }
+    } else if payload.action == "register_storage" {
+        for orphan in storage_orphans {
+            let mime = mime_guess::from_path(&orphan.filename)
+                .first_or_octet_stream()
+                .to_string();
+
+            // Register missing files directly into the DB with no associated user
+            if db
+                .create_file_metadata(
+                    &orphan.filename,
+                    &orphan.filename,
+                    &mime,
+                    orphan.size as i64,
+                    None,
+                )
+                .await
+                .is_ok()
+            {
+                processed += 1;
+            }
+        }
+    } else if payload.action == "flush_db" {
+        for orphan in db_orphans {
+            if db.delete_file_metadata(orphan.id).await.is_ok() {
+                processed += 1;
+            }
+        }
+    } else {
+        return Err(AppError::JsonError("Invalid action requested".into()));
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "processed": processed,
+        "action": payload.action
+    })))
+}
 
 #[utoipa::path(
     post,
