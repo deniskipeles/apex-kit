@@ -103,23 +103,39 @@ impl VectorStore for ApexKit {
         limit: i64,
         offset: i64,
     ) -> std::result::Result<Vec<(i64, String, Vec<f32>)>, Box<dyn StdError + Send + Sync>> {
-        let conn = self.get_vector_read().await;
-        // Apply pagination parameters to query
-        let mut stmt = conn.prepare(
-            "SELECT record_id,field_name,vector FROM vectors WHERE collection_id = ?1 AND model = ?2 LIMIT ?3 OFFSET ?4"
-        )?;
-        let mut rows = stmt.query(params![collection_id, model.to_string(), limit, offset])?;
+        let mut raw_data = Vec::new();
+        {
+            let conn = self.get_vector_read().await;
+            // Apply pagination parameters to query
+            let mut stmt = conn.prepare(
+                "SELECT record_id,field_name,vector FROM vectors WHERE collection_id = ?1 AND model = ?2 LIMIT ?3 OFFSET ?4"
+            )?;
+            let mut rows = stmt.query(params![collection_id, model.to_string(), limit, offset])?;
 
-        let mut vectors = Vec::new();
-        while let Some(row) = rows.next()? {
-            let record_id: i64 = row.get(0)?;
-            let field_name: String = row.get(1)?;
-            let vector_json_str: String = row.get(2)?;
-
-            if let Ok(vector) = serde_json::from_str::<Vec<f32>>(&vector_json_str) {
-                vectors.push((record_id, field_name, vector));
+            while let Some(row) = rows.next()? {
+                let record_id: i64 = row.get(0)?;
+                let field_name: String = row.get(1)?;
+                let vector_blob: Vec<u8> = match row.get_ref(2)? {
+                    rusqlite::types::ValueRef::Blob(b) => b.to_vec(),
+                    rusqlite::types::ValueRef::Text(s) => s.to_vec(),
+                    _ => vec![],
+                };
+                raw_data.push((record_id, field_name, vector_blob));
             }
         }
+
+        let vectors = tokio::task::spawn_blocking(move || {
+            let mut vecs = Vec::new();
+            for (record_id, field_name, blob) in raw_data {
+                if let Ok(vector) = serde_json::from_slice::<Vec<f32>>(&blob) {
+                    vecs.push((record_id, field_name, vector));
+                }
+            }
+            vecs
+        })
+        .await
+        .unwrap();
+
         Ok(vectors)
     }
 

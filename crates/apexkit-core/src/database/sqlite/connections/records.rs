@@ -128,8 +128,9 @@ impl RecordStore for ApexKit {
 
             if expand.is_none() || expand.as_ref().unwrap().trim().is_empty() {
                 // Applied SQL CAST logic for dynamic string/int matching
+                // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
                 let mut stmt = conn.prepare(
-                    "SELECT id,json(data),NULL,created,updated FROM records WHERE collection_id = ?1 AND (id = ?2 OR CAST(id AS TEXT) = CAST(?2 AS TEXT))"
+                    "SELECT id,json(data),NULL,created,updated FROM records WHERE collection_id = ?1 AND id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))"
                 )?;
                 let mut rows = stmt.query(rusqlite::params![collection_id, record_id])?;
                 match rows.next()? {
@@ -182,8 +183,9 @@ impl RecordStore for ApexKit {
                 );
 
                 // Applied SQL CAST logic
+                // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
                 let sql = format!(
-                    "SELECT id,json(data),{},created,updated FROM records WHERE collection_id = ?1 AND (id = ?2 OR CAST(id AS TEXT) = CAST(?2 AS TEXT))",
+                    "SELECT id,json(data),{},created,updated FROM records WHERE collection_id = ?1 AND id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))",
                     expand_json_sql
                 );
 
@@ -233,9 +235,9 @@ impl RecordStore for ApexKit {
             .ok_or("Collection not found")?;
 
             let existing = {
-                // Applied SQL CAST logic
+                // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
                 let mut stmt = conn.prepare(
-                    "SELECT id,json(data),NULL,created,updated FROM records WHERE collection_id = ?1 AND (id = ?2 OR CAST(id AS TEXT) = CAST(?2 AS TEXT))"
+                    "SELECT id,json(data),NULL,created,updated FROM records WHERE collection_id = ?1 AND id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))"
                 )?;
                 let mut rows = stmt.query(rusqlite::params![collection_id, record_id])?;
                 if let Some(row) = rows.next()? {
@@ -275,9 +277,9 @@ impl RecordStore for ApexKit {
             enforce_uniqueness(&conn, collection_id, Some(record_id), &merged_data, &schema)?;
         }
 
-        // Applied SQL CAST logic
+        // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
         self.data_batcher.execute(
-            "UPDATE records SET data = ?1,updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND (id = ?3 OR CAST(id AS TEXT) = CAST(?3 AS TEXT))".into(),
+            "UPDATE records SET data = ?1,updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND id IN (?3, CAST(?3 AS TEXT), CAST(?3 AS INTEGER))".into(),
             vec![rusqlite::types::Value::Blob(jsonb_bytes), collection_id.into_val(), record_id.into_val()]
         ).await.map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
 
@@ -295,7 +297,7 @@ impl RecordStore for ApexKit {
             // COMPENSATING ROLLBACK: Restore previous data state if the uniqueness constraint failed
             if let Ok(old_jsonb) = serde_sqlite_jsonb::to_vec(&existing.data) {
                 let _ = self.data_batcher.execute(
-                    "UPDATE records SET data = ?1, updated = ?2 WHERE collection_id = ?3 AND (id = ?4 OR CAST(id AS TEXT) = CAST(?4 AS TEXT))".into(),
+                    "UPDATE records SET data = ?1, updated = ?2 WHERE collection_id = ?3 AND id IN (?4, CAST(?4 AS TEXT), CAST(?4 AS INTEGER))".into(),
                     vec![
                         rusqlite::types::Value::Blob(old_jsonb),
                         existing.updated.clone().into_val(),
@@ -378,7 +380,7 @@ impl RecordStore for ApexKit {
                         if targets_us {
                             let origin_ids: Vec<i64> = {
                                 let conn = self.get_data_read().await;
-                                let mut stmt = conn.prepare("SELECT origin_rec_id FROM _relations WHERE origin_col_id = ?1 AND target_col_id = ?2 AND (target_rec_id = ?3 OR CAST(target_rec_id AS TEXT) = CAST(?3 AS TEXT)) AND rel_name = ?4").map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                let mut stmt = conn.prepare("SELECT origin_rec_id FROM _relations WHERE origin_col_id = ?1 AND target_col_id = ?2 AND target_rec_id IN (?3, CAST(?3 AS TEXT), CAST(?3 AS INTEGER)) AND rel_name = ?4").map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                                 let mut rows = stmt
                                     .query(rusqlite::params![
                                         other_col_id,
@@ -412,25 +414,25 @@ impl RecordStore for ApexKit {
         }
 
         for (del_col_id, del_rec_id) in visited {
-            // Applied SQL CAST logic
+            // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
             let f1 = self.data_batcher.execute(
-                "DELETE FROM records WHERE collection_id = ?1 AND (id = ?2 OR CAST(id AS TEXT) = CAST(?2 AS TEXT))".into(),
+                "DELETE FROM records WHERE collection_id = ?1 AND id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
             let f2 = self.data_batcher.execute(
-                "DELETE FROM _unique_values WHERE record_id = ?1 OR CAST(record_id AS TEXT) = CAST(?1 AS TEXT)".into(),
+                "DELETE FROM _unique_values WHERE record_id IN (?1, CAST(?1 AS TEXT), CAST(?1 AS INTEGER))".into(),
                 vec![del_rec_id.into_val()],
             );
             let f3 = self.data_batcher.execute(
-                "DELETE FROM _relations WHERE origin_col_id=?1 AND (origin_rec_id=?2 OR CAST(origin_rec_id AS TEXT) = CAST(?2 AS TEXT))".into(),
+                "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
             let f4 = self.data_batcher.execute(
-                "DELETE FROM _relations WHERE target_col_id=?1 AND (target_rec_id=?2 OR CAST(target_rec_id AS TEXT) = CAST(?2 AS TEXT))".into(),
+                "DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
             let f5 = self.vector_batcher.execute(
-                "DELETE FROM vectors WHERE collection_id = ?1 AND (record_id = ?2 OR CAST(record_id AS TEXT) = CAST(?2 AS TEXT))".into(),
+                "DELETE FROM vectors WHERE collection_id = ?1 AND record_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
 
@@ -578,9 +580,9 @@ impl ApexKit {
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for (rel_name, rel_def) in &schema.relations {
             if let Some(val) = data.get(rel_name) {
-                // Applied SQL CAST logic
+                // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
                 self.data_batcher.execute(
-                    "DELETE FROM _relations WHERE origin_col_id=?1 AND (origin_rec_id=?2 OR CAST(origin_rec_id AS TEXT) = CAST(?2 AS TEXT)) AND rel_name=?3".into(),
+                    "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER)) AND rel_name=?3".into(),
                     vec![collection_id.into_val(), record_id.into_val(), rel_name.clone().into_val()]
                 ).await.map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
 

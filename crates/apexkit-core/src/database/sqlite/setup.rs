@@ -219,6 +219,12 @@ pub fn setup_data(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // [CRITICAL PERFORMANCE FIX]: Index on collection_id to prevent Full Table Scans on EVERY API list/query call.
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_records_collection ON records(collection_id, id DESC)",
+        [],
+    );
+
     conn.execute("CREATE TABLE IF NOT EXISTS _storage_files (id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT NOT NULL, original_name TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL, user_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS _relations (id INTEGER PRIMARY KEY AUTOINCREMENT, origin_col_id INTEGER NOT NULL, origin_rec_id INTEGER NOT NULL, target_col_id INTEGER NOT NULL, target_rec_id INTEGER NOT NULL, rel_name TEXT NOT NULL, properties JSON)", [])?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_origin ON _relations(origin_col_id, origin_rec_id, rel_name)", [])?;

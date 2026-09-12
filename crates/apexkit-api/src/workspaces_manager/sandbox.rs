@@ -109,7 +109,14 @@ impl VectorProvider for SandboxVectorProvider {
     }
 
     async fn index(&self, c: i64, r: i64, f: &str, v: &[f32]) -> Result<(), String> {
-        self.index.insert(c, r, f, v);
+        let index_clone = self.index.clone();
+        let field = f.to_string();
+        let vector = v.to_vec();
+        tokio::task::spawn_blocking(move || {
+            index_clone.insert(c, r, &field, &vector);
+        })
+        .await
+        .unwrap();
         Ok(())
     }
 

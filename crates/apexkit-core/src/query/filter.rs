@@ -160,8 +160,8 @@ impl FilterNode {
                             for v in arr {
                                 let inline_val = json_to_inline_sql(v);
                                 sql_clauses.push(format!(
-                                    "({} = {} OR CAST({} AS TEXT) = CAST({} AS TEXT))",
-                                    column, inline_val, column, inline_val
+                                    "{} IN ({}, CAST({} AS TEXT), CAST({} AS INTEGER))",
+                                    column, inline_val, inline_val, inline_val
                                 ));
                             }
                             let joiner = if matches!(op, FilterOp::Nin) {
@@ -170,11 +170,11 @@ impl FilterNode {
                                 " OR "
                             };
                             let prefix = if matches!(op, FilterOp::Nin) {
-                                "NOT "
+                                "NOT ("
                             } else {
-                                ""
+                                "("
                             };
-                            Some(format!("({}{})", prefix, sql_clauses.join(joiner)))
+                            Some(format!("{}{})", prefix, sql_clauses.join(joiner)))
                         } else {
                             None
                         }
@@ -199,13 +199,13 @@ impl FilterNode {
 
                         if matches!(op, FilterOp::Eq) {
                             Some(format!(
-                                "({} = {} OR CAST({} AS TEXT) = CAST({} AS TEXT))",
-                                column, inline_val, column, inline_val
+                                "{} IN ({}, CAST({} AS TEXT), CAST({} AS INTEGER))",
+                                column, inline_val, inline_val, inline_val
                             ))
                         } else if matches!(op, FilterOp::Neq) {
                             Some(format!(
-                                "({} != {} AND CAST({} AS TEXT) != CAST({} AS TEXT))",
-                                column, inline_val, column, inline_val
+                                "{} NOT IN ({}, CAST({} AS TEXT), CAST({} AS INTEGER))",
+                                column, inline_val, inline_val, inline_val
                             ))
                         } else {
                             Some(format!("{} {} {}", column, sql_op, inline_val))
@@ -254,10 +254,11 @@ impl FilterNode {
                             for v in arr {
                                 let val = json_to_sql_val(v);
                                 params.push(val.clone());
+                                params.push(val.clone());
                                 params.push(val);
                                 sql_clauses.push(format!(
-                                    "({} = ? OR CAST({} AS TEXT) = CAST(? AS TEXT))",
-                                    column, column
+                                    "{} IN (?, CAST(? AS TEXT), CAST(? AS INTEGER))",
+                                    column
                                 ));
                             }
                             let joiner = if matches!(op, FilterOp::Nin) {
@@ -266,11 +267,11 @@ impl FilterNode {
                                 " OR "
                             };
                             let prefix = if matches!(op, FilterOp::Nin) {
-                                "NOT "
+                                "NOT ("
                             } else {
-                                ""
+                                "("
                             };
-                            Some(format!("({}{})", prefix, sql_clauses.join(joiner)))
+                            Some(format!("{}{})", prefix, sql_clauses.join(joiner)))
                         } else {
                             None
                         }
@@ -298,17 +299,19 @@ impl FilterNode {
 
                         if matches!(op, FilterOp::Eq) {
                             params.push(final_val.clone());
-                            params.push(final_val);
-                            Some(format!(
-                                "({} = ? OR CAST({} AS TEXT) = CAST(? AS TEXT))",
-                                column, column
-                            ))
-                        } else if matches!(op, FilterOp::Neq) {
                             params.push(final_val.clone());
                             params.push(final_val);
                             Some(format!(
-                                "({} != ? AND CAST({} AS TEXT) != CAST(? AS TEXT))",
-                                column, column
+                                "{} IN (?, CAST(? AS TEXT), CAST(? AS INTEGER))",
+                                column
+                            ))
+                        } else if matches!(op, FilterOp::Neq) {
+                            params.push(final_val.clone());
+                            params.push(final_val.clone());
+                            params.push(final_val);
+                            Some(format!(
+                                "{} NOT IN (?, CAST(? AS TEXT), CAST(? AS INTEGER))",
+                                column
                             ))
                         } else {
                             params.push(final_val);
