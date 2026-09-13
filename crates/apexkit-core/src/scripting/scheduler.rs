@@ -137,11 +137,17 @@ impl QuantumScheduler {
 
             drop(state); // Release scheduler mutex while parked
 
-            let mut running = control.running.lock().unwrap();
-            while !*running {
-                running = control.condvar.wait(running).unwrap();
-            }
-            *running = false; // Reset flag for next rotation
+            // [CRITICAL FIX]: Wrap OS thread blocking in `block_in_place`.
+            // This prevents the Condvar from starving the Tokio Executor threads!
+            // Tokio will dynamically spin up a backup OS thread to serve the Admin Dashboard
+            // and other HTTP requests while this script waits in the round-robin queue.
+            tokio::task::block_in_place(|| {
+                let mut running = control.running.lock().unwrap();
+                while !*running {
+                    running = control.condvar.wait(running).unwrap();
+                }
+                *running = false; // Reset flag for next rotation
+            });
 
             let mut state = self.state.lock().unwrap();
             if let Some(task) = state.tasks.get_mut(&task_id) {
@@ -184,11 +190,14 @@ impl QuantumScheduler {
             drop(state);
 
             if let Some(control) = control {
-                let mut running = control.running.lock().unwrap();
-                while !*running {
-                    running = control.condvar.wait(running).unwrap();
-                }
-                *running = false;
+                // [CRITICAL FIX]: Wrap IO Resume OS thread blocking in `block_in_place`.
+                tokio::task::block_in_place(|| {
+                    let mut running = control.running.lock().unwrap();
+                    while !*running {
+                        running = control.condvar.wait(running).unwrap();
+                    }
+                    *running = false;
+                });
             }
 
             let mut state = self.state.lock().unwrap();

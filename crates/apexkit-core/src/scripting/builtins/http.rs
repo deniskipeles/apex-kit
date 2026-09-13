@@ -4,9 +4,25 @@ use rquickjs::{Ctx, Exception, Function, Object, Value};
 use rquickjs_serde::{from_value, to_value};
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::super::context::ScriptContext;
+
+// [CRITICAL PERFORMANCE FIX]: Use a globally pooled HTTP client.
+// Creating a new reqwest::Client per script execution exhausts OS sockets and causes TCP port exhaustion/timeouts.
+static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn get_shared_client() -> reqwest::Client {
+    SHARED_HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .pool_max_idle_per_host(50)
+                .build()
+                .unwrap()
+        })
+        .clone()
+}
 
 async fn execute_http_request(
     url: String,
@@ -17,23 +33,28 @@ async fn execute_http_request(
     timeout_ms: Option<u64>,
     task_id: Option<u64>,
 ) -> Result<serde_json::Value, String> {
-    let policy = match redirect_mode.as_deref() {
-        Some("manual") => reqwest::redirect::Policy::none(),
-        Some("error") => {
-            reqwest::redirect::Policy::custom(|attempt| attempt.error("Redirects not allowed"))
+    // Fallback to custom client only if special configurations are requested
+    let client = if redirect_mode.is_some() || timeout_ms.is_some() {
+        let policy = match redirect_mode.as_deref() {
+            Some("manual") => reqwest::redirect::Policy::none(),
+            Some("error") => {
+                reqwest::redirect::Policy::custom(|attempt| attempt.error("Redirects not allowed"))
+            }
+            _ => reqwest::redirect::Policy::default(),
+        };
+
+        let mut client_builder = reqwest::Client::builder().redirect(policy);
+
+        if let Some(ms) = timeout_ms {
+            client_builder = client_builder.timeout(std::time::Duration::from_millis(ms));
         }
-        _ => reqwest::redirect::Policy::default(),
+
+        client_builder
+            .build()
+            .map_err(|e| format!("Client Build Error: {}", e))?
+    } else {
+        get_shared_client()
     };
-
-    let mut client_builder = reqwest::Client::builder().redirect(policy);
-
-    if let Some(ms) = timeout_ms {
-        client_builder = client_builder.timeout(std::time::Duration::from_millis(ms));
-    }
-
-    let client = client_builder
-        .build()
-        .map_err(|e| format!("Client Build Error: {}", e))?;
 
     let req_method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
 

@@ -3,7 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use regex::Regex;
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::Semaphore;
 
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function, Object, Promise};
@@ -17,9 +17,30 @@ use super::builtins::{
 use super::context::ScriptContext;
 use super::module_loader::transpile_ts;
 
-static EXECUTION_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
-fn get_execution_semaphore() -> &'static Semaphore {
-    EXECUTION_SEMAPHORE.get_or_init(|| Semaphore::new(50))
+static SCOPED_SEMAPHORES: OnceLock<RwLock<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
+
+fn get_scoped_semaphore(scope_str: &str) -> Arc<Semaphore> {
+    let limit = std::env::var("SCOPE_EXECUTION_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(50);
+
+    let map = SCOPED_SEMAPHORES.get_or_init(|| RwLock::new(HashMap::new()));
+
+    // Fast path: Read lock
+    if let Some(sem) = map.read().unwrap().get(scope_str) {
+        return sem.clone();
+    }
+
+    // Slow path: Write lock to insert new scope
+    let mut write_map = map.write().unwrap();
+    if let Some(sem) = write_map.get(scope_str) {
+        return sem.clone();
+    }
+
+    let new_sem = Arc::new(Semaphore::new(limit));
+    write_map.insert(scope_str.to_string(), new_sem.clone());
+    new_sem
 }
 
 struct SendWrapper<F>(F);
@@ -340,6 +361,117 @@ const JS_PRELUDE: &str = r#"
         }
     }
 
+    globalThis.btoa = function(str) { return globalThis.$util.base64Encode(str); };
+    globalThis.atob = function(b64) { return globalThis.$util.base64Decode(b64); };
+
+    class TextEncoder {
+        constructor(encoding = 'utf-8') { this.encoding = encoding; }
+        encode(str = "") {
+            const ab = globalThis.$util.textEncode(String(str));
+            return new Uint8Array(ab);
+        }
+        encodeInto(str, uint8Array) {
+            const encoded = this.encode(str);
+            const len = Math.min(encoded.length, uint8Array.length);
+            uint8Array.set(encoded.subarray(0, len));
+            return { read: len, written: len };
+        }
+    }
+
+    class TextDecoder {
+        constructor(encoding = 'utf-8', options = {}) {
+            this.encoding = encoding;
+            this.fatal = options.fatal || false;
+            this.ignoreBOM = options.ignoreBOM || false;
+        }
+        decode(bufferSource, options = {}) {
+            if (!bufferSource) return "";
+            return globalThis.$util.textDecode(bufferSource);
+        }
+    }
+
+    globalThis.TextEncoder = TextEncoder;
+    globalThis.TextDecoder = TextDecoder;
+
+    // Hono compatibility requirements: Blob and ReadableStream (Dummy implementations to pass checks)
+    class Blob {
+        constructor(sources = [], options = {}) {
+            this.type = options.type || "";
+            this.size = 0;
+            this.__sources = sources;
+        }
+        async arrayBuffer() { return new ArrayBuffer(0); }
+        async text() { return ""; }
+    }
+    class ReadableStream {
+        constructor(underlyingSource = {}) { this.locked = false; }
+        getReader() { return { read: async () => ({ done: true, value: undefined }), releaseLock: () => {} }; }
+        cancel() { return Promise.resolve(); }
+    }
+    
+    globalThis.Blob = Blob;
+    globalThis.ReadableStream = ReadableStream;
+
+    globalThis.crypto = {
+        randomUUID: function() { return globalThis.$util.uuid(); },
+        getRandomValues: function(typedArray) {
+            if (!typedArray || !typedArray.byteLength) return typedArray;
+            const hex = globalThis.$util.randomHex(typedArray.byteLength);
+            const view = new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength);
+            for (let i = 0; i < view.length; i++) {
+                view[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+            }
+            return typedArray;
+        },
+        subtle: {
+            // Required for Hono ETags and Generic Hashing
+            async digest(algorithm, data) {
+                const alg = typeof algorithm === 'string' ? algorithm : algorithm.name;
+                const hex = globalThis.$util.hash(data, alg);
+                return globalThis.$util.hexDecode(hex);
+            },
+            // Required for Hono JWT and Cookie Signing
+            async importKey(format, keyData, algo, extractable, usages) {
+                return { type: "secret", extractable, algorithm: algo, usages, __keyData: keyData };
+            },
+            async sign(algorithm, key, data) {
+                const algName = typeof algorithm === 'string' ? algorithm : algorithm.name;
+                if (algName === "HMAC") {
+                    const hex = globalThis.$util.hmac(data, key.__keyData);
+                    return globalThis.$util.hexDecode(hex);
+                }
+                throw new Error("Unsupported signature algorithm: " + algName);
+            },
+            async verify(algorithm, key, signature, data) {
+                const algName = typeof algorithm === 'string' ? algorithm : algorithm.name;
+                if (algName === "HMAC") {
+                    const expectedHex = globalThis.$util.hmac(data, key.__keyData);
+                    const providedHex = globalThis.$util.hexEncode(signature);
+                    return expectedHex === providedHex;
+                }
+                throw new Error("Unsupported verification algorithm: " + algName);
+            }
+        }
+    };
+
+    globalThis.setTimeout = function(callback, ms) {
+        let id = globalThis.$util.randomHex(8);
+        if (!globalThis.__timeouts) globalThis.__timeouts = {};
+        globalThis.__timeouts[id] = false; 
+
+        globalThis.$util.sleep(ms).then(() => {
+            if (!globalThis.__timeouts[id]) {
+                callback();
+                delete globalThis.__timeouts[id];
+            }
+        });
+        return id;
+    };
+
+    globalThis.clearTimeout = function(id) {
+        if (globalThis.__timeouts) globalThis.__timeouts[id] = true;
+    };
+
     globalThis.WebAssembly = {
         Memory: WebAssemblyMemory,
         Instance: WebAssemblyInstance,
@@ -562,17 +694,6 @@ impl ScriptEngine {
         method: Option<String>,
         url: Option<String>,
     ) -> Result<JsonValue, String> {
-        let _permit = get_execution_semaphore()
-            .acquire()
-            .await
-            .map_err(|_| "Server is too busy. Please try again later.".to_string())?;
-
-        let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
-            .map_err(|e| e.to_string())?;
-        let code_cleaned = re_config.replace_all(code, "").to_string();
-
-        let js_code = transpile_ts(&code_cleaned, "script.ts").unwrap_or(code_cleaned);
-
         // 1. EXTRACT DYNAMIC SCOPE STRING & RESOLVE CURRENT SCOPED DB
         let scope_str = match context.get_scope() {
             EventScope::Root => "root".to_string(),
@@ -580,6 +701,28 @@ impl ScriptEngine {
             EventScope::Sandbox(id) => format!("sandbox:{}", id),
             _ => "root".to_string(),
         };
+
+        // [CRITICAL FIX] Per-Scope Execution Isolation.
+        // A misbehaving tenant or webhook can only exhaust its own execution slots,
+        // never freezing the whole BaaS engine. Uses a 20s timeout to fast-fail.
+        let sem = get_scoped_semaphore(&scope_str);
+        let _permit = match tokio::time::timeout(std::time::Duration::from_secs(20), sem.acquire())
+            .await
+        {
+            Ok(Ok(p)) => p,
+            _ => {
+                return Err(format!(
+                    "Execution limit reached for scope '{}'. Too many concurrent scripts running. Please try again later.",
+                    scope_str
+                ));
+            }
+        };
+
+        let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
+            .map_err(|e| e.to_string())?;
+        let code_cleaned = re_config.replace_all(code, "").to_string();
+
+        let js_code = transpile_ts(&code_cleaned, "script.ts").unwrap_or(code_cleaned);
 
         let db_arc = super::builtins::db::resolve_db(None, context.clone())
             .await
@@ -813,17 +956,6 @@ impl ScriptEngine {
         base_url: Option<String>,
         _scope: Option<EventScope>,
     ) -> Result<Option<JsonValue>, String> {
-        let _permit = get_execution_semaphore()
-            .acquire()
-            .await
-            .map_err(|_| "Server is too busy. Please try again later.".to_string())?;
-
-        let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
-            .map_err(|e| e.to_string())?;
-        let code_cleaned = re_config.replace_all(code, "").to_string();
-
-        let js_code = transpile_ts(&code_cleaned, "hook.ts").unwrap_or(code_cleaned);
-
         // 1. EXTRACT DYNAMIC SCOPE STRING & RESOLVE CURRENT SCOPED DB
         let scope_str = match context.get_scope() {
             EventScope::Root => "root".to_string(),
@@ -831,6 +963,26 @@ impl ScriptEngine {
             EventScope::Sandbox(id) => format!("sandbox:{}", id),
             _ => "root".to_string(),
         };
+
+        // [CRITICAL FIX] Per-Scope Execution Isolation.
+        let sem = get_scoped_semaphore(&scope_str);
+        let _permit = match tokio::time::timeout(std::time::Duration::from_secs(20), sem.acquire())
+            .await
+        {
+            Ok(Ok(p)) => p,
+            _ => {
+                return Err(format!(
+                    "Execution limit reached for scope '{}'. Too many concurrent hooks running. Please try again later.",
+                    scope_str
+                ));
+            }
+        };
+
+        let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
+            .map_err(|e| e.to_string())?;
+        let code_cleaned = re_config.replace_all(code, "").to_string();
+
+        let js_code = transpile_ts(&code_cleaned, "hook.ts").unwrap_or(code_cleaned);
 
         let db_arc = super::builtins::db::resolve_db(None, context.clone())
             .await

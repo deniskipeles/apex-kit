@@ -128,6 +128,105 @@ pub async fn serve_file(
     }
     let clean_filename = path.filename.trim_start_matches('/');
 
+    let mime_type = if clean_filename.ends_with(".m4s") {
+        "video/iso.segment".to_string()
+    } else if clean_filename.ends_with(".mpd") {
+        "application/dash+xml".to_string()
+    } else if clean_filename.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl".to_string()
+    } else if clean_filename.ends_with(".ts") {
+        "video/mp2t".to_string()
+    } else {
+        mime_guess::from_path(clean_filename)
+            .first_or_octet_stream()
+            .to_string()
+    };
+
+    // [CRITICAL STORAGE OPTIMIZATION]: Preemptive Cache Check
+    // Prevents reading large image files from mounted disks/S3 into memory if their transformed thumbnail is already cached.
+    let is_transform_requested = params.thumb.is_some()
+        || params.format.is_some()
+        || params.quality.is_some()
+        || params.blur.is_some();
+
+    if is_transform_requested && !mime_type.contains("svg") {
+        let step = state
+            .db
+            .get_config("general")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.get("image_processing_step").and_then(|n| n.as_f64()))
+            .unwrap_or(10.0);
+        let quality = params
+            .quality
+            .map(|q| {
+                let q_step = step.max(1.0);
+                ((q as f64 / q_step).round() * q_step) as u8
+            })
+            .unwrap_or(80)
+            .clamp(1, 100);
+
+        let req_blur = params.blur.map(|b| {
+            let b_step = step as f32;
+            ((b / b_step).round() * b_step).clamp(0.1, 50.0)
+        });
+
+        let target_mime = match params
+            .format
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .as_str()
+        {
+            "webp" => "image/webp",
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "avif" => "image/avif",
+            "gif" => "image/gif",
+            _ => mime_type.as_str(),
+        };
+
+        let dim_part = params.thumb.as_deref().unwrap_or("orig");
+        let fmt_part = target_mime.split('/').next_back().unwrap_or("bin");
+        let blur_part = req_blur
+            .map(|b| format!("_blur{:.1}", b))
+            .unwrap_or_default();
+        let full_cache_key = format!(
+            "{}_{}_{}_q{}{}",
+            clean_filename, dim_part, fmt_part, quality, blur_part
+        );
+
+        // Preemptively serve from RAM if hit
+        if let Some(cached_bytes) = state.thumb_cache.get(&full_cache_key).await {
+            let thumb_etag = format!("\"{:x}\"", md5::compute(cached_bytes.as_ref()));
+
+            if let Some(if_none_match) = headers
+                .get(axum::http::header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+            {
+                if if_none_match == thumb_etag {
+                    return Ok(Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .body(axum::body::Body::empty())
+                        .unwrap());
+                }
+            }
+
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, target_mime)
+                .header(
+                    axum::http::header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable",
+                )
+                .header(axum::http::header::ETAG, thumb_etag)
+                .body(axum::body::Body::from(cached_bytes.as_ref().clone()))
+                .unwrap());
+        }
+    }
+
+    // Disk/S3 Load Strategy (Only triggers on a cache miss or non-transformed raw asset download)
     let mut original_bytes = storage.get(clean_filename).await;
 
     if original_bytes.is_err() {
@@ -143,20 +242,6 @@ pub async fn serve_file(
         tracing::error!("Storage failure for {}: {}", clean_filename, e);
         AppError::NotFound("File not found".into())
     })?;
-
-    let mime_type = if clean_filename.ends_with(".m4s") {
-        "video/iso.segment".to_string()
-    } else if clean_filename.ends_with(".mpd") {
-        "application/dash+xml".to_string()
-    } else if clean_filename.ends_with(".m3u8") {
-        "application/vnd.apple.mpegurl".to_string()
-    } else if clean_filename.ends_with(".ts") {
-        "video/mp2t".to_string()
-    } else {
-        mime_guess::from_path(clean_filename)
-            .first_or_octet_stream()
-            .to_string()
-    };
 
     process_image(
         &state,
