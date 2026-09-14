@@ -25,11 +25,31 @@ fn serve_embedded(path: &str) -> Response {
             // Generate simple ETag based on hash of content
             let etag = format!("\"{:x}\"", md5::compute(&content.data));
 
+            let mut body_data = content.data.into_owned();
+
+            // Dynamically inject Root Domain for client-side routing on the default index
+            if path == "index.html" {
+                let html = String::from_utf8_lossy(&body_data);
+                let root_domain = std::env::var("APEXKIT_ROOT_DOMAIN").unwrap_or_default();
+                let injection = format!(
+                    "<script>window.__APEXKIT_ROOT_DOMAIN__ = \"{}\";</script>",
+                    root_domain
+                );
+
+                let modified = if html.contains("<head>") {
+                    html.replace("<head>", &format!("<head>\n    {}", injection))
+                } else {
+                    format!("{}\n{}", injection, html)
+                };
+
+                body_data = modified.into_bytes();
+            }
+
             Response::builder()
                 .header(header::CONTENT_TYPE, mime.as_ref())
                 .header(header::CACHE_CONTROL, cache_control)
                 .header(header::ETAG, etag) // <--- ADD ETAG
-                .body(Body::from(content.data))
+                .body(Body::from(body_data))
                 .unwrap()
         }
         None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),

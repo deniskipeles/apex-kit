@@ -317,8 +317,6 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
     > {
         let engine = self.state.script_engine.clone();
         let state = self.state.clone();
-
-        // When executing a shared script, the context MUST have the correct scope.
         let new_ctx = Arc::new(ScopedScriptContext {
             state: state.clone(),
             scope: scope.clone(),
@@ -327,6 +325,39 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
         Box::pin(async move {
             engine
                 .run_script(&code, payload, new_ctx, None, None, None, None)
+                .await
+        })
+    }
+
+    fn execute_background_script(
+        &self,
+        code: String,
+        payload: serde_json::Value,
+        scope: EventScope,
+        cpu_budget_ms: u64,
+        wall_timeout_secs: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<serde_json::Value, String>> + Send,
+        >,
+    > {
+        let engine = self.state.script_engine.clone();
+        let state = self.state.clone();
+        let new_ctx = Arc::new(ScopedScriptContext {
+            state: state.clone(),
+            scope: scope.clone(),
+        });
+
+        Box::pin(async move {
+            engine
+                .run_background_script(
+                    &code,
+                    payload,
+                    new_ctx,
+                    None,
+                    cpu_budget_ms,
+                    wall_timeout_secs,
+                )
                 .await
         })
     }

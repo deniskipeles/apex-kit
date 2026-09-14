@@ -132,6 +132,8 @@ impl QuantumScheduler {
                 if let Some(task) = state.tasks.get_mut(&task_id) {
                     task.last_slice_start = Some(Instant::now());
                 }
+                drop(state);
+                std::thread::yield_now(); // <-- Gives the CPU thread a micro-breath for Tokio HTTP workers
                 return false;
             }
 

@@ -53,6 +53,21 @@ pub trait ScriptContext: Send + Sync {
             dyn std::future::Future<Output = std::result::Result<serde_json::Value, String>> + Send,
         >,
     >;
+    fn execute_background_script(
+        &self,
+        code: String,
+        payload: serde_json::Value,
+        scope: crate::realtime::EventScope,
+        _cpu_budget_ms: u64,
+        _wall_timeout_secs: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<serde_json::Value, String>> + Send,
+        >,
+    > {
+        // Default fallback to standard execution so tests/mocks don't break
+        self.execute_shared_script(code, payload, scope)
+    }
     fn resolve_tenant_db(
         &self,
         tenant_id: &str,

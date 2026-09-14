@@ -68,17 +68,43 @@ pub fn register_queue<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> R
                         .and_then(|v| from_value(v).ok())
                         .unwrap_or_default();
 
-                    let timeout_ms = opts.timeout_ms.unwrap_or(60_000).min(60_000); // 60s max execution
+                    // Resolve dynamic timeouts from env
+                    let max_timeout_ms = std::env::var("QUEUE_JOB_MAX_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(1_200_000); // 20 mins default
+
+                    let default_timeout_ms = std::env::var("QUEUE_JOB_DEFAULT_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(300_000); // 5 mins default
+
+                    let timeout_ms = opts
+                        .timeout_ms
+                        .unwrap_or(default_timeout_ms)
+                        .min(max_timeout_ms);
                     let scope = app.get_scope();
                     let scope_key = scope_to_key(&scope);
 
-                    // --- 5-MINUTE SLIDING WINDOW CPU QUOTA (60s total CPU per 5 mins) ---
+                    // Resolve quota window and CPU caps from env
+                    let window_secs = std::env::var("QUEUE_WINDOW_SECS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(3600) // 1 hour default
+                        .max(1);
+
+                    let max_cpu_secs = std::env::var("QUEUE_MAX_CPU_SECS_PER_WINDOW")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(1200); // 20 mins default
+
                     let now_secs = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
-                    let window_5m = now_secs / 300; // 300s = 5 minutes
-                    let quota_key = format!("queue_cpu_sec:{}:{}", scope_key, window_5m);
+                    let window_id = now_secs / window_secs;
+                    let quota_key =
+                        format!("queue_cpu_sec:{}:{}:{}", scope_key, window_secs, window_id);
 
                     let used_secs = app
                         .cache_get(&quota_key)
@@ -86,10 +112,13 @@ pub fn register_queue<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> R
                         .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(0);
 
-                    if used_secs >= 60 {
+                    if used_secs >= max_cpu_secs {
                         let js_err = Exception::from_message(
                             js_ctx.clone(),
-                            "QuotaExceeded: Queue CPU limit of 60 seconds per 5 minutes reached.",
+                            &format!(
+                                "QuotaExceeded: Queue CPU limit of {} seconds per window reached.",
+                                max_cpu_secs
+                            ),
                         )
                         .unwrap();
                         return Err(js_ctx.throw(js_err.into()));
@@ -152,14 +181,27 @@ pub fn register_queue<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> R
                         }
 
                         let start = Instant::now();
-                        let exec_future = app_exec.execute_shared_script(
+                        let wall_multiplier = std::env::var("QUEUE_WALL_TIMEOUT_MULTIPLIER")
+                            .ok()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(2)
+                            .max(1);
+                        let wall_timeout_secs = ((timeout_ms / 1000) * wall_multiplier).max(10);
+
+                        let exec_future = app_exec.execute_background_script(
                             runnable_code,
                             args_payload,
                             scope_clone,
+                            timeout_ms,
+                            wall_timeout_secs,
                         );
 
-                        match tokio::time::timeout(Duration::from_millis(timeout_ms), exec_future)
-                            .await
+                        // We rely on wall_timeout_secs in the runner to kill it cleanly, but we wrap in a macro layer timeout just in case it hard-deadlocks
+                        match tokio::time::timeout(
+                            Duration::from_secs(wall_timeout_secs + 10),
+                            exec_future,
+                        )
+                        .await
                         {
                             Ok(Ok(res)) => {
                                 let elapsed = start.elapsed().as_millis() as u64;

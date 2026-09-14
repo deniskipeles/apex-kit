@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize)]
 pub struct SyncQuery {
     pub api_key: Option<String>,
+    pub scope: Option<String>, // Allow Root Admins to target specific workspaces
 }
 
 #[derive(Deserialize, Serialize, Debug)]

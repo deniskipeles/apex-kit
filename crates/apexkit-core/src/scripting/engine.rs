@@ -694,6 +694,68 @@ impl ScriptEngine {
         method: Option<String>,
         url: Option<String>,
     ) -> Result<JsonValue, String> {
+        let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60);
+
+        let total_cpu_budget_ms = std::env::var("SCRIPT_MAX_CPU_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1000);
+
+        self.run_script_internal(
+            code,
+            input_data,
+            context,
+            base_url,
+            headers,
+            method,
+            url,
+            false,
+            total_cpu_budget_ms,
+            timeout_secs,
+        )
+        .await
+    }
+
+    pub async fn run_background_script(
+        &self,
+        code: &str,
+        input_data: JsonValue,
+        context: Arc<dyn ScriptContext>,
+        base_url: Option<String>,
+        cpu_budget_ms: u64,
+        wall_timeout_secs: u64,
+    ) -> Result<JsonValue, String> {
+        self.run_script_internal(
+            code,
+            input_data,
+            context,
+            base_url,
+            None,
+            None,
+            None,
+            true,
+            cpu_budget_ms,
+            wall_timeout_secs,
+        )
+        .await
+    }
+
+    async fn run_script_internal(
+        &self,
+        code: &str,
+        input_data: JsonValue,
+        context: Arc<dyn ScriptContext>,
+        base_url: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        method: Option<String>,
+        url: Option<String>,
+        is_background: bool,
+        total_cpu_budget_ms: u64,
+        timeout_secs: u64,
+    ) -> Result<JsonValue, String> {
         // 1. EXTRACT DYNAMIC SCOPE STRING & RESOLVE CURRENT SCOPED DB
         let scope_str = match context.get_scope() {
             EventScope::Root => "root".to_string(),
@@ -702,20 +764,22 @@ impl ScriptEngine {
             _ => "root".to_string(),
         };
 
-        // [CRITICAL FIX] Per-Scope Execution Isolation.
-        // A misbehaving tenant or webhook can only exhaust its own execution slots,
-        // never freezing the whole BaaS engine. Uses a 20s timeout to fast-fail.
-        let sem = get_scoped_semaphore(&scope_str);
-        let _permit = match tokio::time::timeout(std::time::Duration::from_secs(20), sem.acquire())
-            .await
-        {
-            Ok(Ok(p)) => p,
-            _ => {
-                return Err(format!(
-                    "Execution limit reached for scope '{}'. Too many concurrent scripts running. Please try again later.",
-                    scope_str
-                ));
+        // [CRITICAL FIX] Background Queues bypass the concurrency limit semaphore entirely
+        let _permit = if !is_background {
+            let sem = get_scoped_semaphore(&scope_str);
+            match tokio::time::timeout(std::time::Duration::from_secs(20), sem.acquire_owned())
+                .await
+            {
+                Ok(Ok(p)) => Some(p),
+                _ => {
+                    return Err(format!(
+                        "Execution limit reached for scope '{}'. Too many concurrent scripts running. Please try again later.",
+                        scope_str
+                    ));
+                }
             }
+        } else {
+            None
         };
 
         let re_config = Regex::new(r"export\s+const\s+graphql\s*=\s*(\{[\s\S]*?\})(?:;|\n|$)")
@@ -751,16 +815,6 @@ impl ScriptEngine {
                 .or_else(|| std::env::var("APP_URL").ok().filter(|s| !s.is_empty()))
                 .unwrap_or_else(|| format!("http://127.0.0.1:{}", context.get_port()))
         };
-
-        let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300);
-
-        let total_cpu_budget_ms = std::env::var("SCRIPT_MAX_CPU_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300000);
 
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         let vfs = self.vfs.clone();
@@ -1015,12 +1069,12 @@ impl ScriptEngine {
         let timeout_secs = std::env::var("SCRIPT_EXECUTION_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300);
+            .unwrap_or(60); // 1 minute max total wall-clock lifetime
 
         let total_cpu_budget_ms = std::env::var("SCRIPT_MAX_CPU_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300000);
+            .unwrap_or(1000); // [CRITICAL FIX]: 1 second (1000ms) of pure CPU time maximum
 
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         let vfs = self.vfs.clone();

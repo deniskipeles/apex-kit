@@ -14,9 +14,34 @@
 </head>
 <body>
     <div class="card">
-        <h1>APexKit Server is Running 🚀</h1>
+        <h1>ApexKit Server is Running 🚀</h1>
         <p>The backend API is operational.</p>
-        <a href="/_dashboard">Go to Admin Dashboard</a>
+        <a id="dashboard-link" href="/_dashboard">Go to Admin Dashboard</a>
     </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            const rootDomain = window.__APEXKIT_ROOT_DOMAIN__ || "";
+            const host = window.location.hostname;
+            const path = window.location.pathname;
+            const link = document.getElementById("dashboard-link");
+
+            let scopePrefix = "";
+
+            // Check if we are on a subdomain (e.g. app1.example.com)
+            if (rootDomain && host !== rootDomain && host.endsWith(rootDomain)) {
+                // Scope is implied by subdomain, so the path is just /_dashboard
+                scopePrefix = "";
+            } else {
+                // Check if we are using path-based routing (e.g. /tenant/app1)
+                const match = path.match(/^\/(tenant|sandbox)\/[^\/]+/);
+                if (match) {
+                    scopePrefix = match[0];
+                }
+            }
+
+            link.href = scopePrefix + "/_dashboard";
+        });
+    </script>
 </body>
 </html>

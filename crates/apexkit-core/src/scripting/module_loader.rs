@@ -55,12 +55,11 @@ impl CompilerInterface for TypeScriptCompiler {
 /// Transpiles TypeScript / TSX to clean JavaScript using the Oxc transformer.
 pub fn transpile_ts(source_text: &str, file_path: &str) -> Result<String, String> {
     let path = Path::new(file_path);
-    let is_jsx = file_path.ends_with(".tsx") || file_path.ends_with(".jsx");
-    let source_type = if is_jsx {
-        SourceType::tsx()
-    } else {
-        SourceType::ts()
-    };
+
+    // [CRITICAL FIX]: Always parse source as TSX.
+    // TypeScript is a strict subset of TSX, meaning normal TS works perfectly fine,
+    // but now Webhooks and Modules can natively parse React/Hono JSX tags!
+    let source_type = SourceType::tsx();
 
     let mut compiler = TypeScriptCompiler::default();
     compiler.compile(source_text, source_type, path);
