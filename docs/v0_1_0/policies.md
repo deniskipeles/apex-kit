@@ -1,17 +1,16 @@
-# 🛡️ Security Policies & Access Control
+# 🛡️ Security Policies & Access Control (ABAC & RLS)
 
-**Version:** 0.1.0
-**Context:** Multi-Tenant Row-Level Security (RLS) & RBAC
+**Version:** 0.1.0  
+**Context:** Multi-Tenant Row-Level Security (RLS) & Role-Based Access Control (RBAC)
 
-ApexKit uses a high-performance **Expression Engine** to define who can access what data. Policies are defined directly in the Collection Schema and are evaluated in real-time for every API and GraphQL request.
+ApexKit uses an expression engine to enforce data access rules across all API endpoints, GraphQL queries, and database operations. Policies are defined per collection and evaluated in real time for `read`, `create`, `update`, and `delete` operations.
 
 ---
 
 ## 1. Defining Policies
 
-Policies are mapped to the four core CRUD operations in the `policies` object of a collection.
+Policies are configured inside the `policies` object of a collection schema:
 
-**Example Schema:**
 ```json
 {
   "name": "posts",
@@ -19,13 +18,13 @@ Policies are mapped to the four core CRUD operations in the `policies` object of
     "fields": {
       "title": { "type": "string" },
       "status": { "type": "select", "options": ["draft", "published"] },
-      "owner_id": { "type": "owner" }
+      "author_id": { "type": "owner", "auto": true }
     },
     "policies": {
       "read": "public",
       "create": "auth",
-      "update": "(auth.id == field:owner_id) && field:status == 'draft'",
-      "delete": "admin"
+      "update": "admin || (auth.id == field:author_id && field:status == 'draft')",
+      "delete": "admin || owner:author_id"
     }
   }
 }
@@ -33,114 +32,118 @@ Policies are mapped to the four core CRUD operations in the `policies` object of
 
 ---
 
-## 2. Syntax Reference
+## 2. Policy Syntax
 
-The engine parses logical expressions. Spaces are ignored, but strings must be quoted.
+ApexKit supports two formats:
 
-### Operators
-| Operator | Description | Example |
+1. **String Expressions (Concise):** Uses logical operators (`&&`, `||`), keywords, and variable comparisons.
+2. **JSON Rules (Advanced):** Uses structured MongoDB-style syntax with support for subqueries (`@get()`) and request payload validation (`@request.record`).
+
+### String Expression Operators & Keywords
+
+| Keyword / Operator | Description | Example |
 | :--- | :--- | :--- |
-| `&&` | Logical AND | `auth && field:active == 'true'` |
-| `||` | Logical OR | `admin || auth.id == field:user_id` |
-| `==` | Equality | `auth.role == 'editor'` |
-| `!=` | Inequality | `field:status != 'locked'` |
-| `( )` | Grouping | `(A || B) && C` |
+| **`public`** | Open to all callers (unauthenticated or authenticated). | `public` |
+| **`auth`** | Requires a valid JWT token or API key. | `auth` |
+| **`admin`** | Requires `role: "admin"` in caller claims. | `admin` |
+| **`owner:{field}`** | Shorthand matching `record.data[field] == auth.id`. | `owner:author_id` |
+| **`&&`** | Logical AND | `auth && field:status == 'published'` |
+| **`||`** | Logical OR | `admin || owner:author_id` |
+| **`==` / `!=`** | Equality / Inequality | `auth.role == 'editor'` |
+| **`( )`** | Precedence grouping | `(auth || public) && field:active == 'true'` |
 
-### Literals
-*   **Strings**: `'published'`, `"admin"` (must be quoted).
-*   **Booleans**: `true`, `false`.
-*   **Numbers**: `101`, `5.5`.
-
----
-
-## 3. Context Variables
-
-You have access to the **Requester** (Auth) and the **Record** (Field).
-
-### Authentication Context (`auth.*`)
-These variables are extracted from the JWT token.
+### Context Variables
 
 | Variable | Description |
 | :--- | :--- |
-| `auth` | Returns `true` if the user is logged in. |
-| `admin` | Returns `true` if the user has the `admin` role. |
-| `auth.id` | The unique ID of the logged-in user. |
-| `auth.role` | The role string (e.g., `'manager'`, `'student'`). |
-| `auth.email`| The email address of the user. |
-
-### Record Context (`field:*`)
-These variables access the JSON data of the record in the database.
-
-| Variable | Description |
-| :--- | :--- |
-| `field:{name}` | The value of a specific field in the record. |
-
-> **Crucial for Updates**: During `update` or `delete` operations, `field:*` refers to the **existing** data in the database *before* the changes are applied. This allows for logic like "you cannot edit a post if its current status is 'archived'".
+| **`auth.id`** | Numeric ID (`uid`) of the authenticated user. |
+| **`auth.role`** | Role string of the authenticated user (`"admin"`, `"user"`). |
+| **`auth.email`** | Email address of the authenticated user. |
+| **`field:{name}`** | Current value of `{name}` stored in the database record. |
 
 ---
 
-## 4. Common Use Cases
+## 3. SQL Pushdown (Row-Level Security)
 
-### A. Ownership (Row-Level Security)
-Only allow users to see or edit their own data.
-```json
-{
-  "read": "auth.id == field:user_id",
-  "update": "auth.id == field:user_id"
-}
+For read operations (such as listing records or resolving GraphQL collections), ApexKit compiles policy expressions directly into SQLite `WHERE` clauses:
+
+```rust
+// Policy: "admin || owner:author_id"
+// Caller: Claims { uid: 42, role: "user" }
+```
+Compiles to:
+```sql
+(1=0 OR (json_extract(records.data, '$.author_id') = '42' OR CAST(json_extract(records.data, '$.author_id') AS TEXT) = '42'))
 ```
 
-### B. Role-Based Access (RBAC)
-Allow access based on specific custom roles.
-```json
-{
-  "read": "auth.role == 'editor' || auth.role == 'viewer' || admin"
-}
-```
+This guarantees:
+* Accurate server-side pagination (`page`, `per_page`, `total`).
+* Zero in-memory filtering overhead on large tables.
+* Type-coercion compatibility between integer and string ID formats.
 
-### C. Workflow Locking
-Allow users to update their records, but only if the record is in a 'draft' state.
-```json
-{
-  "update": "auth.id == field:owner_id && field:status == 'draft'"
-}
-```
+---
 
-### D. Public/Private Toggle
-Allow any user to read a record if it is marked as public.
+## 4. Common Security Patterns
+
+### A. Record Ownership (Private User Data)
+Only the creator can read, update, or delete their records:
 ```json
 {
-  "read": "field:is_public == 'true' || auth.id == field:owner_id"
+  "read": "owner:user_id",
+  "create": "auth",
+  "update": "owner:user_id",
+  "delete": "admin || owner:user_id"
 }
 ```
 
 ---
 
-## 5. Multi-Tenancy & Admin Bypass
-
-ApexKit enforces a strict hierarchy for security:
-
-1.  **Root Admin Bypass**: Users with the `admin` role in the **Root App** context bypass all collection policies. They can see and edit any record in any tenant for support or maintenance.
-2.  **Tenant Admin**: Users with the `admin` role inside a **Tenant** context bypass policies *only within that tenant*. They cannot see data in other tenants.
-3.  **Physical Isolation**: Policies are evaluated *after* tenant resolution. A request to `tenant_A` can never leak data from `tenant_B`, regardless of how permissive the policy is.
-
----
-
-## 6. Shorthands (Legacy Support)
-
-ApexKit maintains support for standard shorthands for quick configuration:
-
-| Shorthand | Equivalent Expression |
-| :--- | :--- |
-| `"public"` | Always returns `true`. |
-| `"auth"` | Equivalent to `auth` (logged in). |
-| `"admin"` | Equivalent to `auth.role == 'admin'`. |
-| `"owner:X"` | Equivalent to `auth.id == field:X`. |
+### B. Public Read with Authenticated Creation
+Anyone can view published posts, but only logged-in users can author new ones:
+```json
+{
+  "read": "public",
+  "create": "auth",
+  "update": "admin || owner:author_id",
+  "delete": "admin"
+}
+```
 
 ---
 
-## 7. Performance Note
+### C. State-Dependent Workflow Locking
+Users can edit their submissions only while in `"draft"` status:
+```json
+{
+  "update": "admin || (owner:author_id && field:status == 'draft')"
+}
+```
 
-Policies are evaluated in a high-speed Rust-based virtual machine. However, for large `list` requests (e.g., thousands of records), complex expressions involving many `field:*` lookups may impact latency. 
+---
 
-**Best Practice**: Whenever possible, combine policies with **Filters** in your API requests (`?filter={...}`) to reduce the number of records the policy engine needs to process.
+### D. Multi-Role Permissions (RBAC)
+Grant access based on custom user roles:
+```json
+{
+  "read": "auth.role == 'auditor' || auth.role == 'manager' || admin",
+  "update": "auth.role == 'manager' || admin"
+}
+```
+
+---
+
+## 5. Multi-Tenant Scope Hierarchy
+
+ApexKit enforces physical database separation:
+
+1. **Root Admin Access:** A JWT issued for the `root` scope with `role: "admin"` has global administrative access across all tenant databases.
+2. **Tenant Admin Scope:** A user with `role: "admin"` inside `tenant:client-a` has administrative access **only** within `client-a`.
+3. **Physical Isolation:** Policy checks are executed against the specific tenant's SQLite file (`storage/tenants/{tenant_id}/data.db`). Data cannot leak across tenant boundaries regardless of the policy expression.
+
+---
+
+## 6. Performance Best Practices
+
+1. **Prefer `owner:{field}` Shorthand:** Compiles to optimized, index-friendly SQL expressions.
+2. **Index Policy Fields:** If a policy frequently references a field (e.g. `field:status == 'published'`), add `sql_indexed: true` to that field's schema definition to maintain $O(\log N)$ query speeds.
+3. **Keep Expressions Focused:** For complex conditional flows involving third-party checks, use a server-side `before_create_record` or `before_update_record` script hook instead of oversized policy strings.

@@ -1,6 +1,6 @@
 # Collections & Records SDK Reference
 
-The `apex.collection(id)` namespace provides access to CRUD, querying, and multi-modal vector/text search operations for a specific collection.
+The `apex.collection(id)` namespace provides full CRUD access, advanced SQL analytical queries, Tantivy full-text search, multimodal AI vector search, and relational graph edge operations for any collection.
 
 ## Method Signatures
 
@@ -25,7 +25,7 @@ The `apex.collection(id)` namespace provides access to CRUD, querying, and multi
 
 ## 1. Listing Records
 
-List and filter records with sorting, pagination, and multi-level joins.
+List and filter records with sorting, pagination, and multi-level relational joins.
 
 ```typescript
 const result = await apex.collection('posts').list({
@@ -36,7 +36,7 @@ const result = await apex.collection('posts').list({
         "status": "published",
         "category": { "$in": ["tech", "news"] }
     },
-    expand: 'author_id,comments(5).user_id' // Join relations + nested expansion
+    expand: 'author_id,comments(5,0).user_id' // Join relations + nested expansion
 });
 
 console.log(`Fetched ${result.items.length} of ${result.total} posts.`);
@@ -44,9 +44,9 @@ console.log(`Fetched ${result.items.length} of ${result.total} posts.`);
 
 ### `QueryOptions` Specification:
 - `page`: Page index starting at 1.
-- `per_page`: Number of elements to return.
+- `per_page`: Number of elements to return (max 100).
 - `sort`: Sort attributes. Prefix with `-` for descending order (e.g. `"-created"`, `"title"`).
-- `filter`: SQL-like filter string or JSON evaluation criteria.
+- `filter`: URL-encoded string or MongoDB-style JSON filter object.
 - `expand`: Comma-separated fields to expand (resolves linked relations automatically).
 - `fields`: Comma-separated list of attributes to return, pruning payload size.
 
@@ -61,14 +61,14 @@ const record = await apex.collection('posts').create({
     content: "Content..."
 });
 
-// Update (Full Replace)
+// Update (Full Replace - PUT)
 await apex.collection('posts').update(record.id, {
     title: "Updated Title",
     content: "Updated Content...",
     status: "draft"
 });
 
-// Patch (Partial Update)
+// Patch (Partial Update - PATCH)
 await apex.collection('posts').patch(record.id, {
     status: "published"
 });
@@ -84,7 +84,7 @@ await apex.collection('posts').delete(record.id);
 
 ## 3. Full-Text Search (Tantivy / OSE)
 
-To use full-text search, fields must have `ose_indexed: true` in their collection definition schema.
+To use full-text search, fields must have `ose_indexed: true` enabled in their collection schema definition.
 
 ### Standard Full-Text Search
 ```typescript
@@ -95,7 +95,7 @@ const searchResults = await apex.collection('posts').searchRecordsWithOSE("tech 
 ```
 
 ### Autocomplete Instant Search
-Fuzzy, low-latency search optimized for autocomplete search boxes:
+Fuzzy, low-latency search optimized for autocomplete search bars:
 ```typescript
 const hits = await apex.collection('products').searchRecordsInstantlyWithOSE("iphne");
 // Returns: [{ id: 1, score: 2.1, snippet: { name: "<b>iPhone</b> 15" } }]
@@ -103,7 +103,7 @@ const hits = await apex.collection('products').searchRecordsInstantlyWithOSE("ip
 
 ---
 
-## 4. Multi-Modal Vector Search (Semantic/AI)
+## 4. Multimodal Vector Search (AI)
 
 Search collection records by semantic meaning using high-dimensional vector embeddings.
 

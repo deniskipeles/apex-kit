@@ -1,99 +1,137 @@
 # 📚 Script Samples Library
 
-**Version:** 0.1.0
-**Context:** JavaScript Server Runtime (Boa)
+**Version:** 0.1.0  
+**Context:** Server-Side TypeScript / JavaScript (QuickJS Engine with Oxc Transpilation)
 
-This library provides copy-pasteable examples for common tasks in ApexKit, demonstrating the power of scoped database access, in-memory archiving, and shared Root-to-Tenant logic.
+This library provides production-ready, copy-pasteable script samples demonstrating how to leverage ApexKit's built-in global built-ins (`$db`, `$files`, `$fs`, `$queue`, `$wasm`, `$ai`, `$cache`, `$realtime`, `$mail`, `$util`, `$env`, and `$cmd`).
 
 ---
 
-### 1. Manual API Endpoints
-*Trigger: `manual` | Access: `POST /api/v1/run/{name}`*
+### 1. Manual Webhooks & API Endpoints
+*Trigger: `manual` | Access: `POST /api/v1/webhook/{name}` or `/api/v1/run/{name}`*
 
-#### Sales Performance Report (Analytical Engine)
-Uses the `$db.query` engine to aggregate data directly in SQL.
+#### A. Analytical Sales Report (Query Engine)
+Executes complex SQL grouping and aggregation pipeline over collection data.
 
-```javascript
-export default async function(req) {
-    const { category } = await req.json();
+```typescript
+// Script Name: sales-performance-report
+// Trigger: manual | Path: ./webhooks/sales-performance-report.ts
+
+export default async function (req: Request) {
+    const body = await req.json().catch(() => ({}));
+    const category = body.category;
 
     const report = await $db.query({
-        "from": "sales",
-        "select": [
+        from: "sales",
+        select: [
             "region",
-            { "fn": "sum", "field": "amount", "as": "total_revenue" },
-            { "fn": "count", "field": "id", "as": "order_count" },
-            { "fn": "avg", "field": "amount", "as": "avg_ticket" }
+            { fn: "sum", field: "amount", as: "total_revenue" },
+            { fn: "count", field: "id", as: "order_count" },
+            { fn: "avg", field: "amount", as: "avg_ticket" }
         ],
-        "where": category ? { "category": category } : {},
-        "group_by": ["region"],
-        "sort": "-total_revenue"
+        where: category ? { category } : {},
+        group_by: ["region"],
+        sort: "-total_revenue"
     });
 
-    return new Response({
+    return new Response(JSON.stringify({
         generated_at: new Date().toISOString(),
         regions: report
+    }), {
+        headers: { "Content-Type": "application/json" }
     });
 }
 ```
 
-#### Multi-File Asset Bundler
-Reads binary files from the current scope's storage and creates a ZIP archive.
+#### B. Multi-File Asset Bundler & Zipper
+Reads attachments from scoped storage, bundles them into an in-memory ZIP archive, saves the resulting archive back to disk, and registers its metadata.
 
-```javascript
-export default async function(req) {
+```typescript
+// Script Name: bundle-attachments-zip
+// Trigger: manual | Path: ./webhooks/bundle-attachments-zip.ts
+
+export default async function (req: Request) {
     const { folder_name } = await req.json();
     
-    // 1. Fetch metadata for files in this "folder"
-    const files = await $db.records.list("attachments", { filter: { folder: folder_name } });
+    // 1. Fetch file metadata records matching folder
+    const files = await $db.records.list("attachments", {
+        filter: { folder: folder_name }
+    });
     
-    const zipMap = {};
-    for (const file of files) {
-        // readFile returns Base64 from the scoped storage (Local or S3)
-        const b64 = await $zip.readFile(file.filename);
-        zipMap[file.original_name] = b64;
+    const zipMap: Record<string, string> = {};
+    for (const file of files.items) {
+        // $files.read returns Base64 data from storage (Local or S3)
+        const b64 = await $files.read(file.data.filename);
+        zipMap[file.data.original_name] = b64;
     }
 
-    // 2. Create ZIP and save back to storage
-    const zipB64 = await $zip.create(zipMap);
-    const saved = await $zip.saveFile(`${folder_name}_export.zip`, zipB64);
+    // 2. Create archive and save to storage
+    const zipBase64 = await $zip.create(zipMap);
+    const saved = await $files.save(
+        `${folder_name}_export.zip`, 
+        $util.base64DecodeBuffer(zipBase64), 
+        "application/zip"
+    );
 
-    return new Response({
-        message: "Bundle created",
+    return new Response(JSON.stringify({
+        message: "Archive bundle created successfully",
         download_url: saved.url,
-        size_bytes: saved.size
+        filename: saved.filename
+    }), {
+        headers: { "Content-Type": "application/json" }
     });
 }
 ```
 
 ---
 
-### 2. Shared System Logic (Root Functions)
+### 2. Shared System Logic (Root Public Functions)
 *Trigger: `manual` | Visibility: `public` | Context: Created in Root App*
 
-#### FFmpeg Video Processor
-Demonstrates how a Root script uses `$cmd` to provide heavy processing to Tenants.
+#### FFmpeg Video Transcoder ($cmd)
+A Root-level public utility script that allows tenants to invoke native server-side shell commands (FFmpeg) safely.
 
-```javascript
-// Root Script Name: "system-ffmpeg"
-export default async function(req) {
-    const { input_url, output_name } = await req.json();
-    const caller = req.body.__caller_scope;
+```typescript
+// Script Name: system-ffmpeg-transcoder
+// Trigger: manual | Visibility: public | Path: ./webhooks/system-ffmpeg-transcoder.ts
 
-    if (!caller.Tenant) throw new Error("Tenants only");
+export default async function (req: Request) {
+    const body = await req.json();
+    const { input_file, output_name } = body;
+    const callerScope = body.__caller_scope;
 
-    // Root can execute shell commands
+    // Ensure only tenants invoke this shared service
+    if (!callerScope || !callerScope.Tenant) {
+        return new Response(JSON.stringify({ error: "Access Denied: Tenants only" }), { status: 403 });
+    }
+
+    const tenantId = callerScope.Tenant;
+    const inputPath = `storage/tenants/${tenantId}/uploads/${input_file}`;
+    const outputPath = `storage/tenants/${tenantId}/uploads/${output_name}.mp4`;
+
+    // Execute shell binary via Root-scoped $cmd
     const result = await $cmd.run("ffmpeg", [
-        "-i", input_url,
+        "-y",
+        "-i", inputPath,
         "-vf", "scale=1280:-1",
         "-c:v", "libx264",
         "-crf", "23",
-        output_name
+        outputPath
     ], { timeout: 60000 });
 
-    return new Response({
-        status: result.status === 0 ? "success" : "failed",
-        logs: result.stderr
+    if (result.status !== 0) {
+        return new Response(JSON.stringify({
+            success: false,
+            error: "Transcoding failed",
+            stderr: result.stderr
+        }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+
+    return new Response(JSON.stringify({
+        success: true,
+        output_file: `${output_name}.mp4`
+    }), {
+        headers: { "Content-Type": "application/json" }
     });
 }
 ```
@@ -101,45 +139,52 @@ export default async function(req) {
 ---
 
 ### 3. Database Event Hooks
-*Trigger: `before_create`, `after_list_records`, etc.*
+*Trigger: `before_create_record`, `after_create_record`*
 
-#### Dynamic Row-Level Security (Filter Hook)
-Automatically restricts a `list` request to only show records owned by the user.
+#### A. Dynamic Row-Level Security Enforcer
+Intercepts `list` requests and injects tenant-specific ownership filters dynamically:
 
-```javascript
-// Trigger: before_list_records | Target: "projects"
-export default async function(e) {
-    // Skip for admins
-    if (e.auth.role === 'admin') return e.data;
+```typescript
+// Script Name: enforce-project-ownership
+// Trigger: before_list_records | Target Collection: projects
+// Path: ./webhooks/enforce-project-ownership.ts
 
-    // Parse existing filter or start new
-    const filter = e.data.filter ? JSON.parse(e.data.filter) : {};
+export default async function (event: any) {
+    // Admins bypass scoping rules
+    if (event.auth && event.auth.role === "admin") {
+        return event.data;
+    }
+
+    const filter = event.data.filter ? JSON.parse(event.data.filter) : {};
     
-    // Inject ownership constraint
-    filter.owner_id = e.auth.id;
+    // Force constraint: Users can only query their own organization projects
+    filter.owner_id = event.auth ? event.auth.id : -1;
     
-    // Update the query options
-    e.data.filter = JSON.stringify(filter);
-    
-    return e.data;
+    event.data.filter = JSON.stringify(filter);
+    return event.data;
 }
 ```
 
-#### Slack Notification (Side Effect)
-Triggers an external webhook after a record is successfully saved.
+#### B. Asynchronous Webhook Notification
+Dispatches an external Slack webhook after a record is successfully created:
 
-```javascript
-// Trigger: after_create | Target: "leads"
-export default async function(e) {
-    const webhook = await $env.get("SLACK_WEBHOOK_URL");
-    
-    const message = {
-        text: `🚀 *New Lead:* ${e.record.data.email}\nSource: ${e.record.data.source}`
-    };
+```typescript
+// Script Name: slack-notify-new-lead
+// Trigger: after_create_record | Target Collection: leads
+// Path: ./webhooks/slack-notify-new-lead.ts
 
-    await fetch(webhook, {
+export default async function (event: any) {
+    const { id, data } = event.record;
+    const webhookUrl = await $env.get("SLACK_WEBHOOK_URL");
+
+    if (!webhookUrl) return;
+
+    await fetch(webhookUrl, {
         method: "POST",
-        body: JSON.stringify(message)
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            text: `🚀 *New Lead Captured!*\n• Email: ${data.email}\n• Source: ${data.source}\n• Record ID: ${id}`
+        })
     });
 }
 ```
@@ -150,53 +195,64 @@ export default async function(e) {
 *Trigger: `before_tenant_request` | Context: Root level*
 
 #### Atomic Rate Limiter
-Prevents API abuse by tracking requests per IP in the system cache.
+Prevents API abuse by counting incoming requests per IP address in memory:
 
-```javascript
-export default async function(e) {
-    const ip = e.data.ip;
-    const window = new Date().toISOString().slice(0, 16); // Minute resolution
-    const cacheKey = `rate:${ip}:${window}`;
+```typescript
+// Script Name: global-ip-ratelimiter
+// Trigger: before_tenant_request | Path: ./webhooks/global-ip-ratelimiter.ts
 
-    // Increment atomically
-    const count = await $cache.incr(cacheKey, 1);
+export default async function (event: any) {
+    const ip = event.data.ip || "unknown";
+    const minuteBucket = new Date().toISOString().slice(0, 16);
+    const cacheKey = `ratelimit:${ip}:${minuteBucket}`;
 
-    if (count > 60) {
-        throw new Error("Rate limit exceeded. Try again in a minute.");
+    const hits = await $cache.incr(cacheKey, 1);
+
+    if (hits > 100) {
+        throw new Error("Rate limit exceeded. Maximum 100 requests per minute permitted.");
     }
 }
 ```
 
 ---
 
-### 5. AI & Vector Search
+### 5. AI & Vector Search Integration
 *Trigger: `manual`*
 
 #### Semantic Knowledge Base Search
-Converts a query to a vector and searches the HNSW index.
+Generates a vector embedding for an incoming query and performs an HNSW vector search against stored document embeddings:
 
-```javascript
-export default async function(req) {
-    const { q } = await req.json();
+```typescript
+// Script Name: semantic-search
+// Trigger: manual | Path: ./webhooks/semantic-search.ts
 
-    // 1. Generate Embedding using the scoped AI provider
-    const vector = await $ai.embed(q);
+export default async function (req: Request) {
+    const { query } = await req.json();
 
-    // 2. Search specific collection vector field
+    if (!query) {
+        return new Response(JSON.stringify({ error: "Missing query text" }), { status: 400 });
+    }
+
+    // 1. Generate text embedding vector
+    const queryVector = await $ai.embed(query);
+
+    // 2. Search collection vector field
     const matches = await $db.records.searchVector(
-        "knowledge_base", 
-        "content_vec", 
-        vector, 
+        "knowledge_base",
+        "content_embedding",
+        queryVector,
         5
     );
 
-    return new Response({
-        query: q,
-        results: matches.map(m => ({
+    return new Response(JSON.stringify({
+        query,
+        matches: matches.map(m => ({
             id: m.id,
             title: m.data.title,
-            relevance: m._score
+            relevance_score: m._score
         }))
+    }), {
+        headers: { "Content-Type": "application/json" }
     });
 }
 ```

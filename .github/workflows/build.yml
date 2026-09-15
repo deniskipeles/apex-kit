@@ -83,12 +83,22 @@ jobs:
         run: |
           cargo install cargo-xwin --locked
 
-      - name: Check and Auto-download SDK
+      # - name: Check and Auto-download SDK
+      #   if: matrix.target == 'x86_64-pc-windows-msvc'
+      #   run: |
+      #     # This compiles the dependencies but stops before linking, 
+      #     # forcing cargo-xwin to automatically download and extract the SDK.
+      #     cargo xwin check --target x86_64-pc-windows-msvc --release
+      - name: Download SDK via Empty Project
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: |
-          # This compiles the dependencies but stops before linking, 
-          # forcing cargo-xwin to automatically download and extract the SDK.
-          cargo xwin check --target x86_64-pc-windows-msvc --release
+          mkdir -p /tmp/dummy
+          (
+            cd /tmp/dummy
+            cargo init --bin --name dummy
+            cargo xwin check --target x86_64-pc-windows-msvc
+          )
+          rm -rf /tmp/dummy
 
       - name: Apply Case-Sensitivity Symlinks
         if: matrix.target == 'x86_64-pc-windows-msvc'

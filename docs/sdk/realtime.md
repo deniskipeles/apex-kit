@@ -1,8 +1,8 @@
 # Real-time API
 
-ApexKit provides a real-time stream of database events and custom signaling via WebSockets and Server-Sent Events (SSE).
+ApexKit provides a real-time stream of database change events (`Insert`, `Update`, `Delete`), custom client-to-client ephemeral signals, and low-latency instant search over WebSockets and Server-Sent Events (SSE).
 
-## WebSocket Client
+## WebSocket Client (`ApexKitRealtimeWSClient`)
 
 The `ApexKitRealtimeWSClient` class allows for high-performance, bidirectional real-time communication.
 
@@ -23,7 +23,7 @@ import { ApexKitRealtimeWSClient } from '@apexkit/sdk';
 const realtime = new ApexKitRealtimeWSClient(apex.baseUrl, apex.getToken());
 realtime.connect();
 
-// Listen for connection status
+// Check connection status
 console.log(realtime.isConnected);
 ```
 
@@ -32,27 +32,27 @@ console.log(realtime.isConnected);
 You can subscribe to database changes, custom channels, or both.
 
 ```typescript
-// Subscribe to data changes
+// Subscribe to data changes with filters
 realtime.subscribe({
     collectionId: 5,
     eventType: "Update",
     dataFilter: { "priority": "high" }
 });
 
-// Subscribe to a custom channel
+// Subscribe to a custom ephemeral channel
 realtime.subscribe({
     channel: "chat_room_1",
     customEvent: "NewMessage"
 });
 
-// Handle events
+// Handle incoming events
 const unsubscribe = realtime.onEvent((msg) => {
-    // Handle DB Event
+    // Handle DB Mutation Event
     if (msg.type === "Insert") {
         console.log("Record Created:", msg.payload.data);
     }
 
-    // Handle Custom Signal
+    // Handle Custom Ephemeral Signal
     if (msg.type === "Custom") {
         const { event, data } = msg.payload;
         if (event === "UserTyping") console.log(`${data.user} is typing...`);
@@ -65,7 +65,7 @@ unsubscribe();
 
 ### Signaling (Client-to-Client Broadcast)
 
-Send ephemeral messages to other clients on a specific channel.
+Send ephemeral messages directly to other clients on a specific channel without persisting them to disk.
 
 ```typescript
 realtime.sendSignal("chat_room_1", "UserTyping", { user: "Alice" });
@@ -73,7 +73,7 @@ realtime.sendSignal("chat_room_1", "UserTyping", { user: "Alice" });
 
 ### Instant Search over WebSocket
 
-Perform searches with lower latency than REST.
+Perform full-text searches with lower latency than REST.
 
 ```typescript
 const results = await realtime.search(1, "search query", 5);
@@ -82,9 +82,9 @@ console.log(results); // [{ id: 1, score: 2.5, snippet: {...} }]
 
 ---
 
-## SSE Client
+## SSE Client (`ApexKitRealtimeSSEClient`)
 
-`ApexKitRealtimeSSEClient` is a read-only stream for environments where WebSockets are not required.
+`ApexKitRealtimeSSEClient` provides a read-only stream for environments where WebSockets are not required.
 
 ### Methods
 
@@ -97,9 +97,9 @@ console.log(results); // [{ id: 1, score: 2.5, snippet: {...} }]
 ```typescript
 import { ApexKitRealtimeSSEClient } from '@apexkit/sdk';
 
-const sse = new ApexKitRealtimeSSEClient(apex.baseUrl);
+const sse = new ApexKitRealtimeSSEClient(apex.baseUrl, apex.getToken());
 
-// Connect and filter
+// Connect and filter by channel or event
 sse.connect({
     channel: "notifications",
     eventName: "Alert"

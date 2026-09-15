@@ -233,7 +233,7 @@ fn instantiate_wasm_module<'js>(
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = get_or_compile_module(&engine, bytes, None)?;
 
-    let memory_limit_mb = if is_root { 512 } else { 64 };
+    let memory_limit_mb = if is_root { 512 } else { 256 };
     let limits = StoreLimitsBuilder::new()
         .memory_size(memory_limit_mb * 1024 * 1024)
         .table_elements(1_000_000)
@@ -577,7 +577,7 @@ pub fn register_wasm<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Re
                         .unwrap_or_default();
 
                     let is_root = matches!(app.get_scope(), EventScope::Root);
-                    let memory_limit_mb = opts.memory_mb.unwrap_or(if is_root { 512 } else { 64 });
+                    let memory_limit_mb = opts.memory_mb.unwrap_or(if is_root { 512 } else { 256 });
                     let timeout_ms = opts
                         .timeout_ms
                         .unwrap_or(if is_root { 30_000 } else { 300 });

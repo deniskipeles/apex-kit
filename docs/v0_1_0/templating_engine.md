@@ -1,90 +1,96 @@
-# Server-Side Rendering & Templates
+# 🖥️ Server-Side Rendering (SSR) & Templating Engine
 
-ApexKit features a powerful built-in Server-Side Rendering (SSR) engine. It combines the flexibility of **JavaScript Controllers** with the blazing-fast **Tera HTML templating engine**. 
+**Version:** 0.1.0  
+**Context:** Full-Stack HTML Generation, HTMX Integration, and Dynamic Routing
 
-This architecture allows you to fetch data securely on the server and render dynamic HTML before it ever reaches the user's browser.
+ApexKit features a powerful built-in Server-Side Rendering (SSR) engine. It bridges the flexibility of **Server-Side TypeScript/JavaScript Controllers** with the blazing-fast **Tera HTML templating engine** (similar to Jinja2, Django, and Twig).
+
+This architecture allows you to fetch data securely on the server and render dynamic HTML before it ever reaches the user's browser, ensuring top-tier SEO, fast initial paints, and seamless HTMX compatibility.
 
 ---
 
 ## 1. Anatomy of a Template
 
-A template in ApexKit consists of two parts:
-1. **The Controller (JS):** A Server-Side JavaScript block that executes securely on the backend.
+A template in ApexKit consists of two intertwined parts:
+1. **The Controller (`<script server>`):** An isolated TypeScript/JavaScript block that executes securely on the backend before the page renders.
 2. **The View (HTML):** A Tera HTML template that consumes the JSON returned by the Controller.
 
-To enable syntax highlighting in standard code editors (like VS Code), we wrap the Controller logic inside a standard `<script>` tag using special `// ---@@ssr` delimiters.
+To embed server logic, wrap your controller inside a `<script server>` or `<script type="server/ts">` tag at the top of your HTML file:
 
 ```html
-<script>
-// ---@@ssr
+<script server>
 export default async function(req) {
-    // 1. Parse the incoming request
+    // 1. Parse the incoming request context
     const payload = await req.json();
     
-    // 2. Fetch data using the global $db API
+    // 2. Fetch data using the global $db API (Scoped to current Tenant/Sandbox)
     const posts = await $db.records.list('posts', { limit: 5 });
     
-    // 3. Return JSON to the HTML template
+    // 3. Return JSON state to the HTML template
     return { 
         posts: posts.items,
         title: "Latest News",
         viewer: payload.headers['user-agent']
     };
 }
-// ---@@ssr
 </script>
 
 <!-- The HTML below receives the returned JSON as variables -->
 <div class="container mx-auto p-8">
-    <h1>{{ title }}</h1>
-    <ul>
+    <h1 class="text-3xl font-bold">{{ title }}</h1>
+    <ul class="mt-4 space-y-2">
         {% for post in posts %}
-            <li>{{ post.title }}</li>
+            <li class="p-4 bg-slate-800 rounded">{{ post.data.title }}</li>
         {% else %}
             <li>No posts found.</li>
         {% endfor %}
     </ul>
-    <small>Rendered for: {{ viewer }}</small>
+    <small class="text-slate-500">Rendered for: {{ viewer }}</small>
 </div>
 ```
+
+*(Note: Legacy delimiters like `// ---@@ssr` and Astro-style `---` frontmatter are also still supported for backwards compatibility).*
 
 ---
 
 ## 2. The Request Payload & Authorization
 
-Templates are automatically accessible via the `/render/{slug}` URL. 
+Templates are automatically served via the `/render/{slug}` dynamic routes (e.g. `/render/dashboard` or `/tenant/client-a/render/dashboard`).
 
-When a user visits a template route, the Controller's `req.json()` method yields a payload containing URL parameters, headers, and the authenticated user's claims.
+When a user visits a template route, the Controller's `req.json()` method yields a comprehensive payload containing URL parameters, headers, the parsed request body (JSON or Form Data), and the authenticated user's claims.
 
-### The Payload Object
+### The Payload Object Context
 ```json
 {
   "params": { 
-    "id": "5" // Extracted from URL query string (e.g., ?id=5)
+    "slug": "dashboard" // Extracted from URL path and query strings (?id=5)
   },
   "headers": { 
     "user-agent": "Mozilla/5.0...",
-    "host": "localhost:5000"
+    "host": "localhost:5000",
+    "cookie": "apex_session=..."
   },
-  "is_htmx": true, // True if the request was made via HTMX
+  "is_htmx": true, // True if the request was made via an hx-get/hx-post
   "auth": { 
     "id": 1, 
     "email": "user@example.com", 
     "role": "admin" 
-  } // Null if the user is not logged in
+  }, // Null if the user is not logged in
+  "body": {
+    "search": "database limits" // Parsed from POST JSON or application/x-www-form-urlencoded
+  }
 }
 ```
 
-### Protecting a Route
-You can easily build secure, private pages by checking the `auth` object. If the user is not authenticated, simply return a standard HTTP Response with a `401 Unauthorized` status. The frontend client (`apex.js`) will catch this and redirect the user to the login page.
+### Protecting a Private Route
+You can build secure, private pages by checking the `auth` object. If the user is unauthenticated, return a standard `401 Unauthorized` Response. The `apex.js` frontend client automatically intercepts this and redirects the user to `/render/login`.
 
-```javascript
-<script>
-// ---@@ssr
+```html
+<script server>
 export default async function(req) {
     const payload = await req.json();
     
-    // Block unauthenticated users
+    // Block unauthenticated users gracefully
     if (!payload.auth) {
         return new Response({ error: "Unauthorized" }, { status: 401 });
     }
@@ -96,7 +102,6 @@ export default async function(req) {
 
     return { user: payload.auth, tasks: myTasks.items };
 }
-// ---@@ssr
 </script>
 ```
 
@@ -104,77 +109,55 @@ export default async function(req) {
 
 ## 3. The Universal Client (`apex.js`) & HTMX
 
-ApexKit is uniquely designed to run multi-tenant architecture and isolated sandboxes natively. To ensure your HTML templates work flawlessly across the Root app, Tenants, and Sandboxes *without hardcoding URLs*, ApexKit includes a built-in script called `apex.js`.
+ApexKit injects a highly optimized client script (`/static/js/apex.js`) into all rendered templates. This script seamlessly manages physical multi-tenancy and ephemeral sandboxes without requiring you to hardcode URLs.
 
-### What `apex.js` does:
-1. **Dynamic Routing:** Automatically detects if the app is running in `/tenant/xyz` or `/sandbox/abc` and prefixes all API requests.
-2. **Token Injection:** Automatically retrieves the JWT from `localStorage` and injects it into all `fetch()` and `htmx` headers.
-3. **Auth Helpers:** Exposes a global `$apex` object with `.login()` and `.logout()` methods.
+### What `apex.js` handles automatically:
+1. **Dynamic Scope Rewriting:** Automatically detects if the app is running in `/tenant/xyz` or `/sandbox/abc` and intercepts relative links to maintain the scope boundaries.
+2. **State Hydration:** Hydrates the JSON returned by your server controller into a globally reactive `window.__SSR_STATE__` object.
+3. **Token Injection:** Automatically retrieves the JWT from `localStorage` and injects it into all native `fetch()` calls and `HTMX` triggers.
+4. **Auth Helpers:** Exposes a global `$apex` SDK object with `.auth.login()` and `.auth.logout()` methods.
 
 ### Setting up the Base Layout
-Always include HTMX and `apex.js` in your base template or `index.html`:
+When creating a base layout template, include HTMX and `apex.js` (Tailwind CSS is injected automatically by the server if missing):
 
 ```html
 <!DOCTYPE html>
 <html>
 <head>
     <script src="/static/js/htmx.js"></script>
-    <!-- Automatically handles Auth Headers & Scope Routing! -->
     <script src="/static/js/apex.js"></script>
 </head>
-<body>
+<body class="bg-slate-900 text-white">
     <!-- 
-        HTMX requests are auto-prefixed and auto-authenticated.
-        You write "/api/v1/run/buy_now", but apex.js converts it to 
-        "/tenant/123/api/v1/run/buy_now" behind the scenes!
+        HTMX requests are auto-prefixed and auto-authenticated!
+        You write "/api/v1/run/buy_now", but apex.js safely converts it to 
+        "/tenant/123/api/v1/run/buy_now" behind the scenes.
     -->
-    <button hx-post="/api/v1/run/buy_now">Purchase</button>
+    <button hx-post="/api/v1/run/buy_now" class="bg-indigo-600 p-2 rounded">
+        Purchase
+    </button>
 </body>
 </html>
-```
-
-### Creating a Login Form
-Use the `$apex` helper to easily log users in and route them to the dashboard:
-
-```html
-<form onsubmit="event.preventDefault(); handleLogin(this)">
-    <input id="email" type="email" placeholder="Email">
-    <input id="password" type="password" placeholder="Password">
-    <button type="submit">Login</button>
-</form>
-
-<script>
-async function handleLogin(form) {
-    const res = await $apex.login(form.email.value, form.password.value);
-    
-    if (res.ok) {
-        // $apex.scope contains the current environment prefix (e.g. "/tenant/123")
-        window.location.href = $apex.scope + '/render/dashboard';
-    } else {
-        alert(res.data.message);
-    }
-}
-</script>
 ```
 
 ---
 
 ## 4. Components & Includes
 
-As your UI grows, you should split it into reusable components. ApexKit supports this natively via the `{% include %}` tag.
+As your UI grows, split it into reusable partials using the `{% include %}` tag.
 
 ### ⚠️ The Golden Rule of Components
-**The SSR JavaScript block (`// ---@@ssr`) only executes on the Route Controller.**
-Any JavaScript written inside an included component template will be ignored. The Route template (the one mapped to the URL) must fetch **all** the necessary data for itself and its children, and pass it down.
+**The SSR `<script server>` block only executes on the Route Controller (the parent entry point).**
+Any server-side TypeScript written inside an *included* child component template is ignored. The Route template mapped to the URL must fetch **all** the necessary data for itself and its children, passing it down the rendering tree.
 
-**Example Component (`components/navbar`):**
+**Example Child Component (`components/navbar`):**
 ```html
-<nav class="bg-dark text-white p-4 flex justify-between">
-    <div class="logo">My App</div>
+<nav class="bg-slate-800 text-white p-4 flex justify-between">
+    <div class="font-bold">My SaaS</div>
     <div>
         {% if user %}
-            <span>Hello, {{ user.email }}</span>
-            <button onclick="$apex.logout()">Logout</button>
+            <span class="mr-4">Hello, {{ user.email }}</span>
+            <button onclick="$apex.auth.logout('/render/login')">Logout</button>
         {% else %}
             <a href="/render/login">Login</a>
         {% endif %}
@@ -182,15 +165,13 @@ Any JavaScript written inside an included component template will be ignored. Th
 </nav>
 ```
 
-**Example Route Controller (`dashboard`):**
+**Example Parent Route Controller (`dashboard`):**
 ```html
-<script>
-// ---@@ssr
+<script server>
 export default async function(req) {
     const payload = await req.json();
     return { user: payload.auth };
 }
-// ---@@ssr
 </script>
 
 <div>
@@ -198,7 +179,7 @@ export default async function(req) {
     {% include "components/navbar" %}
 
     <main class="p-8">
-        <h1>Dashboard Content</h1>
+        <h1 class="text-2xl">Dashboard Content</h1>
     </main>
 </div>
 ```
@@ -207,20 +188,21 @@ export default async function(req) {
 
 ## 5. Tera Syntax Cheat Sheet
 
-ApexKit uses the Tera templating engine (similar to Jinja2, Django, and Twig).
+ApexKit uses the Tera templating engine. Here are the most common operations:
 
-### Variables & Output
+### Variables, Filters, & JSON Dumps
 ```html
 <!-- Print a variable -->
 {{ user.email }}
 
-<!-- Apply filters -->
-{{ post.title | upper }}
-{{ post.content | safe }} <!-- Renders HTML without escaping -->
+<!-- Apply string filters -->
+{{ post.data.title | upper }}
+{{ post.content | safe }} <!-- Renders raw HTML without escaping -->
 {{ posts | length }}
 
-<!-- Dump JSON (Great for debugging!) -->
-{{ data | debug }}
+<!-- Dump JSON structures (Great for debugging or passing to Alpine.js) -->
+{{ user_profile | json | safe }}
+<pre>{{ my_data | debug }}</pre>
 ```
 
 ### Conditionals
@@ -236,12 +218,12 @@ ApexKit uses the Tera templating engine (similar to Jinja2, Django, and Twig).
 
 ### Loops
 ```html
-<ul>
+<ul class="space-y-2">
 {% for item in items %}
     <!-- loop.index starts at 1, loop.index0 starts at 0 -->
-    <li>{{ loop.index }}. {{ item.name }}</li>
+    <li>{{ loop.index }}. {{ item.data.name }}</li>
 {% else %}
-    <li>No items found.</li>
+    <li>No items found in the database.</li>
 {% endfor %}
 </ul>
 ```

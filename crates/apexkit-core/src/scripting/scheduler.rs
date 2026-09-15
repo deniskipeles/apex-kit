@@ -163,7 +163,7 @@ impl QuantumScheduler {
     }
 
     /// Called when a script yields for async I/O (e.g. fetch, $db.query).
-    /// Pauses CPU timer and gives the CPU slot to another script immediately.
+    /// Pauses CPU timer and releases the active slot.
     pub fn pause_for_io(&self, task_id: u64) {
         let mut state = self.state.lock().unwrap();
         if let Some(task) = state.tasks.get_mut(&task_id) {
@@ -178,7 +178,8 @@ impl QuantumScheduler {
         }
     }
 
-    /// Called when I/O completes and script is ready to run JS bytecodes again.
+    /// Called when I/O completes and script is ready to resume JS bytecodes.
+    /// Safely queues the task without blocking async Tokio executor threads.
     pub fn resume_from_io(&self, task_id: u64) {
         let mut state = self.state.lock().unwrap();
         if !state.queue.contains(&task_id) {
@@ -187,26 +188,13 @@ impl QuantumScheduler {
 
         if state.active_task_id.is_none() {
             self.rotate_next_task(&mut state);
-        } else if state.active_task_id != Some(task_id) {
-            let control = state.tasks.get(&task_id).map(|t| t.control.clone());
-            drop(state);
-
-            if let Some(control) = control {
-                // [CRITICAL FIX]: Wrap IO Resume OS thread blocking in `block_in_place`.
-                tokio::task::block_in_place(|| {
-                    let mut running = control.running.lock().unwrap();
-                    while !*running {
-                        running = control.condvar.wait(running).unwrap();
-                    }
-                    *running = false;
-                });
-            }
-
-            let mut state = self.state.lock().unwrap();
+        } else if state.active_task_id == Some(task_id) {
             if let Some(task) = state.tasks.get_mut(&task_id) {
                 task.last_slice_start = Some(Instant::now());
             }
         }
+        // Asynchronous futures must NEVER block on condvar.wait() here.
+        // QuickJS's interrupt handler will naturally invoke check_and_yield() when bytecodes run.
     }
 
     pub fn unregister_task(&self, task_id: u64) {

@@ -1,88 +1,85 @@
 # 🔮 GraphQL API Documentation
 
-**Version:** 0.1.0
-**Endpoint:** `/graphql`
-**Playground:** Access `/graphql` or the scoped URL (e.g., `/tenant/{id}/graphql`) for interactive testing.
+**Version:** 0.1.0  
+**Endpoint:** `/graphql`  
+**Playground:** Interactive GraphQL Playground available at `/graphql` (or scoped URLs: `/tenant/{tenant_id}/graphql`, `/sandbox/{session_id}/graphql`).
 
-ApexKit provides a dynamic, high-performance GraphQL API that is automatically generated based on your **Collections** and **Relationships**. It is designed to solve the "N+1" problem using efficient **Dataloaders**, allowing you to fetch deeply nested data in a single network request.
+ApexKit features an automatically generated, dynamic GraphQL API that reflects your **Collections**, **Relationships**, and **Security Policies** in real-time. The engine eliminates the classic N+1 query problem through internal **Dataloaders**, allowing deeply nested graphs to resolve in minimal SQL operations.
 
 ---
 
-## 1. Endpoint & Scoping
+## 1. Endpoints & Multi-Tenant Scoping
 
-The GraphQL API respects ApexKit's multi-tenancy architecture. Use the appropriate URL to target your environment:
+ApexKit routes GraphQL operations according to your current execution scope:
 
-| Scope | GraphQL Endpoint |
-| :--- | :--- |
-| **Root App** | `POST /graphql` |
-| **Tenant** | `POST /tenant/{tenant_id}/graphql` |
-| **Sandbox** | `POST /sandbox/{session_id}/graphql` |
+| Scope Context | GraphQL Execution Endpoint | Interactive Playground |
+| :--- | :--- | :--- |
+| **Root Application** | `POST /graphql` | `GET /graphql` |
+| **Tenant** | `POST /tenant/{tenant_id}/graphql` | `GET /tenant/{tenant_id}/graphql` |
+| **Sandbox** | `POST /sandbox/{session_id}/graphql` | `GET /sandbox/{session_id}/graphql` |
 
-> **Authentication**: All requests must include the `Authorization: Bearer <TOKEN>` header. API Policies (Read/Update/etc.) defined in your collections are strictly enforced.
+### Authentication
+Include your JWT token in the HTTP request headers:
+```http
+Authorization: Bearer <YOUR_JWT_TOKEN>
+# OR
+x-api-key: <YOUR_API_KEY>
+Content-Type: application/json
+```
+
+All collection-level policies (`read`, `create`, `update`, `delete`) and user access rules (`policy_users`) are strictly evaluated for every GraphQL operation.
 
 ---
 
 ## 2. Querying Collections
 
-For every collection you create (e.g., `posts`), the API generates a top-level field and a paginated list type.
-
-### Basic Fetch
-Fetch a list of records. The collection name is lowercase.
+For every registered collection (e.g. `posts`, `products`), ApexKit creates a root query field returning a paginated list object (`{CollectionName}List`):
 
 ```graphql
-query {
-  posts {
+query GetPublishedPosts {
+  posts(
+    limit: 10,
+    offset: 0,
+    where: {
+      status: "published"
+    }
+  ) {
     total
     items {
       id
       title
+      content
       status
     }
   }
 }
 ```
 
-### Pagination
-Use `limit` and `offset` to handle large datasets.
-
-*   `limit`: (Int) Max records (Default 100).
-*   `offset`: (Int) Records to skip.
-
-```graphql
-query GetPageTwo {
-  posts(limit: 10, offset: 10) {
-    items {
-      id
-      title
-    }
-  }
-}
-```
+### Pagination Arguments
+* **`limit`** (`Int`): Maximum number of records to return (defaults to `100`).
+* **`offset`** (`Int`): Number of records to skip from the beginning of the result set.
 
 ---
 
 ## 3. Advanced Filtering (`where`)
 
-The `where` argument accepts a **JSON Scalar** using the MongoDB-style **Filters API**.
-
-### Syntax Examples
-*   **Equality**: `{ "status": "published" }`
-*   **Comparison**: `{ "price": { "$gt": 100 } }`
-*   **Logic**: `{ "$or": [{ "category": "A" }, { "featured": true }] }`
-*   **Containment**: `{ "tags": { "$in": ["news", "tech"] } }`
+The `where` argument accepts a dynamic **JSON Scalar** adhering to the MongoDB-style filter syntax. Filter trees compile down to parameterized SQLite `WHERE` clauses alongside active Row-Level Security (RLS) constraints:
 
 ```graphql
-query FilteredProducts {
+query FilteredCatalog {
   products(
     where: {
-      category: "electronics",
-      price: { "$lte": 500 },
+      category: { "$in": ["electronics", "appliances"] },
+      price: { "$gte": 100, "$lte": 1500 },
       stock: { "$gt": 0 }
     }
   ) {
+    total
     items {
+      id
       name
       price
+      stock
     }
   }
 }
@@ -90,38 +87,25 @@ query FilteredProducts {
 
 ---
 
-## 4. Relationships & Deep Expansion
+## 4. Traversing Graph Relationships
 
-One of the primary benefits of the GraphQL API is fetching related data without multiple round-trips.
-
-### Forward Relations
-Fields defined as `relation` or `owner` in your schema.
+### A. Forward Relationships (`relation` / `owner`)
+When a record holds a foreign key field pointing to another collection or user, it resolves directly as a single entity:
 
 ```graphql
-query GetPostWithAuthor {
+query GetPostWithAuthorAndCategory {
   posts {
     items {
+      id
       title
-      author_id { # This is an 'owner' field
+      author_id {  # 'owner' field resolving to the _AuthUser type
+        id
         email
         role
       }
-    }
-  }
-}
-```
-
-### Reverse Relations
-ApexKit automatically discovers collections that point *to* the current one. If `comments` has a relation to `posts`, you can query comments from within a post.
-
-```graphql
-query GetBlogFeed {
-  posts {
-    items {
-      title
-      comments { # Auto-discovered reverse relation
-        text
-        created_at
+      category {   # 'relation' field resolving to the Category type
+        id
+        name
       }
     }
   }
@@ -130,36 +114,159 @@ query GetBlogFeed {
 
 ---
 
-## 5. Custom Resolvers (Scripts)
+### B. Reverse Relationships & Collections
+Collections referenced by other entities automatically expose reverse fields. When a parent collection expands multiple dependent children, it returns a list type with nested pagination and filtering:
 
-You can extend the GraphQL schema with custom logic by creating a script with the `graphql` trigger. These resolvers can perform aggregations, call external APIs, or run system commands via `$cmd`.
-
-**Example Query for a custom resolver:**
 ```graphql
-query {
-  calculateSystemHealth(detailed: true) # Custom field from a Script
+query GetPostWithComments {
+  posts {
+    items {
+      id
+      title
+      comments(limit: 5, where: { approved: true }) {
+        total
+        items {
+          id
+          body
+          created
+        }
+      }
+    }
+  }
 }
 ```
-*See the [Custom GraphQL Resolvers Guide](./custom-graphql-resolvers.md) for implementation details.*
 
 ---
 
-## 6. Type Mapping Reference
+## 5. System Fields & User Management (`_AuthUser`)
 
-| ApexKit Type | GraphQL Type | Notes |
+To avoid collisions with custom user collections, internal user queries, mutations, and types are prefixed with an underscore (`_`):
+
+* **Type:** `_AuthUser`
+* **List Query:** `_users(limit: Int, offset: Int, search: String): _AuthUserList`
+
+```graphql
+query SearchUsers {
+  _users(limit: 20, search: "alex") {
+    total
+    items {
+      id
+      email
+      role
+    }
+  }
+}
+```
+
+---
+
+## 6. Mutations (Create, Update, Delete)
+
+ApexKit automatically compiles type-safe input objects for each collection (`Create{Type}Input` and `Update{Type}Input`):
+
+### Create Record
+```graphql
+mutation CreateNewPost {
+  createPosts(
+    data: {
+      title: "Building Modern Backends with ApexKit",
+      content: "ApexKit combines Rust and SQLite for low-latency APIs.",
+      status: "published"
+    }
+  ) {
+    id
+    title
+    created
+  }
+}
+```
+
+### Update Record
+```graphql
+mutation UpdateExistingPost {
+  updatePosts(
+    id: "105",
+    data: {
+      status: "archived"
+    }
+  ) {
+    id
+    status
+    updated
+  }
+}
+```
+
+### Delete Record
+```graphql
+mutation RemovePost {
+  deletePosts(id: "105")
+}
+```
+
+---
+
+## 7. Extending with Custom Resolvers
+
+You can attach custom queries, mutations, or computed fields to existing types by creating scripts with `trigger_type: "graphql"`:
+
+```typescript
+// Script: calculate-cart-total
+// Trigger: graphql | Path: ./webhooks/calculate-cart-total.ts
+
+export const graphql = {
+  parent: "Query",
+  name: "calculateCartTotal",
+  args: {
+    cartId: "ID!"
+  },
+  returnType: "JSON"
+};
+
+export default async function (req: Request) {
+  const { cartId } = await req.json();
+
+  const items = await $db.records.list("cart_items", {
+    filter: { cart_id: cartId }
+  });
+
+  const total = items.items.reduce((sum, item) => sum + (item.data.price * item.data.quantity), 0);
+
+  return new Response({
+    cartId,
+    itemCount: items.items.length,
+    total
+  });
+}
+```
+
+**Querying the Custom Resolver:**
+```graphql
+query {
+  calculateCartTotal(cartId: "cart_42")
+}
+```
+
+---
+
+## 8. Type Mapping Reference
+
+| Collection Field Type | Generated GraphQL Type | Notes |
 | :--- | :--- | :--- |
-| `string`, `text`, `email`, `url`, `date` | `String` | |
-| `number` | `Float` | |
-| `bool` | `Boolean` | |
-| `json` | `JSON` | Returns a structured dynamic object/array. |
-| `relation` (One) | `Object` | Returns the related record. |
-| `relation` (Many) | `[Object]` | Returns an array of related records. |
-| `owner` | `User` | Returns the system User object. |
+| `string`, `text`, `email`, `url`, `date` | `String` | UTF-8 encoded text / ISO 8601 strings. |
+| `number` | `Float` | 64-bit IEEE floating-point numbers. |
+| `boolean` | `Boolean` | `true` / `false`. |
+| `json`, `geopoint` | `JSON` | Structured objects and dynamic arrays. |
+| `owner` | `_AuthUser` | Populated user profile (subject to `policy_users`). |
+| `relation` (`relation_type: "one"`) | `{TargetType}` | Single expanded entity map. |
+| `relation` (`relation_type: "many"`) | `{TargetType}List` | Paginated list with `total` and `items`. |
 
 ---
 
-## 7. Performance & Security
+## 9. Performance & Security Safeguards
 
-1.  **Dataloaders**: ApexKit uses an internal batching mechanism. If you fetch 50 `posts` and expand their `authors`, the backend only executes **2 SQL queries** (one for all posts, one for all unique authors) instead of 51.
-2.  **Complexity Limits**: To prevent DoS attacks, queries are limited to a depth of **32 levels** and a complexity score of **2000**.
-3.  **Policy Injection**: When a query is executed, the `auth` context of the requester is injected into the engine. Records that fail the collection's `read` policy are automatically filtered out of the results.
+1. **Automatic Batching (Dataloaders):** Resolving nested relationships across 100 records performs a single batched `WHERE id IN (...)` lookup, preventing N+1 database queries.
+2. **Execution Safeguards:**
+   * **Max Query Depth:** Limited to **32 levels** of nesting.
+   * **Max Complexity:** Capped at **2000 complexity points**.
+3. **Production Introspection Lock:** When running with `APP_ENV=production`, schema introspection is automatically disabled to protect API structure from public enumeration.

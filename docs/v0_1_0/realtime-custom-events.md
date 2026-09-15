@@ -1,161 +1,163 @@
-# ⚡ Real-Time Custom Events Guide
+# ⚡ Real-Time Custom Events & Signaling Guide
 
-**Version:** 0.1.0
-**Context:** Server-Side Scripting & Client Integration
+**Version:** 0.1.0  
+**Context:** Server-Side Scripting, Ephemeral Signaling & Real-Time Client Integration
 
-While ApexKit automatically broadcasts database changes (Insert/Update/Delete), many applications require **Ephemeral Events**—messages that need to be delivered instantly to connected clients but do not need to be permanently stored in the database.
-
-**Common Use Cases:**
-*   Chat "User is typing..." indicators.
-*   Progress bars for long-running background tasks or media processing.
-*   Live cursors or presence indicators.
-*   Custom notifications triggered by specific logic.
+In addition to broadcasting database lifecycle mutations (`Insert`, `Update`, `Delete`), ApexKit provides **Custom Ephemeral Events**. These allow developers to stream high-frequency messages (such as typing indicators, cursor coordinates, and long-running job progress updates) across connected clients without writing rows to SQLite or inflating disk I/O.
 
 ---
 
-## 1. Sending Events (Server-Side)
+## 1. Emitting Custom Events from Server-Side Scripts (`$realtime`)
 
-You can fire custom events from any **Script** (Manual Endpoint, Database Hook, or Cron Job) using the global `$realtime` object.
+You can emit real-time signals from any serverless script, webhook, database hook, or cron job using the global `$realtime` API.
 
-### The `$realtime` API
+### The `$realtime.send` Method
 
-```javascript
-await $realtime.send(channel, eventName, payload);
+```typescript
+await $realtime.send(channel: string, eventName: string, payload: any): Promise<boolean>;
 ```
 
-*   **`channel`** *(string)*: A logical grouping for listeners (e.g., `"room_1"`, `"notifications_user_5"`).
-*   **`eventName`** *(string)*: A label to identify the type of message (e.g., `"Typing"`, `"NewMessage"`).
-*   **`payload`** *(object)*: Any JSON-serializable data.
+* **`channel`** (`string`): Logical broadcast channel (e.g. `"room_101"`, `"user_notifications_5"`).
+* **`eventName`** (`string`): Action or event descriptor (e.g. `"UserTyping"`, `"JobProgress"`, `"Alert"`).
+* **`payload`** (`any`): JSON-serializable data object.
 
-### Example: Broadcast a Progress Update
+### Example: Emitting a Progress Update
 
-```javascript
-// Script Name: process_video
-// Trigger: manual
+```typescript
+// Script Name: transcode-media
+// Trigger: manual | Path: ./webhooks/transcode-media.ts
 
-export default async function(req) {
+export default async function (req: Request) {
     const { videoId } = await req.json();
 
-    // ... processing logic ...
+    // 1. Offload heavy work to background queue
+    await $queue.spawn(async (pid, jobReq) => {
+        const { id } = await jobReq.json();
 
-    // Notify listeners on the specific video channel
-    await $realtime.send(`video_${videoId}`, "ProcessingProgress", {
-        percent: 45,
-        status: "Encoding frames..."
-    });
+        for (let percent = 10; percent <= 100; percent += 20) {
+            await $util.sleep(1000);
 
-    return new Response({ success: true });
+            // Broadcast real-time progress update to listeners
+            await $realtime.send(`video_${id}`, "ProcessingProgress", {
+                videoId: id,
+                percentage: percent,
+                status: percent === 100 ? "completed" : "encoding"
+            });
+        }
+    }, { args: { id: videoId } });
+
+    return new Response({
+        success: true,
+        message: "Processing started",
+        channel: `video_${videoId}`
+    }, { status: 202 });
 }
 ```
 
 ---
 
-## 2. Receiving Events (Client-Side)
+## 2. Consuming Events on the Frontend
 
-ApexKit supports two methods for consuming these events: **WebSockets** (Bi-directional) and **Server-Sent Events** (Uni-directional).
+### Option A: WebSockets (`ApexKitRealtimeWSClient`) — Recommended
 
-### Option A: WebSockets (Recommended)
+WebSockets provide a full-duplex connection for bidirectional messaging, live filtering, and client-to-client signaling.
 
-WebSockets allow you to subscribe/unsubscribe dynamically and send signals back.
+```typescript
+import { ApexKit, ApexKitRealtimeWSClient } from '@apexkit/sdk';
 
-**Endpoint:** `ws://your-api.com/ws` (Scoped automatically if using a Tenant URL).
+const apex = new ApexKit('https://api.your-app.com');
+const realtime = new ApexKitRealtimeWSClient(apex.baseUrl, apex.getToken());
+realtime.connect();
 
-#### 1. Subscribe
-To listen to custom events, send a `Subscribe` message specifying the `channel`.
+// 1. Subscribe to a custom channel
+realtime.subscribe({
+  channel: 'video_42',
+  customEvent: 'ProcessingProgress' // Optional: filter for specific event name
+});
 
-```javascript
-const ws = new WebSocket("ws://localhost:5000/ws");
+// 2. Listen for incoming messages
+const unsubscribe = realtime.onEvent((msg) => {
+  if (msg.type === 'Custom' && msg.payload.event === 'ProcessingProgress') {
+    const { percentage, status } = msg.payload.data;
+    console.log(`Video 42 progress: ${percentage}% (${status})`);
+    
+    document.getElementById('progress-bar')!.style.width = `${percentage}%`;
+  }
+});
 
-ws.onopen = () => {
-    ws.send(JSON.stringify({
-        type: "Subscribe",
-        payload: {
-            channel: "room_1",           // Listen to this channel
-            custom_event: "ChatMessage"  // Optional: Filter for specific event name
-        }
-    }));
-};
-```
-
-#### 2. Handle Messages
-Incoming custom messages will have the type `Custom`.
-
-```javascript
-ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-
-    if (msg.type === "Custom") {
-        const { event: eventName, data } = msg.payload;
-        console.log(`Received ${eventName}:`, data);
-    }
-};
+// Cleanup when component unmounts
+// unsubscribe();
+// realtime.disconnect();
 ```
 
 ---
 
-### Option B: Server-Sent Events (SSE)
+### Option B: Server-Sent Events (`ApexKitRealtimeSSEClient`)
 
-SSE is simpler for read-only scenarios (e.g., live feeds) as it uses standard HTTP.
+For read-only streams over standard HTTP (e.g. notifications or live progress bars without a WebSocket dependency):
 
-**Endpoint:** `GET /sse`
+```typescript
+import { ApexKitRealtimeSSEClient } from '@apexkit/sdk';
 
-#### Usage
-Pass the `channel` and `event` as query parameters.
+const sse = new ApexKitRealtimeSSEClient('https://api.your-app.com', token);
 
-```javascript
-// Listen to all events on "room_1"
-const evtSource = new EventSource("http://localhost:5000/sse?channel=room_1");
+// Connect with specific channel & event filters
+sse.connect({
+  channel: 'video_42',
+  eventName: 'ProcessingProgress'
+});
 
-evtSource.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.type === "Custom") {
-        console.log("New Custom Event:", msg.payload.data);
-    }
-};
+const unsubscribe = sse.onEvent((eventData) => {
+  if (eventData.type === 'Custom') {
+    console.log('Progress received via SSE:', eventData.payload.data);
+  }
+});
+
+// Cleanup
+// unsubscribe();
+// sse.disconnect();
 ```
 
 ---
 
-## 3. Client-to-Client Signaling
+## 3. Client-to-Client Ephemeral Signaling (`sendSignal`)
 
-Sometimes you want to send a message directly from one Client to other Clients without a backend script (e.g., for "User is Typing" indicators). You can use the **`Signal`** command over WebSocket.
+When clients need to communicate directly (e.g. for chat presence, live collaborative cursors, or drawing coordinates), they can broadcast ephemeral messages without routing through a server-side script:
 
-**Client Code:**
-```javascript
-ws.send(JSON.stringify({
-    type: "Signal",
-    payload: {
-        channel: "room_1",
-        event: "UserTyping",
-        data: { username: "Alice" }
-    }
-}));
+```typescript
+// Client A: Broadcast cursor coordinates
+function onMouseMove(x: number, y: number) {
+  realtime.sendSignal('canvas_room_1', 'CursorMoved', {
+    userId: currentUser.id,
+    x,
+    y
+  });
+}
+
+// Client B: Listen for remote cursor movements
+realtime.subscribe({
+  channel: 'canvas_room_1',
+  customEvent: 'CursorMoved'
+});
+
+realtime.onEvent((msg) => {
+  if (msg.type === 'Custom' && msg.payload.event === 'CursorMoved') {
+    const { userId, x, y } = msg.payload.data;
+    renderRemoteCursor(userId, x, y);
+  }
+});
 ```
-*Note: Signals are not stored. They are broadcast immediately to all other subscribers of that channel in the same scope.*
 
 ---
 
-## 4. Security & Scoping
+## 4. Multi-Tenant Scoping & Channel Namespacing
 
-ApexKit automatically namespaces channels to prevent data leakage between tenants.
+ApexKit automatically namespaces channels based on the active execution scope to prevent cross-tenant message leakage:
 
-1.  **Root App**: Channel `general` becomes `root::general`.
-2.  **Tenant A**: Channel `general` becomes `tenant_A::general`.
-3.  **Sandbox B**: Channel `general` becomes `sandbox_B::general`.
+* **Root App:** `channel_name` ➔ `root::channel_name`
+* **Tenant `customer-a`:** `channel_name` ➔ `tenant_customer-a::channel_name`
+* **Sandbox `session-101`:** `channel_name` ➔ `sandbox_session-101::channel_name`
 
-**Impact:**
-*   A user in **Tenant A** cannot listen to or send signals to **Tenant B**, even if they use the same channel name.
-*   The Script Engine automatically applies the current execution's scope when calling `$realtime.send()`.
-*   The API middleware applies the scope based on the URL (e.g., `/tenant/xyz/ws`) when a client connects.
-
----
-
-## 5. Summary Checklist
-
-| Feature | Method | Context |
-| :--- | :--- | :--- |
-| **Send from Backend** | `$realtime.send()` | Any Script |
-| **Send from Frontend** | WS `Signal` | WebSocket Only |
-| **Listen (Complex)** | WebSocket | `Subscribe` command |
-| **Listen (Simple)** | SSE | `/sse?channel=...` |
-| **Isolation** | Automatic | Handled by Scope system |
+### Security Guarantees:
+1. **Zero Data Leakage:** Clients connected to `tenant_customer-a` cannot receive signals broadcast from `tenant_customer-b`, even if both use the channel name `"chat"`.
+2. **Transparent In-Script API:** Inside your server-side scripts, call `$realtime.send("room_1", ...)` normally; ApexKit automatically resolves the caller's scope prefix.

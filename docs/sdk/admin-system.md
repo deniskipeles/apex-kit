@@ -90,7 +90,7 @@ Create, delete, or publish isolated sandboxes programmatically.
 // Spin up a sandbox, copying schemas and up to 20 records per collection
 const sandbox = await apex.admins.createSandbox(
   'Feature-Test-Sandbox',
-  'Partial',
+  'partial',
   20
 );
 console.log(`Sandbox session created with ID: ${sandbox.id}`);
@@ -105,8 +105,12 @@ Upload and manage assets. ApexKit seamlessly handles public and signed URL gener
 ### Method Signatures
 - `files.list(page?, perPage?)`
 - `files.upload(file)`
+- `files.uploadResumable(file, options?)`
 - `files.delete(id)`
 - `files.getFileUrl(filename, options?)`
+- `files.getOpenGraphUrl(template, data, options?)`
+- `files.listOrphans()`
+- `files.resolveOrphans(action)`
 
 ### File Handling with Thumbnails & Signed URLs:
 
@@ -122,7 +126,8 @@ const publicUrl = apex.files.getFileUrl(uploadedFile.filename);
 const thumbUrl = apex.files.getFileUrl(uploadedFile.filename, {
     thumb: '300x300',
     format: 'webp',
-    quality: 85
+    quality: 85,
+    blur: 1.5
 });
 
 // 4. Resolve Private/Secure S3 URL with pre-signature (asynchronous)

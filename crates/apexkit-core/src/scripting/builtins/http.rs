@@ -22,7 +22,7 @@ fn get_http_semaphore(scope_str: &str) -> Arc<tokio::sync::Semaphore> {
     let limit = std::env::var("SCOPE_HTTP_LIMIT")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1); // Default to 1 concurrent fetch per scope
+        .unwrap_or(5); // Default to 5 concurrent fetch per scope
 
     let map = SCOPED_HTTP_SEMAPHORES.get_or_init(|| RwLock::new(HashMap::new()));
 
