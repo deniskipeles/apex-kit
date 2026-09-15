@@ -35,11 +35,11 @@ tracing = "0.1"
 utoipa = "5.4.0"
 
 # Storage & AWS
-aws-config = { version = "1.8.12", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-config = { version = "1.1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
 aws-sdk-s3 = { version = "1.1", default-features = false, features = ["rt-tokio"] }
 aws-credential-types = "1.1"
 aws-smithy-runtime-api = { version = "1.1", features = ["client"] }
-aws-smithy-types = "1.1"
+aws-smithy-types = "=1.2.6"
 http = "0.2.9" 
 
 # HTTP Clients
