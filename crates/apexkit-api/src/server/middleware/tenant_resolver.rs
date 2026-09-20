@@ -83,21 +83,27 @@ pub async fn tenant_resolver_middleware(
         }
 
         if tenant_id.is_empty() {
-            // Check if host is a raw IP Address or "localhost" to prevent wrong subdomain parsing
-            let is_ip_or_localhost =
-                host == "localhost" || host.parse::<std::net::IpAddr>().is_ok();
+            let clean_root = root_domain.split(':').next().unwrap_or("").trim();
 
-            if is_ip_or_localhost {
-                tenant_id = String::new();
-            } else if !root_domain.is_empty() && host == root_domain {
-                tenant_id = String::new();
-            } else {
-                let parts: Vec<&str> = host.split('.').collect();
-                if parts.len() >= 2 {
-                    let sub = parts[0];
-                    if !["localhost", "www", "api"].contains(&sub) {
-                        tenant_id = sub.to_string();
-                    }
+            let is_ip_or_localhost = host == "localhost"
+                || host == "127.0.0.1"
+                || host.parse::<std::net::IpAddr>().is_ok();
+
+            // Subdomains are ONLY calculated if a real, custom APEXKIT_ROOT_DOMAIN is configured (not localhost/IP)
+            let is_custom_root_domain = !clean_root.is_empty()
+                && clean_root != "localhost"
+                && clean_root != "127.0.0.1"
+                && clean_root.parse::<std::net::IpAddr>().is_err();
+
+            if is_custom_root_domain
+                && !is_ip_or_localhost
+                && host != clean_root
+                && host.ends_with(clean_root)
+            {
+                let prefix = host.strip_suffix(clean_root).unwrap().trim_end_matches('.');
+                let sub = prefix.split('.').last().unwrap_or(prefix);
+                if !sub.is_empty() && !["localhost", "www", "api"].contains(&sub) {
+                    tenant_id = sub.to_string();
                 }
             }
         }

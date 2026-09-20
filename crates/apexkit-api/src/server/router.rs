@@ -210,6 +210,27 @@ fn make_api_router() -> Router<AppState> {
             "/admin/system/reload",
             post(crate::api::system::reload_system),
         )
+        // --- Zero-Downtime Binary Upgrade & Rollback Endpoints ---
+        .route(
+            "/admin/system/upgrade",
+            post(crate::api::system::upgrade::upgrade_handler),
+        )
+        .route(
+            "/admin/system/upgrade/remote",
+            post(crate::api::system::upgrade::remote_upgrade_handler),
+        )
+        .route(
+            "/admin/system/upgrade/rollbacks",
+            get(crate::api::system::upgrade::list_rollbacks_handler),
+        )
+        .route(
+            "/admin/system/upgrade/rollback/{name}",
+            post(crate::api::system::upgrade::rollback_handler),
+        )
+        .route(
+            "/admin/system/upgrade/rollbacks/{name}",
+            axum::routing::delete(crate::api::system::upgrade::delete_rollback_handler),
+        )
         .route("/admin/backup", post(backup_routes::trigger_backup_handler))
         .route("/admin/backups", get(backup_routes::list_backups_handler))
         .route("/admin/wasm", get(wasm_management::list_wasm_handler))

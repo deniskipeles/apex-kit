@@ -367,11 +367,18 @@ async fn render_view_core(
         .get("host")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let host_name = host.split(':').next().unwrap_or("").trim();
+    let clean_root = root_domain.split(':').next().unwrap_or("").trim();
+
+    let is_subdomain_routing = !clean_root.is_empty()
+        && clean_root != "localhost"
+        && clean_root != "127.0.0.1"
+        && clean_root.parse::<std::net::IpAddr>().is_err()
+        && host_name.ends_with(clean_root)
+        && host_name != clean_root;
 
     let is_path_routing = match &scope {
-        EventScope::Tenant(_) | EventScope::Sandbox(_) => {
-            root_domain.is_empty() || host.contains(&root_domain)
-        }
+        EventScope::Tenant(_) | EventScope::Sandbox(_) => !is_subdomain_routing,
         _ => false,
     };
 

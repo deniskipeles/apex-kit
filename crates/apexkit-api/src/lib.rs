@@ -45,7 +45,6 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use moka::future::Cache;
 use std::env;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::sync::{RwLock, broadcast};
 
 use crate::replication::{
@@ -55,6 +54,16 @@ use crate::replication::{
 use crate::server::router::app_router;
 use crate::workspaces_manager::{sandbox::SandboxManager, tenant::TenantManager};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// Shared shutdown trigger channel for zero-downtime binary handover
+static SHUTDOWN_TX: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::OnceLock::new();
+
+pub fn trigger_graceful_shutdown() {
+    if let Some(tx) = SHUTDOWN_TX.get() {
+        let _ = tx.send(true);
+    }
+}
 
 // ============================================================================
 // VECTOR ENGINE BRIDGES
@@ -167,6 +176,17 @@ impl VectorProvider for FallbackVectorProvider {
 // ============================================================================
 
 pub async fn start(port: u16) {
+    // Pin APEXKIT_ROOT_DOMAIN to localhost:PORT if not provided
+    if env::var("APEXKIT_ROOT_DOMAIN")
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true)
+    {
+        let default_root = format!("localhost:{}", port);
+        unsafe {
+            env::set_var("APEXKIT_ROOT_DOMAIN", &default_root);
+        }
+    }
+
     system::logging::rotate_logs_on_startup("storage/system/logs.db", "storage/system/logs");
     // Assuming logging queue is exported from apexkit_core or your modules
     // let log_rx = apex_core::logging::init_logging_system();
@@ -529,10 +549,40 @@ pub async fn start(port: u16) {
         // Add the compression layer. It automatically negotiates brotli vs gzip via Accept-Encoding headers.
         .layer(CompressionLayer::new());
 
+    // Bind socket with SO_REUSEADDR and SO_REUSEPORT for seamless process handover
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(&addr).await.unwrap();
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4().expect("Failed to create IPv4 socket")
+    } else {
+        tokio::net::TcpSocket::new_v6().expect("Failed to create IPv6 socket")
+    };
 
-    tracing::info!("ApexKit listening on {}", listener.local_addr().unwrap());
+    socket
+        .set_reuseaddr(true)
+        .expect("Failed to set SO_REUSEADDR");
+    #[cfg(unix)]
+    let _ = socket.set_reuseport(true);
+
+    socket.bind(addr).expect("Failed to bind socket address");
+    let listener = socket.listen(2048).expect("Failed to listen on socket");
+
+    tracing::info!(
+        "ApexKit listening on {} (SO_REUSEPORT enabled)",
+        listener.local_addr().unwrap()
+    );
+
+    // Setup graceful shutdown watch channel
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let _ = SHUTDOWN_TX.set(shutdown_tx);
+
+    let graceful_signal = async move {
+        while !*shutdown_rx.borrow() {
+            if shutdown_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        tracing::info!("🛑 Graceful shutdown signal received. Draining in-flight connections...");
+    };
 
     if is_replica {
         tracing::info!("Running in REPLICA mode. Forwarding writes to Master via gRPC.");
@@ -540,6 +590,7 @@ pub async fn start(port: u16) {
             listener,
             axum_app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(graceful_signal)
         .await
         .unwrap();
     } else {
@@ -580,6 +631,7 @@ pub async fn start(port: u16) {
             listener,
             multiplexed_app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(graceful_signal)
         .await
         .unwrap();
     }

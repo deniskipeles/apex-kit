@@ -48,6 +48,7 @@ swalang
 # Build artifacts
 # ============================
 target/
+.intentionally-empty-file.o
 
 # Other
 .vscode/
@@ -68,3 +69,4 @@ static/dashboard/assets
 
 # Skip
 !admin-ui/src/features/sandboxes/pages/SandboxesListPage.tsx
+dist/

@@ -18,6 +18,7 @@ pub mod api_keys;
 pub mod backup;
 pub mod config;
 pub mod settings;
+pub mod upgrade;
 pub mod vscode_sync;
 pub mod wasm_management;
 

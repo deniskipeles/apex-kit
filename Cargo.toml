@@ -8,8 +8,38 @@ members = [
 resolver = "2"
 
 # Optimize for size and speed in release builds
+# 1. Standard Max-Performance Release (Default opt-level 3)
 [profile.release]
-strip = true        # Automatically strip symbols from the binary to reduce size
-lto = true          # Link Time Optimization (slower build, smaller/faster binary)
-codegen-units = 1   # Maximize optimization (slower build)
-panic = "abort"     # Remove stack unwind tables to reduce size further
+strip = true        # Automatically strip symbols from the binary
+lto = "thin"          # Full Link-Time Optimization
+codegen-units = 1   # Maximize compiler optimization
+panic = "abort"     # Remove stack unwind tables to reduce binary size
+
+# 2. Size-Optimized Release Profile (opt-level "s" with full ML/Search speed)
+[profile.release-small]
+inherits = "release"
+opt-level = "s"
+lto = "thin"        # Multi-threaded LTO: links across all CPU cores (3-5x faster)
+
+# Keep vector math, search, and TypeScript transpilation at max speed:
+[profile.release-small.package.candle-core]
+opt-level = 3
+
+[profile.release-small.package.candle-nn]
+opt-level = 3
+
+[profile.release-small.package.tantivy]
+opt-level = 3
+
+[profile.release-small.package.oxc]
+opt-level = 3
+
+# Maximize ONNX tensor operations & runtime throughput:
+[profile.release-small.package.ort]
+opt-level = 3
+
+[profile.release-small.package.ort-sys]
+opt-level = 3
+
+[profile.release-small.package.ndarray]
+opt-level = 3

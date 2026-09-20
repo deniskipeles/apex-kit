@@ -30,15 +30,22 @@ pub fn register_env<'js>(
         || host.starts_with("192.168.")
         || host.starts_with("10.");
 
+    let clean_root = root_domain.split(':').next().unwrap_or("").trim();
+    let is_custom_root = !clean_root.is_empty()
+        && clean_root != "localhost"
+        && clean_root != "127.0.0.1"
+        && clean_root.parse::<std::net::IpAddr>().is_err();
+
     // Check if the current host ends with the root domain but is not EXACTLY the root domain.
+    // Subdomains are only computed if a valid custom root domain is configured.
     // E.g. host = "abc.example.com", root_domain = "example.com".
-    let use_subdomain_routing = if !root_domain.is_empty() && !is_localhost {
-        host != root_domain && host.ends_with(&root_domain)
+    let use_subdomain_routing = if is_custom_root && !is_localhost {
+        host != clean_root && host.ends_with(clean_root)
     } else {
         false
     };
 
-    let root_url = if !root_domain.is_empty() && !is_localhost {
+    let root_url = if is_custom_root && !is_localhost {
         format!("{}://{}", scheme, root_domain)
     } else {
         base_url_clean.to_string()
