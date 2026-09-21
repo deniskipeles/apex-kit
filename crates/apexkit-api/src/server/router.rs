@@ -213,7 +213,8 @@ fn make_api_router() -> Router<AppState> {
         // --- Zero-Downtime Binary Upgrade & Rollback Endpoints ---
         .route(
             "/admin/system/upgrade",
-            post(crate::api::system::upgrade::upgrade_handler),
+            post(crate::api::system::upgrade::upgrade_handler)
+                .layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
         )
         .route(
             "/admin/system/upgrade/remote",
@@ -413,6 +414,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/write", post(replication::fallback_write_handler))
         .route("/snapshot", get(replication::fallback_snapshot_handler))
         .route("/sync-file", post(replication::fallback_sync_file_handler))
+        .route("/realtime", post(replication::fallback_realtime_handler))
         .route(
             "/ws",
             axum::routing::get(replication::ws_replication_handler),

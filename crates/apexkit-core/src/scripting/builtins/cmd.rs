@@ -284,6 +284,7 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
                                                     let event = DbEvent::Custom {
                                                         event: event_name.clone(),
                                                         data: json!({ "value": val, "raw": line }),
+                                                        is_local: true,
                                                         scope: EventScope::Channel(
                                                             scoped_channel.clone(),
                                                         ),

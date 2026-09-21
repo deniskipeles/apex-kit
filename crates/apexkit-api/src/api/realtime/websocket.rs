@@ -138,6 +138,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                         let event = DbEvent::Custom {
                                             event: req.event,
                                             data: req.data,
+                                            is_local: true,
                                             scope: EventScope::Channel(scoped_channel)
                                         };
                                         let _ = state.tx.send(event);

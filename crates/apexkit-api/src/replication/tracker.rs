@@ -100,7 +100,7 @@ pub async fn init_master_replica_tracker(tx: tokio::sync::broadcast::Sender<Chan
                     if event.db_name == "logs" { continue; }
                     let mut map = tracker.write().await;
                     for (rep_id, info) in map.iter_mut() {
-                        if info.scopes.contains(&event.scope) || event.scope == "root" {
+                        if info.scopes.contains(&event.scope) || event.scope == "root" || event.db_name == "__realtime__" {
                             let pb_event = pb::DbChangeEvent { scope: event.scope.clone(), db_name: event.db_name.clone(), changeset: event.changeset.clone() };
                             if let Some(tx) = &info.tx {
                                 if tx.try_send(Ok(pb_event.clone())).is_err() {

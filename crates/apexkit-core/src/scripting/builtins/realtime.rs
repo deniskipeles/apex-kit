@@ -34,6 +34,7 @@ pub fn register_realtime<'js>(
                 let _ = tx.send(DbEvent::Custom {
                     event: evt,
                     data,
+                    is_local: true,
                     scope: EventScope::Channel(scoped_chan),
                 });
 

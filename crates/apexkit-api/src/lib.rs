@@ -25,17 +25,10 @@ use tower_http::compression::CompressionLayer;
 pub use utils::{BaseUrl, DatabaseConnection, StorageConnection};
 
 use apexkit_core::{
-    Db, VectorProvider,
-    cache::CachedDb,
-    database::{
+    Db, VectorProvider, cache::CachedDb, database::{
         sqlite::connections::a_new_database_connection,
         traits::{CollectionStore, SearchStore, VectorStore},
-    },
-    models::{ChangesetEvent, ai::CreateActionReq, script::CreateScriptReq},
-    realtime,
-    security::vault::{MasterKey, Vault},
-    storage::StorageBackend,
-    workers as jobs,
+    }, models::{ChangesetEvent, ai::CreateActionReq, script::CreateScriptReq}, security::vault::{MasterKey, Vault}, storage::StorageBackend, workers as jobs,
 };
 use apexkit_vector::{CandleEmbedder, EmbeddingModelConfig, VectorEngine};
 use async_graphql::Value;
@@ -213,7 +206,7 @@ pub async fn start(port: u16) {
         new_key
     });
 
-    let master_key = MasterKey::from_string(master_key_str)
+    let master_key = MasterKey::from_string(master_key_str.clone())
         .expect("Invalid Master Key format (must be 32 bytes base64)");
     let vault = Arc::new(Vault::new(&master_key));
 
@@ -415,7 +408,7 @@ pub async fn start(port: u16) {
     });
 
     let job_queue = jobs::start_background_worker(job_context, vault.clone());
-    let (tx, _rx) = broadcast::channel::<realtime::DbEvent>(100);
+    let (tx, _rx) = broadcast::channel::<apexkit_core::realtime::DbEvent>(100);
 
     let storage: Arc<dyn StorageBackend> = Arc::new(api::storage::DynamicStorage::new(
         cached_db.clone(),
@@ -478,6 +471,26 @@ pub async fn start(port: u16) {
         let state_clone = state.clone();
         let mut rx = crate::replication::get_db_sync_tx().subscribe();
 
+        // [NEW]: Replica Upstream Custom Event Forwarder
+        let mut replica_rt_rx = state.tx.subscribe();
+        let master_url = m_url.clone();
+        let master_key = master_key_str.clone();
+        
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            while let Ok(evt) = replica_rt_rx.recv().await {
+                // Only forward Custom events that originated LOCALLY on this node.
+                if let apexkit_core::realtime::DbEvent::Custom { is_local: true, .. } = &evt {
+                    let url = format!("{}/replication/realtime", master_url.trim_end_matches('/'));
+                    let _ = client.post(&url)
+                        .header("Authorization", format!("Bearer {}", master_key))
+                        .json(&evt)
+                        .send()
+                        .await;
+                }
+            }
+        });
+
         tokio::spawn(async move {
             crate::replication::ws_streamer::start_event_streamer(m_url, Some(state_clone.clone()))
                 .await;
@@ -487,6 +500,45 @@ pub async fn start(port: u16) {
         tokio::spawn(async move {
             loop {
                 if let Ok(event) = rx.recv().await {
+                    
+                    // [NEW]: Catch tunneled Realtime events and broadcast them locally
+                    if event.db_name == "__realtime__" {
+                        if let Ok(rt_evt) = serde_json::from_slice::<apexkit_core::realtime::DbEvent>(&event.changeset) {
+                            
+                            // 1. Reconstruct Scope from the Changeset string
+                            let mapped_scope = if event.scope == "root" {
+                                apexkit_core::realtime::EventScope::Root
+                            } else if let Some(id) = event.scope.strip_prefix("tenant:") {
+                                apexkit_core::realtime::EventScope::Tenant(id.to_string())
+                            } else if let Some(id) = event.scope.strip_prefix("sandbox:") {
+                                apexkit_core::realtime::EventScope::Sandbox(id.to_string())
+                            } else if let Some(id) = event.scope.strip_prefix("channel:") {
+                                apexkit_core::realtime::EventScope::Channel(id.to_string())
+                            } else {
+                                apexkit_core::realtime::EventScope::Root
+                            };
+
+                            // 2. Rebuild event with mapped scope and mark is_local = false to prevent echo loop
+                            let final_evt = match rt_evt {
+                                apexkit_core::realtime::DbEvent::Insert { collection_id, record_id, data, .. } => {
+                                    apexkit_core::realtime::DbEvent::Insert { collection_id, record_id, data, scope: mapped_scope }
+                                }
+                                apexkit_core::realtime::DbEvent::Update { collection_id, record_id, data, .. } => {
+                                    apexkit_core::realtime::DbEvent::Update { collection_id, record_id, data, scope: mapped_scope }
+                                }
+                                apexkit_core::realtime::DbEvent::Delete { collection_id, record_id, .. } => {
+                                    apexkit_core::realtime::DbEvent::Delete { collection_id, record_id, scope: mapped_scope }
+                                }
+                                apexkit_core::realtime::DbEvent::Custom { event: e, data, .. } => {
+                                    apexkit_core::realtime::DbEvent::Custom { event: e, data, is_local: false, scope: mapped_scope }
+                                }
+                            };
+
+                            let _ = state_for_apply.tx.send(final_evt);
+                        }
+                        continue;
+                    }
+
                     let db_path =
                         crate::replication::get_db_path_from_scope(&event.scope, &event.db_name);
                     if db_path.is_empty() || db_path.ends_with("logs.db") {
@@ -520,6 +572,37 @@ pub async fn start(port: u16) {
                         state_clone.sandbox_manager.invalidate(sid).await;
                     }
                 }
+            }
+        });
+    }
+
+    if !is_replica {
+        // [NEW]: Master Downstream Realtime Forwarder
+        let mut master_rt_rx = state.tx.subscribe();
+        let repl_tx = sqlite_event_tx.clone();
+        
+        tokio::spawn(async move {
+            while let Ok(evt) = master_rt_rx.recv().await {
+                let scope_str = match &evt {
+                    apexkit_core::realtime::DbEvent::Insert { scope, .. } 
+                    | apexkit_core::realtime::DbEvent::Update { scope, .. } 
+                    | apexkit_core::realtime::DbEvent::Delete { scope, .. } 
+                    | apexkit_core::realtime::DbEvent::Custom { scope, .. } => {
+                        match scope {
+                            apexkit_core::realtime::EventScope::Root => "root".to_string(),
+                            apexkit_core::realtime::EventScope::Tenant(id) => format!("tenant:{}", id),
+                            apexkit_core::realtime::EventScope::Sandbox(id) => format!("sandbox:{}", id),
+                            apexkit_core::realtime::EventScope::Channel(c) => format!("channel:{}", c),
+                        }
+                    }
+                };
+                
+                // Wrap the Realtime Event as a fake SQLite Changeset payload
+                let _ = repl_tx.send(apexkit_core::models::ChangesetEvent {
+                    scope: scope_str,
+                    db_name: "__realtime__".to_string(),
+                    changeset: serde_json::to_vec(&evt).unwrap_or_default(),
+                });
             }
         });
     }

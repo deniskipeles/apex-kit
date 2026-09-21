@@ -64,7 +64,7 @@ pub async fn sse_handler(
     let stream = async_stream::stream! {
         while let Ok(msg) = rx.recv().await {
             let should_yield = match &msg {
-                DbEvent::Custom { event, scope, data: _ } => {
+                DbEvent::Custom { event, scope, .. } => {
                     if let Some(req_evt) = &target_event
                         && req_evt != event { continue; }
 

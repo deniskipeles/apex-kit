@@ -18,27 +18,28 @@ pub enum DbEvent {
         collection_id: i64,
         record_id: i64,
         data: Value,
-        #[serde(skip_serializing)]
         scope: EventScope,
     },
     Update {
         collection_id: i64,
         record_id: i64,
         data: Value,
-        #[serde(skip_serializing)]
         scope: EventScope,
     },
     Delete {
         collection_id: i64,
         record_id: i64,
-        #[serde(skip_serializing)]
         scope: EventScope,
     },
     // [NEW] Custom Event for Scripting
     Custom {
         event: String, // e.g. "UserTyping"
         data: Value,   // e.g. { "user": "Alice" }
-        #[serde(skip_serializing)]
+        #[serde(skip)]
+        #[serde(default = "default_true")]
+        is_local: bool, // Prevents infinite echo loops across distributed nodes
         scope: EventScope, // e.g. Channel("room_1")
     },
 }
+
+fn default_true() -> bool { true }

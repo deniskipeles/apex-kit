@@ -86,6 +86,16 @@ pub async fn fallback_sync_file_handler(
     }
 }
 
+pub async fn fallback_realtime_handler(
+    State(state): State<AppState>,
+    axum::extract::Json(event): axum::extract::Json<apexkit_core::realtime::DbEvent>,
+) -> Result<axum::http::StatusCode, axum::http::StatusCode> {
+    // Master receives a custom event from a Replica and broadcasts it locally.
+    // The Master's local listener will then automatically push this down to ALL other Replicas.
+    let _ = state.tx.send(event);
+    Ok(axum::http::StatusCode::OK)
+}
+
 pub async fn ws_replication_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
