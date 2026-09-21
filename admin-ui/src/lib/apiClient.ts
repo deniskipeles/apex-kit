@@ -14,6 +14,8 @@ import {
   SiteFile,
   Tenant,
   SandboxMetadata,
+  UpgradeResponse,
+  RollbackItem,
 } from '../types';
 import { ApexKit as PowerBase, ApexKitRealtimeWSClient as ApexKitRealtime } from './sdk';
 
@@ -454,6 +456,68 @@ export const apiClient = {
     fetchWasm: async (url: string, name?: string | undefined) =>
       await pb.admins.fetchWasm(url, name),
     deleteWasm: async (name: string) => await pb.admins.deleteWasm(name),
+
+    // --- HOST BINARY UPGRADE & ROLLBACK METHODS ---
+    listRollbacks: async (): Promise<RollbackItem[]> => {
+      const res = await rawFetch('/admin/system/upgrade/rollbacks');
+      return await res.json();
+    },
+    uploadUpgrade: async (file: File, sha256?: string): Promise<UpgradeResponse> => {
+      const formData = new FormData();
+      formData.append('file', file);
+      if (sha256 && sha256.trim()) {
+        formData.append('sha256', sha256.trim());
+      }
+      return await rawFetchWithBody('/admin/system/upgrade', formData);
+    },
+    remoteUpgrade: async (url: string, sha256?: string): Promise<UpgradeResponse> => {
+      let baseUrl = apiUrl;
+      const token = localStorage.getItem(APEX_TOKEN);
+      const res = await fetch(`${baseUrl}/api/v1/admin/system/upgrade/remote`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ url, sha256: sha256?.trim() || undefined }),
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || res.statusText);
+      }
+      return await res.json();
+    },
+    rollback: async (name: string): Promise<UpgradeResponse> => {
+      let baseUrl = apiUrl;
+      const token = localStorage.getItem(APEX_TOKEN);
+      const res = await fetch(
+        `${baseUrl}/api/v1/admin/system/upgrade/rollback/${encodeURIComponent(name)}`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || res.statusText);
+      }
+      return await res.json();
+    },
+    deleteRollback: async (name: string): Promise<void> => {
+      let baseUrl = apiUrl;
+      const token = localStorage.getItem(APEX_TOKEN);
+      const res = await fetch(
+        `${baseUrl}/api/v1/admin/system/upgrade/rollbacks/${encodeURIComponent(name)}`,
+        {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || res.statusText);
+      }
+    },
   },
 
   auth: {

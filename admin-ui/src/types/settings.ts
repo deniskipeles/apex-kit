@@ -170,3 +170,16 @@ export interface SandboxMetadata {
   current_ai_requests: number;
   max_ai_requests: number;
 }
+
+// --- NEW: BINARY UPGRADE & ROLLBACK TYPES ---
+export interface RollbackItem {
+  name: string;
+  size: number;
+  created_at: string;
+}
+
+export interface UpgradeResponse {
+  success: boolean;
+  message: string;
+  backup_name?: string;
+}

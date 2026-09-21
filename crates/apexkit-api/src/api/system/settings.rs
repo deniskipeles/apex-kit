@@ -376,6 +376,10 @@ pub async fn update_settings(
         db.set_config("security", &serde_json::to_value(new_sec).unwrap(), false)
             .await
             .map_err(|e| AppError::UnknownError(e.to_string()))?;
+        state
+            .root_script_cache
+            .invalidate("system:security_config")
+            .await;
     }
 
     // 5. Update Cron Jobs

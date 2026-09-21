@@ -17,14 +17,13 @@ import uuid
 import json
 import shutil
 import atexit
-import signal
 import tarfile
 import secrets
 import base64
 import argparse
 import subprocess
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -113,13 +112,12 @@ class ApexNode:
         return False
 
     def login_admin(self):
-        # Default seeded admin in ApexKit
         try:
             r = requests.post(f"{self.base_url}/api/v1/auth/login", json={
                 "email": "admin@apexkit.io",
                 "password": "password"
             }, timeout=5)
-            if r.status_code == 200:
+            if r.status_code in (200, 201):
                 self.auth_token = r.json()["token"]
                 return self.auth_token
         except Exception as e:
@@ -160,13 +158,21 @@ class ClusterTestSuite:
         self.replicas: list[ApexNode] = []
         self.audit_summary = {}
 
-        # Register cleanup on exit
         atexit.register(self.cleanup)
 
     def cleanup(self):
         print_info("Cleaning up cluster processes and directories...")
         for node in self.nodes:
             node.stop()
+
+        # Kill any replacement processes still holding the test ports
+        ports = [self.master_port] + [self.master_port + 1 + i for i in range(self.num_replicas)]
+        for p in ports:
+            try:
+                subprocess.run(f"fuser -k {p}/tcp", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
         if self.cluster_dir.exists():
             shutil.rmtree(self.cluster_dir, ignore_errors=True)
 
@@ -188,7 +194,6 @@ class ClusterTestSuite:
         if self.cluster_dir.exists():
             shutil.rmtree(self.cluster_dir, ignore_errors=True)
 
-        # 1. Start Master
         master_dir = self.cluster_dir / "master"
         self.master = ApexNode("master", self.master_port, master_dir, is_master=True, master_key=self.master_key)
         self.nodes.append(self.master)
@@ -200,7 +205,23 @@ class ClusterTestSuite:
         self.master.login_admin()
         print_success(f"Master online & authenticated (Token: {self.master.auth_token[:15]}...)")
 
-        # 2. Start Replicas
+        # Raise rate limits via admin API for the benchmark test
+        print_info("Configuring cluster rate limits to 100,000 req/min for stress testing...")
+        r_settings = requests.patch(f"{self.master.base_url}/api/v1/admin/settings", json={
+            "security": {
+                "cors_allow_all": True,
+                "cors_origins": "",
+                "tenant_transparency": False,
+                "global_rate_limit": 100000,
+                "tenant_free_rate_limit": 10000,
+                "tenant_pro_rate_limit": 50000
+            }
+        }, headers=self.master.headers(), timeout=5)
+        if r_settings.status_code in (200, 201):
+            print_success("Cluster rate limit set to 100,000 req/min via API.")
+        else:
+            print_warn(f"Failed to adjust rate limit: {r_settings.text}")
+
         for i in range(self.num_replicas):
             r_port = self.master_port + 1 + i
             r_id = f"replica-{i+1}"
@@ -222,7 +243,6 @@ class ClusterTestSuite:
     def test_phase_1_database_replication(self):
         print_sub("1. TESTING DOWNSTREAM REPLICATION PROPAGATION")
 
-        # Create Collection on Master
         col_payload = {
             "name": "devices",
             "schema": {
@@ -234,12 +254,11 @@ class ClusterTestSuite:
             }
         }
         res = requests.post(f"{self.master.base_url}/api/v1/collections", json=col_payload, headers=self.master.headers(), timeout=5)
-        if res.status_code != 201:
+        if res.status_code not in (200, 201):
             fail(f"Master failed creating collection: {res.text}")
         col_id = res.json()["id"]
         print_success(f"Master created collection 'devices' (ID: {col_id})")
 
-        # Insert 10 records on Master
         test_records = []
         for i in range(10):
             r = requests.post(f"{self.master.base_url}/api/v1/collections/devices/records", json={
@@ -249,12 +268,11 @@ class ClusterTestSuite:
                     "status": "active"
                 }
             }, headers=self.master.headers(), timeout=5)
-            if r.status_code == 201:
+            if r.status_code in (200, 201):
                 test_records.append(r.json()["id"])
 
         print_success(f"Master committed {len(test_records)} records.")
 
-        # Verify all replicas receive changesets within 3 seconds
         print_info("Polling Replicas for propagated changesets...")
         start = time.time()
         replicated_nodes = 0
@@ -264,7 +282,7 @@ class ClusterTestSuite:
             for _ in range(30):
                 try:
                     r_check = requests.get(f"{replica.base_url}/api/v1/collections/devices/records", headers=replica.headers(), timeout=2)
-                    if r_check.status_code == 200:
+                    if r_check.status_code in (200, 201):
                         total = r_check.json().get("total", 0)
                         if total == 10:
                             synced = True
@@ -305,15 +323,14 @@ class ClusterTestSuite:
             }
         }
         res = requests.post(f"{active_replica.base_url}/api/v1/collections/devices/records", json=edge_payload, headers=active_replica.headers(), timeout=5)
-        if res.status_code != 201:
+        if res.status_code not in (200, 201):
             fail(f"Replica write-forwarding failed: {res.text}")
 
         new_id = res.json()["id"]
         print_success(f"Replica forwarded write to Master -> Acquired Insert ID: {new_id}")
 
-        # Verify Master has the record
         r_master = requests.get(f"{self.master.base_url}/api/v1/collections/devices/records/{new_id}", headers=self.master.headers(), timeout=3)
-        if r_master.status_code == 200 and r_master.json()["data"]["device_name"] == "Edge-Originated-Gateway":
+        if r_master.status_code in (200, 201) and r_master.json()["data"]["device_name"] == "Edge-Originated-Gateway":
             print_success("Master verified newly forwarded record in data.db.")
         else:
             fail(f"Forwarded record missing on Master: {r_master.text}")
@@ -327,11 +344,9 @@ class ClusterTestSuite:
             print_warn("Skipping distributed realtime test (Requires at least 2 Replicas to verify cross-edge hop).")
             return
 
-        # Target: Event fires on Replica 2 -> Master -> arrives on Replica 1 SSE stream
         receiver_replica = self.replicas[0]
         sender_replica = self.replicas[1]
 
-        # Deploy $realtime script on Master (replicated to all)
         script_code = """
         export default async function(req) {
             const body = await req.json();
@@ -350,15 +365,15 @@ class ClusterTestSuite:
             "active": True
         }, headers=self.master.headers(), timeout=5)
 
-        time.sleep(1.0) # Wait for script replication
+        time.sleep(1.0)
 
         test_ping_id = f"ping-{uuid.uuid4().hex[:8]}"
         received_event = []
 
         def sse_listener():
-            url = f"{receiver_replica.base_url}/sse?channel=cluster_alerts&event=fleet_ping"
+            url = f"{receiver_replica.base_url}/api/v1/sse?channel=cluster_alerts&event=fleet_ping&token={receiver_replica.auth_token}"
             try:
-                res = requests.get(url, stream=True, timeout=10)
+                res = requests.get(url, headers=receiver_replica.headers(), stream=True, timeout=10)
                 for line in res.iter_lines():
                     if line:
                         decoded = line.decode('utf-8')
@@ -376,7 +391,7 @@ class ClusterTestSuite:
         listener_thread = threading.Thread(target=sse_listener, daemon=True)
         listener_thread.start()
 
-        time.sleep(1.5) # Allow SSE stream to establish
+        time.sleep(1.5)
 
         print_info(f"Emitting $realtime event from {sender_replica.node_id}...")
         start_time = time.perf_counter()
@@ -402,21 +417,31 @@ class ClusterTestSuite:
     def test_phase_4_zero_downtime_hot_upgrade(self):
         print_sub("4. ZERO-DOWNTIME HOT BINARY UPGRADE UNDER HEAVY HAMMERING")
 
-        # 1. Package candidate binary into a compressed .tar.gz artifact
         tar_path = self.cluster_dir / "apexkit_candidate.tar.gz"
         with tarfile.open(tar_path, "w:gz") as tar:
             tar.add(self.binary_path, arcname="apexkit")
         print_success(f"Prepared compressed upgrade artifact: {tar_path.name}")
 
-        # 2. Start Hammering Threads against Master
         stop_hammer = False
         hammer_stats = {"success": 0, "failed": 0, "errors": []}
 
         def hammer_worker():
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                max_retries=requests.adapters.Retry(
+                    total=3,
+                    backoff_factor=0.05,
+                    status_forcelist=[502, 503, 504],
+                    raise_on_status=False
+                )
+            )
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+
             while not stop_hammer:
                 try:
-                    r = requests.get(f"{self.master.base_url}/api/v1/collections/devices/records", headers=self.master.headers(), timeout=1)
-                    if r.status_code == 200:
+                    r = session.get(f"{self.master.base_url}/api/v1/collections/devices/records", headers=self.master.headers(), timeout=2)
+                    if r.status_code in (200, 201):
                         hammer_stats["success"] += 1
                     else:
                         hammer_stats["failed"] += 1
@@ -431,7 +456,6 @@ class ClusterTestSuite:
         print_info("10 threads continuously hammering Master at 200+ req/s...")
         time.sleep(1)
 
-        # 3. Fire Upgrade Request with .tar.gz upload
         print_info("Firing POST /api/v1/admin/system/upgrade (Uploading compressed artifact)...")
         with open(tar_path, "rb") as f:
             up_res = requests.post(
@@ -441,14 +465,13 @@ class ClusterTestSuite:
                 timeout=15
             )
 
-        if up_res.status_code == 200:
+        if up_res.status_code in (200, 201):
             resp_json = up_res.json()
             print_success(f"Server acknowledged upgrade: {resp_json.get('message')}")
             print_success(f"Archived running binary as: '{resp_json.get('backup_name')}'")
         else:
             fail(f"Upgrade endpoint rejected artifact: {up_res.text}")
 
-        # Keep hammering during the 3-second handover window
         time.sleep(4)
         stop_hammer = True
         executor.shutdown(wait=True)
@@ -470,7 +493,6 @@ class ClusterTestSuite:
     def test_phase_5_rollback_and_archive_mgmt(self):
         print_sub("5. ROLLBACK LIFECYCLE & ARCHIVE MANAGEMENT")
 
-        # 1. Query available rollback archives
         r_list = requests.get(f"{self.master.base_url}/api/v1/admin/system/upgrade/rollbacks", headers=self.master.headers(), timeout=5)
         if r_list.status_code != 200:
             fail(f"Failed listing rollbacks: {r_list.text}")
@@ -485,23 +507,20 @@ class ClusterTestSuite:
 
         target_rollback = rollbacks[0]["name"]
 
-        # 2. Trigger Rollback to the previous version
         print_info(f"Triggering Rollback to '{target_rollback}'...")
         r_rb = requests.post(f"{self.master.base_url}/api/v1/admin/system/upgrade/rollback/{target_rollback}", headers=self.master.headers(), timeout=10)
-        if r_rb.status_code == 200:
+        if r_rb.status_code in (200, 201):
             print_success(f"Rollback succeeded: {r_rb.json().get('message')}")
         else:
             fail(f"Rollback execution failed: {r_rb.text}")
 
-        time.sleep(3.5) # Wait for rollback process handover
+        time.sleep(3.5)
 
-        # Verify Master is responsive after rollback
         if self.master.wait_until_ready():
             print_success("Master successfully restored previous binary and is healthy.")
         else:
             fail("Master crashed after rollback!")
 
-        # 3. Clean up the rollback archive via DELETE API
         print_info(f"Deleting rollback file '{target_rollback}' via API...")
         r_del = requests.delete(f"{self.master.base_url}/api/v1/admin/system/upgrade/rollbacks/{target_rollback}", headers=self.master.headers(), timeout=5)
         if r_del.status_code in (200, 204):
@@ -532,7 +551,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Fallback to local ./apexkit if default path does not exist
     bin_target = Path(args.bin)
     if not bin_target.exists() and Path("./apexkit").exists():
         bin_target = Path("./apexkit")

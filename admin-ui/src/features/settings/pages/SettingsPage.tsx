@@ -9,6 +9,7 @@ import {
   Key,
   Mail,
   Globe,
+  ArrowUpCircle,
 } from 'lucide-react';
 import { Button } from '../../../components/ui/Elements';
 import { GeneralSettings } from '../components/GeneralSettings';
@@ -26,6 +27,7 @@ import { AppSettings } from '../../../types';
 import { useToast } from '../../../components/feedback/Toast';
 import { OauthSettings } from '../components/OauthSettings';
 import { apiClient } from '@/src/lib/apiClient';
+import { UpgradeSettings } from '../components/UpgradeSettings';
 
 type Tab =
   | 'general'
@@ -38,7 +40,8 @@ type Tab =
   | 'ai'
   | 'config'
   | 'hosting'
-  | 'wasm';
+  | 'wasm'
+  | 'upgrade';
 
 export const SettingsPage = () => {
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -102,7 +105,14 @@ export const SettingsPage = () => {
     { id: 'hosting', label: 'Static Hosting', icon: Globe, desc: 'Deploy frontend assets' },
   ];
 
+  // Root-only operations
   if (apiClient.getScope().type === 'root') {
+    tabs.push({
+      id: 'upgrade',
+      label: 'Host Binary & Rollbacks',
+      icon: ArrowUpCircle,
+      desc: 'Zero-downtime upgrades & downgrades',
+    });
     tabs.push({
       id: 'wasm',
       label: 'WASM Binaries',
@@ -231,6 +241,7 @@ export const SettingsPage = () => {
             )}
             {activeTab === 'hosting' && <SiteSettings />}
             {activeTab === 'wasm' && <WasmSettings />}
+            {activeTab === 'upgrade' && <UpgradeSettings />}
           </div>
         </div>
       </div>
