@@ -3,37 +3,70 @@ FROM ubuntu:24.04
 # Disable interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Install dependencies (using msmtp-mta to auto-create the sendmail symlink)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Default version if not overridden by .env or exported environment
+ARG VERSION=latest
+ENV VERSION=${VERSION}
+
+# 1. Install dependencies
+# - procps: provides pgrep/pkill and coreutils tail for process supervision
+# - msmtp & msmtp-mta: provides sendmail transport for email delivery
+# - ca-certificates, curl, jq, tar, gzip: required for downloads, backups, and restores
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
     curl \
     jq \
+    ca-certificates \
     msmtp \
     msmtp-mta \
-    ca-certificates \
     tar \
-    rsync \
-    bash \
-    && rm -rf /var/lib/apt/lists/*
+    gzip \
+    procps && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 2. Download & Extract Logic (Public Repository)
-# Fetches the latest 'linux-gnu.tar.gz' archive directly from your public GitHub releases.
-RUN echo "Downloading latest public release archive..." && \
-    LATEST_URL=$(curl -s https://api.github.com/repos/deniskipeles/apexkit/releases/latest | \
-    jq -r '.assets[] | select(.name | contains("linux-gnu.tar.gz")) | .browser_download_url') && \
-    echo "URL: $LATEST_URL" && \
-    curl -L -o apexkit.tar.gz "$LATEST_URL" && \
-    echo "Extracting binary..." && \
-    tar -xzf apexkit.tar.gz && \
-    mv apexkit /usr/local/bin/apexkit && \
-    chmod +x /usr/local/bin/apexkit && \
-    rm apexkit.tar.gz
+ENV PATH="/app:$PATH"
+
+# 2. Pre-download baseline binary at build time (defaults to latest or specified ARG)
+RUN VER="${VERSION:-latest}" && \
+    if [ "$VER" = "latest" ]; then \
+      URL="https://github.com/deniskipeles/apexkit/releases/latest/download/apexkit-x86_64-unknown-linux-gnu.tar.gz"; \
+    else \
+      URL="https://github.com/deniskipeles/apexkit/releases/download/${VER}/apexkit-x86_64-unknown-linux-gnu.tar.gz"; \
+    fi && \
+    echo "Downloading ApexKit (${VER})..." && \
+    curl -fL -o /tmp/apexkit.tar.gz "$URL" && \
+    tar -xzf /tmp/apexkit.tar.gz -C /app && \
+    chmod +x /app/apexkit && \
+    echo "$VER" > /app/.version && \
+    rm -f /tmp/apexkit.tar.gz
 
 # 3. Prepare storage
 RUN mkdir -p storage/system storage/tenants storage/sandboxes storage/backups
 
-# 4. Run with dynamic port and Replica ID injection
-#    - Cloud providers (like Koyeb/Render) provide the $PORT variable automatically.
-#    - If $APEX_REPLICA_ID is set, it forces the app to use that ID to survive disk wipes.
-CMD ["sh", "-c", "if [ -n \"$APEX_REPLICA_ID\" ]; then mkdir -p storage/system && echo \"$APEX_REPLICA_ID\" > storage/system/.replica_id && echo \"[Init] Injected static Replica ID: $APEX_REPLICA_ID\"; fi; exec apexkit --port ${PORT:-5000}"]
+# 4. Run with dynamic port, .env / export VERSION resolution, and clean supervisor
+CMD ["sh", "-c", "\
+if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+VER=\"${VERSION:-latest}\"; \
+if [ ! -f /app/apexkit ] || [ \"$(cat /app/.version 2>/dev/null)\" != \"$VER\" ]; then \
+  if [ \"$VER\" = \"latest\" ]; then \
+    URL=\"https://github.com/deniskipeles/apexkit/releases/latest/download/apexkit-x86_64-unknown-linux-gnu.tar.gz\"; \
+  else \
+    URL=\"https://github.com/deniskipeles/apexkit/releases/download/${VER}/apexkit-x86_64-unknown-linux-gnu.tar.gz\"; \
+  fi; \
+  echo \"[Init] Fetching ApexKit (${VER}) from .env / export...\"; \
+  curl -fL -o /tmp/apexkit.tar.gz \"$URL\" && tar -xzf /tmp/apexkit.tar.gz -C /app && chmod +x /app/apexkit && echo \"$VER\" > /app/.version && rm -f /tmp/apexkit.tar.gz || echo \"[Warning] Failed to fetch ${VER}, using existing binary\"; \
+fi; \
+apexkit --port ${PORT:-5000} & \
+APP_PID=$!; \
+while true; do \
+  tail --pid=$APP_PID -f /dev/null 2>/dev/null; \
+  sleep 2; \
+  NEW_PID=$(pgrep -x apexkit | head -n 1); \
+  if [ -n \"$NEW_PID\" ] && [ \"$NEW_PID\" != \"$APP_PID\" ]; then \
+    echo \"[Supervisor] Live upgrade handover complete. Supervising replacement (PID: $NEW_PID)\"; \
+    APP_PID=$NEW_PID; \
+    continue; \
+  fi; \
+  break; \
+done"]

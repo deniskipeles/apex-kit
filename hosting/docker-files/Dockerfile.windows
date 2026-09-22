@@ -1,0 +1,16 @@
+# Must be built and run on a Windows host
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022
+
+WORKDIR C:\\app
+
+# In Windows containers, PowerShell or CMD is used
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
+
+# Download your Windows release binary
+RUN Invoke-WebRequest -Uri "https://github.com/deniskipeles/apexkit/releases/latest/download/apexkit-x86_64-pc-windows-msvc.zip" -OutFile "apexkit.zip"; \
+    Expand-Archive -Path "apexkit.zip" -DestinationPath "C:\\app"; \
+    Remove-Item "apexkit.zip"
+
+EXPOSE 5000
+
+CMD ["apexkit.exe", "--port", "5000"]

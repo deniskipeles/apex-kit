@@ -1,0 +1,54 @@
+FROM alpine:3.19
+
+# Default version if not overridden by .env or exported environment
+ARG VERSION=v0.1.0-beta.1
+ENV VERSION=${VERSION}
+
+# 1. Install dependencies
+RUN apk add --no-cache curl jq msmtp ca-certificates tar procps coreutils gcompat libstdc++ && \
+    ln -sf /usr/bin/msmtp /usr/sbin/sendmail
+
+WORKDIR /app
+
+ENV PATH="/app:$PATH"
+
+# 2. Pre-download baseline binary at build time (defaults to v0.1.0-beta.1)
+RUN VER="${VERSION:-v0.1.0-beta.1}" && \
+    echo "Downloading ApexKit release archive from Hugging Face (${VER})..." && \
+    URL="https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/${VER}/apexkit-x86_64-unknown-linux-musl-perf.tar.gz?download=true" && \
+    curl -fL -o /tmp/apexkit.tar.gz "$URL" && \
+    echo "Extracting binary..." && \
+    tar -xzf /tmp/apexkit.tar.gz -C /app && \
+    chmod +x /app/apexkit && \
+    ln -sf /app/apexkit /usr/local/bin/apexkit && \
+    echo "$VER" > /app/.version && \
+    rm -f /tmp/apexkit.tar.gz
+
+# 3. Prepare storage
+RUN mkdir -p storage/system storage/tenants storage/sandboxes storage/backups
+
+# 4. Run with dynamic port, .env persistence, and zero-duplicate supervisor
+CMD ["sh", "-c", "\
+if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+VER=\"${VERSION:-v0.1.0-beta.1}\"; \
+if [ ! -f /app/apexkit ] || [ \"$(cat /app/.version 2>/dev/null)\" != \"$VER\" ]; then \
+  URL=\"https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/${VER}/apexkit-x86_64-unknown-linux-musl-perf.tar.gz?download=true\"; \
+  echo \"[Init] Fetching ApexKit (${VER}) from .env / export...\"; \
+  curl -fL -o /tmp/apexkit.tar.gz \"$URL\" && tar -xzf /tmp/apexkit.tar.gz -C /app && chmod +x /app/apexkit && echo \"$VER\" > /app/.version && rm -f /tmp/apexkit.tar.gz || echo \"[Warning] Failed to fetch ${VER}, using existing binary\"; \
+fi; \
+if [ -n \"$APEX_REPLICA_ID\" ]; then \
+  mkdir -p storage/system && echo \"$APEX_REPLICA_ID\" > storage/system/.replica_id && echo \"[Init] Injected static Replica ID: $APEX_REPLICA_ID\"; \
+fi; \
+apexkit --port ${PORT:-5000} & \
+APP_PID=$!; \
+while true; do \
+  tail --pid=$APP_PID -f /dev/null 2>/dev/null; \
+  sleep 2; \
+  NEW_PID=$(pgrep -x apexkit | head -n 1); \
+  if [ -n \"$NEW_PID\" ] && [ \"$NEW_PID\" != \"$APP_PID\" ]; then \
+    echo \"[Supervisor] Live upgrade handover complete. Supervising replacement (PID: $NEW_PID)\"; \
+    APP_PID=$NEW_PID; \
+    continue; \
+  fi; \
+  break; \
+done"]

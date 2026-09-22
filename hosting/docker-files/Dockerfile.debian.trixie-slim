@@ -1,0 +1,61 @@
+FROM debian:trixie-slim
+
+# Disable interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Default version if not overridden by .env or exported environment
+ARG VERSION=latest
+ENV VERSION=${VERSION}
+
+# 1. Install dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl jq ca-certificates msmtp msmtp-mta tar procps gzip && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV PATH="/app:$PATH"
+
+# 2. Pre-download baseline binary at build time
+RUN VER="${VERSION:-latest}" && \
+    if [ "$VER" = "latest" ]; then \
+      URL="https://github.com/deniskipeles/apexkit/releases/latest/download/apexkit-x86_64-unknown-linux-gnu.tar.gz"; \
+    else \
+      URL="https://github.com/deniskipeles/apexkit/releases/download/${VER}/apexkit-x86_64-unknown-linux-gnu.tar.gz"; \
+    fi && \
+    echo "Downloading ApexKit (${VER})..." && \
+    curl -fL -o /tmp/apexkit.tar.gz "$URL" && \
+    tar -xzf /tmp/apexkit.tar.gz -C /app && \
+    chmod +x /app/apexkit && \
+    echo "$VER" > /app/.version && \
+    rm -f /tmp/apexkit.tar.gz
+
+# 3. Prepare storage
+RUN mkdir -p storage/system storage/tenants storage/sandboxes storage/backups
+
+# 4. Run with dynamic port, .env / export VERSION resolution, and clean supervisor
+CMD ["sh", "-c", "\
+if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+VER=\"${VERSION:-latest}\"; \
+if [ ! -f /app/apexkit ] || [ \"$(cat /app/.version 2>/dev/null)\" != \"$VER\" ]; then \
+  if [ \"$VER\" = \"latest\" ]; then \
+    URL=\"https://github.com/deniskipeles/apexkit/releases/latest/download/apexkit-x86_64-unknown-linux-gnu.tar.gz\"; \
+  else \
+    URL=\"https://github.com/deniskipeles/apexkit/releases/download/${VER}/apexkit-x86_64-unknown-linux-gnu.tar.gz\"; \
+  fi; \
+  echo \"[Init] Fetching ApexKit (${VER}) from .env / export...\"; \
+  curl -fL -o /tmp/apexkit.tar.gz \"$URL\" && tar -xzf /tmp/apexkit.tar.gz -C /app && chmod +x /app/apexkit && echo \"$VER\" > /app/.version && rm -f /tmp/apexkit.tar.gz || echo \"[Warning] Failed to fetch ${VER}, using existing binary\"; \
+fi; \
+apexkit --port ${PORT:-5000} & \
+APP_PID=$!; \
+while true; do \
+  tail --pid=$APP_PID -f /dev/null 2>/dev/null; \
+  sleep 2; \
+  NEW_PID=$(pgrep -x apexkit | head -n 1); \
+  if [ -n \"$NEW_PID\" ] && [ \"$NEW_PID\" != \"$APP_PID\" ]; then \
+    echo \"[Supervisor] Live upgrade handover complete. Supervising replacement (PID: $NEW_PID)\"; \
+    APP_PID=$NEW_PID; \
+    continue; \
+  fi; \
+  break; \
+done"]
