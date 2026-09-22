@@ -200,11 +200,11 @@ jobs:
           
           # Commit only if there are changes
           git diff --quiet && git diff --staged --quiet || git commit -m "Sync assets and docs for release ${{ github.ref_name }}"
-          git push origin main
+          git push -f origin main
           
           # Create the tag on the public repo so the release attaches correctly
           git tag ${{ github.ref_name }} || true
-          git push origin ${{ github.ref_name }} || true
+          git push -f origin ${{ github.ref_name }} || true
 
       # 6. Create the Release on the PUBLIC Repo using the PAT
       - name: Create Release on Public Repo

@@ -460,6 +460,7 @@ pub async fn create_record(
         collection_id: col.id,
         record_id: rid,
         data: data_to_save.clone(),
+        node_id: Some(apexkit_core::realtime::types::get_node_id().to_string()),
         scope: event_scope.clone(),
     });
 
@@ -608,6 +609,7 @@ pub async fn update_record(
         collection_id: col.id,
         record_id: path.record_id,
         data: r.data.clone(),
+        node_id: Some(apexkit_core::realtime::types::get_node_id().to_string()),
         scope: event_scope.clone(),
     });
     let _ = trigger_hooks(
@@ -734,6 +736,7 @@ pub async fn delete_record(
     let _ = state.tx.send(DbEvent::Delete {
         collection_id: col.id,
         record_id: path.record_id,
+        node_id: Some(apexkit_core::realtime::types::get_node_id().to_string()),
         scope: event_scope.clone(),
     });
     let _ = trigger_hooks(

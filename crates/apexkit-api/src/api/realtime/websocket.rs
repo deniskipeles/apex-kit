@@ -138,6 +138,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                         let event = DbEvent::Custom {
                                             event: req.event,
                                             data: req.data,
+                                            node_id: Some(apexkit_core::realtime::types::get_node_id().to_string()),
                                             is_local: true,
                                             scope: EventScope::Channel(scoped_channel)
                                         };

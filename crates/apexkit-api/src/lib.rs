@@ -477,19 +477,18 @@ pub async fn start(port: u16) {
         let state_clone = state.clone();
         let mut rx = crate::replication::get_db_sync_tx().subscribe();
 
-        // [NEW]: Replica Upstream Custom Event Forwarder
+        // [NEW]: Replica Upstream Realtime Forwarder
         let mut replica_rt_rx = state.tx.subscribe();
         let master_url = m_url.clone();
         let master_key = master_key_str.clone();
-
+        
         tokio::spawn(async move {
             let client = reqwest::Client::new();
             while let Ok(evt) = replica_rt_rx.recv().await {
-                // Only forward Custom events that originated LOCALLY on this node.
-                if let apexkit_core::realtime::DbEvent::Custom { is_local: true, .. } = &evt {
+                // Forward ANY event (Insert, Update, Delete, Custom) that originated locally on this edge node to the Master
+                if evt.is_from_current_node() {
                     let url = format!("{}/replication/realtime", master_url.trim_end_matches('/'));
-                    let _ = client
-                        .post(&url)
+                    let _ = client.post(&url)
                         .header("Authorization", format!("Bearer {}", master_key))
                         .json(&evt)
                         .send()
@@ -509,66 +508,11 @@ pub async fn start(port: u16) {
                 if let Ok(event) = rx.recv().await {
                     // [NEW]: Catch tunneled Realtime events and broadcast them locally
                     if event.db_name == "__realtime__" {
-                        if let Ok(rt_evt) = serde_json::from_slice::<apexkit_core::realtime::DbEvent>(
-                            &event.changeset,
-                        ) {
-                            // 1. Reconstruct Scope from the Changeset string
-                            let mapped_scope = if event.scope == "root" {
-                                apexkit_core::realtime::EventScope::Root
-                            } else if let Some(id) = event.scope.strip_prefix("tenant:") {
-                                apexkit_core::realtime::EventScope::Tenant(id.to_string())
-                            } else if let Some(id) = event.scope.strip_prefix("sandbox:") {
-                                apexkit_core::realtime::EventScope::Sandbox(id.to_string())
-                            } else if let Some(id) = event.scope.strip_prefix("channel:") {
-                                apexkit_core::realtime::EventScope::Channel(id.to_string())
-                            } else {
-                                apexkit_core::realtime::EventScope::Root
-                            };
-
-                            // 2. Rebuild event with mapped scope and mark is_local = false to prevent echo loop
-                            let final_evt = match rt_evt {
-                                apexkit_core::realtime::DbEvent::Insert {
-                                    collection_id,
-                                    record_id,
-                                    data,
-                                    ..
-                                } => apexkit_core::realtime::DbEvent::Insert {
-                                    collection_id,
-                                    record_id,
-                                    data,
-                                    scope: mapped_scope,
-                                },
-                                apexkit_core::realtime::DbEvent::Update {
-                                    collection_id,
-                                    record_id,
-                                    data,
-                                    ..
-                                } => apexkit_core::realtime::DbEvent::Update {
-                                    collection_id,
-                                    record_id,
-                                    data,
-                                    scope: mapped_scope,
-                                },
-                                apexkit_core::realtime::DbEvent::Delete {
-                                    collection_id,
-                                    record_id,
-                                    ..
-                                } => apexkit_core::realtime::DbEvent::Delete {
-                                    collection_id,
-                                    record_id,
-                                    scope: mapped_scope,
-                                },
-                                apexkit_core::realtime::DbEvent::Custom {
-                                    event: e, data, ..
-                                } => apexkit_core::realtime::DbEvent::Custom {
-                                    event: e,
-                                    data,
-                                    is_local: false,
-                                    scope: mapped_scope,
-                                },
-                            };
-
-                            let _ = state_for_apply.tx.send(final_evt);
+                        if let Ok(rt_evt) = serde_json::from_slice::<apexkit_core::realtime::DbEvent>(&event.changeset) {
+                            // Only broadcast events that originated from OTHER nodes in the cluster
+                            if !rt_evt.is_from_current_node() {
+                                let _ = state_for_apply.tx.send(rt_evt);
+                            }
                         }
                         continue;
                     }
