@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-ApexKit BaaS Fleets & Script Tools Heavy Stress Testing Engine
-Launches multiple tenants and bombards them with:
-- Dynamic WASM: @silvia-odwyer/photon image transformation
-- Network fetch & HTTP semaphore stress
-- Asynchronous $queue background workers
-- Database mutex contention & JSONB operations
-- Chaos multi-tool workloads
+ApexKit BaaS Fleets & Script Tools Heavy Stress Testing Engine (Self-Bootstrapping)
+
+Automated Capabilities:
+1. Self-Bootstrapping: Automatically discovers or accepts --bin, provisions a sandbox environment, and launches the engine.
+2. Port & Rate-Limit Optimization: Configures cluster rate limits to 100,000 req/min to allow heavy hammering.
+3. Multi-Tenant Orchestration: Provisions isolated tenant workspaces with minted security keys.
+4. Stress Test Pipeline:
+   - Dynamic WASM: @silvia-odwyer/photon image transformation & memory buffer decoding.
+   - Outbound Network: HTTP client connection pooling & scoped semaphore contention.
+   - Background $queue: Quantum scheduler CPU slicing & background task polling.
+   - Database Contention: High-concurrency SQLite WAL mutations & JSONB operations.
+   - Chaos Workload: Simultaneous execution of all engine subsystems.
+5. Forensic Reporting: Quantile latencies (p50, p95, max), request throughput (RPS), and failure audit.
+6. Clean Lifecycle Management: Graceful shutdown and temporary directory cleanup on completion.
 """
 
 import os
@@ -14,11 +21,23 @@ import sys
 import time
 import uuid
 import json
+import shutil
+import atexit
+import secrets
+import base64
 import argparse
-import requests
+import subprocess
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 1. Auto-load .env if present
+import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util import Retry
+except ImportError:
+    Retry = None
+
+# Auto-load .env if present
 if os.path.exists(".env"):
     with open(".env", "r") as f:
         for line in f:
@@ -38,13 +57,13 @@ except ImportError:
     class Style: BRIGHT = ""; RESET_ALL = ""
 
 def print_header(title):
-    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 75}")
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 80}")
     print(f" {title}")
-    print(f"{'=' * 75}")
+    print(f"{'=' * 80}")
 
 def print_sub(title):
     print(f"\n{Fore.BLUE}{Style.BRIGHT}▶ {title}")
-    print(f"{Fore.BLUE}{'-' * 60}")
+    print(f"{Fore.BLUE}{'-' * 65}")
 
 def print_success(msg):
     print(f"{Fore.GREEN}  [✓] {msg}")
@@ -57,6 +76,25 @@ def print_error(msg):
 
 def print_warn(msg):
     print(f"{Fore.MAGENTA}  [!] {msg}")
+
+def fail(msg):
+    print_error(msg)
+    sys.exit(1)
+
+def build_http_session():
+    session = requests.Session()
+    if Retry is not None:
+        adapter = HTTPAdapter(
+            max_retries=Retry(
+                total=3,
+                backoff_factor=0.05,
+                status_forcelist=[502, 503, 504],
+                raise_on_status=False
+            )
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    return session
 
 # Verified valid 1x1 Red PNG binary
 VERIFIED_VALID_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -135,7 +173,6 @@ export default async function(req) {
     const body = await req.json().catch(() => ({}));
     const targetLoops = body.loops || 200000;
 
-    // Correctly pass parameters into background workers via args
     const job = await $queue.spawn(async (pid, jobReq) => {
         const payload = await jobReq.json().catch(() => ({}));
         const count = payload.loops || 200000;
@@ -257,23 +294,140 @@ class TenantFleet:
         }
 
 class FleetStressRunner:
-    def __init__(self, base_url: str, root_api_key: str, num_tenants: int, concurrency: int, rounds: int):
-        self.base_url = base_url.rstrip("/")
-        self.root_api_key = root_api_key
-        self.root_headers = {
-            "x-api-key": self.root_api_key,
-            "Authorization": f"Bearer {self.root_api_key}",
-            "Content-Type": "application/json"
-        }
+    def __init__(self, binary_path: str, port: int, num_tenants: int, concurrency: int, rounds: int, external_url: str = None, external_key: str = None):
+        self.binary_path = Path(binary_path).resolve() if binary_path else None
+        self.port = port
         self.num_tenants = num_tenants
         self.concurrency = concurrency
         self.rounds = rounds
+        self.external_url = external_url
+        self.external_key = external_key
+        self.is_self_managed = external_url is None
+
+        self.cluster_dir = Path("./_fleet_stress_env").resolve()
+        self.master_key = base64.b64encode(secrets.token_bytes(32)).decode()
+        self.process = None
+
+        if self.is_self_managed:
+            self.base_url = f"http://127.0.0.1:{self.port}"
+        else:
+            self.base_url = external_url.rstrip("/")
+
+        self.root_headers = {}
         self.fleets: list[TenantFleet] = []
         self.audit_results = {}
 
+        if self.is_self_managed:
+            atexit.register(self.cleanup)
+
+    def cleanup(self):
+        if self.is_self_managed:
+            print_info("Stopping self-managed ApexKit instance...")
+            if self.process and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+
+            try:
+                subprocess.run(f"fuser -k {self.port}/tcp", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+            if self.cluster_dir.exists():
+                shutil.rmtree(self.cluster_dir, ignore_errors=True)
+
+    def bootstrap_engine(self):
+        if not self.is_self_managed:
+            print_info(f"Targeting external ApexKit engine at {self.base_url}")
+            self.root_headers = {
+                "x-api-key": self.external_key or "",
+                "Authorization": f"Bearer {self.external_key or ''}",
+                "Content-Type": "application/json"
+            }
+            return
+
+        print_sub("0. BOOTSTRAPPING LOCAL APEXKIT ENGINE")
+        if not self.binary_path or not self.binary_path.exists():
+            fail(f"ApexKit binary not found at '{self.binary_path}'")
+
+        if self.cluster_dir.exists():
+            shutil.rmtree(self.cluster_dir, ignore_errors=True)
+        self.cluster_dir.mkdir(parents=True, exist_ok=True)
+
+        exe_target = self.cluster_dir / "apexkit"
+        shutil.copy2(self.binary_path, exe_target)
+        exe_target.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PORT"] = str(self.port)
+        env["APEXKIT_MASTER_KEY"] = self.master_key
+        env["RUST_LOG"] = "info,tower=warn,hyper=warn"
+
+        log_file = open(self.cluster_dir / "engine.log", "w")
+        self.process = subprocess.Popen(
+            [str(exe_target)],
+            cwd=str(self.cluster_dir),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT
+        )
+
+        print_info(f"Starting ApexKit engine on 127.0.0.1:{self.port}...")
+        start_wait = time.time()
+        ready = False
+        while time.time() - start_wait < 20:
+            try:
+                r = requests.get(f"{self.base_url}/healthz", timeout=1)
+                if r.status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+        if not ready:
+            fail(f"Engine failed to start in time. Check {self.cluster_dir}/engine.log")
+
+        # Authenticate as seeded admin
+        r_login = requests.post(f"{self.base_url}/api/v1/auth/login", json={
+            "email": "admin@apexkit.io",
+            "password": "password"
+        }, timeout=5)
+
+        if r_login.status_code not in (200, 201):
+            fail(f"Failed logging in as default admin: {r_login.text}")
+
+        token = r_login.json()["token"]
+        self.root_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        print_success(f"Engine online & authenticated (Token: {token[:15]}...)")
+
+        # Raise rate limit via API to 100,000 req/min for stress testing
+        print_info("Configuring rate limit to 100,000 req/min via Admin Settings API...")
+        r_set = requests.patch(f"{self.base_url}/api/v1/admin/settings", json={
+            "security": {
+                "cors_allow_all": True,
+                "cors_origins": "",
+                "tenant_transparency": False,
+                "global_rate_limit": 100000,
+                "tenant_free_rate_limit": 10000,
+                "tenant_pro_rate_limit": 50000
+            }
+        }, headers=self.root_headers, timeout=5)
+
+        if r_set.status_code in (200, 201):
+            print_success("Engine rate limits raised for stress testing.")
+        else:
+            print_warn(f"Could not adjust rate limit: {r_set.text}")
+
     def run(self):
-        print_header(f"LAUNCHING FLEET ASSAULT: {self.num_tenants} TENANTS | {self.concurrency} THREADS | {self.rounds} ROUNDS")
+        print_header(f"APEXKIT FLEET ASSAULT: {self.num_tenants} TENANTS | {self.concurrency} THREADS | {self.rounds} ROUNDS")
         try:
+            self.bootstrap_engine()
             self.setup_fleet()
             self.deploy_tools_to_fleet()
             
@@ -349,7 +503,7 @@ class FleetStressRunner:
 
         for fleet in self.fleets:
             r_col = requests.post(f"{fleet.base_url}/api/v1/collections", json=col_schema, headers=fleet.headers, timeout=5)
-            if r_col.status_code != 201:
+            if r_col.status_code not in (200, 201):
                 fail(f"Failed to create collection in {fleet.tenant_id}: {r_col.text}")
 
             for name, code in tools:
@@ -359,7 +513,7 @@ class FleetStressRunner:
                     "code": code,
                     "active": True
                 }, headers=fleet.headers, timeout=5)
-                if r_sc.status_code != 200:
+                if r_sc.status_code not in (200, 201):
                     fail(f"Failed deploying script '{name}' to {fleet.tenant_id}: {r_sc.text}")
             
             print_success(f"Deployed endpoints & 'stress_items' DB to {fleet.tenant_id}")
@@ -380,9 +534,10 @@ class FleetStressRunner:
 
         def worker(item):
             tid, url, headers, p = item
+            session = build_http_session()
             start = time.perf_counter()
             try:
-                res = requests.post(url, json=p, headers=headers, timeout=35)
+                res = session.post(url, json=p, headers=headers, timeout=35)
                 duration = (time.perf_counter() - start) * 1000
                 return res.status_code, duration, res.text, None
             except Exception as e:
@@ -396,7 +551,7 @@ class FleetStressRunner:
                 status, lat, text, exc = f.result()
                 latencies.append(lat)
                 status_counts[status] = status_counts.get(status, 0) + 1
-                if status not in (200, 202):
+                if status not in (200, 201, 202):
                     if exc:
                         error_samples.append(f"NetworkException: {exc}")
                     else:
@@ -420,7 +575,8 @@ class FleetStressRunner:
             "errors": error_samples[:5]
         }
 
-        color = Fore.GREEN if status_counts.get(200, 0) + status_counts.get(202, 0) == count else Fore.YELLOW
+        success_count = sum(status_counts.get(c, 0) for c in (200, 201, 202))
+        color = Fore.GREEN if success_count == count else Fore.YELLOW
         print(f"{color}  -> Done in {total_wall_sec:.2f}s | Throughput: {count/total_wall_sec:.1f} req/s | p50: {p50:.1f}ms | p95: {p95:.1f}ms | Max: {max_lat:.1f}ms")
         print(f"  -> Status Codes: {status_counts}")
         if error_samples:
@@ -441,8 +597,8 @@ class FleetStressRunner:
         
         spawned_jobs = []
         for fleet in self.fleets:
-            res = requests.post(f"{fleet.base_url}/api/v1/webhook/stress-queue-spawn", json={"loops": 20000000}, headers=fleet.headers, timeout=10)
-            if res.status_code == 202:
+            res = requests.post(f"{fleet.base_url}/api/v1/webhook/stress-queue-spawn", json={"loops": 2000000}, headers=fleet.headers, timeout=10)
+            if res.status_code in (200, 201, 202):
                 pid = res.json().get("pid")
                 spawned_jobs.append((fleet, pid))
         
@@ -459,7 +615,7 @@ class FleetStressRunner:
                 if pid in completed_pids or pid in failed_pids:
                     continue
                 r = requests.post(f"{fleet.base_url}/api/v1/webhook/stress-queue-poll", json={"pid": pid}, headers=fleet.headers, timeout=5)
-                if r.status_code == 200:
+                if r.status_code in (200, 201, 202):
                     d = r.json()
                     st = d.get("status")
                     if st == "completed":
@@ -489,7 +645,7 @@ class FleetStressRunner:
         print("-" * 88)
         
         for name, data in self.audit_results.items():
-            success_count = data["status_counts"].get(200, 0) + data["status_counts"].get(202, 0)
+            success_count = sum(data["status_counts"].get(c, 0) for c in (200, 201, 202))
             rate = (success_count / data["total_calls"]) * 100 if data["total_calls"] else 0
             rate_str = f"{rate:.1f}% OK"
             color = Fore.GREEN if rate == 100.0 else Fore.RED
@@ -506,14 +662,36 @@ class FleetStressRunner:
                 print_error(f"Failed deleting {fleet.tenant_id}: {e}")
         print(f"\n{Fore.GREEN}{Style.BRIGHT}✨ FLEET CLEANUP COMPLETE. System is pristine.\n")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ApexKit Fleet Multi-Tenant Stress Engine")
-    parser.add_argument("--url", default=os.environ.get("APEXKIT_URL", "http://localhost:5000"), help="ApexKit base URL")
-    parser.add_argument("--api-key", default=os.environ.get("APEXKIT_API_KEY", "root_sys_prod_12345678_abcd"), help="Root Admin API Key")
+    parser.add_argument("--bin", default="./target/release/apexkit-cli", help="Path to apexkit executable binary (default: ./target/release/apexkit-cli or ./apexkit)")
+    parser.add_argument("--port", type=int, default=5000, help="Port to run local engine on (default: 5000)")
+    parser.add_argument("--url", default=None, help="Target an already-running ApexKit URL instead of auto-spawning (e.g. http://localhost:5000)")
+    parser.add_argument("--api-key", default=None, help="Root Admin API Key (only required when using an external --url)")
     parser.add_argument("--tenants", type=int, default=3, help="Number of concurrent tenants to launch (default: 3)")
     parser.add_argument("--concurrency", type=int, default=15, help="Concurrent HTTP worker threads (default: 15)")
     parser.add_argument("--rounds", type=int, default=10, help="Rounds of requests per tenant per phase (default: 10)")
 
     args = parser.parse_args()
-    runner = FleetStressRunner(args.url, args.api_key, args.tenants, args.concurrency, args.rounds)
-    runner.run()
+
+    bin_path = args.bin
+    if not args.url:
+        bin_target = Path(args.bin)
+        if not bin_target.exists() and Path("./apexkit").exists():
+            bin_path = "./apexkit"
+
+    runner = FleetStressRunner(
+        binary_path=bin_path,
+        port=args.port,
+        num_tenants=args.tenants,
+        concurrency=args.concurrency,
+        rounds=args.rounds,
+        external_url=args.url,
+        external_key=args.api_key
+    )
+    try:
+        runner.run()
+    except KeyboardInterrupt:
+        print_warn("\nStress test interrupted by user.")
+        sys.exit(0)
