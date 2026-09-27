@@ -68,8 +68,6 @@ docker run -p 5000:5000 \
   deniskipeles/apexkit:latest
 ```
 
-#### `REPLACE WITH`
-```markdown
 ### 2. Run via Pre-compiled Binary
 
 <a id="downloads"></a>
