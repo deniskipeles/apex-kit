@@ -35,7 +35,59 @@ if ! python3 -c "import huggingface_hub" &> /dev/null; then
   pip3 install --quiet --no-cache-dir "huggingface_hub>=0.20.0"
 fi
 
-# Upload the entire dist folder to the tag subfolder in the repository
+# ------------------------------------------------------------------------------
+# Stage Root Files (README, LICENSE) and Tagged Binaries
+# ------------------------------------------------------------------------------
+STAGING_DIR="$(mktemp -d)"
+trap 'rm -rf "${STAGING_DIR}"' EXIT
+
+echo "📁 Staging files for atomic repository commit..."
+
+# 1. Copy README.md & LICENSE to the repo root
+if [ -f "README.md" ]; then
+  cp "README.md" "${STAGING_DIR}/"
+  echo "  📄 Included /README.md"
+else
+  echo "⚠️  README.md not found in current directory"
+fi
+
+if [ -f "LICENSE" ]; then
+  cp "LICENSE" "${STAGING_DIR}/"
+  echo "  ⚖️  Included /LICENSE"
+else
+  echo "⚠️  LICENSE not found in current directory"
+fi
+
+# 2. Copy Logo SVG for repo branding
+mkdir -p "${STAGING_DIR}/static/images"
+LOGO_FOUND=false
+
+for logo_candidate in "apex-kit/static/images/apexkit-logo.svg" "static/images/apexkit-logo.svg"; do
+  if [ -f "${logo_candidate}" ]; then
+    cp "${logo_candidate}" "${STAGING_DIR}/static/images/apexkit-logo.svg"
+    echo "  🎨 Included /static/images/apexkit-logo.svg (from ${logo_candidate})"
+    LOGO_FOUND=true
+    break
+  fi
+done
+
+if [ "${LOGO_FOUND}" = false ]; then
+  echo "⚠️  apexkit-logo.svg not found"
+fi
+
+# 3. Copy binaries into the release tag folder (${TAG}/...)
+mkdir -p "${STAGING_DIR}/${TAG}"
+cp -r "${DIST_DIR}/"* "${STAGING_DIR}/${TAG}/"
+
+# Also include copies of LICENSE and README inside the release folder
+[ -f "LICENSE" ] && cp "LICENSE" "${STAGING_DIR}/${TAG}/"
+[ -f "README.md" ] && cp "README.md" "${STAGING_DIR}/${TAG}/"
+
+echo "  📦 Included ${TAG}/* artifacts"
+
+# ------------------------------------------------------------------------------
+# Upload Staged Tree in a Single Atomic Commit
+# ------------------------------------------------------------------------------
 python3 - <<EOF
 import os
 import sys
@@ -44,22 +96,22 @@ from huggingface_hub import HfApi
 repo_id = "${HF_REPO}"
 repo_type = "${REPO_TYPE}"
 tag = "${TAG}"
-dist_dir = "${DIST_DIR}"
+staging_dir = "${STAGING_DIR}"
 token = os.environ["HF_TOKEN"]
 
 api = HfApi(token=token)
 
-print(f"⏳ Uploading files from {dist_dir} to {repo_id}/{tag}...")
+print(f"⏳ Uploading README, LICENSE, and {tag}/* to {repo_id}...")
 
 try:
     api.upload_folder(
-        folder_path=dist_dir,
-        path_in_repo=tag,
+        folder_path=staging_dir,
+        path_in_repo="",  # Upload to repository root
         repo_id=repo_id,
         repo_type=repo_type,
-        commit_message=f"Release {tag} binaries",
+        commit_message=f"Release {tag} with root LICENSE and README.md",
     )
-    print("✅ Upload complete!")
+    print("✅ Atomic upload complete!")
 except Exception as e:
     print(f"❌ Upload failed: {e}", file=sys.stderr)
     sys.exit(1)
@@ -74,4 +126,9 @@ for file in "${DIST_DIR}"/*; do
   fname="$(basename "$file")"
   echo "  📥 https://huggingface.co/${REPO_TYPE}s/${HF_REPO}/resolve/main/${TAG}/${fname}"
 done
+echo ""
+echo "Root Repository Links:"
+echo "  📄 https://huggingface.co/${REPO_TYPE}s/${HF_REPO}/blob/main/README.md"
+echo "  ⚖️  https://huggingface.co/${REPO_TYPE}s/${HF_REPO}/blob/main/LICENSE"
+echo "  🎨 https://huggingface.co/${REPO_TYPE}s/${HF_REPO}/resolve/main/static/images/apexkit-logo.svg"
 echo "======================================================================"

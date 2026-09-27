@@ -1,0 +1,47 @@
+# Business Source License 1.1
+
+Parameters:
+
+*   Licensor: ApexKit (or Denis Kipeles)
+*   Licensed Work: The software programs and source code contained within this repository, including all core orchestrators, edge minion protocols, real-time routing engines, embedded runtimes, CLI utilities, and associated documentation.
+*   Change License: Apache License, Version 2.0 (as published by the Apache Software Foundation)
+*   Change Date: Two (2) years from the date of each specific source code release or commit.
+
+## 1. Grant of License
+
+Subject to your compliance with the terms and conditions of this License, Licensor hereby grants you a worldwide, non-exclusive, non-transferable, royalty-free, revocable license to copy, modify, create derivative works of, redistribute, and run the Licensed Work for production, commercial, internal, and non-commercial purposes, subject to the exclusions set forth in Section 2.
+
+## 2. Licensed Production Use Limits (The Startup & Non-Compete Exclusions)
+
+The license granted in Section 1 is explicitly conditioned upon the following size and operational thresholds. You may NOT use the Licensed Work without an express, separate commercial license agreement from the Licensor if your organization (including all Affiliates under common control) crosses either of the following limits:
+
+### A. Financial Thresholds (The Startup Limits)
+
+*   Gross Revenue Limit: Your total annual gross revenue across all products, services, and parent organizations exceeds Five Million United States Dollars ($5,000,000 USD).
+*   Funding Limit: Your total raised capital, including but not limited to venture capital, private equity, corporate backing, or institutional grants, exceeds Ten Million United States Dollars ($10,000,000 USD).
+
+### B. Prohibited Mega-Scale Commercial Use (The Big Tech Block)
+
+Notwithstanding the financial thresholds in Section 2(A), you may not use the Licensed Work to provide, bundle, embed, or host a commercial, fully managed, or co-branded "Backend-as-a-Service" (BaaS), "Database-as-a-Service" (DBaaS), or substantially similar infrastructure platform directly to third-party developers if your organization is a public cloud provider, a subsidiary thereof, or an enterprise infrastructure company exceeding the limits defined in Section 2(A).
+
+For clarity:
+
+*   Startups and organizations meeting the limits in Section 2(A) are fully permitted to use the Licensed Work to launch competing hosting or managed platforms.
+*   Any entity may use the Licensed Work to power their own proprietary applications, SaaS offerings, or internal business operations, provided they comply with the limits in Section 2(A).
+
+## 3. The Freedom Transition (Change License)
+
+On the Change Date for any given version or commit of the Licensed Work, or if the Licensor permanently ceases business operations without assigning this software to a successor corporate entity, this License shall automatically terminate, and the Licensed Work shall automatically convert to, and be governed entirely by, the Change License (Apache License, Version 2.0). All rights and restrictions under Section 2 of this License shall completely expire on that date.
+
+## 4. Definitions
+
+*   "Affiliate" means any entity that directly or indirectly controls, is controlled by, or is under common control with the subject entity. "Control" means the ownership of more than fifty percent (50%) of the voting stock or success equity interests.
+*   "Change Date" means the exact calendar date occurring precisely 730 days (2 years) after the public release, tag, or version commit of a specific block of source code.
+
+## 5. Termination
+
+This license terminates automatically if you violate any of its terms, or if you initiate patent or intellectual property litigation against the Licensor.
+
+## 6. Disclaimer of Warranty
+
+THE LICENSED WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE LICENSED WORK OR THE USE OR OTHER DEALINGS IN THE LICENSED WORK.

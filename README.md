@@ -10,10 +10,11 @@
 </p>
 
 <p align="center">
+  <a href="https://apexkit.pages.dev"><strong>Official Website & Docs</strong></a> • 
   <a href="#features">Features</a> • 
+  <a href="#downloads">Downloads</a> • 
   <a href="#quickstart">Quickstart</a> • 
-  <a href="#architecture">Architecture</a> • 
-  <a href="#documentation">Documentation</a>
+  <a href="#architecture">Architecture</a>
 </p>
 
 ---
@@ -37,9 +38,12 @@ Beyond standard BaaS features, ApexKit introduces natively integrated **Generati
 - **Instant Search:** Typo-tolerant, ultra-fast full-text search powered by Tantivy.
 - **AI Actions:** Securely define and execute LLM prompts on the server, exposing them as simple API endpoints to your frontend.
 
-### ⚡ Edge Scripting (JavaScript in Rust)
-- **V8-style Engine:** Write custom endpoints, cron jobs, and database triggers using JavaScript.
-- **Sandboxed Execution:** Runs natively inside Rust using the `boa_engine`, providing access to `$db`, `$http`, `$ai`, and `$fs` without needing Node.js or external runtimes.
+### ⚡ High-Performance Edge Runtime (QuickJS + TS/WASM)
+- **Embedded QuickJS Engine:** Lightning-fast, standards-compliant JavaScript/TypeScript runtime powered by QuickJS (`rquickjs`) with full async/await and ES Module support.
+- **Native TypeScript & TSX:** First-class support for `.ts` and `.tsx` scripts (via in-memory Oxc compiler). Run webhooks using [Hono](https://hono.dev/) with zero compile steps.
+- **WASM & WASI Orchestration:** Call high-performance WebAssembly binaries and precompiled modules directly from scripts using `$wasm`.
+- **Preemptible Task Scheduling:** Built-in quantum round-robin scheduler ensures long-running loops or tasks yield CPU slices without freezing Tokio worker threads.
+- **Rich Standard Globals:** Built-in access to `$db`, `$http`, `$files`, `$fs`, `$cache`, `$mail`, `$realtime`, `$ai`, and `$env`.
 
 ### 🏢 Built-in Multi-Tenancy & Sandboxes
 - Designed for B2B/SaaS apps out of the box. Securely isolate data using **Tenants**.
@@ -64,16 +68,38 @@ docker run -p 5000:5000 \
   deniskipeles/apexkit:latest
 ```
 
+#### `REPLACE WITH`
+```markdown
 ### 2. Run via Pre-compiled Binary
 
-Download the latest binary for your OS from the [Releases page](https://github.com/deniskipeles/apexkit/releases), make it executable, and run it:
+<a id="downloads"></a>
+Download pre-built standalone binaries for your target architecture from our global CDN:
+
+| Operating System | Architecture | Build Flavor | Size | Download |
+| :--- | :--- | :--- | :--- | :--- |
+| **Linux (glibc / Ubuntu)** | `x86_64` | **Performant (ONNX)** | 34 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-x86_64-unknown-linux-gnu-perf.tar.gz) |
+| **Linux (glibc / Ubuntu)** | `x86_64` | **Small Size (ONNX)** | 28 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-x86_64-unknown-linux-gnu-small.tar.gz) |
+| **Linux (musl / Alpine)** | `x86_64` | **Performant (Candle)** | 25 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-x86_64-unknown-linux-musl-perf.tar.gz) |
+| **Linux (musl / Alpine)** | `x86_64` | **Small Size (Candle)** | 19 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-x86_64-unknown-linux-musl-small.tar.gz) |
+| **Linux (musl / ARM64)** | `aarch64` | **Performant (Candle)** | 24 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-aarch64-unknown-linux-musl-perf.tar.gz) |
+| **Linux (musl / ARM64)** | `aarch64` | **Small Size (Candle)** | 18 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-aarch64-unknown-linux-musl-small.tar.gz) |
+| **macOS (Apple Silicon)** | `arm64 (M1-M4)`| **Performant (Candle)** | 21 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-aarch64-apple-darwin-perf.tar.gz) |
+| **macOS (Apple Silicon)** | `arm64 (M1-M4)`| **Small Size (Candle)** | 17 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-aarch64-apple-darwin-small.tar.gz) |
+| **macOS (Intel)** | `x86_64` | **Performant (Candle)** | 23 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-x86_64-apple-darwin-perf.tar.gz) |
+| **macOS (Intel)** | `x86_64` | **Small Size (Candle)** | 18 MB | [Download `.tar.gz`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-x86_64-apple-darwin-small.tar.gz) |
+| **Windows** | `x86_64` | **Performant (Candle)** | 24 MB | [Download `.zip`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-x86_64-pc-windows-gnu-perf.zip) |
+| **Windows** | `x86_64` | **Small Size (Candle)** | 17 MB | [Download `.zip`](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/apexkit-x86_64-pc-windows-gnu-small.zip) |
+
+*Verify download integrity using the official [SHA-256 Checksums](https://huggingface.co/datasets/kipeles/apexkit-releases/resolve/main/v0.1.0-beta.1/checksums.txt).*
 
 ```bash
 # Linux / macOS
+tar -xzf apexkit-*.tar.gz
 chmod +x apexkit
 ./apexkit --port 5000
 
 # Windows
+# Extract the zip archive and run:
 apexkit.exe --port 5000
 ```
 
@@ -92,10 +118,12 @@ Log in using the default credentials:
 
 ApexKit achieves its performance and small footprint by utilizing a modern, carefully selected tech stack:
 
+*   **Official Website:** [apexkit.pages.dev](https://apexkit.pages.dev)
 *   **Core Backend:** [Rust](https://www.rust-lang.org/) & [Axum](https://github.com/tokio-rs/axum)
-*   **Database:** [SQLite](https://sqlite.org/) (via `rusqlite`)
-*   **Search Engine:** [Tantivy](https://github.com/quickwit-oss/tantivy) (Full-text) & [Candle](https://github.com/huggingface/candle) (Machine Learning / Vectors)
-*   **JavaScript Engine:** [Boa](https://github.com/boa-dev/boa)
+*   **Database Engine:** [SQLite](https://sqlite.org/) (via `rusqlite` with zero-copy JSONB and WAL mode)
+*   **Search & Vector Engine:** [Tantivy](https://github.com/quickwit-oss/tantivy) (Full-text search), [Candle](https://github.com/huggingface/candle) & [ONNX Runtime](https://onnxruntime.ai/)
+*   **JavaScript & TS Runtime:** [QuickJS](https://bellard.org/quickjs/) (via `rquickjs`) & [Oxc](https://oxc.rs/) (High-speed TypeScript transpiler)
+*   **WebAssembly Engine:** [Wasmtime](https://wasmtime.dev/) (WASI Preview 1)
 *   **Admin Dashboard:** [React 19](https://react.dev/), [Vite](https://vitejs.dev/), [Tailwind CSS](https://tailwindcss.com/), & [Monaco Editor](https://microsoft.github.io/monaco-editor/)
 
 ---
@@ -153,6 +181,16 @@ cargo build --release -p apexkit-api
 
 ---
 
-## 📝 License
+## ⚖️ License & The "Anti-Big-Tech" Guarantee
 
-This project is licensed under the [MIT License](LICENSE).
+This engine is licensed under the Business Source License (BSL 1.1). See the full [LICENSE](LICENSE) file for legal details.
+
+### The TL;DR for Startups & Devs:
+
+*   ✅ **Building an App/SaaS?** 100% Free forever. Self-host it on your own servers, scale globally, and keep 100% of your revenue.
+*   ✅ **Building a Competing Service?** If you want to use our engine to launch your own hosting platform or managed BaaS to compete with us, **go for it!** As long as your company makes under $5M/year or has raised under $10M, you have our full blessing. Work hard, innovate, and keep us on our toes.
+*   ❌ **Are you a Tech Giant?** If you are a mega-corporation (like AWS, GCP, Azure) or a company making over $5M/year, you cannot bundle or host our engine as a managed service without a separate commercial agreement.
+
+### No Vendor Lock-In
+
+Every line of code we write automatically converts into pure, unrestricted **Apache 2.0 open-source** exactly 2 years after its release. If we disappear or stop maintaining the project, the community owns the code under Apache 2.0 forever.
