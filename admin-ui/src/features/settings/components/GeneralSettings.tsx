@@ -8,6 +8,7 @@ import {
   Input,
   Label,
   Button,
+  Switch,
 } from '../../../components/ui/Elements';
 import { AppSettings } from '../../../types';
 import { useTheme } from '../../../context/ThemeContext';
@@ -76,6 +77,7 @@ export const GeneralSettings = ({ settings, onChange, onSave }: GeneralSettingsP
         maxSandboxVectors: settings.maxSandboxVectors,
         maxSandboxAiRequests: settings.maxSandboxAiRequests,
         imageProcessingStep: settings.imageProcessingStep,
+        disableIntrospection: settings.disableIntrospection,
       });
     } finally {
       setIsSaving(false);
@@ -254,6 +256,21 @@ export const GeneralSettings = ({ settings, onChange, onSave }: GeneralSettingsP
               </div>
             </>
           )}
+        </div>
+
+        {/* GRAPHQL PRODUCTION INTROSPECTION LOCK */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between rounded-lg border border-border p-4 gap-4 bg-secondary/5">
+          <div className="space-y-0.5">
+            <Label className="text-base font-semibold">Disable GraphQL Introspection</Label>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              Lock down <code>__schema</code> and <code>__type</code> queries for this scope to
+              prevent schema reverse-engineering in production.
+            </p>
+          </div>
+          <Switch
+            checked={settings.disableIntrospection ?? false}
+            onCheckedChange={(checked: boolean) => onChange({ disableIntrospection: checked })}
+          />
         </div>
 
         <div className="space-y-2">

@@ -284,7 +284,10 @@ pub fn register_cmd<'js>(ctx: &Ctx<'js>, app_ctx: Arc<dyn ScriptContext>) -> Res
                                                     let event = DbEvent::Custom {
                                                         event: event_name.clone(),
                                                         data: json!({ "value": val, "raw": line }),
-                                                        node_id: Some(crate::realtime::types::get_node_id().to_string()),
+                                                        node_id: Some(
+                                                            crate::realtime::types::get_node_id()
+                                                                .to_string(),
+                                                        ),
                                                         is_local: true,
                                                         scope: EventScope::Channel(
                                                             scoped_channel.clone(),

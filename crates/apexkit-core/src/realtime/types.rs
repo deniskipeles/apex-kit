@@ -70,4 +70,6 @@ impl DbEvent {
     }
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}

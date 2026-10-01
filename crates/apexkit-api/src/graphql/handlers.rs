@@ -32,7 +32,7 @@ pub async fn graphql_handler(
 }
 
 pub async fn tenant_graphql_handler(
-    auth: Option<Extension<Claims>>, // <--- Extract Claims
+    auth: Option<Extension<Claims>>,
     DatabaseConnection(db): DatabaseConnection,
     State(state): State<AppState>,
     scope: Option<Extension<EventScope>>,
@@ -49,17 +49,22 @@ pub async fn tenant_graphql_handler(
     match crate::graphql::build_schema(tenant_state, relation_loader).await {
         Ok(schema) => {
             let mut request = req.into_inner().data(event_scope);
-            // Inject claims
             if let Some(Extension(claims)) = auth {
                 request = request.data(claims);
             }
             schema.execute(request).await.into()
         }
-        Err(e) => async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(
-            e.to_string(),
-            None,
-        )])
-        .into(),
+        Err(e) => {
+            tracing::warn!(
+                "[Tenant GraphQL Shield] Error generating tenant schema: {}",
+                e
+            );
+            async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(
+                format!("Tenant GraphQL Schema Error: {}", e),
+                None,
+            )])
+            .into()
+        }
     }
 }
 
@@ -81,11 +86,17 @@ pub async fn sandbox_graphql_handler(
             .execute(req.into_inner().data(event_scope))
             .await
             .into(),
-        Err(e) => async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(
-            e.to_string(),
-            None,
-        )])
-        .into(),
+        Err(e) => {
+            tracing::warn!(
+                "[Sandbox GraphQL Shield] Error generating sandbox schema: {}",
+                e
+            );
+            async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(
+                format!("Sandbox GraphQL Schema Error: {}", e),
+                None,
+            )])
+            .into()
+        }
     }
 }
 

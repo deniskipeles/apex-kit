@@ -135,6 +135,7 @@ export interface AppSettings {
   maxSandboxVectors?: number;
   maxSandboxAiRequests?: number;
   imageProcessingStep?: number;
+  disableIntrospection?: boolean;
   ai: AIProvider;
 }
 

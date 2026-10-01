@@ -16,6 +16,7 @@ const mapToFrontend = (apiData: any): AppSettings => {
     maxSandboxVectors: apiData.max_sandbox_vectors || 1000,
     maxSandboxAiRequests: apiData.max_sandbox_ai_requests || 100,
     imageProcessingStep: apiData.image_processing_step || 10,
+    disableIntrospection: apiData.disable_introspection ?? false,
     smtp: {
       enabled: apiData.smtp?.enabled || false,
       blockSmtp: apiData.smtp?.block_smtp || false, // <--- NEW MAPPING
@@ -92,6 +93,8 @@ const mapToApi = (settings: Partial<AppSettings>): any => {
     payload.max_sandbox_ai_requests = settings.maxSandboxAiRequests;
   if (settings.imageProcessingStep !== undefined)
     payload.image_processing_step = settings.imageProcessingStep;
+  if (settings.disableIntrospection !== undefined)
+    payload.disable_introspection = settings.disableIntrospection;
 
   if (settings.smtp) {
     payload.smtp = {

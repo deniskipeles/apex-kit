@@ -120,6 +120,14 @@ pub async fn get_settings(
         image_processing_step: general
             .get("image_processing_step")
             .and_then(|v| v.as_u64()),
+        disable_introspection: general
+            .get("disable_introspection")
+            .and_then(|v| v.as_bool())
+            .or_else(|| {
+                general
+                    .get("production_introspection_lock")
+                    .and_then(|v| v.as_bool())
+            }),
         smtp: None,
         storage: None,
         security: None,
@@ -288,10 +296,20 @@ pub async fn update_settings(
     if let Some(v) = &payload.image_processing_step {
         general["image_processing_step"] = json!(v);
     }
+    if let Some(v) = &payload.disable_introspection {
+        general["disable_introspection"] = json!(v);
+    }
 
     db.set_config("general", &general, false)
         .await
         .map_err(|e| AppError::UnknownError(e.to_string()))?;
+
+    // Instantly rebuild the GraphQL schema if introspection setting changed
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        crate::utils::trigger_scope_reload(state_clone, apexkit_core::realtime::EventScope::Root)
+            .await;
+    });
 
     // 2. Update SMTP (Encrypt Password if changed)
     if let Some(new_smtp) = &payload.smtp {

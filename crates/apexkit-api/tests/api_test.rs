@@ -318,3 +318,88 @@ async fn test_api_auth_register_and_login() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn test_graphql_duplicate_field_and_relation_shield() {
+    let dir = generate_temp_dir();
+    let state = setup_test_state(&dir).await;
+
+    // Schema containing colliding field and relation names (identical to user's crash scenario)
+    let schema_json = serde_json::json!({
+        "fields": {
+            "course_id": {
+                "type": "number",
+                "required": true,
+                "sql_indexed": true,
+                "auto": false,
+                "position": 0,
+                "uid": "f_course_id"
+            },
+            "student_id": {
+                "type": "number",
+                "required": true,
+                "sql_indexed": true,
+                "auto": false,
+                "position": 1,
+                "uid": "f_student_id"
+            }
+        },
+        "relations": {
+            "course_id": {
+                "target_collection": "courses",
+                "relation_type": "one",
+                "required": true,
+                "position": 2,
+                "uid": "r_course_id"
+            },
+            "student_id": {
+                "target_collection": "students",
+                "relation_type": "one",
+                "required": true,
+                "position": 3,
+                "uid": "r_student_id"
+            }
+        },
+        "policies": {
+            "read": "public",
+            "create": "public",
+            "update": "public",
+            "delete": "public"
+        }
+    });
+
+    let schema: apexkit_core::models::schema::CollectionSchema =
+        serde_json::from_value(schema_json).unwrap();
+
+    // 1. Create target collections and the grades collection
+    state
+        .db
+        .create_collection("courses", &None, None)
+        .await
+        .unwrap();
+    state
+        .db
+        .create_collection("students", &None, None)
+        .await
+        .unwrap();
+    state
+        .db
+        .create_collection("grades", &Some(schema), None)
+        .await
+        .unwrap();
+
+    let relation_loader = std::sync::Arc::new(async_graphql::dataloader::DataLoader::new(
+        apexkit_api::graphql::RelationLoader::new(state.db.clone()),
+        tokio::spawn,
+    ));
+
+    // 2. Build GraphQL Schema - MUST NOT PANIC!
+    let schema_res =
+        apexkit_api::graphql::builder::build_schema(state.clone(), relation_loader).await;
+    assert!(
+        schema_res.is_ok(),
+        "GraphQL schema build must succeed without panicking on colliding field and relation names"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

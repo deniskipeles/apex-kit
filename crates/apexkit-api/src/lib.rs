@@ -457,7 +457,7 @@ pub async fn start(port: u16) {
         tx,
         storage,
         vault,
-        schema: Arc::new(RwLock::new(empty_schema)),
+        schema: Arc::new(RwLock::new(empty_schema.clone())),
         scheduler: scheduler_arc.clone(),
         script_engine,
         thumb_cache: Cache::builder().max_capacity(1000).build(),
@@ -481,14 +481,15 @@ pub async fn start(port: u16) {
         let mut replica_rt_rx = state.tx.subscribe();
         let master_url = m_url.clone();
         let master_key = master_key_str.clone();
-        
+
         tokio::spawn(async move {
             let client = reqwest::Client::new();
             while let Ok(evt) = replica_rt_rx.recv().await {
                 // Forward ANY event (Insert, Update, Delete, Custom) that originated locally on this edge node to the Master
                 if evt.is_from_current_node() {
                     let url = format!("{}/replication/realtime", master_url.trim_end_matches('/'));
-                    let _ = client.post(&url)
+                    let _ = client
+                        .post(&url)
                         .header("Authorization", format!("Bearer {}", master_key))
                         .json(&evt)
                         .send()
@@ -508,7 +509,9 @@ pub async fn start(port: u16) {
                 if let Ok(event) = rx.recv().await {
                     // [NEW]: Catch tunneled Realtime events and broadcast them locally
                     if event.db_name == "__realtime__" {
-                        if let Ok(rt_evt) = serde_json::from_slice::<apexkit_core::realtime::DbEvent>(&event.changeset) {
+                        if let Ok(rt_evt) = serde_json::from_slice::<apexkit_core::realtime::DbEvent>(
+                            &event.changeset,
+                        ) {
                             // Only broadcast events that originated from OTHER nodes in the cluster
                             if !rt_evt.is_from_current_node() {
                                 let _ = state_for_apply.tx.send(rt_evt);
@@ -586,9 +589,18 @@ pub async fn start(port: u16) {
     }
 
     // --- 9. Final Setup & HTTP Bind ---
-    let gql_schema = crate::graphql::builder::build_schema(state.clone(), relation_loader)
+    let gql_schema = match crate::graphql::builder::build_schema(state.clone(), relation_loader)
         .await
-        .expect("Failed to build GraphQL schema");
+    {
+        Ok(schema) => schema,
+        Err(e) => {
+            tracing::error!(
+                "[Startup Shield] Failed to build full GraphQL schema: {}. Falling back to safe minimal schema.",
+                e
+            );
+            empty_schema
+        }
+    };
 
     {
         let mut lock = state.schema.write().await;

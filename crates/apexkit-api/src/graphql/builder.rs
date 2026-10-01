@@ -6,7 +6,7 @@ use super::utils::{
 use crate::AppState;
 use apexkit_core::auth::Claims;
 use apexkit_core::auth::policies;
-use apexkit_core::models::{ListResult, Record};
+use apexkit_core::models::{Collection, ListResult, Record};
 use apexkit_core::query::QueryOptions;
 use apexkit_core::realtime::EventScope;
 use apexkit_core::{
@@ -18,11 +18,11 @@ use async_graphql::extensions::Analyzer;
 use async_graphql::{Value as GqlValue, dynamic::*};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info, warn};
 
 // --- COLLISION TRACKER HELPER ---
 // Ensures we never panic on "Field already exists". If a collision occurs,
-// it preserves the data by appending the requested suffix (e.g. __rrc_list1)
+// it preserves data by attempting descriptive aliases (_expand, _rel) before fallback numbering.
 fn get_unique_field_name(
     object_name: &str,
     desired_name: &str,
@@ -33,15 +33,31 @@ fn get_unique_field_name(
         return desired_name.to_string();
     }
 
+    let candidate_expand = format!("{}_expand", desired_name);
+    if set.insert(candidate_expand.clone()) {
+        warn!(
+            "[GraphQL] Field '{}' conflicted on object '{}'. Disambiguated to '{}'.",
+            desired_name, object_name, candidate_expand
+        );
+        return candidate_expand;
+    }
+
+    let candidate_rel = format!("{}_rel", desired_name);
+    if set.insert(candidate_rel.clone()) {
+        warn!(
+            "[GraphQL] Field '{}' conflicted on object '{}'. Disambiguated to '{}'.",
+            desired_name, object_name, candidate_rel
+        );
+        return candidate_rel;
+    }
+
     let mut counter = 1;
     loop {
         let candidate = format!("{}___rrc_list{}", desired_name, counter);
         if set.insert(candidate.clone()) {
-            tracing::warn!(
-                "⚠️ [GraphQL] Field '{}' conflicted on object '{}'. Renamed to '{}' to prevent data loss.",
-                desired_name,
-                object_name,
-                candidate
+            warn!(
+                "[GraphQL] Field '{}' conflicted on object '{}'. Renamed to '{}' to prevent data loss.",
+                desired_name, object_name, candidate
             );
             return candidate;
         }
@@ -49,12 +65,73 @@ fn get_unique_field_name(
     }
 }
 
-// --- SCHEMA BUILDER ---
-
+// --- HARDENED SCHEMA BUILDER ---
+// Completely panic-shielded using std::panic::catch_unwind so schema building never kills threads.
 pub async fn build_schema(
     state: AppState,
     loader: Arc<DataLoader<RelationLoader>>,
-) -> Result<Schema, SchemaError> {
+) -> Result<Schema, String> {
+    // 1. Fetch data asynchronously outside of catch_unwind (from the active scope DB)
+    let collections = state.db.list_collections().await.unwrap_or_default();
+    let policy_users_json = state.db.get_config("policy_users").await.unwrap_or(None);
+    let scripts = state.db.list_scripts().await.unwrap_or_default();
+
+    // Resolve scope-aware introspection lock from General Settings
+    let general_config = state.db.get_config("general").await.unwrap_or(None);
+    let disable_introspection = general_config
+        .as_ref()
+        .and_then(|v| {
+            v.get("disable_introspection")
+                .and_then(|b| b.as_bool())
+                .or_else(|| {
+                    v.get("production_introspection_lock")
+                        .and_then(|b| b.as_bool())
+                })
+        })
+        .unwrap_or(false);
+
+    // 2. Perform synchronous assembly under a panic shield
+    let state_clone = state.clone();
+    let loader_clone = loader.clone();
+
+    let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        build_schema_sync(
+            state_clone,
+            loader_clone,
+            collections,
+            policy_users_json,
+            scripts,
+            disable_introspection,
+        )
+    }));
+
+    match build_result {
+        Ok(res) => res,
+        Err(panic_err) => {
+            let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown panic during GraphQL schema generation".to_string()
+            };
+            error!(
+                "[GraphQL Panic Shield] Caught panic during schema generation: {}",
+                msg
+            );
+            Err(format!("GraphQL Schema Generation Error: {}", msg))
+        }
+    }
+}
+
+fn build_schema_sync(
+    state: AppState,
+    loader: Arc<DataLoader<RelationLoader>>,
+    collections: Vec<Collection>,
+    policy_users_json: Option<serde_json::Value>,
+    scripts: Vec<apexkit_core::models::script::Script>,
+    disable_introspection: bool,
+) -> Result<Schema, String> {
     let user_loader = DataLoader::new(
         UserLoader {
             db: state.db.clone(),
@@ -69,14 +146,12 @@ pub async fn build_schema(
         .limit_complexity(2000)
         .extension(Analyzer);
 
-    let collections = state.db.list_collections().await.unwrap_or_default();
     let col_id_to_name: HashMap<String, String> = collections
         .iter()
         .map(|c| (c.id.to_string(), c.name.clone()))
         .collect();
 
     // 0. FETCH USER POLICIES
-    let policy_users_json = state.db.get_config("policy_users").await.unwrap_or(None);
     let user_read_policy = if let Some(val) = policy_users_json {
         let parsed_val = match val {
             serde_json::Value::String(s) => {
@@ -95,12 +170,23 @@ pub async fn build_schema(
         "admin || owner:id".to_string()
     };
 
-    // --- FIELD TRACKER ---
+    // Global field collision tracker
     let mut field_tracker: HashMap<String, HashSet<String>> = HashMap::new();
 
-    // --- 1. PRE-CALCULATE REVERSE RELATIONS & TARGET POLICIES ---
+    // Global registered type name tracker (prevents duplicate type panics)
+    let mut registered_types: HashSet<String> = HashSet::new();
+    registered_types.insert("Query".to_string());
+    registered_types.insert("Mutation".to_string());
+    registered_types.insert("_AuthUser".to_string());
+    registered_types.insert("_AuthUserList".to_string());
+    registered_types.insert("JSON".to_string());
+    registered_types.insert("String".to_string());
+    registered_types.insert("Int".to_string());
+    registered_types.insert("Float".to_string());
+    registered_types.insert("Boolean".to_string());
+    registered_types.insert("ID".to_string());
 
-    // A. User Reverse Owner Relations: (col_id, col_name, owner_field_name, target_policy)
+    // --- 1. PRE-CALCULATE REVERSE RELATIONS & TARGET POLICIES ---
     let mut user_reverse_fields = Vec::new();
     let mut user_field_names_count: HashMap<String, usize> = HashMap::new();
 
@@ -121,7 +207,6 @@ pub async fn build_schema(
         }
     }
 
-    // B. Collection Reverse Relations: Target Col ID -> Vec<(Origin Col ID, Origin Col Name, Rel Field Name, Origin Policy, RelationType)>
     let mut reverse_relations_map: HashMap<i64, Vec<(i64, String, String, String, RelationType)>> =
         HashMap::new();
     for other_col in &collections {
@@ -141,21 +226,19 @@ pub async fn build_schema(
                         other_col.name.clone(),
                         rel_name.clone(),
                         origin_policy.clone(),
-                        def.relation_type.clone(), // Record cardinality
+                        def.relation_type.clone(),
                     ));
                 }
             }
         }
     }
 
-    // --- 2. PREPARE STANDARD OBJECTS ---
-
+    // --- 2. PREPARE STANDARD ROOT OBJECTS ---
     let mut query_root = Object::new("Query");
     let mut mutation_root = Object::new("Mutation");
     let mut user_object = Object::new("_AuthUser");
     let mut collection_objects: HashMap<String, Object> = HashMap::new();
 
-    // Standard System Fields
     let fname = get_unique_field_name("Query", "_status", &mut field_tracker);
     query_root = query_root.field(Field::new(fname, TypeRef::named(TypeRef::STRING), |_| {
         FieldFuture::new(async { Ok(Some(GqlValue::from("ApexKit is running"))) })
@@ -365,11 +448,36 @@ pub async fn build_schema(
         .argument(InputValue::new("search", TypeRef::named(TypeRef::STRING))),
     );
 
-    // --- 4. BUILD COLLECTION OBJECTS (QUERIES & MUTATIONS) ---
+    // --- 4. BUILD COLLECTION OBJECTS & MUTATIONS (SHIELDED PER COLLECTION) ---
     for col in &collections {
-        let type_name = capitalize(&col.name);
-        let col_id = col.id;
+        let col_name_log = col.name.clone();
 
+        // Disambiguate type names so collision never crashes SchemaBuilder::register
+        let mut type_name = capitalize(&col.name);
+        if registered_types.contains(&type_name) {
+            type_name = format!("{}_{}", type_name, col.id);
+        }
+        registered_types.insert(type_name.clone());
+
+        let mut create_input_name = format!("Create{}Input", type_name);
+        if registered_types.contains(&create_input_name) {
+            create_input_name = format!("{}_{}", create_input_name, col.id);
+        }
+        registered_types.insert(create_input_name.clone());
+
+        let mut update_input_name = format!("Update{}Input", type_name);
+        if registered_types.contains(&update_input_name) {
+            update_input_name = format!("{}_{}", update_input_name, col.id);
+        }
+        registered_types.insert(update_input_name.clone());
+
+        let mut list_type_name = format!("{}List", type_name);
+        if registered_types.contains(&list_type_name) {
+            list_type_name = format!("{}_{}", list_type_name, col.id);
+        }
+        registered_types.insert(list_type_name.clone());
+
+        let col_id = col.id;
         let mut object = Object::new(&type_name);
 
         let read_policy = col
@@ -377,19 +485,16 @@ pub async fn build_schema(
             .as_ref()
             .map(|s| s.policies.read.clone())
             .unwrap_or("public".to_string());
-
         let create_policy = col
             .schema
             .as_ref()
             .map(|s| s.policies.create.clone())
             .unwrap_or("auth".to_string());
-
         let update_policy = col
             .schema
             .as_ref()
             .map(|s| s.policies.update.clone())
             .unwrap_or("admin".to_string());
-
         let delete_policy = col
             .schema
             .as_ref()
@@ -408,14 +513,15 @@ pub async fn build_schema(
             },
         ));
 
-        let create_input_name = format!("Create{}Input", type_name);
-        let update_input_name = format!("Update{}Input", type_name);
-
         let mut create_input = InputObject::new(&create_input_name);
         let mut update_input = InputObject::new(&update_input_name);
 
         let mut create_fields_count = 0;
         let mut update_fields_count = 0;
+
+        // [SHIELD FIX]: InputObject field deduplication trackers
+        let mut create_input_tracker: HashSet<String> = HashSet::new();
+        let mut update_input_tracker: HashSet<String> = HashSet::new();
 
         if let Some(schema) = &col.schema {
             for (field_name, def) in &schema.fields {
@@ -433,14 +539,11 @@ pub async fn build_schema(
                     let field = Field::new(fname, TypeRef::named("_AuthUser"), move |ctx| {
                         let name = name_clone.clone();
                         let policy_rule = u_read_policy.clone();
-
-                        // Extract state from the GraphQL Context dynamically
                         let state = ctx.data::<AppState>().unwrap().clone();
                         let db_for_policy = state.db.clone();
 
                         FieldFuture::new(async move {
                             let record = ctx.parent_value.try_downcast_ref::<Record>()?;
-
                             let user_id = record
                                 .data
                                 .get(&name)
@@ -477,7 +580,6 @@ pub async fn build_schema(
                                         "metadata": u.metadata
                                     });
 
-                                    // Pass the extracted db_for_policy
                                     if policies::check_access(
                                         &policy_rule,
                                         claims,
@@ -520,7 +622,7 @@ pub async fn build_schema(
                     _ => TypeRef::STRING,
                 };
 
-                if !is_owner || !def.auto {
+                if (!is_owner || !def.auto) && create_input_tracker.insert(field_name.clone()) {
                     let create_type_ref = if def.required {
                         TypeRef::named_nn(input_type)
                     } else {
@@ -530,9 +632,11 @@ pub async fn build_schema(
                     create_fields_count += 1;
                 }
 
-                update_input =
-                    update_input.field(InputValue::new(field_name, TypeRef::named(input_type)));
-                update_fields_count += 1;
+                if update_input_tracker.insert(field_name.clone()) {
+                    update_input =
+                        update_input.field(InputValue::new(field_name, TypeRef::named(input_type)));
+                    update_fields_count += 1;
+                }
             }
 
             for (rel_name, rel_def) in &schema.relations {
@@ -550,10 +654,7 @@ pub async fn build_schema(
                     .map(|s| s.policies.read.clone())
                     .unwrap_or("public".to_string());
 
-                // FORWARD RELATION: A foreign field on this collection points to ONE target entity.
-                // It must ALWAYS be a single Map (Object), NEVER a List/Array!
                 let type_ref = TypeRef::named(&target_type_name);
-
                 let fname = get_unique_field_name(&type_name, rel_name, &mut field_tracker);
 
                 let field = Field::new(fname, type_ref, move |ctx| {
@@ -600,26 +701,38 @@ pub async fn build_schema(
                             }
                         }
 
-                        // Returns a single Map or null (NEVER an empty array [])
                         Ok(target_record.map(FieldValue::owned_any))
                     })
                 });
                 object = object.field(field);
 
-                // Input types for mutations: scalar ID, not [ID]
                 let create_rel_type = if rel_def.required {
                     TypeRef::named_nn(TypeRef::ID)
                 } else {
                     TypeRef::named(TypeRef::ID)
                 };
-
                 let update_rel_type = TypeRef::named(TypeRef::ID);
 
-                create_input = create_input.field(InputValue::new(rel_name, create_rel_type));
-                create_fields_count += 1;
+                // [SHIELD FIX]: Only add relation fields to InputObject if not already added by schema.fields
+                if create_input_tracker.insert(rel_name.clone()) {
+                    create_input = create_input.field(InputValue::new(rel_name, create_rel_type));
+                    create_fields_count += 1;
+                } else {
+                    warn!(
+                        "[GraphQL Shield] Field '{}' in collection '{}' is defined in both fields and relations. Skipping duplicate on Create input.",
+                        rel_name, col_name_log
+                    );
+                }
 
-                update_input = update_input.field(InputValue::new(rel_name, update_rel_type));
-                update_fields_count += 1;
+                if update_input_tracker.insert(rel_name.clone()) {
+                    update_input = update_input.field(InputValue::new(rel_name, update_rel_type));
+                    update_fields_count += 1;
+                } else {
+                    warn!(
+                        "[GraphQL Shield] Field '{}' in collection '{}' is defined in both fields and relations. Skipping duplicate on Update input.",
+                        rel_name, col_name_log
+                    );
+                }
             }
         }
 
@@ -651,7 +764,6 @@ pub async fn build_schema(
 
                 let fname = get_unique_field_name(&type_name, &base_key, &mut field_tracker);
 
-                // Return List if reverse Many, or single Object if reverse One (unique)
                 let type_ref = if is_reverse_many {
                     TypeRef::named(&list_type)
                 } else {
@@ -747,13 +859,13 @@ pub async fn build_schema(
             }
         }
 
-        if create_fields_count == 0 {
+        if create_fields_count == 0 && create_input_tracker.insert("clientMutationId".to_string()) {
             create_input = create_input.field(InputValue::new(
                 "clientMutationId",
                 TypeRef::named(TypeRef::STRING),
             ));
         }
-        if update_fields_count == 0 {
+        if update_fields_count == 0 && update_input_tracker.insert("clientMutationId".to_string()) {
             update_input = update_input.field(InputValue::new(
                 "clientMutationId",
                 TypeRef::named(TypeRef::STRING),
@@ -764,10 +876,8 @@ pub async fn build_schema(
         schema_builder = schema_builder.register(create_input);
         schema_builder = schema_builder.register(update_input);
 
-        // List Type
-        let list_type_name = format!("{}List", type_name);
+        // List Object
         let mut list_object = Object::new(&list_type_name);
-
         let fname_total = get_unique_field_name(&list_type_name, "total", &mut field_tracker);
         list_object = list_object.field(Field::new(
             fname_total,
@@ -854,7 +964,6 @@ pub async fn build_schema(
         query_root = query_root.field(list_field);
 
         // --- MUTATIONS ---
-
         // 1. CREATE
         let create_name = format!("create{}", type_name);
         let c_policy = create_policy.clone();
@@ -886,12 +995,6 @@ pub async fn build_schema(
                 {
                     return Err(async_graphql::Error::new("Forbidden: Create denied"));
                 }
-
-                let input_val = ctx
-                    .args
-                    .get("data")
-                    .ok_or(async_graphql::Error::new("Missing data"))?;
-                let json_data = gql_input_to_json(input_val.as_value().clone());
 
                 let uid = claims.as_ref().map(|c| c.uid);
                 let final_data = prepare_data_for_create(json_data, &sch, uid);
@@ -1035,9 +1138,7 @@ pub async fn build_schema(
         mutation_root = mutation_root.field(delete_mutation);
     }
 
-    // --- 5. FETCH & INJECT CUSTOM RESOLVERS FROM SCRIPTS ---
-    let scripts = state.db.list_scripts().await.unwrap_or_default();
-
+    // --- 5. INJECT CUSTOM SCRIPT RESOLVERS ---
     for script in scripts {
         if script.trigger_type == "graphql"
             && script.active
@@ -1047,7 +1148,6 @@ pub async fn build_schema(
             let args_def = config.args.clone().unwrap_or_default();
             let return_type = map_type_ref(&config.return_type);
 
-            // Create Field
             let parent_obj_name = config.parent.clone();
             let fname = get_unique_field_name(&parent_obj_name, &config.name, &mut field_tracker);
 
@@ -1115,8 +1215,11 @@ pub async fn build_schema(
             });
 
             if let Some(args) = config.args {
+                let mut arg_tracker = HashSet::new();
                 for (k, v) in args {
-                    field = field.argument(InputValue::new(k, map_type_ref(&v)));
+                    if arg_tracker.insert(k.clone()) {
+                        field = field.argument(InputValue::new(k, map_type_ref(&v)));
+                    }
                 }
             }
 
@@ -1157,9 +1260,9 @@ pub async fn build_schema(
         .data(loader)
         .data(user_loader);
 
-    if std::env::var("APP_ENV").unwrap_or_default() == "production" {
+    if disable_introspection {
         builder = builder.disable_introspection();
     }
 
-    builder.finish()
+    builder.finish().map_err(|e| e.to_string())
 }

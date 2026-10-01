@@ -22,6 +22,7 @@ pub struct AppSettingsDto {
     pub max_sandbox_vectors: Option<i64>,
     pub max_sandbox_ai_requests: Option<i64>,
     pub image_processing_step: Option<u64>,
+    pub disable_introspection: Option<bool>,
     pub backups: Option<BackupConfigDto>,
 }
 
