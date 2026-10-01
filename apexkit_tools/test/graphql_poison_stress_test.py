@@ -102,7 +102,7 @@ class GraphqlPoisonRunner:
         self.tenant_id = f"tenant-{uuid.uuid4().hex[:6]}"
         self.tenant_key = None
         self.tenant_headers = {}
-        self.audit_results = {}
+        self.audit_summary = {}
 
         if self.is_self_managed:
             atexit.register(self.cleanup)
