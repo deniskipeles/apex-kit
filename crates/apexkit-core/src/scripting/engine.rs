@@ -1114,6 +1114,12 @@ impl ScriptEngine {
             #[allow(deprecated)]
             let res = rquickjs::async_with!(ctx => |js_ctx| {
                 js_ctx.globals().set("__TASK_ID", task_id).unwrap();
+
+                // Inject hook name into global scope for internal restrictions (e.g. blocking $realtime inside before_realtime_data_pushed)
+                if let Some(trigger_val) = event_data.get("trigger").and_then(|v| v.as_str()) {
+                    js_ctx.globals().set("__HOOK_NAME", trigger_val).unwrap();
+                }
+
                 setup_quickjs(&js_ctx, context.clone(), resolved_base_url.clone())?;
 
                 let import_code = format!("import('{}')", module_name);

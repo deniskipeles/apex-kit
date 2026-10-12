@@ -1,5 +1,5 @@
 use rquickjs::function::Async;
-use rquickjs::{Ctx, Function, Object, Value};
+use rquickjs::{Ctx, Exception, Function, Object, Value};
 use rquickjs_serde::from_value;
 use serde_json::json;
 use std::sync::Arc;
@@ -17,9 +17,17 @@ pub fn register_realtime<'js>(
     let app_send = app_ctx.clone();
     let send_fn = Function::new(
         ctx.clone(),
-        Async(move |channel: String, evt: String, data_val: Value<'js>| {
+        Async(move |js_ctx: Ctx<'js>, channel: String, evt: String, data_val: Value<'js>| {
             let app = app_send.clone();
             async move {
+                // --- PREVENT INFINITE LOOP ---
+                let hook_name: Option<String> = js_ctx.globals().get("__HOOK_NAME").unwrap_or(None);
+                if hook_name.as_deref() == Some("before_realtime_data_pushed") {
+                    let err = Exception::from_message(js_ctx.clone(), "$realtime.send is blocked inside before_realtime_data_pushed to prevent infinite loops.").unwrap();
+                    return Err(js_ctx.throw(err.into()));
+                }
+                // -----------------------------
+
                 let data: serde_json::Value = from_value(data_val).unwrap_or(json!({}));
                 let scope = app.get_scope();
                 let tx = app.get_realtime_tx();

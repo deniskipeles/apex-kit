@@ -21,6 +21,10 @@ const TRIGGER_TYPES = [
   { value: 'graphql', label: 'GraphQL Resolver', group: 'API' },
   { value: 'cron', label: 'Scheduled Job (Cron)', group: 'System' },
 
+  // --- Realtime (WebSockets / SSE) ---
+  { value: 'before_realtime_connection_established', label: 'Before Realtime Connection', group: 'Realtime' },
+  { value: 'before_realtime_data_pushed', label: 'Before Realtime Data Pushed', group: 'Realtime' },
+
   // --- AI Engine ---
   { value: 'before_ai_run', label: 'Before AI Action Run', group: 'AI Engine' },
   { value: 'after_ai_run', label: 'After AI Action Run', group: 'AI Engine' },
@@ -106,6 +110,23 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     template: `export default async function(req) {\n  const body = await req.json();\n  log("Processing payment: " + body.amount);\n  \n  // Return a standard HTTP Response\n  return new Response({ success: true, message: "Processed" });\n}`,
     returns:
       'Must return a standard `Response` object or a plain JSON object (which is automatically wrapped in a 200 OK response).',
+  },
+  // Realtime
+  before_realtime_connection_established: {
+    name: 'Before Realtime Connection',
+    desc: 'Intercepts incoming SSE and WebSocket connections. Return false or throw an error to immediately drop the connection.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "data": {\n    "ip": "127.0.0.1",\n    "protocol": "websocket",\n    "headers": {\n      "user-agent": "Mozilla...",\n      "origin": "https://..."\n    }\n  },\n  "auth": { "id": 1, "role": "user" }\n}`,
+    template: `export default async function(e) {\n  if(e.data.headers["user-agent"]?.includes("Bot")) {\n    throw "Bots not allowed";\n  }\n}`,
+    returns: 'Void. Throwing an error will deny the connection.'
+  },
+  before_realtime_data_pushed: {
+    name: 'Before Realtime Data Pushed',
+    desc: 'Intercepts data events just before they are broadcasted to the connected client. Modify the payload, or throw an error to send an empty object instead.',
+    signature: 'export default async function(e: HookEvent): Promise<Object>',
+    payload: `{\n  "data": { "type": "Insert", "collection_id": 1, "data": { ... } },\n  "auth": { "id": 1, "role": "user" }\n}`,
+    template: `export default async function(e) {\n  // Redact sensitive info\n  if (e.data.data && e.data.data.password) {\n    e.data.data.password = "***";\n  }\n  return e.data;\n}`,
+    returns: 'Return the modified event object. Throw an error to broadcast an empty `{}` object instead.'
   },
   graphql: {
     name: 'GraphQL Resolver',

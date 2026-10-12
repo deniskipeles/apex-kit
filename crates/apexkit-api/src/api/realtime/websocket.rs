@@ -1,9 +1,13 @@
 use crate::AppState;
+use crate::BaseUrl;
+use crate::hooks::{trigger_filter_hook, trigger_void_hook};
 use crate::utils::{resolve_collection_by_id_or_name, resolve_db_from_scope};
 use apexkit_core::{
     query::filter::FilterNode,
     realtime::{DbEvent, EventScope},
 };
+use axum::extract::ConnectInfo;
+use axum::http::StatusCode;
 use axum::{
     Extension,
     extract::{
@@ -14,6 +18,7 @@ use axum::{
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::Deserialize;
+use std::net::SocketAddr;
 use tracing::warn;
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -61,9 +66,44 @@ pub async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     scope: Option<Extension<EventScope>>,
-) -> impl IntoResponse {
-    let client_scope = scope.map(|e| e.0).unwrap_or_default();
-    ws.on_upgrade(move |socket| handle_socket(socket, state, client_scope))
+    auth: Option<Extension<apexkit_core::auth::Claims>>,
+    BaseUrl(base_url): BaseUrl,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    let client_scope = scope.clone().map(|e| e.0).unwrap_or_default();
+    let claims = auth.map(|c| c.0);
+
+    let mut headers_map = std::collections::HashMap::new();
+    for (k, v) in headers.iter() {
+        if let Ok(val) = v.to_str() {
+            headers_map.insert(k.to_string(), val.to_string());
+        }
+    }
+
+    // --- HOOK: before_realtime_connection_established ---
+    let hook_payload = serde_json::json!({
+        "ip": addr.ip().to_string(),
+        "protocol": "websocket",
+        "headers": headers_map
+    });
+
+    if let Err(e) = trigger_void_hook(
+        &state,
+        "before_realtime_connection_established",
+        hook_payload,
+        claims.as_ref(),
+        Some(&client_scope),
+        Some(base_url.clone()),
+    )
+    .await
+    {
+        tracing::warn!("WebSocket connection blocked by hook: {:?}", e);
+        return Err(StatusCode::FORBIDDEN); // Drops connection immediately
+    }
+    // ----------------------------------------------------
+
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, client_scope, base_url, claims)))
 }
 
 fn namespaced_channel(scope: &EventScope, channel: &str) -> String {
@@ -75,7 +115,13 @@ fn namespaced_channel(scope: &EventScope, channel: &str) -> String {
     }
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventScope) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    client_scope: EventScope,
+    base_url: String,
+    claims: Option<apexkit_core::auth::Claims>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = state.tx.subscribe();
 
@@ -85,7 +131,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
     let mut current_resolved_col_id: Option<i64> = None;
 
     // Hold authenticated claims in memory for this connection
-    let mut current_claims: Option<apexkit_core::auth::Claims> = None;
+    let mut current_claims: Option<apexkit_core::auth::Claims> = claims.clone();
 
     loop {
         tokio::select! {
@@ -96,8 +142,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                             Message::Text(text) => {
                                 match serde_json::from_str::<ClientMessage>(&text) {
                                     Ok(ClientMessage::Auth(req)) => {
-                                        if let Ok(claims) = apexkit_core::auth::decode_jwt(&req.token) {
-                                            current_claims = Some(claims);
+                                        if let Ok(c) = apexkit_core::auth::decode_jwt(&req.token) {
+                                            current_claims = Some(c);
                                             let _ = sender.send(Message::Text(serde_json::json!({ "type": "AuthSuccess" }).to_string().into())).await;
                                         } else {
                                             let _ = sender.send(Message::Text(serde_json::json!({ "type": "Error", "message": "Invalid token" }).to_string().into())).await;
@@ -177,7 +223,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                                             && let Ok(Some(col)) = current_db.get_collection(col_id).await {
                                                 let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
 
-                                                // [FIXED]: Added missing arguments and .await
                                                 allowed = apexkit_core::auth::policies::check_access(
                                                     policy,
                                                     current_claims.as_ref(),
@@ -229,23 +274,44 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_scope: EventSc
                         DbEvent::Insert { collection_id, data, .. } | DbEvent::Update { collection_id, data, .. } => {
                             if let Ok(Some(col)) = state.db.get_collection(*collection_id).await {
                                 let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-                                allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref(), Some(data), None, Some(state.db.clone())).await;
+                                allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref().or(claims.as_ref()), Some(data), None, Some(state.db.clone())).await;
                             }
                         }
                         DbEvent::Delete { collection_id, .. } => {
                             if let Ok(Some(col)) = state.db.get_collection(*collection_id).await {
                                 let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-                                allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref(), None, None, Some(state.db.clone())).await;
+                                allowed = apexkit_core::auth::policies::check_access(policy, current_claims.as_ref().or(claims.as_ref()), None, None, Some(state.db.clone())).await;
                             }
                         }
                         _ => {}
                     }
 
-                    if allowed
-                        && let Ok(json_msg) = serde_json::to_string(&event)
-                            && sender.send(Message::Text(json_msg.into())).await.is_err() {
-                                break;
+                    if allowed {
+                        let event_json = serde_json::to_value(&event).unwrap_or(serde_json::json!({}));
+
+                        // --- HOOK: before_realtime_data_pushed ---
+                        match trigger_filter_hook(
+                            &state,
+                            "before_realtime_data_pushed",
+                            event_json,
+                            current_claims.as_ref().or(claims.as_ref()),
+                            Some(&client_scope),
+                            Some(base_url.clone())
+                        ).await {
+                            Ok(modified_data) => {
+                                if let Ok(json_msg) = serde_json::to_string(&modified_data) {
+                                    if sender.send(Message::Text(json_msg.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
                             }
+                            Err(_) => {
+                                // Errored Hook returns an empty object
+                                let _ = sender.send(Message::Text(serde_json::json!({}).to_string().into())).await;
+                            }
+                        }
+                        // -----------------------------------------
+                    }
                 }
             }
         }
