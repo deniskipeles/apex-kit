@@ -77,6 +77,8 @@ impl TenantStore for ApexKit {
         max_vectors: Option<i64>,
         max_storage_mb: Option<i64>,
         max_ai_requests: Option<i64>,
+        max_sse: Option<i64>,
+        max_ws: Option<i64>,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
         let mut sets = Vec::new();
         let mut params: Vec<rusqlite::types::Value> = vec![];
@@ -105,6 +107,14 @@ impl TenantStore for ApexKit {
         if let Some(ma) = max_ai_requests {
             sets.push("max_ai_requests = ?");
             params.push(ma.into_val());
+        }
+        if let Some(sse) = max_sse {
+            sets.push("max_sse = ?");
+            params.push(sse.into_val());
+        }
+        if let Some(ws) = max_ws {
+            sets.push("max_ws = ?");
+            params.push(ws.into_val());
         }
         // -------------------
 
@@ -142,7 +152,7 @@ impl TenantStore for ApexKit {
     ) -> std::result::Result<Vec<models::Tenant>, Box<dyn StdError + Send + Sync>> {
         let conn = self.get_core_read().await;
         let mut stmt = conn.prepare(
-            "SELECT id,name,status,tier,max_storage_mb,current_storage_mb,max_vectors,current_vectors,max_ai_requests,current_ai_requests,created_at \
+            "SELECT id,name,status,tier,max_storage_mb,current_storage_mb,max_vectors,current_vectors,max_ai_requests,current_ai_requests,max_sse,max_ws,created_at \
              FROM _tenants \
              ORDER BY created_at DESC"
         )?;
@@ -162,8 +172,10 @@ impl TenantStore for ApexKit {
                     max_vectors: row.get(6)?,
                     ai_requests: row.get(9)?,
                     max_ai_requests: row.get(8)?,
+                    max_sse: row.get(10).unwrap_or(500),
+                    max_ws: row.get(11).unwrap_or(300),
                 },
-                created_at: row.get(10)?,
+                created_at: row.get(12)?,
             });
         }
         Ok(tenants)

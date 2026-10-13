@@ -191,6 +191,8 @@ pub struct TenantStats {
     pub max_vectors: i64,
     pub ai_requests: i64,
     pub max_ai_requests: i64,
+    pub max_sse: i64,
+    pub max_ws: i64,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema, Clone, Debug)]

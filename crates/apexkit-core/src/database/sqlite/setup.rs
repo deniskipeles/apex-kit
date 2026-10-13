@@ -159,11 +159,22 @@ pub fn setup_core(conn: &Connection) -> Result<()> {
         current_vectors INTEGER DEFAULT 0,
         max_ai_requests INTEGER DEFAULT 100,
         current_ai_requests INTEGER DEFAULT 0,
+        max_sse INTEGER DEFAULT 500,
+        max_ws INTEGER DEFAULT 300,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )",
         [],
     )?;
+
+    let _ = conn.execute(
+        "ALTER TABLE _tenants ADD COLUMN max_sse INTEGER DEFAULT 500",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE _tenants ADD COLUMN max_ws INTEGER DEFAULT 300",
+        [],
+    );
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS _sandboxes (

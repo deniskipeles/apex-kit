@@ -415,6 +415,8 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
             // --- NEW ---
             let max_storage_mb = updates.get("max_storage_mb").and_then(|v| v.as_i64());
             let max_ai_requests = updates.get("max_ai_requests").and_then(|v| v.as_i64());
+            let max_sse = updates.get("max_sse").and_then(|v| v.as_i64());
+            let max_ws = updates.get("max_ws").and_then(|v| v.as_i64());
 
             // 1. Update Metadata
             db.update_tenant_full(
@@ -425,6 +427,8 @@ impl apexkit_core::ScriptContext for ScopedScriptContext {
                 max_vectors,
                 max_storage_mb,
                 max_ai_requests,
+                max_sse,
+                max_ws,
             )
             .await
             .map_err(|e| e.to_string())?;

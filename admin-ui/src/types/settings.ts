@@ -146,6 +146,8 @@ export interface TenantStats {
   max_vectors: number;
   ai_requests: number;
   max_ai_requests: number;
+  max_sse: number;
+  max_ws: number;
 }
 
 export interface Tenant {

@@ -18,12 +18,101 @@ use axum::{
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{OnceLock, RwLock};
 use tracing::warn;
+
+static WS_CONNECTIONS: OnceLock<RwLock<HashMap<String, usize>>> = OnceLock::new();
+
+fn get_ws_connections() -> &'static RwLock<HashMap<String, usize>> {
+    WS_CONNECTIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn get_scope_key(scope: &EventScope) -> String {
+    match scope {
+        EventScope::Root => "root".to_string(),
+        EventScope::Tenant(id) => format!("tenant:{}", id),
+        EventScope::Sandbox(id) => format!("sandbox:{}", id),
+        EventScope::Channel(c) => format!("channel:{}", c),
+    }
+}
+
+async fn resolve_realtime_limits(state: &AppState, scope: &EventScope) -> (usize, usize) {
+    match scope {
+        EventScope::Root => (usize::MAX, usize::MAX),
+        EventScope::Tenant(id) => {
+            let mut max_sse = 500;
+            let mut max_ws = 300;
+            if let Ok(tenants) = state.db.list_tenants().await {
+                if let Some(t) = tenants.iter().find(|t| &t.id == id) {
+                    max_sse = t.stats.max_sse as usize;
+                    max_ws = t.stats.max_ws as usize;
+                }
+            }
+            (max_sse, max_ws)
+        }
+        EventScope::Sandbox(_) => (50, 30),
+        _ => (usize::MAX, usize::MAX),
+    }
+}
+
+struct WsConnectionGuard {
+    scope_key: String,
+    state: AppState,
+    client_scope: EventScope,
+    base_url: String,
+    claims: Option<apexkit_core::auth::Claims>,
+    headers_map: HashMap<String, String>,
+    ip: String,
+}
+
+impl Drop for WsConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(map) = WS_CONNECTIONS.get() {
+            if let Ok(mut lock) = map.write() {
+                if let Some(count) = lock.get_mut(&self.scope_key) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+        }
+
+        let state = self.state.clone();
+        let client_scope = self.client_scope.clone();
+        let base_url = self.base_url.clone();
+        let claims = self.claims.clone();
+        let payload = serde_json::json!({
+            "ip": self.ip,
+            "protocol": "websocket",
+            "headers": self.headers_map,
+        });
+
+        tokio::spawn(async move {
+            let _ = trigger_void_hook(
+                &state,
+                "after_realtime_connection_disconnected",
+                payload.clone(),
+                claims.as_ref(),
+                Some(&client_scope),
+                Some(base_url.clone()),
+            )
+            .await;
+            let _ = trigger_void_hook(
+                &state,
+                "after_realtime_connection_desconnected",
+                payload,
+                claims.as_ref(),
+                Some(&client_scope),
+                Some(base_url),
+            )
+            .await;
+        });
+    }
+}
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct SubscriptionFilter {
-    pub collection_id: Option<serde_json::Value>, // Accepts String (Name/ID) or Number (ID)
+    pub collection_id: Option<serde_json::Value>,
     pub record_id: Option<i64>,
     pub event_type: Option<String>,
     pub filter: Option<serde_json::Value>,
@@ -33,7 +122,7 @@ pub struct SubscriptionFilter {
 
 #[derive(Deserialize, Debug)]
 pub struct SearchRequest {
-    pub collection_id: serde_json::Value, // Accepts String (Name/ID) or Number (ID)
+    pub collection_id: serde_json::Value,
     pub query: String,
     pub limit: Option<usize>,
     pub request_id: Option<String>,
@@ -72,13 +161,34 @@ pub async fn websocket_handler(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
     let client_scope = scope.clone().map(|e| e.0).unwrap_or_default();
+    let scope_key = get_scope_key(&client_scope);
     let claims = auth.map(|c| c.0);
 
-    let mut headers_map = std::collections::HashMap::new();
+    let mut headers_map = HashMap::new();
     for (k, v) in headers.iter() {
         if let Ok(val) = v.to_str() {
             headers_map.insert(k.to_string(), val.to_string());
         }
+    }
+
+    // --- ENFORCE REALTIME CONNECTION QUOTA LIMITS ---
+    let (_, max_ws) = resolve_realtime_limits(&state, &client_scope).await;
+    {
+        let map = get_ws_connections().read().unwrap();
+        let current_count = map.get(&scope_key).copied().unwrap_or(0);
+        if current_count >= max_ws {
+            tracing::warn!(
+                "WebSocket connection limit reached for scope {}: {}/{}",
+                scope_key,
+                current_count,
+                max_ws
+            );
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+    {
+        let mut map = get_ws_connections().write().unwrap();
+        *map.entry(scope_key.clone()).or_insert(0) += 1;
     }
 
     // --- HOOK: before_realtime_connection_established ---
@@ -99,11 +209,29 @@ pub async fn websocket_handler(
     .await
     {
         tracing::warn!("WebSocket connection blocked by hook: {:?}", e);
-        return Err(StatusCode::FORBIDDEN); // Drops connection immediately
+        if let Some(map) = WS_CONNECTIONS.get() {
+            if let Ok(mut lock) = map.write() {
+                if let Some(count) = lock.get_mut(&scope_key) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+        }
+        return Err(StatusCode::FORBIDDEN);
     }
-    // ----------------------------------------------------
 
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, client_scope, base_url, claims)))
+    let guard = WsConnectionGuard {
+        scope_key,
+        state: state.clone(),
+        client_scope: client_scope.clone(),
+        base_url: base_url.clone(),
+        claims: claims.clone(),
+        headers_map,
+        ip: addr.ip().to_string(),
+    };
+
+    Ok(ws.on_upgrade(move |socket| {
+        handle_socket(socket, state, client_scope, base_url, claims, guard)
+    }))
 }
 
 fn namespaced_channel(scope: &EventScope, channel: &str) -> String {
@@ -121,7 +249,10 @@ async fn handle_socket(
     client_scope: EventScope,
     base_url: String,
     claims: Option<apexkit_core::auth::Claims>,
+    guard: WsConnectionGuard,
 ) {
+    let _guard = guard;
+
     let (mut sender, mut receiver) = socket.split();
     let mut rx = state.tx.subscribe();
 
@@ -130,7 +261,6 @@ async fn handle_socket(
     let mut active_namespaced_channel: Option<String> = None;
     let mut current_resolved_col_id: Option<i64> = None;
 
-    // Hold authenticated claims in memory for this connection
     let mut current_claims: Option<apexkit_core::auth::Claims> = claims.clone();
 
     loop {
@@ -162,7 +292,6 @@ async fn handle_socket(
                                             active_namespaced_channel = None;
                                         }
 
-                                        // Resolve collection name or ID upon subscribing to optimize throughput
                                         current_resolved_col_id = None;
                                         if let Some(ref col_val) = filter.collection_id
                                             && let Ok(db) = resolve_db_from_scope(&state, &client_scope).await {
@@ -203,7 +332,7 @@ async fn handle_socket(
                                         let limit = req.limit.unwrap_or(10).min(50);
 
                                         let mut resolved_search_id = None;
-                                        let mut current_db = state.db.clone(); // Fallback to Root
+                                        let mut current_db = state.db.clone();
 
                                         if let Ok(db) = resolve_db_from_scope(&state, &client_scope).await {
                                             current_db = db.clone();
@@ -222,7 +351,6 @@ async fn handle_socket(
                                         if let Some(col_id) = resolved_search_id
                                             && let Ok(Some(col)) = current_db.get_collection(col_id).await {
                                                 let policy = col.schema.as_ref().map(|s| s.policies.read.as_str()).unwrap_or("public");
-
                                                 allowed = apexkit_core::auth::policies::check_access(
                                                     policy,
                                                     current_claims.as_ref(),
@@ -268,7 +396,6 @@ async fn handle_socket(
             Ok(event) = rx.recv() => {
                 if matches_scope(&event, &client_scope, &active_namespaced_channel) && matches_filter(&event, &current_filter, &current_filter_node, current_resolved_col_id) {
 
-                    // Row-Level Security checks for Streaming Realtime Broadcasts
                     let mut allowed = true;
                     match &event {
                         DbEvent::Insert { collection_id, data, .. } | DbEvent::Update { collection_id, data, .. } => {
@@ -294,7 +421,7 @@ async fn handle_socket(
                             &state,
                             "before_realtime_data_pushed",
                             event_json,
-                            current_claims.as_ref().or(claims.as_ref()),
+                            current_claims.as_ref(),
                             Some(&client_scope),
                             Some(base_url.clone())
                         ).await {
@@ -306,11 +433,9 @@ async fn handle_socket(
                                 }
                             }
                             Err(_) => {
-                                // Errored Hook returns an empty object
                                 let _ = sender.send(Message::Text(serde_json::json!({}).to_string().into())).await;
                             }
                         }
-                        // -----------------------------------------
                     }
                 }
             }

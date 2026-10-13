@@ -398,6 +398,8 @@ export const apiClient = {
           max_vectors: 0,
           ai_requests: 0,
           max_ai_requests: 0,
+          max_sse: t.stats?.max_sse ?? 500,
+          max_ws: t.stats?.max_ws ?? 300,
         },
         created_at: t.created_at,
       }));

@@ -60,6 +60,8 @@ export const TenantsListPage = () => {
     max_storage_mb: 500,
     max_vectors: 10000,
     max_ai_requests: 100,
+    max_sse: 500,
+    max_ws: 300,
   });
 
   const { toast } = useToast();
@@ -106,6 +108,8 @@ export const TenantsListPage = () => {
         max_vectors: formData.max_vectors,
         max_storage_mb: formData.max_storage_mb,
         max_ai_requests: formData.max_ai_requests,
+        max_sse: formData.max_sse,
+        max_ws: formData.max_ws,
       });
 
       toast(`Tenant '${formData.tenantId}' successfully created.`, 'success');
@@ -132,6 +136,8 @@ export const TenantsListPage = () => {
         max_vectors: formData.max_vectors,
         max_storage_mb: formData.max_storage_mb,
         max_ai_requests: formData.max_ai_requests,
+        max_sse: formData.max_sse,
+        max_ws: formData.max_ws,
       });
       toast(`Tenant metadata updated successfully.`, 'success');
       setIsEditOpen(false);
@@ -185,6 +191,8 @@ export const TenantsListPage = () => {
       max_storage_mb: tenant.stats?.max_storage_mb ?? 500,
       max_vectors: tenant.stats?.max_vectors ?? 10000,
       max_ai_requests: tenant.stats?.max_ai_requests ?? 100,
+      max_sse: tenant.stats?.max_sse ?? 500,
+      max_ws: tenant.stats?.max_ws ?? 300,
     });
     setIsEditOpen(true);
   };
@@ -198,6 +206,8 @@ export const TenantsListPage = () => {
       max_storage_mb: 500,
       max_vectors: 10000,
       max_ai_requests: 100,
+      max_sse: 500,
+      max_ws: 300,
     });
   };
 
@@ -630,6 +640,38 @@ export const TenantsListPage = () => {
                     })
                   }
                 />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label>Max SSE Connections</Label>
+                <Input
+                  type="number"
+                  placeholder="500"
+                  value={formData.max_sse ?? ''}
+                  onChange={(e: any) =>
+                    setFormData({
+                      ...formData,
+                      max_sse: e.target.value !== '' ? Number(e.target.value) : 500,
+                    })
+                  }
+                />
+                <p className="text-[10px] text-muted-foreground">Default: 500</p>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label>Max WebSocket Connections</Label>
+                <Input
+                  type="number"
+                  placeholder="300"
+                  value={formData.max_ws ?? ''}
+                  onChange={(e: any) =>
+                    setFormData({
+                      ...formData,
+                      max_ws: e.target.value !== '' ? Number(e.target.value) : 300,
+                    })
+                  }
+                />
+                <p className="text-[10px] text-muted-foreground">Default: 300</p>
               </div>
             </div>
           </div>

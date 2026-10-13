@@ -22,8 +22,17 @@ const TRIGGER_TYPES = [
   { value: 'cron', label: 'Scheduled Job (Cron)', group: 'System' },
 
   // --- Realtime (WebSockets / SSE) ---
-  { value: 'before_realtime_connection_established', label: 'Before Realtime Connection', group: 'Realtime' },
+  {
+    value: 'before_realtime_connection_established',
+    label: 'Before Realtime Connection',
+    group: 'Realtime',
+  },
   { value: 'before_realtime_data_pushed', label: 'Before Realtime Data Pushed', group: 'Realtime' },
+  {
+    value: 'after_realtime_connection_desconnected',
+    label: 'After Realtime Connection Disconnected',
+    group: 'Realtime',
+  },
 
   // --- AI Engine ---
   { value: 'before_ai_run', label: 'Before AI Action Run', group: 'AI Engine' },
@@ -118,7 +127,7 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<void>',
     payload: `{\n  "data": {\n    "ip": "127.0.0.1",\n    "protocol": "websocket",\n    "headers": {\n      "user-agent": "Mozilla...",\n      "origin": "https://..."\n    }\n  },\n  "auth": { "id": 1, "role": "user" }\n}`,
     template: `export default async function(e) {\n  if(e.data.headers["user-agent"]?.includes("Bot")) {\n    throw "Bots not allowed";\n  }\n}`,
-    returns: 'Void. Throwing an error will deny the connection.'
+    returns: 'Void. Throwing an error will deny the connection.',
   },
   before_realtime_data_pushed: {
     name: 'Before Realtime Data Pushed',
@@ -126,7 +135,16 @@ const TRIGGER_DOCS: Record<string, TriggerDoc> = {
     signature: 'export default async function(e: HookEvent): Promise<Object>',
     payload: `{\n  "data": { "type": "Insert", "collection_id": 1, "data": { ... } },\n  "auth": { "id": 1, "role": "user" }\n}`,
     template: `export default async function(e) {\n  // Redact sensitive info\n  if (e.data.data && e.data.data.password) {\n    e.data.data.password = "***";\n  }\n  return e.data;\n}`,
-    returns: 'Return the modified event object. Throw an error to broadcast an empty `{}` object instead.'
+    returns:
+      'Return the modified event object. Throw an error to broadcast an empty `{}` object instead.',
+  },
+  after_realtime_connection_desconnected: {
+    name: 'After Realtime Connection Disconnected',
+    desc: 'Fires asynchronously after an SSE or WebSocket client disconnects, terminates, or loses connection.',
+    signature: 'export default async function(e: HookEvent): Promise<void>',
+    payload: `{\n  "data": {\n    "ip": "127.0.0.1",\n    "protocol": "websocket",\n    "headers": {\n      "user-agent": "Mozilla...",\n      "origin": "https://..."\n    }\n  },\n  "auth": { "id": 1, "email": "user@example.com", "role": "user" },\n  "trigger": "after_realtime_connection_desconnected"\n}`,
+    template: `export default async function(e) {\n  log("Client disconnected (" + e.data.protocol + "): " + e.data.ip);\n  \n  // Optional: Broadcast departure to a channel\n  // await $realtime.send("presence", "user_left", { ip: e.data.ip, user_id: e.auth?.id });\n}`,
+    returns: 'Void. Returning a value has no effect.',
   },
   graphql: {
     name: 'GraphQL Resolver',

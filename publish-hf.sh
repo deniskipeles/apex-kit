@@ -9,7 +9,7 @@ HF_REPO="${HF_REPO:-kipeles/apexkit-releases}"
 # Repo type: "dataset" (recommended for binaries), "model", or "space"
 REPO_TYPE="${REPO_TYPE:-dataset}"
 
-TAG="${TAG:-v0.1.0-beta.1}"
+TAG="${TAG:-v0.1.0-beta.2}"
 DIST_DIR="$(pwd)/dist"
 
 if [ ! -d "${DIST_DIR}" ]; then
