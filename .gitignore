@@ -70,3 +70,7 @@ static/dashboard/assets
 # Skip
 !admin-ui/src/features/sandboxes/pages/SandboxesListPage.tsx
 dist/
+# Test artifacts & local secrets
+.testbin/
+.token
+__pycache__/
