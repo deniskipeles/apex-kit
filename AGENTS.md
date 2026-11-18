@@ -61,3 +61,24 @@ Uniqueness and lookup indexes are real SQLite **expression indexes** on the
   `EXPLAIN QUERY PLAN` against a real `data.db`.
 - SQLite reports a violation as `UNIQUE constraint failed: index '<name>'`; the
   index name is decoded back to the field name from the in-memory schema.
+
+## Relations subsystem (`apexkit-core`)
+
+A relation is a single directed edge between two records, stored in `_relations`
+as `(origin_rec_id, target_rec_id, properties)` — no collection ids and no
+`rel_name`. The pair is unique, and both columns have
+`FOREIGN KEY ... REFERENCES records(id) ON DELETE CASCADE`, so deleting either
+endpoint removes the edge automatically (`PRAGMA foreign_keys = ON` is set in
+`apply_pragmas`).
+
+- `create_relation` is a guarded insert (`SELECT ... WHERE EXISTS`), so a
+  dangling id is a no-op rather than a foreign-key error.
+- Relation *names* live in the collection schema (`schema.relations`), not on the
+  edge. `sync_relations` groups a record's relation fields by target collection
+  and treats the union of their values as that collection's edge set; it leaves
+  edges to other collections (e.g. those made through the relations API) alone.
+- Expand is schema-driven (`crates/apexkit-core/src/query/builder.rs`): forward
+  resolves the scalar id to one record, reverse resolves the id to a list.
+- Legacy wide-table databases are migrated once by
+  `crates/apexkit-core/src/database/sqlite/migrate.rs` (`needs_relations_migration`
+  / `migrate_relations`), which collapses named duplicates to one edge.

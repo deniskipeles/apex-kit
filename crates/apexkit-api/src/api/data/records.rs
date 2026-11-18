@@ -784,7 +784,6 @@ pub async fn create_relation(
         path.record_id,
         p.target_collection_id,
         p.target_record_id,
-        &p.relation_name,
     )
     .await
     .map_err(|e| AppError::UnknownError(e.to_string()))?;
@@ -847,7 +846,6 @@ pub async fn delete_relation(
         path.record_id,
         p.target_collection_id,
         p.target_record_id,
-        &p.relation_name,
     )
     .await
     .map_err(|e| AppError::UnknownError(e.to_string()))?;

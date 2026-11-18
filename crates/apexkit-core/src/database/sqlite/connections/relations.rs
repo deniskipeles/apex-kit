@@ -6,54 +6,47 @@ use async_trait::async_trait;
 use rusqlite::params;
 use std::error::Error as StdError;
 
+fn map_err(e: String) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::other(e))
+}
+
 #[async_trait]
 impl RelationStore for ApexKit {
     async fn create_relation(
         &self,
-        origin_col: i64,
+        _origin_col: i64,
         origin_id: i64,
-        target_col: i64,
+        _target_col: i64,
         target_id: i64,
-        rel_name: &str,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // The foreign keys enforce that both endpoints exist. The EXISTS guard
+        // makes a dangling target id a no-op instead of a constraint error, so
+        // linking to a missing record does not surface as a server error.
         self.data_batcher
             .execute(
-                "INSERT INTO _relations (origin_col_id,origin_rec_id,target_col_id,target_rec_id,rel_name) VALUES (?1,?2,?3,?4,?5)".into(),
-                vec![
-                    origin_col.into_val(),
-                    origin_id.into_val(),
-                    target_col.into_val(),
-                    target_id.into_val(),
-                    rel_name.into_val()
-                ]
+                "INSERT OR IGNORE INTO _relations (origin_rec_id,target_rec_id) \
+                 SELECT ?1, ?2 \
+                 WHERE EXISTS (SELECT 1 FROM records WHERE id = ?1) \
+                   AND EXISTS (SELECT 1 FROM records WHERE id = ?2)"
+                    .into(),
+                vec![origin_id.into_val(), target_id.into_val()],
             )
             .await
-            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(map_err)?;
         Ok(())
     }
 
     async fn delete_relation(
         &self,
-        origin_col: i64,
+        _origin_col: i64,
         origin_id: i64,
-        target_col: i64,
+        _target_col: i64,
         target_id: i64,
-        rel_name: &str,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
-        let map_err = |e: String| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::other(e))
-        };
         self.data_batcher
             .execute(
-                "DELETE FROM _relations \
-                 WHERE origin_col_id=?1 AND origin_rec_id=?2 AND target_col_id=?3 AND target_rec_id=?4 AND rel_name=?5".into(),
-                vec![
-                    origin_col.into_val(),
-                    origin_id.into_val(),
-                    target_col.into_val(),
-                    target_id.into_val(),
-                    rel_name.into_val()
-                ]
+                "DELETE FROM _relations WHERE origin_rec_id=?1 AND target_rec_id=?2".into(),
+                vec![origin_id.into_val(), target_id.into_val()],
             )
             .await
             .map_err(map_err)?;
@@ -62,19 +55,15 @@ impl RelationStore for ApexKit {
 
     async fn get_related_ids(
         &self,
-        origin_col: i64,
         origin_id: i64,
-        rel_name: &str,
-    ) -> std::result::Result<Vec<(i64, i64)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> std::result::Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.get_data_read().await;
-        let mut stmt = conn.prepare(
-            "SELECT target_col_id,target_rec_id FROM _relations \
-             WHERE origin_col_id=?1 AND origin_rec_id=?2 AND rel_name=?3",
-        )?;
-        let mut rows = stmt.query(params![origin_col, origin_id, rel_name])?;
+        let mut stmt =
+            conn.prepare("SELECT target_rec_id FROM _relations WHERE origin_rec_id=?1")?;
+        let mut rows = stmt.query(params![origin_id])?;
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
-            results.push((row.get(0)?, row.get(1)?));
+            results.push(row.get(0)?);
         }
         Ok(results)
     }
@@ -87,18 +76,19 @@ impl RelationStore for ApexKit {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let id_list = ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = vec!["?"; ids.len()].join(",");
         let sql = format!(
             "SELECT id,json(data),NULL,created,updated FROM records WHERE collection_id = ? AND id IN ({})",
-            id_list
+            placeholders
         );
+
+        let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 1);
+        values.push(collection_id.into_val());
+        values.extend(ids.iter().map(|id| id.into_val()));
+
         let conn = self.get_data_read().await;
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(params![collection_id])?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
         let mut records = Vec::new();
         while let Some(row) = rows.next()? {
             records.push(row_to_record(row)?);

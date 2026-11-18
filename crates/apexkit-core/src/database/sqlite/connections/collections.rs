@@ -212,7 +212,10 @@ impl CollectionStore for ApexKit {
                     }
                 }
 
-                // 2. Handle relational field renames within the JSON blob and linkages table
+                // 2. Handle relational field renames within the JSON blob.
+                // Edges are keyed by id pair only, so a renamed relation field
+                // needs no change in `_relations` — the edges are rebuilt from
+                // the record data on the next write.
                 for (new_name, new_def) in &s.relations {
                     if let Some((old_name, _)) = old_s
                         .relations
@@ -227,22 +230,6 @@ impl CollectionStore for ApexKit {
                         );
                         self.data_batcher
                             .execute(sql, vec![id.into_val()])
-                            .await
-                            .map_err(|e| {
-                                Box::new(std::io::Error::other(e))
-                                    as Box<dyn std::error::Error + Send + Sync>
-                            })?;
-
-                        let rel_sql = "UPDATE _relations SET rel_name = ? WHERE origin_col_id = ? AND rel_name = ?".to_string();
-                        self.data_batcher
-                            .execute(
-                                rel_sql,
-                                vec![
-                                    new_name.clone().into_val(),
-                                    id.into_val(),
-                                    old_name.clone().into_val(),
-                                ],
-                            )
                             .await
                             .map_err(|e| {
                                 Box::new(std::io::Error::other(e))
@@ -269,7 +256,7 @@ impl CollectionStore for ApexKit {
                     }
                 }
 
-                // 4. Handle Deleted Relations (Remove from JSON and linkage table)
+                // 4. Handle Deleted Relations (Remove from JSON)
                 for (old_name, old_def) in &old_s.relations {
                     let still_exists = s
                         .relations
@@ -282,19 +269,6 @@ impl CollectionStore for ApexKit {
                         );
                         self.data_batcher
                             .execute(sql, vec![id.into_val()])
-                            .await
-                            .map_err(|e| {
-                                Box::new(std::io::Error::other(e))
-                                    as Box<dyn std::error::Error + Send + Sync>
-                            })?;
-
-                        let rel_sql =
-                            "DELETE FROM _relations WHERE origin_col_id = ? AND rel_name = ?";
-                        self.data_batcher
-                            .execute(
-                                rel_sql.to_string(),
-                                vec![id.into_val(), old_name.clone().into_val()],
-                            )
                             .await
                             .map_err(|e| {
                                 Box::new(std::io::Error::other(e))
@@ -326,23 +300,11 @@ impl CollectionStore for ApexKit {
             Box::new(std::io::Error::other(e))
         };
 
+        // Removing the collection's records cascades their edges away via the
+        // `_relations` foreign keys, so no edge cleanup is needed here.
         self.data_batcher
             .execute(
                 "DELETE FROM records WHERE collection_id = ?1".into(),
-                vec![id.into_val()],
-            )
-            .await
-            .map_err(map_err)?;
-        self.data_batcher
-            .execute(
-                "DELETE FROM _relations WHERE origin_col_id = ?1".into(),
-                vec![id.into_val()],
-            )
-            .await
-            .map_err(map_err)?;
-        self.data_batcher
-            .execute(
-                "DELETE FROM _relations WHERE target_col_id = ?1".into(),
                 vec![id.into_val()],
             )
             .await

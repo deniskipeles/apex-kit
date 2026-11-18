@@ -795,9 +795,8 @@ impl RelationStore for CachedDb {
         oi: i64,
         tc: i64,
         ti: i64,
-        rn: &str,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.create_relation(oc, oi, tc, ti, rn).await
+        self.inner.create_relation(oc, oi, tc, ti).await
     }
 
     async fn delete_relation(
@@ -806,18 +805,15 @@ impl RelationStore for CachedDb {
         oi: i64,
         tc: i64,
         ti: i64,
-        rn: &str,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
-        self.inner.delete_relation(oc, oi, tc, ti, rn).await
+        self.inner.delete_relation(oc, oi, tc, ti).await
     }
 
     async fn get_related_ids(
         &self,
-        oc: i64,
         oi: i64,
-        rn: &str,
-    ) -> std::result::Result<Vec<(i64, i64)>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.get_related_ids(oc, oi, rn).await
+    ) -> std::result::Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_related_ids(oi).await
     }
 
     async fn get_records_by_ids(

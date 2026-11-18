@@ -720,33 +720,35 @@ pub trait PluginStore: Send + Sync {
 /// Store operations for relationship graphs linking independent record entries.
 #[async_trait]
 pub trait RelationStore: Send + Sync {
-    /// Registers a directional relationship between two records.
+    /// Registers a single directed edge between two records.
+    ///
+    /// A relation is an edge: the `(origin, target)` pair is unique, so the
+    /// same two records cannot be linked twice. Modelling a many-to-many
+    /// relationship is done with a join collection rather than repeated edges.
+    /// The collection ids are used to confirm both endpoints exist; they are
+    /// not stored on the edge.
     async fn create_relation(
         &self,
         origin_col: i64,
         origin_id: i64,
         target_col: i64,
         target_id: i64,
-        rel_name: &str,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Clears direction links mapped on target database entities.
+    /// Removes the edge between two records.
     async fn delete_relation(
         &self,
         origin_col: i64,
         origin_id: i64,
         target_col: i64,
         target_id: i64,
-        rel_name: &str,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
 
-    /// Fetches linked target identifiers related to a record.
+    /// Fetches the ids of every record the given record points at.
     async fn get_related_ids(
         &self,
-        origin_col: i64,
         origin_id: i64,
-        rel_name: &str,
-    ) -> std::result::Result<Vec<(i64, i64)>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> std::result::Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Returns structural entities from distinct collections matching a list of record IDs.
     async fn get_records_by_ids(
