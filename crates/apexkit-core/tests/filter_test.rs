@@ -95,8 +95,16 @@ fn inline_sql_maps_id_to_records_column() {
 fn inline_sql_uses_json_extract_for_nested_fields() {
     let node = FilterNode::parse(&json!({"meta.author.name": "jane"}));
     let sql = node.to_inline_sql().unwrap();
-    assert!(sql.contains("->> 'name'"), "got {sql}");
-    assert!(sql.contains("-> 'author'"), "got {sql}");
+    // Single dotted path so the expression matches the generated indexes.
+    assert!(sql.contains("json_extract(records.data, '$.meta.author.name')"), "got {sql}");
+    assert!(!sql.contains("->>"), "must not emit ->> chains: {sql}");
+}
+
+#[test]
+fn inline_sql_uses_json_extract_for_simple_field() {
+    let node = FilterNode::parse(&json!({"email": "a@b.com"}));
+    let sql = node.to_inline_sql().unwrap();
+    assert!(sql.contains("json_extract(records.data, '$.email')"), "got {sql}");
 }
 
 #[test]
