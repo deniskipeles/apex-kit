@@ -92,21 +92,76 @@ async fn relation_creation_and_lookup() {
     let author_id = db.create_record(authors, &json!({"title": "Jane"})).await.unwrap();
     let book_id = db.create_record(books, &json!({"title": "Book"})).await.unwrap();
 
-    db.create_relation(books, book_id, authors, author_id, "author")
+    db.create_relation(books, book_id, authors, author_id)
         .await
         .unwrap();
 
-    let related = db.get_related_ids(books, book_id, "author").await.unwrap();
-    assert_eq!(related, vec![(authors, author_id)]);
+    let related = db.get_related_ids(book_id).await.unwrap();
+    assert_eq!(related, vec![author_id]);
 
     let records = db.get_records_by_ids(authors, &[author_id]).await.unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].data["title"], "Jane");
 
-    db.delete_relation(books, book_id, authors, author_id, "author")
+    db.delete_relation(books, book_id, authors, author_id)
         .await
         .unwrap();
-    assert!(db.get_related_ids(books, book_id, "author").await.unwrap().is_empty());
+    assert!(db.get_related_ids(book_id).await.unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn relation_edge_is_unique_per_pair() {
+    let (dir, db) = fresh_db("relation_unique").await;
+    let authors = db
+        .create_collection("authors", &Some(parse_schema(simple_schema())), None)
+        .await
+        .unwrap();
+    let books = db
+        .create_collection("books", &Some(parse_schema(simple_schema())), None)
+        .await
+        .unwrap();
+
+    let author_id = db.create_record(authors, &json!({"title": "Jane"})).await.unwrap();
+    let book_id = db.create_record(books, &json!({"title": "Book"})).await.unwrap();
+
+    // The same pair cannot be linked twice, regardless of any relation name.
+    db.create_relation(books, book_id, authors, author_id)
+        .await
+        .unwrap();
+    db.create_relation(books, book_id, authors, author_id)
+        .await
+        .unwrap();
+
+    assert_eq!(db.get_related_ids(book_id).await.unwrap(), vec![author_id]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn deleting_target_record_cascades_edges() {
+    let (dir, db) = fresh_db("relation_cascade").await;
+    let authors = db
+        .create_collection("authors", &Some(parse_schema(simple_schema())), None)
+        .await
+        .unwrap();
+    let books = db
+        .create_collection("books", &Some(parse_schema(simple_schema())), None)
+        .await
+        .unwrap();
+
+    let author_id = db.create_record(authors, &json!({"title": "Jane"})).await.unwrap();
+    let book_id = db.create_record(books, &json!({"title": "Book"})).await.unwrap();
+
+    db.create_relation(books, book_id, authors, author_id)
+        .await
+        .unwrap();
+    assert_eq!(db.get_related_ids(book_id).await.unwrap(), vec![author_id]);
+
+    // SQLite foreign-key cascade must remove the edge when the target goes away.
+    db.delete_record(authors, author_id).await.unwrap();
+    assert!(db.get_related_ids(book_id).await.unwrap().is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

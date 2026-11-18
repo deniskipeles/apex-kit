@@ -515,8 +515,15 @@ async fn test_policy_sql_compilation() {
         .unwrap();
 
     // Check if the boolean AND NOT wrapping is correctly distributed across the array elements
-    assert!(compiled_nin.contains("NOT (records.data ->> 'role' = 'guest'"));
-    assert!(compiled_nin.contains("AND NOT (records.data ->> 'role' = 'banned'"));
+    assert!(
+        compiled_nin.contains("NOT (json_extract(records.data, '$.role') IN ('guest'"),
+        "got {compiled_nin}"
+    );
+    assert!(
+        compiled_nin.contains("AND NOT json_extract(records.data, '$.role') IN ('banned'"),
+        "got {compiled_nin}"
+    );
+    assert!(!compiled_nin.contains("->>"), "must not emit ->> chains: {compiled_nin}");
 }
 
 #[tokio::test]
@@ -576,8 +583,9 @@ async fn test_log_directive_policies() {
         .await
         .unwrap();
 
-    assert!(compiled.contains("records.data ->> 'status' = 'published'"));
-    assert!(compiled.contains("records.data ->> 'count' > 5"));
+    assert!(compiled.contains("json_extract(records.data, '$.status')"));
+    assert!(compiled.contains("json_extract(records.data, '$.count') > 5"));
+    assert!(!compiled.contains("->>"), "must not emit ->> chains: {compiled}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

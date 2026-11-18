@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt::Write;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterOp {
@@ -343,16 +342,13 @@ impl FilterNode {
         }
 
         let parts: Vec<&str> = clean_key.split('.').collect();
-        let mut sql = "records.data".to_string();
-
-        for (i, part) in parts.iter().enumerate() {
-            if i == parts.len() - 1 {
-                write!(sql, " ->> '{}'", part).unwrap();
-            } else {
-                write!(sql, " -> '{}'", part).unwrap();
-            }
-        }
-        sql
+        // Emit `json_extract(data, '$.a.b')`, not `data ->> 'a' -> 'b'` or
+        // `data ->> 'b'`: only the `json_extract` form is recognized by
+        // SQLite's query planner as matching the expression indexes the
+        // schema-to-DDL compiler creates, so this is what turns an
+        // indexed filter into an index seek instead of a full scan.
+        let json_path = format!("$.{}", parts.join("."));
+        format!("json_extract(records.data, '{}')", json_path)
     }
 
     pub fn matches(&self, record_data: &Value) -> bool {

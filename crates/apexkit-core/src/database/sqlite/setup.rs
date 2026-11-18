@@ -4,6 +4,8 @@ use crate::search::SearchManager;
 use rusqlite::{Connection, Result};
 use std::sync::Arc;
 
+pub mod migrate;
+
 pub async fn a_new_database_connection(
     vector_provider: Arc<dyn VectorProvider>,
     forwarder: Option<Arc<dyn crate::batching::WriteForwarder>>,
@@ -109,6 +111,7 @@ pub fn apply_pragmas(conn: &Connection) -> Result<()> {
         PRAGMA cache_size = -64000;
         PRAGMA wal_autocheckpoint = 1000;
         PRAGMA mmap_size = 30000000000;
+        PRAGMA foreign_keys = ON;
     ",
     )?;
     Ok(())
@@ -219,6 +222,12 @@ pub fn setup_data(conn: &Connection) -> Result<()> {
     conn.execute("CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, schema JSON, index_key TEXT UNIQUE)", [])?;
     let _ = conn.execute("ALTER TABLE collections ADD COLUMN index_key TEXT", []);
 
+    // Bring legacy wide-relation databases forward before the CREATE IF NOT
+    // EXISTS statements below (which are no-ops once migrated).
+    if migrate::needs_relations_migration(conn)? {
+        migrate::migrate_relations(conn)?;
+    }
+
     conn.execute("CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id INTEGER NOT NULL, data JSONB NOT NULL, created DATETIME DEFAULT CURRENT_TIMESTAMP, updated DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
 
     let _ = conn.execute(
@@ -237,22 +246,24 @@ pub fn setup_data(conn: &Connection) -> Result<()> {
     );
 
     conn.execute("CREATE TABLE IF NOT EXISTS _storage_files (id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT NOT NULL, original_name TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL, user_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", [])?;
-    conn.execute("CREATE TABLE IF NOT EXISTS _relations (id INTEGER PRIMARY KEY AUTOINCREMENT, origin_col_id INTEGER NOT NULL, origin_rec_id INTEGER NOT NULL, target_col_id INTEGER NOT NULL, target_rec_id INTEGER NOT NULL, rel_name TEXT NOT NULL, properties JSON)", [])?;
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_origin ON _relations(origin_col_id, origin_rec_id, rel_name)", [])?;
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_target ON _relations(target_col_id, target_rec_id)", [])?;
 
-    // [FIX] Unique constraint to prevent duplicate relationship links
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique ON _relations(origin_col_id, origin_rec_id, target_col_id, target_rec_id, rel_name)", [])?;
+    // A relation is a single edge between two records: (origin, target). The
+    // pair is unique, and the foreign keys let SQLite remove an edge
+    // automatically when either endpoint record is deleted.
+    conn.execute("CREATE TABLE IF NOT EXISTS _relations (id INTEGER PRIMARY KEY AUTOINCREMENT, origin_rec_id INTEGER NOT NULL, target_rec_id INTEGER NOT NULL, properties JSON, FOREIGN KEY (origin_rec_id) REFERENCES records(id) ON DELETE CASCADE, FOREIGN KEY (target_rec_id) REFERENCES records(id) ON DELETE CASCADE)", [])?;
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique ON _relations(origin_rec_id, target_rec_id)", [])?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_origin ON _relations(origin_rec_id)", [])?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_target ON _relations(target_rec_id)", [])?;
 
-    conn.execute("CREATE TABLE IF NOT EXISTS _unique_values (index_key TEXT NOT NULL, value TEXT NOT NULL, record_id INTEGER NOT NULL, PRIMARY KEY (index_key, value))", [])?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_unique_lookup ON _unique_values(index_key, value)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_unique_record ON _unique_values(record_id)",
-        [],
-    )?;
+    // Uniqueness and lookup indexes are now real SQLite expression indexes on
+    // `records`, reconciled from the collection schemas (see
+    // `database::sqlite::indexes`). `_applied_indexes` is the diff base that
+    // records which of those indexes the compiler created.
+    conn.execute("CREATE TABLE IF NOT EXISTS _applied_indexes (index_name TEXT PRIMARY KEY, collection_id INTEGER NOT NULL, kind TEXT NOT NULL, fields TEXT NOT NULL)", [])?;
+
+    // Legacy side-table from the pre-expression-index implementation. Dropped
+    // on upgrade; uniqueness is now enforced by the expression indexes above.
+    let _ = conn.execute("DROP TABLE IF EXISTS _unique_values", []);
     Ok(())
 }
 

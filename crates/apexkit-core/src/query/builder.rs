@@ -139,9 +139,10 @@ impl SqlBuilder {
                     if desc { "DESC" } else { "ASC" }
                 ));
             } else {
-                // Otherwise sort by JSON data field
+                // Sort by JSON data field using the `json_extract` form so the
+                // expression can be satisfied by the compiler's indexes.
                 sql.push_str(&format!(
-                    " ORDER BY records.data ->> '{}' {}",
+                    " ORDER BY json_extract(records.data, '$.{}') {}",
                     field,
                     if desc { "DESC" } else { "ASC" }
                 ));
@@ -301,7 +302,6 @@ pub fn build_expand_json_object(
         let mut target_col_name = String::new();
         let mut reverse_lookup = false;
         let mut relation_cardinality = RelationType::Many;
-        let mut actual_rel_name_in_db = relation_name.clone();
 
         // 1. Forward Relation: Defined directly on the current collection (holding the foreign key)
         if let Some(rel_def) = schema.relations.get(&relation_name) {
@@ -314,12 +314,11 @@ pub fn build_expand_json_object(
             target_col_name = relation_name.clone();
             target_col_id = *name_to_id.get(&target_col_name).unwrap_or(&0);
 
-            for (r_name, r_def) in &reverse_schema.relations {
+            for (_r_name, r_def) in &reverse_schema.relations {
                 if r_def.target_collection == current_col_name
                     || r_def.target_collection == current_col_id.to_string()
                 {
                     reverse_lookup = true;
-                    actual_rel_name_in_db = r_name.clone();
                     relation_cardinality = r_def.relation_type.clone();
                     break;
                 }
@@ -354,6 +353,10 @@ pub fn build_expand_json_object(
         // Otherwise (forward expansion from child holding the foreign key, or reverse 1-to-1), return a MAP.
         let is_array_return = reverse_lookup && relation_cardinality == RelationType::Many;
 
+        // Edges carry only the id pair, so the joined record must be filtered
+        // to the expected collection. For a forward relation that is the
+        // declared target; for a reverse relation it is the collection that
+        // declares the relation field.
         let subquery = if !is_array_return {
             // Case A: Return Single Object (MAP)
             let (join_target, join_condition) = if reverse_lookup {
@@ -364,17 +367,8 @@ pub fn build_expand_json_object(
                     ),
                     format!(
                         "WHERE {}.target_rec_id = {}.id \
-                         AND {}.origin_col_id = {} \
-                         AND {}.target_col_id = {} \
-                         AND {}.rel_name = '{}'",
-                        rel_alias,
-                        parent_alias,
-                        rel_alias,
-                        target_col_id,
-                        rel_alias,
-                        current_col_id,
-                        rel_alias,
-                        actual_rel_name_in_db
+                         AND {}.collection_id = {}",
+                        rel_alias, parent_alias, target_alias, target_col_id
                     ),
                 )
             } else {
@@ -385,8 +379,8 @@ pub fn build_expand_json_object(
                     ),
                     format!(
                         "WHERE {}.origin_rec_id = {}.id \
-                         AND {}.rel_name = '{}'",
-                        rel_alias, parent_alias, rel_alias, relation_name
+                         AND {}.collection_id = {}",
+                        rel_alias, parent_alias, target_alias, target_col_id
                     ),
                 )
             };
@@ -406,17 +400,8 @@ pub fn build_expand_json_object(
             );
             let join_condition = format!(
                 "WHERE {}.target_rec_id = {}.id \
-                 AND {}.origin_col_id = {} \
-                 AND {}.target_col_id = {} \
-                 AND {}.rel_name = '{}'",
-                rel_alias,
-                parent_alias,
-                rel_alias,
-                target_col_id,
-                rel_alias,
-                current_col_id,
-                rel_alias,
-                actual_rel_name_in_db
+                 AND {}.collection_id = {}",
+                rel_alias, parent_alias, target_alias, target_col_id
             );
 
             format!(

@@ -89,7 +89,10 @@ pub struct ProblemDetail {
 pub struct RelationRequest {
     pub target_collection_id: i64,
     pub target_record_id: i64,
-    pub relation_name: String,
+    /// Accepted for backward compatibility. A relation is now identified by the
+    /// record-id pair alone, so this field is ignored.
+    #[serde(default)]
+    pub relation_name: Option<String>,
 }
 #[derive(Deserialize, ToSchema, IntoParams)]
 pub struct SearchQuery {

@@ -1,7 +1,7 @@
 use super::ApexKit;
-use crate::database::sqlite::utils::{
-    commit_uniqueness, enforce_uniqueness, row_to_collection, row_to_record,
-};
+use crate::database::sqlite::indexes::diagnostics::translate_constraint_error;
+use crate::database::sqlite::indexes::field_for_index_name;
+use crate::database::sqlite::utils::{row_to_collection, row_to_record};
 use crate::database::traits::{CollectionStore, IntoSqlVal, RecordStore};
 use crate::models::schema::CollectionSchema;
 use crate::models::{ListResult, Record};
@@ -9,6 +9,25 @@ use crate::query::QueryOptions;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Maps a raw SQLite write failure into the stable application error used by
+/// the API layer. Uniqueness is now enforced by real expression indexes, so a
+/// conflict surfaces as `UNIQUE constraint failed: index '<name>'`; the index
+/// name is decoded back to its field name from the in-memory schema, so no
+/// database round-trip is needed while a write lock is held. Any other failure
+/// keeps its raw message and is not reported as a conflict.
+fn write_error(
+    raw: &str,
+    collection_id: i64,
+    schema: &CollectionSchema,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match translate_constraint_error(raw, |name| {
+        field_for_index_name(collection_id, schema, name)
+    }) {
+        Some(msg) => Box::new(std::io::Error::new(std::io::ErrorKind::AlreadyExists, msg)),
+        None => Box::new(std::io::Error::other(raw.to_string())),
+    }
+}
 
 #[async_trait]
 impl RecordStore for ApexKit {
@@ -272,29 +291,20 @@ impl RecordStore for ApexKit {
 
         let jsonb_bytes = serde_sqlite_jsonb::to_vec(&merged_data).map_err(Box::new)?;
 
-        {
-            let conn = self.get_data_read().await;
-            enforce_uniqueness(&conn, collection_id, Some(record_id), &merged_data, &schema)?;
-        }
-
+        // Uniqueness is enforced by the expression indexes created at collection
+        // creation/update time, so this UPDATE fails atomically on a conflict.
         // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
-        self.data_batcher.execute(
+        if let Err(e) = self.data_batcher.execute(
             "UPDATE records SET data = ?1,updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND id IN (?3, CAST(?3 AS TEXT), CAST(?3 AS INTEGER))".into(),
             vec![rusqlite::types::Value::Blob(jsonb_bytes), collection_id.into_val(), record_id.into_val()]
-        ).await.map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        let unique_future = commit_uniqueness(
-            &self.data_batcher,
-            collection_id,
-            record_id,
-            &merged_data,
-            &schema,
-        );
+        ).await {
+            return Err(write_error(&e, collection_id, &schema));
+        }
 
         let sync_future = self.sync_relations(collection_id, record_id, &merged_data, &schema);
 
-        if let Err(e) = tokio::try_join!(unique_future, sync_future) {
-            // COMPENSATING ROLLBACK: Restore previous data state if the uniqueness constraint failed
+        if let Err(e) = sync_future.await {
+            // COMPENSATING ROLLBACK: Restore previous data state if relation sync failed
             if let Ok(old_jsonb) = serde_sqlite_jsonb::to_vec(&existing.data) {
                 let _ = self.data_batcher.execute(
                     "UPDATE records SET data = ?1, updated = ?2 WHERE collection_id = ?3 AND id IN (?4, CAST(?4 AS TEXT), CAST(?4 AS INTEGER))".into(),
@@ -306,15 +316,6 @@ impl RecordStore for ApexKit {
                     ]
                 ).await;
             }
-            // Restore previous unique values
-            let _ = commit_uniqueness(
-                &self.data_batcher,
-                collection_id,
-                record_id,
-                &existing.data,
-                &schema,
-            )
-            .await;
             // Restore previous relations
             let _ = self
                 .sync_relations(collection_id, record_id, &existing.data, &schema)
@@ -322,10 +323,7 @@ impl RecordStore for ApexKit {
 
             let err_msg = e.to_string();
             if err_msg.contains("UNIQUE constraint failed") {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "Unique constraint violation: This value or combination already exists.",
-                )));
+                return Err(write_error(&err_msg, collection_id, &schema));
             }
             return Err(e);
         }
@@ -348,6 +346,10 @@ impl RecordStore for ApexKit {
             Box::new(std::io::Error::other(e))
         };
 
+        // `cascade_on_target_delete` is a per-relation schema rule, so the set of
+        // records to remove is still resolved in Rust. Edge rows themselves are
+        // no longer deleted by hand: the `_relations` foreign keys cascade in
+        // SQLite, so removing the records below removes their edges atomically.
         let mut to_delete = vec![(collection_id, record_id)];
         let mut visited = std::collections::HashSet::new();
 
@@ -370,43 +372,38 @@ impl RecordStore for ApexKit {
             visited.insert((col_id, rec_id));
 
             for (other_col_id, other_schema) in &schema_map {
-                for (rel_name, rel_def) in &other_schema.relations {
-                    if rel_def.cascade_on_target_delete {
-                        let targets_us = match name_to_id.get(&rel_def.target_collection) {
-                            Some(id) => *id == col_id,
-                            None => false,
-                        };
+                for rel_def in other_schema.relations.values() {
+                    if !rel_def.cascade_on_target_delete {
+                        continue;
+                    }
+                    let targets_us = name_to_id
+                        .get(&rel_def.target_collection)
+                        .map(|id| *id == col_id)
+                        .unwrap_or(false);
+                    if !targets_us {
+                        continue;
+                    }
 
-                        if targets_us {
-                            let origin_ids: Vec<i64> = {
-                                let conn = self.get_data_read().await;
-                                let mut stmt = conn.prepare("SELECT origin_rec_id FROM _relations WHERE origin_col_id = ?1 AND target_col_id = ?2 AND target_rec_id IN (?3, CAST(?3 AS TEXT), CAST(?3 AS INTEGER)) AND rel_name = ?4").map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                                let mut rows = stmt
-                                    .query(rusqlite::params![
-                                        other_col_id,
-                                        col_id,
-                                        rec_id,
-                                        rel_name
-                                    ])
-                                    .map_err(|e| {
-                                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                    })?;
-                                let mut ids = Vec::new();
-                                while let Some(row) = rows.next().map_err(|e| {
-                                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                })? {
-                                    ids.push(row.get(0).map_err(|e| {
-                                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                    })?);
-                                }
-                                ids
-                            };
+                    // Origins in the declaring collection that point at the
+                    // record being removed, matched on the id pair alone.
+                    let origin_ids: Vec<i64> = {
+                        let conn = self.get_data_read().await;
+                        let mut stmt = conn.prepare(
+                            "SELECT r.id FROM _relations rel \
+                             JOIN records r ON r.id = rel.origin_rec_id \
+                             WHERE rel.target_rec_id = ?1 AND r.collection_id = ?2",
+                        )?;
+                        let mut rows = stmt.query(rusqlite::params![rec_id, other_col_id])?;
+                        let mut ids = Vec::new();
+                        while let Some(row) = rows.next()? {
+                            ids.push(row.get(0)?);
+                        }
+                        ids
+                    };
 
-                            for origin_rec_id in origin_ids {
-                                if !visited.contains(&(*other_col_id, origin_rec_id)) {
-                                    to_delete.push((*other_col_id, origin_rec_id));
-                                }
-                            }
+                    for origin_rec_id in origin_ids {
+                        if !visited.contains(&(*other_col_id, origin_rec_id)) {
+                            to_delete.push((*other_col_id, origin_rec_id));
                         }
                     }
                 }
@@ -414,30 +411,17 @@ impl RecordStore for ApexKit {
         }
 
         for (del_col_id, del_rec_id) in visited {
-            // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
             let f1 = self.data_batcher.execute(
-                "DELETE FROM records WHERE collection_id = ?1 AND id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
+                "DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
-            let f2 = self.data_batcher.execute(
-                "DELETE FROM _unique_values WHERE record_id IN (?1, CAST(?1 AS TEXT), CAST(?1 AS INTEGER))".into(),
-                vec![del_rec_id.into_val()],
-            );
-            let f3 = self.data_batcher.execute(
-                "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
-                vec![del_col_id.into_val(), del_rec_id.into_val()],
-            );
-            let f4 = self.data_batcher.execute(
-                "DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
-                vec![del_col_id.into_val(), del_rec_id.into_val()],
-            );
-            let f5 = self.vector_batcher.execute(
-                "DELETE FROM vectors WHERE collection_id = ?1 AND record_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
+            let f4 = self.vector_batcher.execute(
+                "DELETE FROM vectors WHERE collection_id = ?1 AND record_id = ?2".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
 
-            let _ = tokio::try_join!(f1, f2, f3, f4).map_err(map_err)?;
-            let _ = f5.await.map_err(map_err)?;
+            let _ = f1.await.map_err(map_err)?;
+            let _ = f4.await.map_err(map_err)?;
 
             let _ = self.search.delete_record(del_col_id, del_rec_id);
         }
@@ -493,11 +477,8 @@ impl ApexKit {
 
         let jsonb_bytes = serde_sqlite_jsonb::to_vec(&final_data).map_err(Box::new)?;
 
-        {
-            let conn = self.get_data_read().await;
-            enforce_uniqueness(&conn, collection_id, record_id, &final_data, &schema)?;
-        }
-
+        // Uniqueness is enforced by the expression indexes created when the
+        // collection schema was written, so this INSERT is atomic on conflict.
         let actual_record_id = if let Some(rid) = record_id {
             self.data_batcher
                 .execute(
@@ -508,7 +489,8 @@ impl ApexKit {
                         rusqlite::types::Value::Blob(jsonb_bytes),
                     ],
                 )
-                .await?;
+                .await
+                .map_err(|e| write_error(&e, collection_id, &schema))?;
             rid
         } else {
             self.data_batcher
@@ -519,22 +501,15 @@ impl ApexKit {
                         rusqlite::types::Value::Blob(jsonb_bytes),
                     ],
                 )
-                .await?
+                .await
+                .map_err(|e| write_error(&e, collection_id, &schema))?
         };
-
-        let unique_future = commit_uniqueness(
-            &self.data_batcher,
-            collection_id,
-            actual_record_id,
-            &final_data,
-            &schema,
-        );
 
         let relation_future =
             self.sync_relations(collection_id, actual_record_id, &final_data, &schema);
 
-        if let Err(e) = tokio::try_join!(unique_future, relation_future) {
-            // COMPENSATING ROLLBACK: Prevent leaked duplicate records during high-concurrency race conditions
+        if let Err(e) = relation_future.await {
+            // COMPENSATING ROLLBACK: Prevent leaked records if relation sync failed
             let _ = self
                 .data_batcher
                 .execute(
@@ -542,28 +517,12 @@ impl ApexKit {
                     vec![collection_id.into_val(), actual_record_id.into_val()],
                 )
                 .await;
-            let _ = self
-                .data_batcher
-                .execute(
-                    "DELETE FROM _unique_values WHERE record_id = ?1".into(),
-                    vec![actual_record_id.into_val()],
-                )
-                .await;
-            let _ = self
-                .data_batcher
-                .execute(
-                    "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id=?2".into(),
-                    vec![collection_id.into_val(), actual_record_id.into_val()],
-                )
-                .await;
+            // Edges cascade from the records delete above.
 
             // Format the raw SQLite constraint error for the user
             let err_msg = e.to_string();
             if err_msg.contains("UNIQUE constraint failed") {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "Unique constraint violation: This value or combination already exists.",
-                )));
+                return Err(write_error(&err_msg, collection_id, &schema));
             }
             return Err(e);
         }
@@ -573,74 +532,92 @@ impl ApexKit {
 
     pub(crate) async fn sync_relations(
         &self,
-        collection_id: i64,
+        _collection_id: i64,
         record_id: i64,
         data: &Value,
         schema: &CollectionSchema,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for (rel_name, rel_def) in &schema.relations {
-            if let Some(val) = data.get(rel_name) {
-                // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
-                self.data_batcher.execute(
-                    "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER)) AND rel_name=?3".into(),
-                    vec![collection_id.into_val(), record_id.into_val(), rel_name.clone().into_val()]
-                ).await.map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
+        let map_err =
+            |e: String| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::other(e)) };
 
-                let mut target_ids = Vec::new();
-                if let Value::Array(arr) = val {
-                    for v in arr {
-                        let tid = match v {
-                            Value::String(s) => s.parse::<i64>().unwrap_or(0),
-                            Value::Number(n) => n.as_i64().unwrap_or(0),
-                            _ => 0,
-                        };
-                        if tid != 0 {
-                            target_ids.push(tid);
-                        }
+        // An edge is keyed only by the id pair, so edges cannot be attributed to
+        // an individual relation field. Fields are therefore grouped by target
+        // collection: the union of every present field's value becomes that
+        // collection's edge set for this record. Edges to other collections are
+        // left alone (e.g. those created directly through the relations API).
+        let mut by_target: std::collections::HashMap<i64, Vec<i64>> =
+            std::collections::HashMap::new();
+
+        for (rel_name, rel_def) in &schema.relations {
+            let Some(val) = data.get(rel_name) else {
+                continue;
+            };
+
+            let identifier = &rel_def.target_collection;
+            let target_col_id: Option<i64> = {
+                let conn = self.get_data_read().await;
+                let mut name_stmt = conn.prepare("SELECT id FROM collections WHERE name = ?1")?;
+                let mut name_rows = name_stmt.query(rusqlite::params![identifier.clone()])?;
+                if let Some(r) = name_rows.next()? {
+                    Some(r.get(0)?)
+                } else if let Ok(id_num) = identifier.parse::<i64>() {
+                    let mut id_stmt = conn.prepare("SELECT id FROM collections WHERE id = ?1")?;
+                    let mut id_rows = id_stmt.query(rusqlite::params![id_num])?;
+                    if id_rows.next()?.is_some() {
+                        Some(id_num)
+                    } else {
+                        None
                     }
                 } else {
-                    let tid = match val {
-                        Value::String(s) => s.parse::<i64>().unwrap_or(0),
-                        Value::Number(n) => n.as_i64().unwrap_or(0),
-                        _ => 0,
-                    };
-                    if tid != 0 {
-                        target_ids.push(tid);
-                    }
+                    None
                 }
+            };
 
-                if target_ids.is_empty() {
-                    continue;
-                }
+            let Some(tc_id) = target_col_id else {
+                continue;
+            };
 
-                let identifier = &rel_def.target_collection;
-                let mut target_col_id: Option<i64> = None;
-
+            let bucket = by_target.entry(tc_id).or_default();
+            let mut push = |v: &Value| {
+                if let Some(tid) = v
+                    .as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    && tid != 0
                 {
-                    let conn = self.get_data_read().await;
-                    let mut name_stmt =
-                        conn.prepare("SELECT id FROM collections WHERE name = ?1")?;
-                    let mut name_rows = name_stmt.query(rusqlite::params![identifier.clone()])?;
-                    if let Some(r) = name_rows.next()? {
-                        target_col_id = Some(r.get(0)?);
-                    } else if let Ok(id_num) = identifier.parse::<i64>() {
-                        let mut id_stmt =
-                            conn.prepare("SELECT id FROM collections WHERE id = ?1")?;
-                        let mut id_rows = id_stmt.query(rusqlite::params![id_num])?;
-                        if id_rows.next()?.is_some() {
-                            target_col_id = Some(id_num);
-                        }
-                    }
+                    bucket.push(tid);
                 }
+            };
+            match val {
+                Value::Array(arr) => arr.iter().for_each(&mut push),
+                other => push(other),
+            }
+        }
 
-                if let Some(tc_id) = target_col_id {
-                    for target_rec_id in target_ids {
-                        self.data_batcher.execute(
-                            "INSERT OR IGNORE INTO _relations (origin_col_id,origin_rec_id,target_col_id,target_rec_id,rel_name) VALUES (?1,?2,?3,?4,?5)".into(),
-                            vec![collection_id.into_val(), record_id.into_val(), tc_id.into_val(), target_rec_id.into_val(), rel_name.clone().into_val()]
-                        ).await.map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
-                    }
-                }
+        for (tc_id, mut target_ids) in by_target {
+            target_ids.sort_unstable();
+            target_ids.dedup();
+
+            // Drop this origin's existing edges into the target collection, then
+            // re-add the union computed above.
+            self.data_batcher
+                .execute(
+                    "DELETE FROM _relations WHERE origin_rec_id = ?1 AND target_rec_id IN (SELECT id FROM records WHERE collection_id = ?2)".into(),
+                    vec![record_id.into_val(), tc_id.into_val()],
+                )
+                .await
+                .map_err(map_err)?;
+
+            for target_rec_id in target_ids {
+                // The EXISTS guard keeps a dangling id in the payload from
+                // violating the foreign key; a missing target is simply skipped.
+                self.data_batcher
+                    .execute(
+                        "INSERT OR IGNORE INTO _relations (origin_rec_id,target_rec_id) \
+                         SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM records WHERE id = ?2)".into(),
+                        vec![record_id.into_val(), target_rec_id.into_val()],
+                    )
+                    .await
+                    .map_err(map_err)?;
             }
         }
         Ok(())

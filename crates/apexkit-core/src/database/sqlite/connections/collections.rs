@@ -1,10 +1,28 @@
 use super::ApexKit;
-use crate::database::sqlite::utils::{reconcile_sql_indexes, row_to_collection};
+use crate::database::sqlite::indexes::{execute_plan, plan_collection};
+use crate::database::sqlite::utils::row_to_collection;
 use crate::database::traits::{CollectionStore, IntoSqlVal};
 use crate::models::schema::CollectionSchema;
 use crate::models::{Collection, FieldType};
 use async_trait::async_trait;
 use rusqlite::params;
+
+/// Reconciles the expression indexes for one collection: compute the plan under
+/// the read lock, then apply it through the write batcher.
+async fn reconcile_indexes(
+    kit: &ApexKit,
+    collection_id: i64,
+    schema: &CollectionSchema,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let plan = {
+        let conn = kit.get_data_read().await;
+        plan_collection(&conn, collection_id, schema).map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?
+    };
+    execute_plan(&kit.data_batcher, &plan).await
+}
 
 fn validate_identifier(name: &str) -> Result<(), String> {
     let re = regex::Regex::new(r"^[a-zA-Z0-9_]+$").unwrap();
@@ -75,7 +93,7 @@ impl CollectionStore for ApexKit {
             {
                 self.search.load_index(id, s)?;
             }
-            reconcile_sql_indexes(&self.data_batcher, id, s, None).await?;
+            reconcile_indexes(self, id, s).await?;
         }
         Ok(id)
     }
@@ -194,7 +212,10 @@ impl CollectionStore for ApexKit {
                     }
                 }
 
-                // 2. Handle relational field renames within the JSON blob and linkages table
+                // 2. Handle relational field renames within the JSON blob.
+                // Edges are keyed by id pair only, so a renamed relation field
+                // needs no change in `_relations` — the edges are rebuilt from
+                // the record data on the next write.
                 for (new_name, new_def) in &s.relations {
                     if let Some((old_name, _)) = old_s
                         .relations
@@ -209,22 +230,6 @@ impl CollectionStore for ApexKit {
                         );
                         self.data_batcher
                             .execute(sql, vec![id.into_val()])
-                            .await
-                            .map_err(|e| {
-                                Box::new(std::io::Error::other(e))
-                                    as Box<dyn std::error::Error + Send + Sync>
-                            })?;
-
-                        let rel_sql = "UPDATE _relations SET rel_name = ? WHERE origin_col_id = ? AND rel_name = ?".to_string();
-                        self.data_batcher
-                            .execute(
-                                rel_sql,
-                                vec![
-                                    new_name.clone().into_val(),
-                                    id.into_val(),
-                                    old_name.clone().into_val(),
-                                ],
-                            )
                             .await
                             .map_err(|e| {
                                 Box::new(std::io::Error::other(e))
@@ -251,7 +256,7 @@ impl CollectionStore for ApexKit {
                     }
                 }
 
-                // 4. Handle Deleted Relations (Remove from JSON and linkage table)
+                // 4. Handle Deleted Relations (Remove from JSON)
                 for (old_name, old_def) in &old_s.relations {
                     let still_exists = s
                         .relations
@@ -269,24 +274,11 @@ impl CollectionStore for ApexKit {
                                 Box::new(std::io::Error::other(e))
                                     as Box<dyn std::error::Error + Send + Sync>
                             })?;
-
-                        let rel_sql =
-                            "DELETE FROM _relations WHERE origin_col_id = ? AND rel_name = ?";
-                        self.data_batcher
-                            .execute(
-                                rel_sql.to_string(),
-                                vec![id.into_val(), old_name.clone().into_val()],
-                            )
-                            .await
-                            .map_err(|e| {
-                                Box::new(std::io::Error::other(e))
-                                    as Box<dyn std::error::Error + Send + Sync>
-                            })?;
                     }
                 }
             }
 
-            reconcile_sql_indexes(&self.data_batcher, id, s, old_schema.as_ref()).await?;
+            reconcile_indexes(self, id, s).await?;
 
             if s.fields.values().any(|f| f.ose_indexed)
                 || s.relations.values().any(|r| r.ose_indexed)
@@ -308,23 +300,11 @@ impl CollectionStore for ApexKit {
             Box::new(std::io::Error::other(e))
         };
 
+        // Removing the collection's records cascades their edges away via the
+        // `_relations` foreign keys, so no edge cleanup is needed here.
         self.data_batcher
             .execute(
                 "DELETE FROM records WHERE collection_id = ?1".into(),
-                vec![id.into_val()],
-            )
-            .await
-            .map_err(map_err)?;
-        self.data_batcher
-            .execute(
-                "DELETE FROM _relations WHERE origin_col_id = ?1".into(),
-                vec![id.into_val()],
-            )
-            .await
-            .map_err(map_err)?;
-        self.data_batcher
-            .execute(
-                "DELETE FROM _relations WHERE target_col_id = ?1".into(),
                 vec![id.into_val()],
             )
             .await
@@ -336,6 +316,26 @@ impl CollectionStore for ApexKit {
             )
             .await
             .map_err(map_err)?;
+
+        // Drop the collection's expression indexes and forget their metadata,
+        // otherwise a future collection reusing this id would inherit stale
+        // unique constraints.
+        let plan = {
+            let conn = self.get_data_read().await;
+            let applied = crate::database::sqlite::indexes::meta::load_applied(&conn)
+                .map_err(|e| map_err(e.to_string()))?;
+            let mut plan = crate::database::sqlite::indexes::IndexPlan::default();
+            for (name, spec) in applied {
+                if spec.collection_id == id {
+                    plan.drop.push(name);
+                }
+            }
+            plan
+        };
+        crate::database::sqlite::indexes::execute_plan(&self.data_batcher, &plan)
+            .await
+            .map_err(|e| map_err(e.to_string()))?;
+
         let _ = self.search.delete_index(id);
         Ok(())
     }

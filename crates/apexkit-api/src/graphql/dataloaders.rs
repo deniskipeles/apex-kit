@@ -61,52 +61,44 @@ impl Loader<RelationKey> for RelationLoader {
                 .push(key.origin_rec_id);
         }
 
-        let mut target_ids_map: HashMap<RelationKey, Vec<(i64, i64)>> = HashMap::new();
+        let mut target_ids_map: HashMap<RelationKey, Vec<i64>> = HashMap::new();
         let mut needed_records: HashMap<String, Vec<i64>> = HashMap::new();
 
-        for ((o_col, rel), o_ids) in grouped_keys {
+        for ((_o_col, rel), o_ids) in grouped_keys {
             for o_id in o_ids {
-                let mut links = self
-                    .db
-                    .get_related_ids(o_col, o_id, &rel)
-                    .await
-                    .unwrap_or_default();
+                // Edges are keyed by id pair only, so the loader resolves the
+                // origin's edges and filters them by target collection.
+                let links = self.db.get_related_ids(o_id).await.unwrap_or_default();
 
-                // FALLBACK: If _relations table is empty, check origin_record.data[rel_name] directly
-                if links.is_empty() {
-                    if let Ok(Some(origin_rec)) = self.db.get_record(o_col, o_id, None).await {
+                // FALLBACK: If no edge rows exist, check origin_record.data[rel_name] directly
+                let links = if links.is_empty() {
+                    let mut fallback_ids = Vec::new();
+                    if let Ok(Some(origin_rec)) = self.db.get_record(_o_col, o_id, None).await {
                         if let Some(val) = origin_rec.data.get(&rel) {
-                            let mut fallback_ids = Vec::new();
-                            if let Some(arr) = val.as_array() {
-                                for v in arr {
-                                    if let Some(id) = v
-                                        .as_i64()
-                                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                                    {
-                                        fallback_ids.push(id);
-                                    }
+                            let mut push = |v: &serde_json::Value| {
+                                if let Some(id) = v
+                                    .as_i64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                {
+                                    fallback_ids.push(id);
                                 }
-                            } else if let Some(id) = val
-                                .as_i64()
-                                .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
-                            {
-                                fallback_ids.push(id);
-                            }
-
-                            if !fallback_ids.is_empty() {
-                                for t_id in fallback_ids {
-                                    links.push((0, t_id));
-                                }
+                            };
+                            match val {
+                                serde_json::Value::Array(arr) => arr.iter().for_each(&mut push),
+                                other => push(other),
                             }
                         }
                     }
-                }
+                    fallback_ids
+                } else {
+                    links
+                };
 
                 if let Some(key) = keys_cloned.iter().find(|k| {
-                    k.origin_col_id == o_col && k.origin_rec_id == o_id && k.rel_name == rel
+                    k.origin_col_id == _o_col && k.origin_rec_id == o_id && k.rel_name == rel
                 }) {
                     target_ids_map.insert(key.clone(), links.clone());
-                    for (_, t_rec_id) in links {
+                    for t_rec_id in links {
                         needed_records
                             .entry(key.target_col_name.clone())
                             .or_default()
@@ -138,7 +130,7 @@ impl Loader<RelationKey> for RelationLoader {
         for key in keys_cloned {
             let mut records = Vec::new();
             if let Some(links) = target_ids_map.get(&key) {
-                for (_, t_rec_id) in links {
+                for t_rec_id in links {
                     if let Some(rec) =
                         fetched_record_cache.get(&(key.target_col_name.clone(), *t_rec_id))
                     {
