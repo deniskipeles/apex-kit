@@ -139,9 +139,10 @@ impl SqlBuilder {
                     if desc { "DESC" } else { "ASC" }
                 ));
             } else {
-                // Otherwise sort by JSON data field
+                // Sort by JSON data field using the `json_extract` form so the
+                // expression can be satisfied by the compiler's indexes.
                 sql.push_str(&format!(
-                    " ORDER BY records.data ->> '{}' {}",
+                    " ORDER BY json_extract(records.data, '$.{}') {}",
                     field,
                     if desc { "DESC" } else { "ASC" }
                 ));

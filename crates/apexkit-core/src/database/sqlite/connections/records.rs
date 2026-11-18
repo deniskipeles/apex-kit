@@ -1,7 +1,7 @@
 use super::ApexKit;
-use crate::database::sqlite::utils::{
-    commit_uniqueness, enforce_uniqueness, row_to_collection, row_to_record,
-};
+use crate::database::sqlite::indexes::diagnostics::translate_constraint_error;
+use crate::database::sqlite::indexes::field_for_index_name;
+use crate::database::sqlite::utils::{row_to_collection, row_to_record};
 use crate::database::traits::{CollectionStore, IntoSqlVal, RecordStore};
 use crate::models::schema::CollectionSchema;
 use crate::models::{ListResult, Record};
@@ -9,6 +9,25 @@ use crate::query::QueryOptions;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Maps a raw SQLite write failure into the stable application error used by
+/// the API layer. Uniqueness is now enforced by real expression indexes, so a
+/// conflict surfaces as `UNIQUE constraint failed: index '<name>'`; the index
+/// name is decoded back to its field name from the in-memory schema, so no
+/// database round-trip is needed while a write lock is held. Any other failure
+/// keeps its raw message and is not reported as a conflict.
+fn write_error(
+    raw: &str,
+    collection_id: i64,
+    schema: &CollectionSchema,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match translate_constraint_error(raw, |name| {
+        field_for_index_name(collection_id, schema, name)
+    }) {
+        Some(msg) => Box::new(std::io::Error::new(std::io::ErrorKind::AlreadyExists, msg)),
+        None => Box::new(std::io::Error::other(raw.to_string())),
+    }
+}
 
 #[async_trait]
 impl RecordStore for ApexKit {
@@ -272,29 +291,20 @@ impl RecordStore for ApexKit {
 
         let jsonb_bytes = serde_sqlite_jsonb::to_vec(&merged_data).map_err(Box::new)?;
 
-        {
-            let conn = self.get_data_read().await;
-            enforce_uniqueness(&conn, collection_id, Some(record_id), &merged_data, &schema)?;
-        }
-
+        // Uniqueness is enforced by the expression indexes created at collection
+        // creation/update time, so this UPDATE fails atomically on a conflict.
         // [V2 MIGRATION SAFE]: Cast the parameter instead of the column to maintain O(1) Index lookups
-        self.data_batcher.execute(
+        if let Err(e) = self.data_batcher.execute(
             "UPDATE records SET data = ?1,updated = CURRENT_TIMESTAMP WHERE collection_id = ?2 AND id IN (?3, CAST(?3 AS TEXT), CAST(?3 AS INTEGER))".into(),
             vec![rusqlite::types::Value::Blob(jsonb_bytes), collection_id.into_val(), record_id.into_val()]
-        ).await.map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        let unique_future = commit_uniqueness(
-            &self.data_batcher,
-            collection_id,
-            record_id,
-            &merged_data,
-            &schema,
-        );
+        ).await {
+            return Err(write_error(&e, collection_id, &schema));
+        }
 
         let sync_future = self.sync_relations(collection_id, record_id, &merged_data, &schema);
 
-        if let Err(e) = tokio::try_join!(unique_future, sync_future) {
-            // COMPENSATING ROLLBACK: Restore previous data state if the uniqueness constraint failed
+        if let Err(e) = sync_future.await {
+            // COMPENSATING ROLLBACK: Restore previous data state if relation sync failed
             if let Ok(old_jsonb) = serde_sqlite_jsonb::to_vec(&existing.data) {
                 let _ = self.data_batcher.execute(
                     "UPDATE records SET data = ?1, updated = ?2 WHERE collection_id = ?3 AND id IN (?4, CAST(?4 AS TEXT), CAST(?4 AS INTEGER))".into(),
@@ -306,15 +316,6 @@ impl RecordStore for ApexKit {
                     ]
                 ).await;
             }
-            // Restore previous unique values
-            let _ = commit_uniqueness(
-                &self.data_batcher,
-                collection_id,
-                record_id,
-                &existing.data,
-                &schema,
-            )
-            .await;
             // Restore previous relations
             let _ = self
                 .sync_relations(collection_id, record_id, &existing.data, &schema)
@@ -322,10 +323,7 @@ impl RecordStore for ApexKit {
 
             let err_msg = e.to_string();
             if err_msg.contains("UNIQUE constraint failed") {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "Unique constraint violation: This value or combination already exists.",
-                )));
+                return Err(write_error(&err_msg, collection_id, &schema));
             }
             return Err(e);
         }
@@ -420,24 +418,20 @@ impl RecordStore for ApexKit {
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
             let f2 = self.data_batcher.execute(
-                "DELETE FROM _unique_values WHERE record_id IN (?1, CAST(?1 AS TEXT), CAST(?1 AS INTEGER))".into(),
-                vec![del_rec_id.into_val()],
-            );
-            let f3 = self.data_batcher.execute(
                 "DELETE FROM _relations WHERE origin_col_id=?1 AND origin_rec_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
-            let f4 = self.data_batcher.execute(
+            let f3 = self.data_batcher.execute(
                 "DELETE FROM _relations WHERE target_col_id=?1 AND target_rec_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
-            let f5 = self.vector_batcher.execute(
+            let f4 = self.vector_batcher.execute(
                 "DELETE FROM vectors WHERE collection_id = ?1 AND record_id IN (?2, CAST(?2 AS TEXT), CAST(?2 AS INTEGER))".into(),
                 vec![del_col_id.into_val(), del_rec_id.into_val()],
             );
 
-            let _ = tokio::try_join!(f1, f2, f3, f4).map_err(map_err)?;
-            let _ = f5.await.map_err(map_err)?;
+            let _ = tokio::try_join!(f1, f2, f3).map_err(map_err)?;
+            let _ = f4.await.map_err(map_err)?;
 
             let _ = self.search.delete_record(del_col_id, del_rec_id);
         }
@@ -493,11 +487,8 @@ impl ApexKit {
 
         let jsonb_bytes = serde_sqlite_jsonb::to_vec(&final_data).map_err(Box::new)?;
 
-        {
-            let conn = self.get_data_read().await;
-            enforce_uniqueness(&conn, collection_id, record_id, &final_data, &schema)?;
-        }
-
+        // Uniqueness is enforced by the expression indexes created when the
+        // collection schema was written, so this INSERT is atomic on conflict.
         let actual_record_id = if let Some(rid) = record_id {
             self.data_batcher
                 .execute(
@@ -508,7 +499,8 @@ impl ApexKit {
                         rusqlite::types::Value::Blob(jsonb_bytes),
                     ],
                 )
-                .await?;
+                .await
+                .map_err(|e| write_error(&e, collection_id, &schema))?;
             rid
         } else {
             self.data_batcher
@@ -519,34 +511,20 @@ impl ApexKit {
                         rusqlite::types::Value::Blob(jsonb_bytes),
                     ],
                 )
-                .await?
+                .await
+                .map_err(|e| write_error(&e, collection_id, &schema))?
         };
-
-        let unique_future = commit_uniqueness(
-            &self.data_batcher,
-            collection_id,
-            actual_record_id,
-            &final_data,
-            &schema,
-        );
 
         let relation_future =
             self.sync_relations(collection_id, actual_record_id, &final_data, &schema);
 
-        if let Err(e) = tokio::try_join!(unique_future, relation_future) {
-            // COMPENSATING ROLLBACK: Prevent leaked duplicate records during high-concurrency race conditions
+        if let Err(e) = relation_future.await {
+            // COMPENSATING ROLLBACK: Prevent leaked records if relation sync failed
             let _ = self
                 .data_batcher
                 .execute(
                     "DELETE FROM records WHERE collection_id = ?1 AND id = ?2".into(),
                     vec![collection_id.into_val(), actual_record_id.into_val()],
-                )
-                .await;
-            let _ = self
-                .data_batcher
-                .execute(
-                    "DELETE FROM _unique_values WHERE record_id = ?1".into(),
-                    vec![actual_record_id.into_val()],
                 )
                 .await;
             let _ = self
@@ -560,10 +538,7 @@ impl ApexKit {
             // Format the raw SQLite constraint error for the user
             let err_msg = e.to_string();
             if err_msg.contains("UNIQUE constraint failed") {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "Unique constraint violation: This value or combination already exists.",
-                )));
+                return Err(write_error(&err_msg, collection_id, &schema));
             }
             return Err(e);
         }

@@ -244,15 +244,15 @@ pub fn setup_data(conn: &Connection) -> Result<()> {
     // [FIX] Unique constraint to prevent duplicate relationship links
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique ON _relations(origin_col_id, origin_rec_id, target_col_id, target_rec_id, rel_name)", [])?;
 
-    conn.execute("CREATE TABLE IF NOT EXISTS _unique_values (index_key TEXT NOT NULL, value TEXT NOT NULL, record_id INTEGER NOT NULL, PRIMARY KEY (index_key, value))", [])?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_unique_lookup ON _unique_values(index_key, value)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_unique_record ON _unique_values(record_id)",
-        [],
-    )?;
+    // Uniqueness and lookup indexes are now real SQLite expression indexes on
+    // `records`, reconciled from the collection schemas (see
+    // `database::sqlite::indexes`). `_applied_indexes` is the diff base that
+    // records which of those indexes the compiler created.
+    conn.execute("CREATE TABLE IF NOT EXISTS _applied_indexes (index_name TEXT PRIMARY KEY, collection_id INTEGER NOT NULL, kind TEXT NOT NULL, fields TEXT NOT NULL)", [])?;
+
+    // Legacy side-table from the pre-expression-index implementation. Dropped
+    // on upgrade; uniqueness is now enforced by the expression indexes above.
+    let _ = conn.execute("DROP TABLE IF EXISTS _unique_values", []);
     Ok(())
 }
 
